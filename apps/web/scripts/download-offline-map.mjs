@@ -158,7 +158,7 @@ if (!existsSync(tilesDir)) {
     failed.push(`tiles/: manifest says ${manifestTotal}, disk has ${tileCount}`);
   }
   if (manifestPerZoom) {
-    for (const [z, expected] of Object.entries(EXPECTED_PER_ZOOM)) {
+    for (const [z] of Object.entries(EXPECTED_PER_ZOOM)) {
       if (manifestPerZoom[z]?.downloaded !== (perZoomOnDisk[z] ?? 0)) {
         failed.push(`tiles/: manifest perZoom z${z} downloaded ${manifestPerZoom[z]?.downloaded}, disk has ${perZoomOnDisk[z] ?? 0}`);
       }
