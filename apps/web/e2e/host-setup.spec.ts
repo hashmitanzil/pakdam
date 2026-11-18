@@ -42,13 +42,14 @@ test('host setup: every stepper and toggle moves the live summary strip', async 
   // #zone-radius slider fill + "Radius 1.5 km" lines are gone).
   // One Increase steps the radius 500 -> 550 m (50 m step,
   // types.ts ZONE_RADIUS_STEP_M); the stepper shows the compact
-  // radius ("550m", formatRadiusCompact, draft.ts:180) while the
-  // map's "Zone size:" line still shows the diameter — 550 m radius
-  // is about 1.1 km across (formatDistance, freshness.ts:168).
-  // The strip follows the radius: "550m zone …".
+  // radius ("550m", formatRadiusCompact, draft.ts:180). The map's
+  // old "Zone size: about 1.1 km across" line was removed
+  // (founder cleanup, 2026-11-18) — the Radius output is the only
+  // size readout in Circle mode now. The strip follows the radius:
+  // "550m zone …".
   await page.getByRole('button', { name: /Increase Radius/ }).click();
   await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('550m');
-  await expect(page.getByText(/Zone size: about 1\.1 km across/i)).toBeVisible();
+  await expect(page.getByText(/Zone size: about/i)).toHaveCount(0);
   await expect(page.getByText(/550m zone . 1 hunter . 3m pulse . 30m/i).first()).toBeVisible();
   // The "Radius at least 100 m, no maximum" line was removed in
   // simplification §5c — assert the removed text stays gone.

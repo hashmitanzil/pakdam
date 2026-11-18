@@ -131,7 +131,6 @@ export default function HostSetupForm({ value, onChange, showPresets, shrinkAsOw
         checked={value.showPingHistory ?? false}
         onChange={(v) => update({ showPingHistory: v })}
       />
-      <p><strong>Outside the zone:</strong> if a player leaves the play zone, a 30-second countdown appears on their screen. Get back inside before it ends, or they are ejected from the game. This is a fixed rule, not a setting — there is nothing to adjust here.</p>
     </>
   );
 

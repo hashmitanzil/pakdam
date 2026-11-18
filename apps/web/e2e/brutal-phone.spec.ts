@@ -159,21 +159,25 @@ test('brutal: GPS denied shows an honest fallback on host setup', async ({ page 
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('No GPS Host');
   await page.getByRole('button', { name: /Use my location/ }).click();
-  // Denied state, current copy (geolocation.ts LOCATION_DENIED_HELP):
-  // "Location is off — allow it in your browser settings, then tap
-  // the map to place the zone." The old "Location unavailable" line
-  // never existed on this screen (the only "Location unavailable" in
-  // the app is the play page's fallback), and neither did "Tap the
-  // map to place the zone where you are standing". The line is
-  // rendered twice — banner alert + polite announce line
-  // (PlayAreaMap.tsx) — so scope to the banner in the Play area
-  // region. (No grant in this context, so the permission check fails
-  // fast with the denied line — no long chain wait.)
-  const deniedBanner = page.getByRole('region', { name: 'Play area' }).getByRole('alert');
-  await expect(deniedBanner).toBeVisible({ timeout: 30_000 });
-  await expect(deniedBanner).toContainText(/Location is off — allow it in your browser settings, then tap the map to place the zone/i);
+  // Denied state, current behaviour (founder cleanup, 2026-11-18):
+  // the denied-help line ("Location is off — allow it in your
+  // browser settings, then tap the map to place the zone.") was
+  // REMOVED from the setup screen — no banner, no announce for it.
+  // The host just taps the map to place the zone. The old "Location
+  // unavailable" line never existed on this screen (the only
+  // "Location unavailable" in the app is the play page's fallback).
+  // Wait for the attempt to settle — the button is disabled while
+  // locating and enabled again once it ends — then assert the
+  // denied text is nowhere and no alert banner exists in the Play
+  // area region. (No grant in this context, so the permission check
+  // fails fast — no long chain wait.)
+  await expect(page.getByRole('button', { name: /Use my location/ })).toBeEnabled({ timeout: 30_000 });
+  await expect(page.getByRole('region', { name: 'Play area' }).getByRole('alert')).toHaveCount(0);
+  await expect(page.getByText(/Location is off — allow it in your browser settings/i)).toHaveCount(0);
   // Nothing is centred on a guess: create stays blocked, map still works.
-  await expect(page.getByText(/No centre yet/)).toBeVisible();
+  // The "No centre yet." helper was removed with the denied line —
+  // the un-centred evidence is the map region's accessible name.
+  await expect(page.getByRole('region', { name: /tap the map to place the zone/i })).toBeVisible();
   // CREATE LOBBY is never silently disabled (founder bug fix (a)):
   // it stays tappable and explains what is missing instead. It has
   // NO native `disabled` attribute — only aria-disabled="true"

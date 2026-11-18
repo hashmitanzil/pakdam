@@ -162,8 +162,25 @@ async function verifyHost(env: WorkerEnv, roomId: string, playerId: string, toke
 }
 
 const json = (data: unknown, status = 200): Response =>
-  new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
+  new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
 const err = (message: string, status: number): Response => json({ error: message }, status);
+
+/** CORS for the browser game client. The web app runs on a different
+ *  origin (Vercel) from this Worker, so every browser fetch is
+ *  cross-origin — and a POST with `Content-Type: application/json`
+ *  triggers a preflight OPTIONS first. Without these headers the
+ *  browser blocks the response and fetch rejects, so the client
+ *  reports "Could not reach the game server" even though the Worker
+ *  answered (curl works because it does not enforce CORS). Auth
+ *  travels in request bodies (per-player secret tokens), never
+ *  cookies, so `*` is safe. WebSocket upgrades (101) are not
+ *  CORS-gated and pass through untouched. */
+const CORS_PREFLIGHT_HEADERS: Record<string, string> = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Max-Age': '86400',
+};
 
 async function readJsonBody(req: Request): Promise<unknown> {
   try {
@@ -185,7 +202,7 @@ async function doOp(env: WorkerEnv, roomId: string, body: Record<string, unknown
   }));
   const text = await res.text();
   const contentType = res.headers.get('content-type') ?? 'application/json';
-  return new Response(text, { status: res.status, headers: { 'content-type': contentType } });
+  return new Response(text, { status: res.status, headers: { 'content-type': contentType, 'Access-Control-Allow-Origin': '*' } });
 }
 
 /** Forward one internal op to the singleton code-index Durable
@@ -202,7 +219,7 @@ async function indexOp(env: WorkerEnv, body: Record<string, unknown>): Promise<R
   }));
   const text = await res.text();
   const contentType = res.headers.get('content-type') ?? 'application/json';
-  return new Response(text, { status: res.status, headers: { 'content-type': contentType } });
+  return new Response(text, { status: res.status, headers: { 'content-type': contentType, 'Access-Control-Allow-Origin': '*' } });
 }
 
 /** Register code → roomId in the index (Worker F). 'ok' on success;
@@ -877,6 +894,12 @@ async function handleWebSocket(req: Request, env: WorkerEnv, roomId: string, url
 
 export default {
   async fetch(req: Request, env: WorkerEnv, ctx: ExecutionContext): Promise<Response> {
+    // CORS preflight: browsers send OPTIONS before any POST with a
+    // JSON body. Answer it here, before routing, or the preflight
+    // gets a 405 and the real request never happens.
+    if (req.method === 'OPTIONS') {
+      return new Response(null, { status: 204, headers: CORS_PREFLIGHT_HEADERS });
+    }
     const url = new URL(req.url);
     const path = url.pathname;
     const kind = route(path);

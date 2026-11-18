@@ -13,11 +13,11 @@ const MapView = dynamic(() => import('../map/MapView'), { ssr: false });
  *  starts from LOCATION, never from a typed place name. There is no
  *  venue/area-name field anywhere in this component — the host taps
  *  "Use my location" (real GPS centre on a real map) or taps the map to
- *  drop the zone, sizes it with a slider (diameter shown in m/km), and
- *  draws no-go areas as circles on the map. On load the editor requests
+ *  drop the zone, sizes it with a slider (diameter shown in m/km).
+ *  On load the editor requests
  *  the host's real GPS location and centres there; until a fix arrives
  *  it shows "Finding your location…" and the zone stays un-centred —
- *  never a fallback place as the centre, and no city name anywhere in the map UI. No-go areas are drawn
+ *  never a fallback place as the centre, and no city name anywhere in the map UI. Restricted areas are drawn
  *  shapes, never a typed list of names. The old venue-derived
  *  area-check code is deleted: players confirm the same play area by
  *  the zone itself, in the lobby.
@@ -35,7 +35,6 @@ export interface ZoneDraft {
 
 const PRESET_KEY = 'pakdam.zone-presets.v1';
 const STEP_DEG = 0.0005; // ~55 m per arrow press — labelled on screen
-const NO_GO_RADIUS_M = 25; // each drawn no-go circle, ~50 m across
 
 /** Zone radius from player count. Kept as a helper only; it is not
  *  shown anywhere in the host-setup UI. */
@@ -77,7 +76,6 @@ export default function ZoneEditor({
    *  so the host sees which method is being tried instead of a
    *  static spinner. */
   const [locStage, setLocStage] = useState<string | null>(null);
-  const [noGoMode, setNoGoMode] = useState(false);
   const mapRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -104,6 +102,16 @@ export default function ZoneEditor({
   }, [onChange]);
 
   const handleLocError = useCallback((msg: string) => {
+    // Founder decision, 2026-11-18: the denied-help line ("Location
+    // is off — allow it in your browser settings…") is removed from
+    // this screen — no banner, no announce for it. The coarse-fix
+    // line ("GPS is too rough here…") still shows, as before.
+    if (msg === LOCATION_DENIED_HELP) {
+      setLocState('idle');
+      setLocError('');
+      setAnnounce('');
+      return;
+    }
     setLocState('error');
     setLocError(msg);
     setAnnounce(msg);
@@ -141,8 +149,8 @@ export default function ZoneEditor({
 
   // Auto-locate on mount when no centre is set yet. Permission is
   // checked FIRST: when location is already denied, the chain is
-  // skipped entirely (no spinner, no waiting) and the denied help
-  // shows with tap-the-map as the primary path.
+  // skipped entirely (no spinner, no waiting) and no denied text is
+  // shown — the host just taps the map (founder decision, 2026-11-18).
   const useMyLocationRef = useRef(useMyLocation);
   useMyLocationRef.current = useMyLocation;
   const autoLocRequestedRef = useRef(false);
@@ -152,9 +160,7 @@ export default function ZoneEditor({
     if (value.centreLat == null || value.centreLng == null) {
       void checkLocationPermission().then((perm) => {
         if (perm === 'denied') {
-          setLocState('error');
-          setLocError(LOCATION_DENIED_HELP);
-          setAnnounce(LOCATION_DENIED_HELP);
+          handleLocError(LOCATION_DENIED_HELP);
         } else {
           useMyLocationRef.current();
         }
@@ -163,18 +169,11 @@ export default function ZoneEditor({
   }, [value.centreLat, value.centreLng]);
 
   const onMapClick = useCallback((lat: number, lng: number) => {
-    if (noGoMode) {
-      apply(
-        { ...value, noGoAreas: [...value.noGoAreas, circlePolygon(lat, lng, NO_GO_RADIUS_M)] },
-        `No-go area added. ${value.noGoAreas.length + 1} no-go ${value.noGoAreas.length + 1 === 1 ? 'area' : 'areas'} on the map.`,
-      );
-    } else {
-      apply(
-        { ...value, centreLat: lat, centreLng: lng },
-        'Zone centre moved.',
-      );
-    }
-  }, [apply, noGoMode, value]);
+    apply(
+      { ...value, centreLat: lat, centreLng: lng },
+      'Zone centre moved.',
+    );
+  }, [apply, value]);
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     const isArrow = e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight';
@@ -229,20 +228,19 @@ export default function ZoneEditor({
           {locState === 'locating' ? 'Finding your location…' : 'Use my location'}
         </button>
       </p>
-      {locState === 'locating' ? <p role="status">{locStage ?? 'Finding your location…'} Waiting for a good GPS fix (accuracy ±10 m or better) — this can take a few seconds outdoors. Indoors GPS may not lock at all.{locBest != null ? ` Best fix so far: ±${Math.round(locBest)} m — still refining…` : ''} You can tap the map right now to place the zone — no need to wait for GPS.</p> : null}
+      {locState === 'locating' ? <p role="status">{locStage ?? 'Finding your location…'}{locBest != null ? ` Best fix so far: ±${Math.round(locBest)} m — still refining…` : ''}</p> : null}
       {locState === 'ok' && locAccuracy != null ? <p role="status">✓ Location found — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m). The map is centred where you are standing.</p> : null}
       {locState === 'error' ? (
         <div className="banner" role="alert">
           {locError}
         </div>
       ) : null}
-      {!centreSet ? <p className="small">No centre yet. Tap “Use my location” above, or tap anywhere on the map to drop the zone there. Nothing is centred on a guessed place.</p> : null}
 
       <div
         ref={mapRef}
         className="zone-editor-map"
         role="region"
-        aria-label={centreSet ? `Play zone map — centre set, about ${formatDistance(value.radiusMeters * 2)} across. Use arrow keys to move the zone, plus and minus to change its size, U to undo.` : 'Play zone map — no centre yet. Use your location or tap the map to place the zone.'}
+        aria-label={centreSet ? `Play zone map — centre set, about ${formatDistance(value.radiusMeters * 2)} across.` : 'Play zone map — tap the map to place the zone.'}
         tabIndex={0}
         onKeyDown={onKeyDown}
       >
@@ -251,8 +249,6 @@ export default function ZoneEditor({
           zoneBoundary={zoneDraftToBoundary(value)} noGoAreas={value.noGoAreas}
           onMapClick={onMapClick} keyboardPan={false}
         />
-        <p><strong>Zone size:</strong> about {formatDistance(value.radiusMeters * 2)} across (radius {formatDistance(value.radiusMeters)})</p>
-        <p className="small">Tap the map to move the centre. Arrow keys move it, + / − resize.</p>
         <p aria-live="polite" className="small">{announce}</p>
       </div>
 
@@ -278,25 +274,6 @@ export default function ZoneEditor({
         <button type="button" className="btn btn-secondary" onClick={() => apply({ ...value, radiusMeters: value.radiusMeters + ZONE_RADIUS_STEP_M }, `Radius increased to ${value.radiusMeters + ZONE_RADIUS_STEP_M} metres.`)}>+ 50 m</button>
       </p>
       <p><button type="button" className="btn btn-secondary" onClick={undo} disabled={history.length === 0}>Undo last map change (U)</button></p>
-
-      <h3>No-go areas</h3>
-      <p className="small">Tap the map to drop a no-go circle. Players must stay out.</p>
-      <p>
-        <button type="button" className="btn btn-secondary" aria-pressed={noGoMode} onClick={() => setNoGoMode((m) => !m)}>
-          {noGoMode ? 'No-go mode: ON — tap the map to add a no-go area' : 'Add no-go areas on the map'}
-        </button>
-      </p>
-      {value.noGoAreas.length === 0 ? <p>No no-go areas drawn yet.</p> : (
-        <ul>{value.noGoAreas.map((_a, i) => {
-          return (
-            <li key={i}>
-              No-go area {i + 1}
-              {' '}
-              <button type="button" className="btn btn-secondary" onClick={() => apply({ ...value, noGoAreas: value.noGoAreas.filter((_, j) => j !== i) }, `Removed no-go area ${i + 1}.`)}>Remove</button>
-            </li>
-          );
-        })}</ul>
-      )}
 
       <h3>Save as preset</h3>
       {savedPresets.length === 0 ? <p className="small">No saved presets yet — your first setup can be saved here.</p> : (

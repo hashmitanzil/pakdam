@@ -50,7 +50,6 @@ import {
  * survives into Circle mode. Returning to Draw starts clean: the form
  * generates a fresh regular polygon around the centre.
  */
-const NO_GO_RADIUS_M = 25;
 const STEP_DEG = 0.0005; // ~55 m per arrow press — labelled on screen
 const DRAW_DEFAULT_CORNERS = 6;
 
@@ -120,7 +119,6 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
    *  came from GPS: a hand-placed centre is labelled as such until a
    *  real GPS fix arrives (founder bug fix, 2026-11-17). */
   const [centreSource, setCentreSource] = useState<'gps' | 'placed' | null>(null);
-  const [noGoMode, setNoGoMode] = useState(false);
   const [announce, setAnnounce] = useState('');
   const [selectedCorner, setSelectedCorner] = useState<number | null>(null);
   const selectedCornerRef = useRef<number | null>(null);
@@ -138,8 +136,6 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
    *  skipped, and the zone sat off-screen). */
   const lastFittedRef = useRef<string | null>(null);
 
-  const noGoModeRef = useRef(noGoMode);
-  noGoModeRef.current = noGoMode;
   const onChangeRef = useRef(onChange);
   onChangeRef.current = onChange;
 
@@ -391,10 +387,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       map.on('click', (e) => {
         if (!e.lngLat) return;
         const p = propsRef.current;
-        if (noGoModeRef.current) {
-          onChangeRef.current({ ...p, noGoAreas: [...p.noGoAreas, circlePolygon(e.lngLat.lat, e.lngLat.lng, NO_GO_RADIUS_M)] });
-          setAnnounce(`No-go area added. ${p.noGoAreas.length + 1} no-go areas on the map.`);
-        } else if (p.zoneShape === 'draw') {
+        if (p.zoneShape === 'draw') {
           // Draw mode: taps do not move anything — corners and the middle
           // marker are dragged. Tapping only selects a corner (on the
           // marker itself), never reshapes the zone by accident.
@@ -491,6 +484,17 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   };
 
   const handleLocError = (msg: string) => {
+    // Founder decision, 2026-11-18: the denied-help line ("Location
+    // is off — allow it in your browser settings…") is removed from
+    // this screen — no banner, no announce for it. The host just taps
+    // the map to place the zone. The coarse-fix line ("GPS is too
+    // rough here…") still shows, as before.
+    if (msg === LOCATION_DENIED_HELP) {
+      setLocState('idle');
+      setLocError('');
+      setAnnounce('');
+      return;
+    }
     setLocState('error');
     setLocError(msg);
     setAnnounce(msg);
@@ -533,8 +537,8 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   // only when no centre is set yet — reopening settings with a centre
   // already placed must not re-prompt for location. Permission is
   // checked FIRST: when location is already denied, the chain is
-  // skipped entirely (no spinner, no waiting) and the denied help
-  // shows with tap-the-map as the primary path.
+  // skipped entirely (no spinner, no waiting) and no denied text is
+  // shown — the host just taps the map (founder decision, 2026-11-18).
   const useMyLocationRef = useRef(useMyLocation);
   useMyLocationRef.current = useMyLocation;
   const autoLocRequestedRef = useRef(false);
@@ -544,9 +548,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     if (propsRef.current.centreLat == null || propsRef.current.centreLng == null) {
       void checkLocationPermission().then((perm) => {
         if (perm === 'denied') {
-          setLocState('error');
-          setLocError(LOCATION_DENIED_HELP);
-          setAnnounce(LOCATION_DENIED_HELP);
+          handleLocError(LOCATION_DENIED_HELP);
         } else {
           useMyLocationRef.current();
         }
@@ -615,21 +617,20 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
           {locState === 'locating' ? 'Finding your location…' : 'Use my location'}
         </button>
       </p>
-      {locState === 'locating' ? <p role="status">{locStage ?? 'Finding your location…'} Waiting for a good GPS fix (accuracy ±10 m or better) — this can take a few seconds outdoors. Indoors GPS may not lock at all.{locBest != null ? ` Best fix so far: ±${Math.round(locBest)} m — still refining…` : ''} You can tap the map right now to place the zone — no need to wait for GPS.</p> : null}
+      {locState === 'locating' ? <p role="status">{locStage ?? 'Finding your location…'}{locBest != null ? ` Best fix so far: ±${Math.round(locBest)} m — still refining…` : ''}</p> : null}
       {locState === 'ok' && locAccuracy != null ? <p role="status">✓ Location found — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m). The map is centred where you are standing.</p> : null}
       {locState === 'error' ? (
         <div className="banner" role="alert">
           {locError}
         </div>
       ) : null}
-      {!centreSet ? <p className="small">No centre yet. Tap “Use my location” above, or tap anywhere on the map to drop the zone there. Nothing is centred on a guessed place.</p> : null}
 
       <div
         className="mapbox"
         role="region"
         aria-label={isDraw
-          ? (drawn ? `Drawn play zone — ${drawn.length} corners, about ${formatDistance(drawSize)} across. Drag a numbered corner to reshape it, drag the middle marker to move the whole zone. Arrow keys move the whole zone, plus and minus change its size, U undoes.` : 'Drawn play zone — no shape yet. Use your location to place the starting shape.')
-          : centreSet ? `Play zone map — centre set, about ${formatDistance(value.radiusMeters * 2)} across. Arrow keys move the zone, plus and minus change its size.` : 'Play zone map — no centre yet. Use your location or tap the map to place the zone.'}
+          ? (drawn ? `Drawn play zone — ${drawn.length} corners, about ${formatDistance(drawSize)} across.` : 'Drawn play zone — no shape yet. Use your location to place the starting shape.')
+          : centreSet ? `Play zone map — centre set, about ${formatDistance(value.radiusMeters * 2)} across.` : 'Play zone map — tap the map to place the zone.'}
         tabIndex={0}
         onKeyDown={onKeyDown}
         style={{ height: 320, borderRadius: 12, overflow: 'hidden', position: 'relative' }}
@@ -649,7 +650,6 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
           <p><strong>Drawn zone:</strong> {drawn ? `${drawn.length} corners · about ${formatDistance(drawSize)} across` : 'not drawn yet — use your location to place the starting shape'}</p>
           {drawn && centreSource === 'gps' && locAccuracy != null ? <p className="small">GPS fix — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m).</p> : null}
           {drawn && centreSource === 'placed' ? <p className="small">Placed by hand on the map — not a GPS fix. Tap “Use my location” for your real position.</p> : null}
-          <p className="small">Drag a numbered corner to reshape the zone. Arrow keys move it, + / − resize.</p>
           <p style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button type="button" className="btn btn-secondary" disabled={selectedCorner === null || !drawn || drawn.length <= 3} onClick={() => {
               if (selectedCorner === null || !drawn) return;
@@ -666,31 +666,9 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
         <>
           {centreSet && centreSource === 'gps' && locAccuracy != null ? <p className="small">GPS fix — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m).</p> : null}
           {centreSet && centreSource === 'placed' ? <p className="small">Placed by hand on the map — not a GPS fix. Tap “Use my location” for your real position.</p> : null}
-          {centreSet && centreSource === null ? <p className="small">Centre set before this screen opened — tap “Use my location” to confirm it against your real GPS position.</p> : null}
-          <p><strong>Zone size:</strong> about {formatDistance(value.radiusMeters * 2)} across (radius {formatDistance(value.radiusMeters)})</p>
-          <p className="small">Tap the map to move the centre. Arrow keys move it, + / − resize.</p>
         </>
       )}
       <p aria-live="polite" className="small">{announce}</p>
-
-      <h3>No-go areas</h3>
-      <p className="small">Tap the map to drop a no-go circle. Players must stay out.</p>
-      <p>
-        <button type="button" className="btn btn-secondary" aria-pressed={noGoMode} onClick={() => setNoGoMode((m) => !m)}>
-          {noGoMode ? 'No-go mode: ON — tap the map to add a no-go area' : 'Add no-go areas on the map'}
-        </button>
-      </p>
-      {value.noGoAreas.length === 0 ? <p>No no-go areas drawn yet.</p> : (
-        <ul>{value.noGoAreas.map((_a, i) => {
-          return (
-            <li key={i}>
-              No-go area {i + 1}
-              {' '}
-              <button type="button" className="btn btn-secondary" onClick={() => onChange({ ...value, noGoAreas: value.noGoAreas.filter((_, j) => j !== i) })}>Remove</button>
-            </li>
-          );
-        })}</ul>
-      )}
     </div>
   );
 }

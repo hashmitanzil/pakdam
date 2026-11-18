@@ -16,9 +16,10 @@
 //      host is ever requested: OpenFreeMap / Esri / OSM / CARTO /
 //      Google are all gone from the runtime map.
 //  (2) Use-my-location granted → YOU marker + centring; denied →
-//      the one short line ("Location is off — allow it in your
-//      browser settings, then tap the map to place the zone."), no
-//      Android/iOS enable steps (simplification §5b).
+//      NO banner and NO denied text at all on the setup screen
+//      (founder cleanup, 2026-11-18 — the denied-help line was
+//      removed; the host just taps the map to place the zone), no
+//      Android/iOS enable steps.
 //  (3) No numbered test markers 1–4 on Circle setup / play maps.
 //  (4) Phone-width clipping: header, helper text, map controls.
 //  (5) Mode switch Circle ⇄ Draw clears every corner marker.
@@ -48,11 +49,11 @@
 //    corners showing — the open question for the founder is whether
 //    Draw corners should keep their numbers at all.
 //  - The denied state takes up to ~20 s (geolocation timeout is 15 s).
-//    The denied banner renders LOCATION_DENIED_HELP (geolocation.ts),
-//    which is the short §5b line now ("Location is off — allow
-//    it in your browser settings, then tap the map to place the
-//    zone."), with no Android/iPhone enable steps, so the denied
-//    test below asserts that short line instead.
+//    The setup screen shows NO denied banner and NO denied text
+//    (founder cleanup, 2026-11-18 removed the denied-help line from
+//    the setup screen — the play page still shows it, via its own
+//    locError), so the denied test below asserts the absence of both
+//    instead of asserting the old short line.
 import { test, expect, type Page } from '@playwright/test';
 import { expectNoOverflow, startMatch } from './helpers';
 
@@ -213,22 +214,24 @@ test('Use my location denied: honest denied state with one short line, no silent
   // Hydration gate (see test 1): the click must land on a live button.
   await expect(page.locator(MAP_CANVAS).first()).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: /Use my location/ }).click();
-  // The denied callback can take the full 15 s geolocation timeout
-  // to arrive in headless Chromium — wait up to 30 s for the banner.
-  // Simplification §5b: the denied state is ONE short line
-  // ("Location is off — allow it in your browser settings, then tap
-  // the map to place the zone.") — the old Android/iOS enable steps
-  // were removed, so this test asserts the short line and that no OS
-  // steps appear, instead of asserting them as present.
-  // Unscoped getByRole('alert') also matches the validation error-text
-  // and Next's route announcer — the denied banner is the alert inside
-  // the Play area section (PlayAreaMap.tsx).
-  const banner = page.getByRole('region', { name: 'Play area' }).getByRole('alert');
-  await expect(banner).toBeVisible({ timeout: 30_000 });
-  await expect(banner).toContainText(/Location is off — allow it in your browser settings|GPS is too rough here/);
-  await expect(banner, 'DEFECT (location): denied state must not carry Android/iOS enable steps').not.toContainText(/Android|iOS|iPhone/);
-  // No silent default spot: nothing is centred on a guess.
-  await expect(page.getByText(/No centre yet/)).toBeVisible();
+  // Founder cleanup, 2026-11-18: the denied-help line ("Location is
+  // off — allow it in your browser settings, then tap the map to
+  // place the zone.") was REMOVED from the setup screen — no banner,
+  // no announce for it. The host just taps the map to place the
+  // zone. The denied callback can take the full 15 s geolocation
+  // timeout to arrive in headless Chromium, so wait for the attempt
+  // to settle: the button is disabled while locating and enabled
+  // again once the attempt ends. Then assert the denied text is
+  // nowhere on the screen and no alert banner exists in the Play
+  // area region.
+  await expect(page.getByRole('button', { name: /Use my location/ })).toBeEnabled({ timeout: 30_000 });
+  await expect(page.getByRole('region', { name: 'Play area' }).getByRole('alert')).toHaveCount(0);
+  await expect(page.getByText(/Location is off — allow it in your browser settings/i)).toHaveCount(0);
+  await expect(page.getByText(/Android|iOS|iPhone/)).toHaveCount(0);
+  // No silent default spot: nothing is centred on a guess. The
+  // "No centre yet." helper line was removed with the denied line —
+  // the un-centred evidence is the map region's accessible name.
+  await expect(page.getByRole('region', { name: /tap the map to place the zone/i })).toBeVisible();
   // CREATE LOBBY is never silently disabled (founder bug fix (a)):
   // it stays tappable and explains what is missing instead. It has
   // NO native `disabled` attribute — only aria-disabled="true"
@@ -297,10 +300,11 @@ test('phone-width clipping: header, helper text and map controls stay inside the
   // still fully visible after scrolling it into view (the sticky
   // header must not cover it — scroll-padding-top guards this).
   // Geolocation is granted here, so PlayAreaMap auto-locates on mount
-  // and the centre is set before this line — the "No centre yet"
-  // helper is gone by design; the helper in its place is the
-  // "Location found — …" status line (same pattern as the granted
-  // test, .first() because the message renders twice).
+  // and the centre is set before this line — the "No centre yet."
+  // helper was removed in the founder cleanup (2026-11-18); the
+  // helper in its place is the "Location found — …" status line
+  // (same pattern as the granted test, .first() because the message
+  // renders twice).
   const helper = phone.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first();
   await expect(helper).toBeVisible();
   const helperTop0 = (await helper.boundingBox())!.y;
@@ -337,9 +341,10 @@ test('mode switch: Draw → Circle clears every corner marker; back to Draw star
   const corners = page.locator('[aria-label^="Corner "]');
   // Circle is the default: no corner markers at all.
   await expect(corners).toHaveCount(0);
-  // Circle mode shows the "Zone size:" summary line (the old
-  // "Zone centre:" status line was removed in §5c).
-  await expect(page.getByText(/Zone size:/)).toBeVisible();
+  // Circle mode: the Radius stepper is the size readout (the old
+  // "Zone size:" line was removed in the founder cleanup,
+  // 2026-11-18).
+  await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('500m');
   // Switch to Draw: 6 corners appear, with the Drawn-zone summary.
   await page.getByRole('radio', { name: /Draw/ }).check();
   await expect(corners).toHaveCount(6);
@@ -350,7 +355,7 @@ test('mode switch: Draw → Circle clears every corner marker; back to Draw star
   await expect(corners).toHaveCount(0);
   await expect(page.getByText(/Drawn zone:/)).toHaveCount(0);
   await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
-  await expect(page.getByText(/Zone size:/)).toBeVisible();
+  await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('500m');
   // Back to Draw: starts clean with a fresh regular polygon — the
   // circle is gone, 6 corners again, Drawn-zone summary back.
   await page.getByRole('radio', { name: /Draw/ }).check();

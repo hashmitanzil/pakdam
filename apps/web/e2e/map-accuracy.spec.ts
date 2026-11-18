@@ -16,7 +16,10 @@
 //   lines were removed in simplification §5c. Centre-set evidence
 //   now is the "Location found — … (GPS accuracy ±N m)" status line
 //   (GPS fix) or the "Placed by hand on the map" line (hand-placed);
-//   the un-centred state reads "No centre yet."
+//   the un-centred state has no text line any more (founder cleanup,
+//   2026-11-18 removed the "No centre yet." helper) — its evidence
+//   is the map region's accessible name, "tap the map to place the
+//   zone", which flips to "centre set" once the centre is placed.
 //
 // RECONSTRUCTED 2026-11-17: this file was truncated to 0 bytes by the
 // VM's EPERM write flapping and rebuilt from the run-2 Playwright
@@ -50,13 +53,16 @@ test('coarse GPS (±2.5 km) never centres the zone — km message, manual pin fa
   const roughBanner = page.getByRole('region', { name: 'Play area' }).getByRole('alert');
   await expect(roughBanner).toBeVisible({ timeout: 30_000 });
   await expect(roughBanner).toContainText(/GPS is too rough here — tap the map to place the zone/i);
-  await expect(page.getByText(/No centre yet/)).toBeVisible();
+  // No centre yet: the "No centre yet." helper line was removed
+  // (founder cleanup, 2026-11-18) — the un-centred evidence is the
+  // map region's accessible name, "tap the map to place the zone".
+  await expect(page.getByRole('region', { name: /tap the map to place the zone/i })).toBeVisible();
   // Manual fallback: tap the map to place the zone by hand. Wait for
   // the map canvas first (hydration gate — a tap before MapLibre
   // mounts lands on an empty container and places nothing).
   await expect(page.locator('.mapbox .maplibregl-canvas').first()).toBeVisible({ timeout: 30_000 });
   await page.locator('.mapbox').click({ position: { x: 180, y: 160 } });
-  await expect(page.getByText(/No centre yet/)).toHaveCount(0);
+  await expect(page.getByRole('region', { name: /centre set/i })).toBeVisible();
   await expect(page.getByText(/Placed by hand on the map/)).toBeVisible();
 });
 
@@ -93,8 +99,10 @@ test('centre pin can be moved by hand — arrow keys move the centre (no coordin
   await page.locator('.mapbox').focus();
   await page.keyboard.press('ArrowUp');
   // Arrow keys move the centre by hand without an announce line —
-  // the evidence is the hand-placed label plus the Zone size line.
-  await expect(page.getByText(/Zone size:/)).toBeVisible();
+  // the evidence is the hand-placed label plus the Radius stepper
+  // still showing the unchanged radius (the old "Zone size:" line
+  // was removed in the founder cleanup, 2026-11-18).
+  await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('500m');
   await expect(page.getByText(/Placed by hand on the map/)).toBeVisible();
 });
 
