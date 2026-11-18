@@ -3,10 +3,10 @@ import {
   DEFAULT_HOST_TOGGLES, ZONE_RADIUS_DEFAULT_M, ZONE_RADIUS_UI_MAX_M,
   ZONE_RADIUS_MIN_M, ZONE_RADIUS_STEP_M, suggestZoneRadiusMeters, validateRules,
 } from '@pakdam/shared';
-import type { GeoPolygon, HouseRulePreset, HouseRules, RoomConfig } from '@pakdam/shared';
+import type { GeoPolygon, HouseRules, RoomConfig } from '@pakdam/shared';
 import { balancedHunterCount, shrinkTimesSeconds, zoneDiameterMeters } from '@pakdam/engine';
 import { circlePolygon, scalePolygonTowardCentroid } from '@/components/match/ZoneEditor';
-import { formatDistance, polygonCentroid } from '@/components/match/freshness';
+import { polygonCentroid } from '@/components/match/freshness';
 
 /**
  * Host-setup draft — the single state object behind the create screen
@@ -40,13 +40,18 @@ export interface HostSetupDraft extends HouseRules {
   zoneShape: 'circle' | 'draw';
   /** The drawn polygon (Draw mode only). Null until the host draws one. */
   drawnBoundary: GeoPolygon | null;
-  /** Final zone size as % of the starting size, or null = Auto. */
+  /** Final zone size as % of the starting size, or null = Auto
+   *  (the zone keeps 75% of its size per shrink). NO setup control
+   *  edits this any more (video rebuild, 2026-11-18 — the Final size
+   *  Auto + % control was removed; shrinking is always "loses a
+   *  quarter every N min"). The field stays so rooms saved before
+   *  the removal round-trip through draftFromConfig/draftToConfig
+   *  with their stored value intact. */
   finalSizePercent: number | null;
 }
 
 export const DRAW_DEFAULT_CORNERS = 6;
 export const CORNER_STEPS = [3, 4, 5, 6, 8, 10, 12] as const;
-export const FINAL_SIZE_STEPS = [10, 15, 20, 25, 30, 40, 50, 60, 75, 100] as const;
 
 export const DURATION_STEPS_MIN = [5, 10, 15, 30, 45, 60, 90, 120, 180] as const;
 export const HEAD_START_STEPS_S = [0, 30, 90, 180, 300, 600, 900, 1800] as const;
@@ -66,7 +71,7 @@ export const RADIUS_BOUNDS = { min: ZONE_RADIUS_MIN_M, max: ZONE_RADIUS_UI_MAX_M
  *  3 min, shrink on every 10 min, 500 m zone, code-only.
  *  Runner confirmation is ALWAYS on (fixed decided rule, not a
  *  host option): catchConfirmationRequired is forced true in every
- *  draft path below (default, presets, config round-trip). */
+ *  draft path below (default, config round-trip). */
 export function defaultDraft(): HostSetupDraft {
   return {
     mode: 'classic', teamAssignment: 'random', maxPlayers: 30, hunterCount: 2,
@@ -134,24 +139,17 @@ export function maxManualHunterCount(maxPlayers: number): number {
  *  joined — never from a pre-set player count. Balance ON reads the
  *  provisional table from the roster size at match start; otherwise
  *  the host's stepper value, clamped so Hunters never outnumber
- *  Runners in that roster. Callers without a roster (create screen,
- *  lobby sheet) must use balancedHunterRange for the preview instead
- *  of passing the room cap in as if it were a roster. */
+ *  Runners in that roster. This is the single count the room summary
+ *  strip shows (roomSummaryStrip): callers that know the roster
+ *  pass it; callers without one pass the smallest possible roster
+ *  (3 players → 1 Hunter) — never a range. */
 export function effectiveHunterCount(d: Pick<HostSetupDraft, 'balanceHunters' | 'hunterCount'>, rosterSize: number): number {
   const n = d.balanceHunters ? balancedHunterCount(rosterSize) : d.hunterCount;
   return Math.max(1, Math.min(n, rosterSize - 1));
 }
 
-/** The Hunter-count range Balance produces as the roster grows to
- *  the room cap: 1 Hunter for a 3–4 player roster, up to 5 for
- *  25–30. The preview range, not a single count — the single number
- *  only exists once the roster is known (effectiveHunterCount). */
-export function balancedHunterRange(maxPlayers: number): { min: number; max: number } {
-  return { min: balancedHunterCount(3), max: balancedHunterCount(Math.max(3, maxPlayers)) };
-}
-
 /** Mode rules, applied wherever a draft is rebuilt from stored
- *  rules (config, preset, or a fresh config). Classic and Infection
+ *  rules (config or a fresh config). Classic and Infection
  *  carry no forced rules, so the rules pass through unchanged. */
 export function applyModeRules(r: HouseRules): HouseRules {
   return r;
@@ -161,7 +159,7 @@ export function formatMinutes(min: number): string {
   if (min < 60) return `${min} min`;
   const h = Math.floor(min / 60);
   const m = min % 60;
-  return m === 0 ? `${h} h` : `${h} h ${m} min`;
+  return m === 0 ? `${h} h` : `${h} h ${m}`;
 }
 /** Short seconds: 30 -> "30s", 90 -> "1m 30s", 180 -> "3 min", 0 -> "None". */
 export function formatSecondsShort(s: number): string {
@@ -175,24 +173,49 @@ export function formatPing(s: number): string {
   return s === 0 ? 'No pings' : `every ${formatSecondsShort(s)}`;
 }
 
-/** Room summary strip, computed from the real settings — the line the
- *  lobby shows under the room code ("500m zone · 1 hunter · 30s pulse
- *  · 15m" style). */
-export function roomSummaryStrip(d: HostSetupDraft): string {
-  // Balance ON: no single Hunter count exists before the roster
-  // joins — show the range Balance produces (1 for 3–4 players, up
-  // to 5 for 25–30), never a count derived from the room cap.
-  const range = balancedHunterRange(d.maxPlayers);
+/** Compact radius for the summary strip and the Radius stepper:
+ *  250 -> "250m", 500 -> "500m", 1000 -> "1km", 1500 -> "1.5km".
+ *  No space, km at or above 1000 m. This is the RADIUS the stepper
+ *  shows — never the diameter (the old strip showed the diameter). */
+export function formatRadiusCompact(meters: number): string {
+  if (meters < 1000) return `${Math.round(meters)}m`;
+  const km = Math.round((meters / 1000) * 10) / 10;
+  return `${Number.isInteger(km) ? Math.round(km) : km}km`;
+}
+
+/** Compact interval for the summary strip: 30 -> "30s", 90 ->
+ *  "1m30s", 180 -> "3m", 1800 -> "30m", 5400 -> "1h30m". Seconds
+ *  stay seconds, minutes stay minutes — no spaces. */
+export function formatCompactInterval(seconds: number): string {
+  if (seconds <= 0) return '0s';
+  if (seconds < 60) return `${seconds}s`;
+  const m = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (m < 60) return rest === 0 ? `${m}m` : `${m}m${rest}s`;
+  const h = Math.floor(m / 60);
+  const mm = m % 60;
+  return mm === 0 ? `${h}h` : `${h}h${mm}m`;
+}
+
+/** Room summary strip, computed from the real settings — the line
+ *  the create screen and the lobby show under the room code:
+ *  "500m zone · 1 hunter · 30s pulse · 10m".
+ *  - Zone is the RADIUS the stepper shows (500m / 250m / 1km).
+ *  - Hunters is ONE count, never a range: the roster count when
+ *    Balance is ON (pass the roster size when it is known — neither
+ *    call site passes one yet, so the lobby shows the smallest-game
+ *    count, 1 Hunter for 3 players), the host's stepper value when
+ *    Balance is OFF.
+ *  - Ping is the compact interval ("30s" / "3m"), "no pings" at 0.
+ *  - Duration is compact ("10m" / "30m" / "1h30m"). */
+export function roomSummaryStrip(d: HostSetupDraft, rosterSize?: number): string {
   const hunters = d.balanceHunters
-    ? `${range.min}–${range.max} hunters`
-    : `${d.hunterCount} hunter${d.hunterCount === 1 ? '' : 's'}`;
-  const ping = d.pingIntervalSeconds === 0 ? 'no pings' : `${formatSecondsShort(d.pingIntervalSeconds)} pulse`;
-  const zone = !d.playZoneEnabled
-    ? 'no zone'
-    : d.zoneShape === 'draw' && d.drawnBoundary
-      ? `${formatDistance(zoneDiameterMeters(d.drawnBoundary))} custom zone`
-      : `${formatDistance(d.radiusMeters * 2)} zone`;
-  return `${zone} · ${hunters} · ${ping} · ${formatMinutes(d.durationSeconds / 60)}`;
+    ? effectiveHunterCount(d, rosterSize ?? 3)
+    : d.hunterCount;
+  const hunterText = `${hunters} hunter${hunters === 1 ? '' : 's'}`;
+  const ping = d.pingIntervalSeconds === 0 ? 'no pings' : `${formatCompactInterval(d.pingIntervalSeconds)} pulse`;
+  const zone = !d.playZoneEnabled ? 'no zone' : `${formatRadiusCompact(d.radiusMeters)} zone`;
+  return `${zone} · ${hunterText} · ${ping} · ${formatCompactInterval(d.durationSeconds)}`;
 }
 
 /** Suggested radius for a player count. Kept for compatibility;
@@ -339,84 +362,23 @@ export function draftFromConfig(c: RoomConfig): HostSetupDraft {
   };
 }
 
-// --- Built-in presets (Quick / Standard / Big Park) ---
-// Decided defaults, hardcoded here — NOT read from CALIBRATION_OPEN,
-// which resolves differently (quick 30 min, standard 60 min) and
-// would show the wrong defaults. Standard is the create screen's
-// default: 30 min match, 3 min head start, ping every 3 min.
-// Quick follows the SCRAM video: 15 min, 2 min head start, ping
-// every 1 min. Big Park shares Standard's timings on a bigger zone
-// (its values were never shown in the video).
-export type BuiltInPresetId = 'quick' | 'standard' | 'big-park';
-export const BUILT_INS: Record<BuiltInPresetId, { label: string; blurb: string; rules: Omit<HouseRules, 'maxPlayers'>; radiusMeters: number }> = {
-  quick: {
-    label: 'Quick', blurb: 'A short, sharp 15-minute game', radiusMeters: 500,
-    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 1, durationSeconds: 900, headStartSeconds: 120, pingIntervalSeconds: 60, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: 600, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
-  },
-  standard: {
-    label: 'Standard', blurb: 'A full game with room to hide', radiusMeters: 500,
-    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 2, durationSeconds: 1800, headStartSeconds: 180, pingIntervalSeconds: 180, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: 600, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
-  },
-  'big-park': {
-    label: 'Big Park', blurb: 'A bigger ground, more Hunters', radiusMeters: 1000,
-    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 3, durationSeconds: 1800, headStartSeconds: 180, pingIntervalSeconds: 180, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: 600, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
-  },
-};
+// --- Presets: REMOVED (video rebuild, 2026-11-18) ---
+// The Quick / Standard / Big Park built-in presets (BUILT_INS,
+// presetIdForDraft) and the saved house-rule presets on this device
+// (HOUSE_PRESETS_KEY, load/saveHousePresets, applyPresetToDraft)
+// are gone: the video has no preset chips, and the founder ruled
+// presets out as a third feature on top of the two SCRAM features.
+// The underlying room config is untouched — defaults still live in
+// defaultDraft() above (500 m radius, 30 min, 3 min head start,
+// ping every 3 min, shrinking ON every 10 min, Balance ON,
+// Random ON). HouseRules / HouseRulePreset in @pakdam/shared and
+// validateHousePreset stay in place: the engine test suite
+// (packages/engine/test/modes.test.ts) still exercises them, and
+// presets already saved on a device are still cleared by the
+// profile's "Delete my local data" (its own copy of the key).
+// No code in the app reads or writes saved presets any more.
 
-/** Which built-in preset a draft matches, or 'custom' when it matches
- *  none — used for the preset chips' initial selection (create screen
- *  starts on Standard; the lobby sheet starts on whatever the room
- *  already matches). */
-export function presetIdForDraft(d: HostSetupDraft): BuiltInPresetId | 'custom' {
-  for (const id of Object.keys(BUILT_INS) as BuiltInPresetId[]) {
-    const b = BUILT_INS[id];
-    if (
-      d.mode === b.rules.mode
-      && d.durationSeconds === b.rules.durationSeconds
-      && d.headStartSeconds === b.rules.headStartSeconds
-      && d.pingIntervalSeconds === b.rules.pingIntervalSeconds
-      && d.hunterCount === b.rules.hunterCount
-      && d.radiusMeters === b.radiusMeters
-      && d.zoneShrinkEnabled === b.rules.zoneShrinkEnabled
-      && d.zoneShrinkIntervalSeconds === b.rules.zoneShrinkIntervalSeconds
-    ) return id;
-  }
-  return 'custom';
-}
+// (presetIdForDraft removed with BUILT_INS above.)
 
-// --- House-rule presets on this device (localStorage) ---
-export const HOUSE_PRESETS_KEY = 'pakdam.house-presets.v1';
-export function loadHousePresets(): HouseRulePreset[] {
-  if (typeof window === 'undefined') return [];
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(HOUSE_PRESETS_KEY) ?? '[]');
-    return Array.isArray(parsed) ? (parsed as HouseRulePreset[]) : [];
-  } catch {
-    return [];
-  }
-}
-export function saveHousePresets(next: HouseRulePreset[]): void {
-  try { localStorage.setItem(HOUSE_PRESETS_KEY, JSON.stringify(next)); } catch { /* storage full — kept for this session only */ }
-}
-/** Apply a saved preset's rules (and zone size, when the preset has
- *  one) onto a draft. Rules saved before the new toggles existed get
- *  the create screen's defaults, not the legacy ones — a preset is an
- *  explicit host choice, so Balance/Random stay ON as the host saved
- *  them in the new flow. */
-export function applyPresetToDraft(d: HostSetupDraft, p: HouseRulePreset): HostSetupDraft {
-  const r = p.rules;
-  return {
-    ...d,
-    ...applyModeRules(r),
-    // Runner confirmation is a fixed rule, never a preset value.
-    catchConfirmationRequired: true,
-    balanceHunters: r.balanceHunters ?? DEFAULT_HOST_TOGGLES.balanceHunters,
-    randomDraw: r.randomDraw ?? DEFAULT_HOST_TOGGLES.randomDraw,
-    showPingHistory: r.showPingHistory ?? DEFAULT_HOST_TOGGLES.showPingHistory,
-    playZoneEnabled: r.playZoneEnabled ?? d.playZoneEnabled,
-    huntersCanTalk: r.huntersCanTalk ?? d.huntersCanTalk,
-    finalSizePercent: r.finalSizePercent ?? d.finalSizePercent,
-    hunterCount: Math.min(r.hunterCount, maxManualHunterCount(r.maxPlayers)),
-    radiusMeters: p.radiusMeters ?? d.radiusMeters,
-  };
-}
+// (load/saveHousePresets and applyPresetToDraft removed with the
+// saved-preset UI above — see the Presets note.)

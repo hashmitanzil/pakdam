@@ -20,14 +20,16 @@ test('outside zone: countdown appears, ticks down, player is ejected at 0', asyn
   test.setTimeout(180_000);
   // Centre on the mocked GPS position (23.36, 85.33), then move the
   // mock far outside the 500 m zone BEFORE the play page loads.
-  const { roomId, roomCode, hostId } = await createLobby(page, context, { preset: 'Standard' });
+  // (No preset arg: presets were removed in the video rebuild —
+  // the defaults already are the old Standard.)
+  const { roomId, roomCode, hostId } = await createLobby(page, context);
   const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
   await expect(guest).toHaveURL(`/room/${roomId}`);
   await guest.getByRole('button', { name: /I.m ready/i }).click();
   await setPlayer(page, hostId);
   // No "Add 3 demo players" button any more — no demo seats exist.
   await addRealPlayers(context, roomCode, ['Guest Two', 'Guest Three', 'Guest Four']);
-  await expect(page.getByText(/Players \(5\/6\)/)).toBeVisible();
+  await expect(page.getByText(/Players \(5\/30\)/)).toBeVisible();
 
   // Host-picked Hunters: two extra guests, so the host stays a Runner
   // and is the one who gets ejected.
@@ -74,7 +76,7 @@ test('outside zone: countdown appears, ticks down, player is ejected at 0', asyn
 
 test('outside zone: no banner and no false alarm while inside the zone', async ({ page, context }) => {
   test.setTimeout(120_000);
-  const { roomId, roomCode } = await createLobby(page, context, { preset: 'Standard' });
+  const { roomId, roomCode } = await createLobby(page, context);
   const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
   await expect(guest).toHaveURL(`/room/${roomId}`);
   await guest.getByRole('button', { name: /I.m ready/i }).click();
@@ -96,7 +98,7 @@ test('outside zone: no banner and no false alarm while inside the zone', async (
 
 test('outside zone: no fix shows the "needs your location" banner state', async ({ page, context }) => {
   test.setTimeout(120_000);
-  const { roomId, roomCode, hostId } = await createLobby(page, context, { preset: 'Standard' });
+  const { roomId, roomCode, hostId } = await createLobby(page, context);
   const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
   await expect(guest).toHaveURL(`/room/${roomId}`);
   await guest.getByRole('button', { name: /I.m ready/i }).click();
@@ -125,14 +127,14 @@ test('outside zone: poor GPS accuracy pauses the countdown; it resumes when accu
   // Founder decision (2026-11-17): a coarse live fix must not eject
   // anyone — the countdown pauses and says so, and resumes when GPS
   // recovers. Accuracy 100 m is worse than the good tier (±10 m).
-  const { roomId, roomCode, hostId } = await createLobby(page, context, { preset: 'Standard' });
+  const { roomId, roomCode, hostId } = await createLobby(page, context);
   const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
   await expect(guest).toHaveURL(`/room/${roomId}`);
   await guest.getByRole('button', { name: /I.m ready/i }).click();
   await setPlayer(page, hostId);
   // No "Add 3 demo players" button any more — no demo seats exist.
   await addRealPlayers(context, roomCode, ['Guest Two', 'Guest Three', 'Guest Four']);
-  await expect(page.getByText(/Players \(5\/6\)/)).toBeVisible();
+  await expect(page.getByText(/Players \(5\/30\)/)).toBeVisible();
 
   // Host-picked Hunters: two extra guests, so the host stays a Runner
   // and is the one who goes outside.

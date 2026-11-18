@@ -26,7 +26,7 @@ const MENU_SECTIONS: { heading: string; links: { href: string; label: string }[]
   {
     heading: 'Play',
     links: [
-      { href: '/create', label: 'Host a Game' },
+      { href: '/create/mode', label: 'Host a Game' },
       { href: '/join', label: 'Join a Game' },
       { href: '/how-it-works', label: 'How it works' },
       { href: '/game-modes', label: 'Game modes' },
@@ -111,7 +111,7 @@ export default function TopBar() {
             {link.label}
           </a>
         ))}
-        <a className="topbar-cta" href="/create">Host a Game</a>
+        <a className="topbar-cta" href="/create/mode">Host a Game</a>
       </nav>
       <button
         type="button"
@@ -146,7 +146,7 @@ export default function TopBar() {
               </button>
             </div>
             <p className="mobile-menu-cta">
-              <a className="btn btn-lg" href="/create" onClick={() => closeMenu(false)}>
+              <a className="btn btn-lg" href="/create/mode" onClick={() => closeMenu(false)}>
                 Host a Game
               </a>
             </p>

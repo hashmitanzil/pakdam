@@ -126,8 +126,12 @@ export default function JoinCodePage({ params }: { params: Promise<{ code: strin
         </div>
       </form>
       <p className={styles.center}>
-        <span className="small">Wrong code? </span><Link href="/join">Type a different code</Link>
-        {' · '}<Link href="/how-it-works">How it works</Link>
+        <span className="small">Wrong code? </span>
+        <span className={styles.footerLinks}>
+          <Link href="/join">Type a different code</Link>
+          <span aria-hidden="true">·</span>
+          <Link href="/how-it-works">How it works</Link>
+        </span>
       </p>
     </div>
   );

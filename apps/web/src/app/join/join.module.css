@@ -146,3 +146,18 @@
   text-align: center;
 }
 
+/* Footer links: flex items that wrap as whole links at 390px.
+ * As plain inline text the "How it works" link wrapped mid-link and
+ * its bounding box spanned both lines, which the brutal overlap
+ * check flags as overlapping "Create a game" (same bug class the
+ * landing fixed with .questions-links in tokens.css). As flex items
+ * each link keeps its own box and wraps as a unit. */
+.footerLinks {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+  justify-content: center;
+  align-items: baseline;
+  margin-top: 4px;
+}
+

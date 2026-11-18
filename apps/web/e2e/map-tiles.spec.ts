@@ -130,16 +130,6 @@ async function assertTilesPaint(page: Page, t: TileLog, where: string): Promise<
   expect(t.consoleTileErrors, `${where}: console must not carry tile errors — ${t.consoleTileErrors.slice(0, 2).join(' | ')}`).toEqual([]);
 }
 
-/** Click a preset chip only if it is not already selected (the
- *  chips are buttons with aria-pressed, not radios — presets
- *  became chips in the simplification round, 2026-11-18; the old
- *  getByLabel(...).check() timed out on a button). */
-async function checkPreset(page: Page, name: RegExp): Promise<void> {
-  const chip = page.getByRole('button', { name });
-  if ((await chip.getAttribute('aria-pressed')) !== 'true') await chip.click();
-  await expect(chip).toHaveAttribute('aria-pressed', 'true');
-}
-
 /** No numbered markers 1–4 inside any map container on this page. */
 async function assertNoNumberedMarkers(page: Page, where: string): Promise<void> {
   const markers = page.locator('.mapbox').getByText(/^[1-4]$/, { exact: true });
@@ -152,7 +142,10 @@ test('map tiles paint on host setup (PlayAreaMap) after 15 s', async ({ page, co
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.goto('/create');
-  await checkPreset(page, /Standard/);
+  // No preset chip any more: the Quick / Standard / Big Park
+  // presets were removed in the video rebuild (2026-11-18) and the
+  // defaults already are the old Standard (30 min, 500 m zone,
+  // Balance + Random ON) — defaultDraft, draft.ts:77-78.
   await page.getByLabel(/codename/i).fill('Tile Host');
   // Wait for the map: it only exists after hydration + the MapLibre
   // load, so a click before it appears can land on an unhydrated
@@ -227,18 +220,30 @@ test('Use my location denied: honest denied state with one short line, no silent
   // the map to place the zone.") — the old Android/iOS enable steps
   // were removed, so this test asserts the short line and that no OS
   // steps appear, instead of asserting them as present.
-  const banner = page.getByRole('alert');
+  // Unscoped getByRole('alert') also matches the validation error-text
+  // and Next's route announcer — the denied banner is the alert inside
+  // the Play area section (PlayAreaMap.tsx).
+  const banner = page.getByRole('region', { name: 'Play area' }).getByRole('alert');
   await expect(banner).toBeVisible({ timeout: 30_000 });
   await expect(banner).toContainText(/Location is off — allow it in your browser settings|GPS is too rough here/);
   await expect(banner, 'DEFECT (location): denied state must not carry Android/iOS enable steps').not.toContainText(/Android|iOS|iPhone/);
   // No silent default spot: nothing is centred on a guess.
   await expect(page.getByText(/No centre yet/)).toBeVisible();
   // CREATE LOBBY is never silently disabled (founder bug fix (a)):
-  // it stays tappable and explains what is missing instead.
+  // it stays tappable and explains what is missing instead. It has
+  // NO native `disabled` attribute — only aria-disabled="true"
+  // (create/page.tsx:143) — so a real mouse user can click it.
+  // Playwright disagrees: in playwright-core 1.65.1 the "enabled"
+  // element state is !getAriaDisabled(element), and getAriaDisabled
+  // counts aria-disabled="true" on a button (kAriaDisabledRoles
+  // includes "button"), so toBeEnabled() can never pass here and a
+  // plain click waits for "enabled" until it times out. Assert the
+  // DOM fact instead, and force the click — the same treatment as
+  // session-restore.spec.ts:26-33 and brutal-phone.spec.ts:185-191.
   const createBtn = page.getByRole('button', { name: /CREATE LOBBY/ });
-  await expect(createBtn).toBeEnabled();
+  expect(await createBtn.getAttribute('disabled')).toBeNull();
   await expect(createBtn).toHaveAttribute('aria-disabled', 'true');
-  await createBtn.click();
+  await createBtn.click({ force: true });
   await expect(page.getByText(/Set the zone centre first/)).toBeVisible();
   await expect(page.locator(YOU_MARKER)).toHaveCount(0);
 });
@@ -291,7 +296,12 @@ test('phone-width clipping: header, helper text and map controls stay inside the
   // Helper text under the header: fully visible at scroll 0, and
   // still fully visible after scrolling it into view (the sticky
   // header must not cover it — scroll-padding-top guards this).
-  const helper = phone.getByText(/No centre yet/);
+  // Geolocation is granted here, so PlayAreaMap auto-locates on mount
+  // and the centre is set before this line — the "No centre yet"
+  // helper is gone by design; the helper in its place is the
+  // "Location found — …" status line (same pattern as the granted
+  // test, .first() because the message renders twice).
+  const helper = phone.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first();
   await expect(helper).toBeVisible();
   const helperTop0 = (await helper.boundingBox())!.y;
   expect(helperTop0, 'helper text must start below the sticky header at scroll 0').toBeGreaterThanOrEqual(headerBottom - 1);

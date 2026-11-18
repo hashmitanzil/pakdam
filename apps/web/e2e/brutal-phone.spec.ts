@@ -9,7 +9,7 @@
 // phones, desktop keeps the tab row).
 // Runs ONLY on the brutal-phone project (390x844, touch).
 import { test, expect, type BrowserContext, type Page } from '@playwright/test';
-import { addRealPlayers, clickPresetChip, expectNoOverflow, roomState, setPlayer } from './helpers';
+import { addRealPlayers, expectNoOverflow, roomState, setPlayer } from './helpers';
 
 const KEY_ROUTES = [
   '/', '/create', '/join', '/host',
@@ -131,8 +131,14 @@ test('brutal: hamburger menu on phones; desktop keeps normal tabs', async ({ pag
   const current = menu.locator('a[aria-current="page"]');
   await expect(current, 'current section is not highlighted in the menu').toHaveCount(1);
   await expect(current.first()).toContainText(/Safety/);
-  // Tap to close; the panel unmounts and focus returns to the button.
-  await menuBtn.tap();
+  // Tap to close — through the panel's own Close button, not the
+  // hamburger. Once the menu is open its fixed panel (right 320px,
+  // z-index 61) covers the hamburger in the sticky header (z-40),
+  // so tapping the hamburger retries until the test times out (CI
+  // dbfaffd: 120s). The panel Close button is the reachable close
+  // control; it calls the same closeMenu(true), so focus still
+  // returns to the hamburger below.
+  await menu.getByRole('button', { name: 'Close' }).tap();
   await expect(menu).toHaveCount(0);
   await expect(menuBtn).toBeFocused();
 
@@ -153,16 +159,36 @@ test('brutal: GPS denied shows an honest fallback on host setup', async ({ page 
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('No GPS Host');
   await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Location unavailable/)).toBeVisible();
-  await expect(page.getByText(/Tap the map to place the zone where you are standing/)).toBeVisible();
+  // Denied state, current copy (geolocation.ts LOCATION_DENIED_HELP):
+  // "Location is off — allow it in your browser settings, then tap
+  // the map to place the zone." The old "Location unavailable" line
+  // never existed on this screen (the only "Location unavailable" in
+  // the app is the play page's fallback), and neither did "Tap the
+  // map to place the zone where you are standing". The line is
+  // rendered twice — banner alert + polite announce line
+  // (PlayAreaMap.tsx) — so scope to the banner in the Play area
+  // region. (No grant in this context, so the permission check fails
+  // fast with the denied line — no long chain wait.)
+  const deniedBanner = page.getByRole('region', { name: 'Play area' }).getByRole('alert');
+  await expect(deniedBanner).toBeVisible({ timeout: 30_000 });
+  await expect(deniedBanner).toContainText(/Location is off — allow it in your browser settings, then tap the map to place the zone/i);
   // Nothing is centred on a guess: create stays blocked, map still works.
   await expect(page.getByText(/No centre yet/)).toBeVisible();
   // CREATE LOBBY is never silently disabled (founder bug fix (a)):
-  // it stays tappable and explains what is missing instead.
+  // it stays tappable and explains what is missing instead. It has
+  // NO native `disabled` attribute — only aria-disabled="true"
+  // (create/page.tsx:131) — so a real mouse user can click it.
+  // Playwright disagrees: in the installed playwright-core 1.65.1
+  // the "enabled" element state is !getAriaDisabled(element), and
+  // getAriaDisabled counts aria-disabled="true" on a button
+  // (kAriaDisabledRoles includes "button"), so toBeEnabled() can
+  // never pass here and a plain click waits for "enabled" until it
+  // times out. Assert the DOM fact instead, and force the click —
+  // the same treatment as session-restore.spec.ts:26-33.
   const createBtn = page.getByRole('button', { name: /CREATE LOBBY/ });
-  await expect(createBtn).toBeEnabled();
+  expect(await createBtn.getAttribute('disabled')).toBeNull();
   await expect(createBtn).toHaveAttribute('aria-disabled', 'true');
-  await createBtn.click();
+  await createBtn.click({ force: true });
   await expect(page.getByText(/Set the zone centre first/)).toBeVisible();
   const canvas = page.locator('.mapbox .maplibregl-canvas').first();
   await expect(canvas).toBeVisible();
@@ -195,9 +221,8 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.goto('/create');
-  await clickPresetChip(page, 'Standard');
   // Step the head start down to 30 s (as helpers.createLobby does):
-  // the Standard preset is 3 min, and the play assertions below wait
+  // the default is 3 min, and the play assertions below wait
   // at most 60 s for ACTIVE.
   await page.getByRole('button', { name: /Decrease Head start/ }).click();
   await page.getByRole('button', { name: /Decrease Head start/ }).click();
@@ -216,12 +241,13 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   expect(setupBox!.height).toBeGreaterThan(100);
   await expect(page.getByText(/The offline map tiles could not be loaded/)).toHaveCount(0);
   await expect.poll(() => tileResponses.filter((t) => t.status === 200).length, { timeout: 30_000 }).toBeGreaterThan(0);
-  // Standard strip: formatDistance(1000) -> "1.0 km", formatMinutes(60)
-  // -> "1 h" (Standard is 60 min, not 30).
-  await expect(page.getByText(/1\.0 km zone . 2 hunters . 3 min pulse . 1 h/i).first()).toBeVisible();
+  // Default strip (roomSummaryStrip, draft.ts:210): 500 m radius,
+  // Balance ON with no roster known -> 1 hunter, 3 min ping -> "3m",
+  // 30 min -> "30m".
+  await expect(page.getByText(/500m zone . 1 hunter . 3m pulse . 30m/i).first()).toBeVisible();
   // Steppers + toggles on phone width.
-  await page.getByRole('button', { name: /Increase Zone size/ }).click();
-  await expect(page.getByRole('group', { name: 'Zone size' }).locator('output')).toHaveText('about 1.1 km across');
+  await page.getByRole('button', { name: /Increase Radius/ }).click();
+  await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('550m');
   await page.getByRole('switch', { name: 'Show ping history' }).click();
   await expect(page.getByRole('switch', { name: 'Show ping history' })).toHaveAttribute('aria-checked', 'true');
   await expectNoOverflow(page, 'create @390px');
@@ -252,7 +278,7 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   // Three more real guests first: the game needs 3+ players and every
   // player ready before "Ready to start" appears (no demo seats).
   await addRealPlayers(context, roomCode, ['Guest Two', 'Guest Three', 'Guest Four']);
-  await expect(page.getByText(/Players \(5\/6\)/)).toBeVisible();
+  await expect(page.getByText(/Players \(5\/30\)/)).toBeVisible();
   await expect(page.getByText(/Ready to start/i)).toBeVisible();
   await expect(page.getByText(/5 of 5 ready/)).toBeVisible();
   await expectNoOverflow(page, 'lobby @390px');
@@ -261,7 +287,7 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   // Lobby radio works on phone width.
   const lobbyRadio = page.getByRole('region', { name: 'Lobby radio' });
   await lobbyRadio.getByRole('button', { name: /Let.s go!/ }).click();
-  await expect(lobbyRadio.getByText(/Let.s go!/)).toBeVisible();
+  await expect(lobbyRadio.locator('ul').getByText(/Let.s go!/)).toBeVisible();
 
   // Host-picked Hunters so the host is the Hunter (deterministic).
   await page.getByRole('button', { name: /Switch to host-picked Hunters/i }).click();
@@ -281,7 +307,7 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   await guest.close();
 
   // --- Play: head start flips to ACTIVE after the configured head
-  // start (30 s — stepped down from the 3 min preset above). ---
+  // start (30 s — stepped down from the 3 min default above). ---
   await expect(page.getByRole('heading', { name: 'Head start — what to do now' })).toBeVisible();
   const simLocation = page.getByRole('button', { name: /Use simulated location/i });
   if (await simLocation.isVisible()) await simLocation.click();

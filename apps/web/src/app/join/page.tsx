@@ -190,9 +190,10 @@ export default function JoinPage() {
       </form>
       <p className={styles.center}>
         <span className="small">No code yet? Ask your host for the 6-letter room code — games are private invite-only.</span>
-        <br />
-        <span className="small">Hosting instead? </span><Link href="/create">Create a game</Link>
-        {' · '}<Link href="/how-it-works">How it works</Link>
+      </p>
+      <p className={styles.center}>
+        <span className="small">Hosting instead? </span>
+        <Link href="/create/mode">Create a game</Link>
       </p>
     </div>
   );

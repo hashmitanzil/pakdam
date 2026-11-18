@@ -54,9 +54,12 @@ test('mobile: host setup fits — steppers usable, sticky CREATE LOBBY reachable
   await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   await expectNoOverflow(page, '/create (top)');
 
-  // Stepper buttons are tappable and change the value.
-  await page.getByRole('button', { name: /Increase Zone size/ }).click();
-  await expect(page.getByRole('group', { name: 'Zone size' }).locator('output')).toHaveText('about 1.1 km across');
+  // Stepper buttons are tappable and change the value. The setup
+  // form's zone stepper is "Radius" (HostSetupForm.tsx — the old
+  // "Zone size" stepper is gone; the Radius display is the compact
+  // radius, formatRadiusCompact: 500m -> 550m on one + tap).
+  await page.getByRole('button', { name: /Increase Radius/ }).click();
+  await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('550m');
   await expectNoOverflow(page, '/create (after stepper)');
 
   // Sticky bar: CREATE LOBBY stays in the viewport at the bottom even

@@ -1,5 +1,5 @@
 'use client';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { createRoom, setCurrentPlayerId } from '@/lib/demo-store';
 import { createLiveRoom, isLiveEnabled, storeLiveSeat } from '@/lib/live-client';
@@ -27,6 +27,18 @@ export default function CreatePage() {
   const [error, setError] = useState('');
   const [fieldError, setFieldError] = useState('');
   const [creating, setCreating] = useState(false);
+  // Mode picker handoff: /create/mode links here with ?mode=classic
+  // or ?mode=infection — pre-select that mode once on mount. The
+  // Mode section in the setup form below can still change it.
+  const modeAppliedRef = useRef(false);
+  useEffect(() => {
+    if (modeAppliedRef.current) return;
+    modeAppliedRef.current = true;
+    const m = new URLSearchParams(window.location.search).get('mode');
+    if (m === 'classic' || m === 'infection') {
+      setDraft((d) => (d.mode === m ? d : { ...d, mode: m }));
+    }
+  }, []);
   // Live when a Worker URL is configured; otherwise the local demo
   // loop (clearly labelled below). Never mixed in one room.
   const live = isLiveEnabled();

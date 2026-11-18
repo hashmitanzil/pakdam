@@ -306,8 +306,19 @@ main:has(> .subpage) { max-width: 880px; }
    Modes preview, safety strip. Extends the pass-1 system above;
    nothing earlier is changed. */
 /* Anchor / focus scrolling must clear the sticky header (60px) so no
- * heading or helper text ever slides underneath it on phones. */
-html { scroll-padding-top: 76px; }
+ * heading or helper text ever slides underneath it on phones.
+ * scroll-padding-bottom clears the sticky BOTTOM bars the same way:
+ * the /create CREATE LOBBY bar is 205px tall at 800px width (247px
+ * at 390px, 310px at 277px) and at 800x360 landscape it covered
+ * every control scrollIntoView parked at the viewport bottom, so
+ * Playwright clicks on the preset chips / switches / steppers
+ * retried until the test timed out (CI dbfaffd: 4 host-setup +
+ * 1 responsive timeout, landscape only). 240px parks a 48px
+ * control's centre at 96px from the top — clear of the 60px header
+ * and of a bottom bar up to ~264px tall. It also helps real
+ * keyboard users: a focused control no longer slides under the
+ * sticky bar. */
+html { scroll-padding-top: 76px; scroll-padding-bottom: 240px; }
 html, body { overflow-x: clip; }
 
 .trust-strip-4 { grid-template-columns: repeat(4, 1fr); }

@@ -8,7 +8,7 @@
 // Run: `npx playwright test --config apps/web/playwright.config.ts`
 // (config starts `next start` on port 3105 from the production build).
 import { test, expect, type Page } from '@playwright/test';
-import { addRealPlayers, clickPresetChip } from './helpers';
+import { addRealPlayers } from './helpers';
 
 const ROOM_KEY = 'pakdam.demo.rooms.v1';
 
@@ -67,12 +67,13 @@ test('full loop: create -> join -> lobby -> start -> play -> catch -> results', 
   await expect(page.getByRole('heading', { name: /Pakdam/ })).toBeVisible();
 
   // --- Create (single-screen host setup: codename -> rules -> zone -> confirm) ---
-  // Standard preset (2 Hunters) so 5 players split 2 Hunters / 3 Runners.
-  // The default draft already has 2 Hunters; Standard pins it explicitly.
+  // The default draft already is the old Standard (2 Hunters via
+  // Balance on a 5-player roster, 30 min, 3 min head start) —
+  // the Quick / Standard / Big Park preset chips were removed in
+  // the video rebuild (2026-11-18), so there is nothing to pin.
   await page.goto('/create');
-  await clickPresetChip(page, 'Standard');
   // Step the head start down to 30 s (as helpers.createLobby does):
-  // the Standard preset is 3 min, and the play assertions below wait
+  // the default head start is 3 min, and the play assertions below wait
   // at most 60 s for ACTIVE.
   await page.getByRole('button', { name: /Decrease Head start/ }).click();
   await page.getByRole('button', { name: /Decrease Head start/ }).click();
@@ -126,15 +127,15 @@ test('full loop: create -> join -> lobby -> start -> play -> catch -> results', 
   await expect(page.getByRole('heading', { name: /Host controls/ })).toBeVisible();
   // No "Add 3 demo players" button any more — no demo seats exist.
   await addRealPlayers(context, roomCode, ['Guest Two', 'Guest Three', 'Guest Four']);
-  // 5 players in a 6-player room (the default draft sizes the game for 6).
-  await expect(page.getByText(/Players \(5\/6\)/)).toBeVisible();
+  // 5 players in a 30-player room (the default draft caps the game at 30).
+  await expect(page.getByText(/Players \(5\/30\)/)).toBeVisible();
   await expect(page.getByRole('button', { name: /Start game/i })).toBeEnabled();
   await page.getByRole('button', { name: /Start game/i }).click();
   await expect(page).toHaveURL(`/room/${roomId}/play`);
   await guest.close();
 
   // --- Play: head start flips to ACTIVE after the configured head
-  // start (30 s — stepped down from the 3 min preset above); host is the Hunter
+  // start (30 s — stepped down from the 3 min default above); host is the Hunter
   // (Random draw in this build: the first players to join are Hunters in
   // the demo; production shuffles — the HUD shows "Teams: random"). ---
   // The head-start card only renders in HEAD_START phase (the HUD phase
@@ -147,7 +148,7 @@ test('full loop: create -> join -> lobby -> start -> play -> catch -> results', 
   const hud = page.getByRole('region', { name: 'Match status' });
   await expect(hud).toContainText('Active — hunt on', { timeout: 60_000 });
   // Roles are hidden until each player taps to reveal (no peeking).
-  // Hunters are drawn at random (Standard preset: Balance + Random ON),
+  // Hunters are drawn at random (default draft: Balance + Random ON),
   // so the host is NOT necessarily the Hunter — assert the "You are:"
   // line shows the host's actual role from the store.
   await page.getByRole('button', { name: /Tap to find out your role/i }).click();
@@ -185,7 +186,7 @@ test('full loop: create -> join -> lobby -> start -> play -> catch -> results', 
   }
   // Ping stays until replaced (Hunter only — the demo ping button is a
   // Hunter tool): simulate two pings; with Show ping history OFF (the
-  // Standard preset default) only the latest area shows, and it stays
+  // default draft) only the latest area shows, and it stays
   // rendered with its age — it is never removed on a timer.
   if (hostRole === 'hunter') {
     await page.getByRole('tab', { name: 'Radar' }).click();
@@ -261,10 +262,9 @@ test('no-zone game: play page shows no NaN and the no-zone banner', async ({ pag
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(e.message));
   await page.goto('/create');
-  await clickPresetChip(page, 'Standard');
   await page.getByLabel(/codename/i).fill('No Zone Host');
   // Step the head start down to 30 s (as helpers.createLobby does):
-  // the Standard preset is 3 min, and the play assertion below waits
+  // the default head start is 3 min, and the play assertion below waits
   // at most 60 s for ACTIVE.
   await page.getByRole('button', { name: /Decrease Head start/ }).click();
   await page.getByRole('button', { name: /Decrease Head start/ }).click();
@@ -295,7 +295,7 @@ test('no-zone game: play page shows no NaN and the no-zone banner', async ({ pag
   await setPlayer(page, hostId);
   // No "Add 3 demo players" button any more — no demo seats exist.
   await addRealPlayers(context, roomCode, ['Guest Two', 'Guest Three', 'Guest Four']);
-  await expect(page.getByText(/Players \(5\/6\)/)).toBeVisible();
+  await expect(page.getByText(/Players \(5\/30\)/)).toBeVisible();
   await page.getByRole('button', { name: /Start game/i }).click();
   await expect(page).toHaveURL(`/room/${roomId}/play`);
   await guest.close();

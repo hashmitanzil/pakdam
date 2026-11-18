@@ -22,7 +22,15 @@ test('(a) Create with no zone centre explains instead of silently doing nothing,
   // un-centred and Create must explain instead of doing nothing.
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('Test Host');
-  await page.getByRole('button', { name: /CREATE LOBBY/ }).click();
+  // The button is intentionally never disabled (founder fix: it must
+  // explain what is missing instead of doing nothing silently) — but
+  // it carries aria-disabled="true" while the form is incomplete, and
+  // Playwright treats aria-disabled as disabled, so a plain click
+  // retries until the test times out (CI dbfaffd: 120s, desktop +
+  // portrait). A real mouse user CAN click it (aria-disabled blocks
+  // no pointer events), so force the click: it dispatches real mouse
+  // events at the button, submit() runs, and the explanation appears.
+  await page.getByRole('button', { name: /CREATE LOBBY/ }).click({ force: true });
   await expect(page.getByText(/Set the zone centre first/i)).toBeVisible({ timeout: 10_000 });
   await expect(page).not.toHaveURL(/\/room\//);
   // Manual fallback: tap the map to place the zone by hand, then
@@ -60,7 +68,11 @@ test('(b) reload restores the room, the host seat and the guest seat', async ({ 
   // Reload the guest tab: the room and the guest seat come back.
   await guest.reload();
   await expect(guest).toHaveURL(`/room/${roomId}`);
-  await expect(guest.getByText(/Guest Runner/)).toBeVisible();
+  // Same 5-way duplication as the invite-link test (roster row, "Your
+  // checks (Guest Runner)", "All players" <strong>, "You are playing
+  // as Guest Runner", the "joined" event log) — scope to the roster
+  // in the Players region, the proof the guest seat came back.
+  await expect(guest.getByRole('region', { name: 'Players' }).getByText(/Guest Runner/)).toBeVisible();
   const afterGuestReload = await roomState(guest);
   expect(afterGuestReload).not.toBeNull();
   expect(afterGuestReload!.players.some((p) => p.displayName === 'Guest Runner')).toBe(true);

@@ -4,9 +4,10 @@
 // counts up ("0:27 ago" clock), the ONE bundled offline map (no map
 // styles — no Standard / Dark / Satellite switcher), bottom tabs
 // Map / Radar / Radio, the Hunters radio channel, safety pause +
-// SOS + Get help, the colour-blind theme, and the app-wide Dark mode
-// (see the last test — it exists now: a switch in the More sheet
-// and on /accessibility, key pakdam.dark-mode).
+// SOS + Get help, and the app-wide Dark mode — removed in the
+// simplification round (2026-11-18): there is no colour-blind theme
+// and no Dark mode toggle anywhere (see the last test, which asserts
+// the controls are gone from the More sheet and /accessibility).
 import { test, expect } from '@playwright/test';
 import { roomState, setPlayer, startMatch } from './helpers';
 
@@ -35,15 +36,24 @@ test('start → head-start tutorial → live HUD with time, ping, zone, runners'
   const hud = page.getByRole('region', { name: 'Match status' });
   await expect(hud).toContainText('Active — hunt on', { timeout: 60_000 });
   await expect(hud).toContainText('Time left');
-  // Standard is a 60 min match (CALIBRATION_OPEN.standardDurationSeconds
-  // = 3600), so just after ACTIVE the clock reads 59:xx — the old
-  // 29:xx was written when Standard was 30 min.
-  await expect(hud).toContainText(/59:\d\d/);
+  // The default draft is a 30 min match (defaultDraft,
+  // draft.ts:77-78: durationSeconds = 1800, headStartSeconds = 180).
+  // The Quick / Standard / Big Park BUILT_INS presets are gone
+  // (video rebuild, 2026-11-18 — draft.ts Presets note), but the
+  // defaults are not: 30 min, 3 min head start, ping every 3 min.
+  // CALIBRATION_OPEN.standardDurationSeconds = 3600
+  // (packages/shared/src/calibration.ts:36) is NOT read by the
+  // create screen. The match clock starts at HEAD_START, not ACTIVE
+  // (demo-store.ts:260-271: endsAt = start + durationSeconds), so
+  // after the 30 s head start the clock just after ACTIVE reads
+  // 29:xx (1800 − 30 = 1770 s, formatClock renders m:ss,
+  // freshness.ts:142).
+  await expect(hud).toContainText(/29:\d\d/);
   await expect(hud).toContainText('Next ping');
   await expect(hud).toContainText(/in \d:\d\d/);
   await expect(hud).toContainText('Coarse area only — never an exact pin');
   await expect(hud).toContainText('Zone');
-  // Zone label is the app's own formatter: the Standard 500 m circle
+  // Zone label is the app's own formatter: the default 500 m circle
   // polygon measures 999 m across (zoneDiameterMeters over the
   // equirectangular 32-gon), so the HUD reads "About 999 m across" —
   // never "About 1 km across".
@@ -169,7 +179,7 @@ test('runner view: safe check-in + refresh, radar note, runner radio channel', a
   await expect(page.getByText(/Runners never see Hunter positions/i)).toBeVisible();
   // Radio tab: the Runners-only channel (Hunters never see it).
   await page.getByRole('tab', { name: 'Radio' }).click();
-  const radio = page.getByRole('region', { name: 'Runner radio ▲ R' });
+  const radio = page.getByRole('region', { name: 'Runners channel ▲ R' });
   await expect(radio).toBeVisible();
   await expect(radio).toContainText(/Only Runners can read this channel/);
   await radio.getByRole('button', { name: /I.m safe for now/ }).click();
@@ -180,12 +190,17 @@ test('hunter radio channel: quick messages are Hunters-only', async ({ page, con
   test.setTimeout(120_000);
   await startMatch(page, context, { pickHunters: 'host' });
   await page.getByRole('tab', { name: 'Radio' }).click();
-  const radio = page.getByRole('region', { name: 'Hunter radio ◆ H' });
+  const radio = page.getByRole('region', { name: 'Hunters channel ◆ H' });
   await expect(radio).toBeVisible();
   await expect(radio).toContainText(/Only Hunters can read this channel/);
   await radio.getByRole('button', { name: /Cover the far edge/ }).click();
   await expect(radio.getByText(/Cover the far edge/)).toBeVisible();
-  await expect(radio.getByText(/Text only in this web version/)).toBeVisible();
+  // Demo mode has no live voice transport, so the radio says so
+  // plainly (TeamRadio.tsx — "Voice needs the live game
+  // connection…"). There is no "Text only in this web version"
+  // line anywhere in the app (that phrase survives only as a CSS
+  // comment in radio.module.css).
+  await expect(radio).toContainText(/Voice needs the live game connection — in demo mode there is no live connection, so use the text radio below/);
 });
 
 test('safety pause, SOS and Get help from the play screen', async ({ page, context }) => {

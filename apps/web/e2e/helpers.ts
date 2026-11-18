@@ -22,6 +22,8 @@ export interface RoomState {
       durationSeconds: number;
       headStartSeconds: number;
       showPingHistory?: boolean;
+      zoneShrinkEnabled?: boolean;
+      zoneShrinkIntervalSeconds: number;
     };
   };
   players: {
@@ -50,26 +52,16 @@ export async function setPlayer(page: Page, playerId: string): Promise<void> {
   await page.evaluate((value) => sessionStorage.setItem('pakdam.playerId', value), playerId);
 }
 
-/** Create a lobby through the real host-setup UI. Defaults: Standard
- *  preset, codename "Test Host", GPS centre 23.36, 85.33 (mocked).
+/** Create a lobby through the real host-setup UI. Defaults: codename
+ *  "Test Host", GPS centre 23.36, 85.33 (mocked). The create screen
+ *  starts from defaultDraft() — there are no presets any more
+ *  (removed in the video rebuild, 2026-11-18).
  *  Returns the room ids + the host page (already on the lobby). */
-/** Click a preset chip (a button with aria-pressed) unless it is
- *  already selected; then assert it is selected. Presets became
- *  chips in the simplification round (2026-11-18) — the old
- *  getByLabel(...).check() timed out, because a button is not a
- *  radio and has no checked state. */
-export async function clickPresetChip(page: Page, name: string): Promise<void> {
-  const chip = page.getByRole('button', { name, exact: true });
-  if ((await chip.getAttribute('aria-pressed')) !== 'true') await chip.click();
-  await expect(chip).toHaveAttribute('aria-pressed', 'true');
-}
-
 export async function createLobby(
   page: Page,
   context: BrowserContext,
   opts: {
     codename?: string;
-    preset?: 'Quick' | 'Standard' | 'Big Park';
     /** Extra host-setup changes (toggles/steppers) before creating. */
     configureDraft?: (page: Page) => Promise<void>;
   } = {},
@@ -77,13 +69,7 @@ export async function createLobby(
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.goto('/create');
-  if (opts.preset) {
-    // Presets are chips (buttons with aria-pressed), not radios —
-    // simplification round, 2026-11-18. Skip the click when the
-    // preset is already applied.
-    await clickPresetChip(page, opts.preset);
-  }
-  // Head start is the CONFIGURED value (3 min in every preset) — the
+  // Head start is the CONFIGURED value (3 min by default) — the
   // play page honours it exactly, so the suite uses a short 30 s head
   // start here (180 -> 90 -> 30) instead of waiting out 3 minutes per
   // match. The head-start tutorial still shows for the full 30 s.
@@ -165,7 +151,6 @@ export async function startMatch(
   context: BrowserContext,
   opts: {
     pickHunters?: 'host' | 'others';
-    preset?: 'Quick' | 'Standard' | 'Big Park';
     configureDraft?: (page: Page) => Promise<void>;
     /** False = return as soon as the play page loads (HEAD_START),
      *  so the caller can assert the head-start tutorial itself. */
@@ -173,7 +158,6 @@ export async function startMatch(
   } = {},
 ): Promise<StartedMatch> {
   const { roomId, roomCode, hostId } = await createLobby(page, context, {
-    preset: opts.preset ?? 'Standard',
     configureDraft: opts.configureDraft,
   });
   const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
@@ -183,14 +167,14 @@ export async function startMatch(
 
   await setPlayer(page, hostId);
   await expect(page.getByRole('heading', { name: /Host controls/ })).toBeVisible();
-  // Three more real guests (host + Guest Runner + 3 = 5 of 6).
+  // Three more real guests (host + Guest Runner + 3 = 5 of 30).
   // The "Add 3 demo players" button is gone — no demo seats exist.
   const extras = await addRealPlayers(context, roomCode, ['Guest Two', 'Guest Three', 'Guest Four']);
-  await expect(page.getByText(/Players \(5\/6\)/)).toBeVisible();
+  await expect(page.getByText(/Players \(5\/30\)/)).toBeVisible();
 
   if (opts.pickHunters) {
     // Switch Random -> host-picked, pick exactly hunterCount Hunters
-    // (Standard = 2), save, then start. Deterministic roles: no
+    // (default = 2), save, then start. Deterministic roles: no
     // Random-draw flakiness in the specs that depend on who is who.
     await page.getByRole('button', { name: /Switch to host-picked Hunters/i }).click();
     const before = await roomState(page);

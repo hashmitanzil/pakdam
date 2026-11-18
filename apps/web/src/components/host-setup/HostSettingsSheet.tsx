@@ -75,7 +75,7 @@ export default function HostSettingsSheet({ open, config, onDone, onClose }: {
           <button type="button" className="btn btn-secondary" onClick={requestClose} aria-label="Close settings">✕ Close</button>
         </div>
         <p className="small" style={{ marginTop: 0 }}>{roomSummaryStrip(draft)}</p>
-        <HostSetupForm value={draft} onChange={setDraft} showPresets={false} />
+        <HostSetupForm value={draft} onChange={setDraft} showPresets={false} shrinkAsOwnSection />
         {error ? <p role="alert">{error}</p> : null}
         {errors.length > 0 ? <p role="alert" className="small">{errors[0]}</p> : null}
         <div style={{ position: 'sticky', bottom: 0, background: 'var(--surface)', padding: '12px 0 calc(4px + env(safe-area-inset-bottom, 0px))', borderTop: '1px solid var(--line, #E8CFCF)' }}>

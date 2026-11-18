@@ -3,7 +3,7 @@ import { use, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { getRoom, setPhase, toggleReady, hostCheckin, currentPlayerId, clearCurrentPlayerId, leaveRoom, setTeamAssignment, setSelectedHunters, updateRoomConfig } from '@/lib/demo-store';
 import { describeMode } from '@pakdam/engine';
-import { zoneSizeLabel } from '@/components/match/freshness';
+import { draftFromConfig, roomSummaryStrip } from '@/components/host-setup/draft';
 import Roster from '@/components/lobby/Roster';
 import ReadinessChecklist from '@/components/lobby/ReadinessChecklist';
 import { PRE_MATCH_WARNING } from '@/components/lobby/ReadinessChecklist';
@@ -893,9 +893,9 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
         <div className={styles.codeActions}>
           <button type="button" onClick={() => void copyText(room.roomCode, 'Room code')}>Copy code</button>
           <button type="button" onClick={() => void shareCode()}>Share code</button>
+          {isHost ? <button type="button" onClick={() => setSettingsOpen(true)}>Settings</button> : null}
           {isHost ? <button type="button" aria-disabled={codeBusy} onClick={() => void regenerateCode()}>{codeBusy ? 'Changing…' : 'Change code'}</button> : null}
           {mode === 'demo' ? <button type="button" onClick={() => void copyText(inviteLink, 'Invite link')}>Copy invite link</button> : null}
-          {isHost ? <button type="button" onClick={() => setSettingsOpen(true)}>Settings</button> : null}
         </div>
         {copied ? <p className={styles.copiedNote} role="status">{copied}</p> : null}
         {shareNote && !copied ? <p className={styles.copiedNote} role="status">{shareNote}</p> : null}
@@ -906,25 +906,25 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
         )}
       </div>
 
-      {/* Summary strip — computed from the room's real settings. */}
-      <div className={styles.summaryStrip} role="region" aria-label="Match summary">
-        <div className={styles.summaryItem}>
-          <div className={styles.summaryLabel}>Zone</div>
-          <div className={styles.summaryValue}>{room.config.playZoneEnabled === false ? 'No zone' : zoneSizeLabel(room.config.zone.boundary)}</div>
-        </div>
-        <div className={styles.summaryItem}>
-          <div className={styles.summaryLabel}>Hunters</div>
-          <div className={styles.summaryValue}>{room.config.hunterCount} Hunter{room.config.hunterCount === 1 ? '' : 's'}</div>
-        </div>
-        <div className={styles.summaryItem}>
-          <div className={styles.summaryLabel}>Ping every</div>
-          <div className={styles.summaryValue}>{room.config.pingIntervalSeconds === 0 ? 'No pings' : fmtMinutes(room.config.pingIntervalSeconds)}</div>
-        </div>
-        <div className={styles.summaryItem}>
-          <div className={styles.summaryLabel}>Duration</div>
-          <div className={styles.summaryValue}>{fmtMinutes(room.config.durationSeconds)}</div>
-        </div>
-      </div>
+      {/* Compact summary strip — one line from the room's real
+          settings, via roomSummaryStrip (the same builder the setup
+          form uses: "500m zone · 1 hunter · 30s pulse · 10m").
+          Tapping it opens the Game Settings sheet for the host; a
+          guest tapping it is told only the host can change the
+          settings. It re-renders from room.config, so saving in the
+          sheet updates the strip live. */}
+      <button
+        type="button"
+        className={styles.summaryStripButton}
+        onClick={() => {
+          if (isHost) { setSettingsOpen(true); return; }
+          setCopied('Only the host can change the game settings.');
+          window.setTimeout(() => setCopied(''), 3000);
+        }}
+        aria-label={`Game settings: ${roomSummaryStrip(draftFromConfig(room.config))}. ${isHost ? 'Tap to open game settings.' : 'Only the host can change the settings.'}`}
+      >
+        {roomSummaryStrip(draftFromConfig(room.config))}
+      </button>
 
       {/* Start gate — the lobby cannot start until 3+ players are in. */}
       {players.length < MIN_PLAYERS ? (
@@ -949,6 +949,18 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
           <p>Everyone is ready — the host can start the game.</p>
         </div>
       )}
+
+      <section className="card" aria-label="Players">
+        <h2 className={styles.sectionTitle}>Players ({players.length}/{room.config.maxPlayers})</h2>
+        <p className={styles.sectionSub}>
+          {readyCount} of {players.length} ready · Briefing confirmed: {acked} of {players.length} players.
+          Roles are decided by the host when the game starts — players do not pick their own side.
+          Tap a player’s name to report or block them.
+        </p>
+        {players.length === 0 ? <p>No players yet — share the invite link or room code.</p> : (
+          <Roster players={players} meId={me} isHost={isHost} onRemove={isHost ? handleRemove : undefined} onReport={(_playerId, displayName) => setReportTarget(displayName)} />
+        )}
+      </section>
 
       {offline ? <div className="banner" role="status"><strong>You are offline — reconnecting…</strong> The roster below is last-known, shown with last-seen times, never as live.</div> : null}
       <div className="banner"><strong>Before you start:</strong> everyone must confirm the rules, the boundary and the safety briefing. Keep this app open and your screen on once the game starts.</div>
@@ -984,18 +996,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
             <p>Nothing about you is shared exactly. A catch only counts when you tap &ldquo;Got tagged&rdquo; and show your QR for the Hunter to scan — or confirm it yourself if their camera can&apos;t scan.</p>
           </div>
         </div>
-      </section>
-
-      <section className="card" aria-label="Players">
-        <h2 className={styles.sectionTitle}>Players ({players.length}/{room.config.maxPlayers})</h2>
-        <p className={styles.sectionSub}>
-          {readyCount} of {players.length} ready · Briefing confirmed: {acked} of {players.length} players.
-          Roles are decided by the host when the game starts — players do not pick their own side.
-          Tap a player’s name to report or block them.
-        </p>
-        {players.length === 0 ? <p>No players yet — share the invite link or room code.</p> : (
-          <Roster players={players} meId={me} isHost={isHost} onRemove={isHost ? handleRemove : undefined} onReport={(_playerId, displayName) => setReportTarget(displayName)} />
-        )}
       </section>
 
       <ReadinessChecklist

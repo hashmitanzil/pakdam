@@ -142,7 +142,7 @@ test('responsive: live play page fits — tab bar fits, thumb zone reachable', a
   await expect(page.getByRole('heading', { name: /Compass radar/ })).toBeVisible();
   await expectNoOverflow(page, `/room/${roomId}/play @${width}px (radar view)`);
   await page.getByRole('tab', { name: 'Radio' }).click();
-  await expect(page.getByRole('region', { name: /Hunter radio/ })).toBeVisible();
+  await expect(page.getByRole('region', { name: /Hunters channel/ })).toBeVisible();
   await expectNoOverflow(page, `/room/${roomId}/play @${width}px (radio view)`);
   await page.getByRole('tab', { name: 'Map' }).click();
 
