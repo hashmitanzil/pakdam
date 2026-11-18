@@ -1,0 +1,223 @@
+# Pakdam CI — clean build + full test suite on a GitHub-hosted runner.
+#
+# Why this exists: the dev VM cannot produce a production build or run
+# Playwright (child processes get EPERM on write() there), so the
+# authoritative build + test run happens here, on a clean ubuntu-latest
+# runner, on every push and pull request. A green run on this workflow
+# is the only "build passes" evidence that counts — never a local run
+# from the EPERM VM.
+#
+# Installer: pnpm, NOT npm (migrated 2026-11-17, tooling worker).
+# The repo's lockfile is pnpm-lock.yaml (pnpm 10.34.9,
+# packageManager field in the root package.json); package-lock.json
+# was deleted in the migration. Internal dependencies use the
+# `workspace:` protocol (apps/web, workers, packages/engine), so
+# `pnpm install` links them locally instead of fetching @pakdam/*
+# from the registry. The root scripts still call
+# `npm run ... --workspace=...` internally — those keep working under
+# the pnpm-managed tree (verified locally: typecheck + production
+# build pass), so only the CI steps below use `pnpm run` /
+# `pnpm --filter` directly.
+#
+# Ordering matters: lint -> typecheck -> unit tests (which build
+# shared/engine/workers) -> production build (all 4 workspaces incl.
+# the web app) -> Playwright browsers -> full e2e suite against the
+# production build. The e2e webServer starts `next start` on port
+# 3105 and reuses it if already running; it must NOT run before the
+# build step, or it would serve a stale/missing .next.
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+        # Fails fast if pnpm-lock.yaml is out of sync with any
+        # package.json. Fix locally with `pnpm install` (regenerates
+        # the lockfile), commit it, and re-push. Never hand-edit the
+        # lockfile.
+
+      - name: Lint
+        run: pnpm run lint
+
+      - name: Typecheck (all 4 workspaces)
+        run: pnpm run typecheck
+
+      - name: Unit tests (engine + workers)
+        # Root `pnpm test` builds shared/engine/workers first, then
+        # runs `node --test` on their dist/test suites. No network,
+        # no secrets, no live services needed.
+        run: pnpm test
+
+      - name: Vitest unit/integration tests
+        # vitest/ (engine smoke + worker Zod validation), TS source
+        # directly. node --test cannot run these (they import 'vitest').
+        run: pnpm run test:vitest
+
+      - name: Web lib tests (websocket-reconnect + session + live-client)
+        # node --test via tsc to scratch (scripts/test-web-lib.sh).
+        # Vitest 5.1.0 does not execute `node:test` files, so these
+        # run here instead of in the Vitest step above.
+        run: pnpm run test:web
+
+      - name: Production build
+        # CI verification build only: the placeholder-URL guard in
+        # apps/web/next.config.ts fails a production build by default.
+        # This escape is dev/CI-only and must NEVER be set in a real
+        # production deploy (Vercel must get the real
+        # NEXT_PUBLIC_SITE_URL instead — see docs/DEPLOYMENT-RUNBOOK.md).
+        # NEXT_PUBLIC_WORKER_URL is intentionally unset here, so the
+        # app builds against the local demo loop; live transport is
+        # verified by the workers unit tests + wrangler smoke, not by
+        # this build.
+        # Record BUILD_ID right after the ONE build: the e2e step
+        # below compares it before and after the suite (Meera
+        # re-review #2 §3.3) so a concurrent rebuild corrupting
+        # .next mid-run fails the job instead of producing the
+        # uniform chunk-400 failure seen on 2026-11-17. No other
+        # build runs after this step.
+        run: |
+          pnpm run build
+          echo "BUILD_ID_BEFORE=$(cat apps/web/.next/BUILD_ID)" >> "$GITHUB_ENV"
+          echo "Production BUILD_ID: $(cat apps/web/.next/BUILD_ID)"
+        env:
+          PAKDAM_ALLOW_PLACEHOLDER_URL: '1'
+
+      - name: Install Playwright Chromium
+        # Only Chromium is needed: every project in
+        # apps/web/playwright.config.ts uses the default Chromium
+        # engine. --with-deps installs the OS libraries headless
+        # Chromium needs on ubuntu.
+        run: pnpm --filter pakdam-web exec playwright install --with-deps chromium
+        working-directory: apps/web
+
+      - name: Playwright end-to-end suite
+        # 63 test definitions in 13 spec files, 173 executions across
+        # 6 projects (desktop 59 / tablet 16 / phone-360-portrait 59 /
+        # phone-360-landscape 11 / brutal-phone 12 / mobile-zoom130 16;
+        # the zoom130 test in mobile-layout.spec.ts is skipped on the
+        # three non-277px projects that run it, so 170 run + 3 skip).
+        # Counted from the spec files 2026-11-18: 63 `test('…')`
+        # definitions. A naive `grep -c "test("` returns 74 because 11
+        # regex `.test(` calls (e.g. /…/.test(e.text)) are not test
+        # definitions — do not "correct" this to 73/74.
+        # Sequential runbook (Meera re-review #2 §3.3): ONE invocation,
+        # full 6-project matrix, --workers=1, JSON reporter. Do NOT
+        # split per-project and do NOT use --project subsets for the
+        # green run. The server is started explicitly here (not left
+        # to the Playwright webServer) so a boot failure is visible,
+        # and the pre-flight gates below fail the job before the suite
+        # if the serving layer is broken.
+        # G-1 (Meera re-review #2): this step MUST set
+        # PAKDAM_ALLOW_PLACEHOLDER_URL=1 — the build step's env does
+        # not carry to later steps, and without it `next start`
+        # refuses to boot (next.config.ts guard) and the whole e2e
+        # run would be 0/x. The step env below covers both the
+        # explicit server start and the Playwright webServer fallback.
+        timeout-minutes: 45
+        working-directory: apps/web
+        run: |
+          # (a) Kill anything on port 3105 first — reuseExistingServer
+          # must never pick up a stale server from an earlier run.
+          fuser -k 3105/tcp || true
+          # (b) Start the production server explicitly, in the
+          # background, so a boot failure is visible in the log.
+          PAKDAM_ALLOW_PLACEHOLDER_URL=1 PLAYWRIGHT_BASE_URL=http://localhost:3105 \
+            npx next start -p 3105 > /tmp/pakdam-next-start.log 2>&1 &
+          SERVER_PID=$!
+          # (c) Readiness loop — the server must answer within 120 s.
+          READY=0
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:3105/ -o /dev/null; then READY=1; break; fi
+            sleep 2
+          done
+          if [ "$READY" != "1" ]; then
+            echo "Pre-flight gate FAILED: server did not answer http://localhost:3105/ within 120 s." >&2
+            cat /tmp/pakdam-next-start.log || true
+            exit 1
+          fi
+          # (d) BUILD_ID stability check — the build must not have
+          # changed since the build step (a concurrent rebuild
+          # corrupting .next mid-run is the 2026-11-17 chunk-400 cause).
+          BUILD_ID_AFTER=$(cat .next/BUILD_ID)
+          if [ "$BUILD_ID_AFTER" != "$BUILD_ID_BEFORE" ]; then
+            echo "Pre-flight gate FAILED: BUILD_ID changed ($BUILD_ID_BEFORE -> $BUILD_ID_AFTER) — a concurrent build ran; stop and re-run from the build step." >&2
+            exit 1
+          fi
+          # (e) Chunk-200 gate — every built chunk must serve HTTP 200.
+          # Any 400 reproduces the 15-failure environmental run: stop
+          # and check for a concurrent build. Plus one offline-tile
+          # spot-check (16/48301/28392.jpg must be 200).
+          for chunk in .next/static/chunks/*.js; do
+            name=$(basename "$chunk")
+            code=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:3105/_next/static/chunks/$name")
+            if [ "$code" != "200" ]; then
+              echo "Pre-flight gate FAILED: chunk /_next/static/chunks/$name returned HTTP $code (expected 200)." >&2
+              exit 1
+            fi
+          done
+          curl -fsS http://localhost:3105/offline-map/tiles/16/48301/28392.jpg -o /dev/null || {
+            echo "Pre-flight gate FAILED: offline tile spot-check did not return 200." >&2
+            exit 1
+          }
+          echo "Pre-flight gates passed (BUILD_ID $BUILD_ID_BEFORE, all chunks 200, tile spot-check 200)."
+          # The suite — one command, sequential, full matrix, JSON.
+          # --workers=1 overrides config workers: 2; --reporter=json
+          # overrides config reporter: 'list'. The `|| TEST_EXIT=$?`
+          # keeps the post-run checks below running even when tests
+          # fail (the step's bash runs with -e).
+          PAKDAM_ALLOW_PLACEHOLDER_URL=1 PLAYWRIGHT_BASE_URL=http://localhost:3105 \
+            pnpm exec playwright test --workers=1 --reporter=json > playwright-report.json || TEST_EXIT=$?
+          # After the run (always): BUILD_ID must still match, else
+          # the run is invalid and must be re-run from the build step.
+          BUILD_ID_AFTER_RUN=$(cat .next/BUILD_ID)
+          if [ "$BUILD_ID_AFTER_RUN" != "$BUILD_ID_BEFORE" ]; then
+            echo "Post-run check FAILED: BUILD_ID changed during the run ($BUILD_ID_BEFORE -> $BUILD_ID_AFTER_RUN) — this run is invalid." >&2
+            TEST_EXIT=1
+          fi
+          # Stop the server and confirm port 3105 is down.
+          kill "$SERVER_PID" || true
+          sleep 2
+          fuser -k 3105/tcp || true
+          if curl -fsS http://localhost:3105/ -o /dev/null 2>/dev/null; then
+            echo "Post-run check FAILED: port 3105 still answers after stopping the server." >&2
+            TEST_EXIT=1
+          fi
+          exit ${TEST_EXIT:-0}
+        env:
+          PLAYWRIGHT_BASE_URL: http://localhost:3105
+          PAKDAM_ALLOW_PLACEHOLDER_URL: '1'
+
+      - name: Upload Playwright failure artefacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: |
+            apps/web/test-results
+            apps/web/playwright-report.json
+          if-no-files-found: ignore
+          retention-days: 7

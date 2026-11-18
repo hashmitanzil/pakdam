@@ -1,0 +1,44 @@
+/* Catch QR display — Pakdam redesign (2026-11-17). */
+
+.qrCard {
+  text-align: center;
+}
+
+.qrTitle {
+  font-size: 20px;
+  margin: 0 0 4px;
+}
+
+.qrSub {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 0 0 12px;
+}
+
+.qrFrame {
+  display: inline-block;
+  background: #fff;
+  border: 3px solid var(--ember);
+  border-radius: var(--radius);
+  padding: 12px;
+  line-height: 0;
+}
+
+.qrFrame img {
+  display: block;
+}
+
+.qrExpiry {
+  font-weight: 700;
+  margin: 4px 0 12px;
+}
+
+.qrExpiryExpired {
+  color: var(--ember-dark);
+}
+
+/* Dark mode (2026-11-17, UI worker): the expired label is --ember-dark
+ * (#991B1B) text on the dark surface — invisible. It goes ember-light.
+ * The .qrFrame stays WHITE in every theme on purpose: a QR code needs
+ * a white quiet zone to scan. */
+:global(html.dark) .qrExpiryExpired { color: var(--ember-light); }

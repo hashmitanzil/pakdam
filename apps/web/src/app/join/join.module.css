@@ -1,0 +1,147 @@
+/* Join screens — Pakdam redesign (2026-11-17). */
+
+.wrap {
+  max-width: 520px;
+  margin: 0 auto;
+}
+
+.hero {
+  text-align: center;
+  padding: 12px 0 4px;
+}
+
+.hero h1 {
+  font-size: 32px;
+  margin: 8px 0 4px;
+  letter-spacing: -0.5px;
+}
+
+.hero p {
+  color: var(--muted);
+  margin: 4px 0 12px;
+}
+
+.eyebrow {
+  display: inline-block;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--red-dark);
+}
+
+.codeBoxes {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin: 12px 0 4px;
+}
+
+/* Fixed 48px boxes overflow at 320px and at 130% zoom on a 390px
+ *  phone (~300px effective width: 6×48 + 5×8 gaps = 328px > 268px of
+ *  content). The boxes flex down and share the row instead, capped
+ *  at 48px so they never grow past thumb size on wide screens. */
+.codeBoxes input {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 48px;
+  height: 62px;
+  text-align: center;
+  font-size: 28px;
+  font-weight: 800;
+  text-transform: uppercase;
+  border: 2px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.codeBoxes input:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+  border-color: var(--ember);
+}
+
+.codeBoxes input.filled {
+  border-color: var(--ember);
+  background: #FEE2E2;
+}
+
+.codeHint {
+  text-align: center;
+  color: var(--muted);
+  font-size: 14px;
+  margin: 4px 0 12px;
+}
+
+.fieldLabel {
+  font-weight: 700;
+  display: block;
+  margin-top: 12px;
+}
+
+.ageBox {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: #FEF2F2;
+  border: 2px solid var(--red);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 16px 0;
+}
+
+.ageBox input {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  margin-top: 2px;
+  accent-color: var(--ember);
+}
+
+.error {
+  background: #FEF2F2;
+  border: 2px solid var(--ember);
+  border-radius: var(--radius);
+  padding: 12px;
+  color: var(--red-dark);
+  font-weight: 700;
+  margin: 12px 0;
+}
+
+.primaryAction {
+  position: sticky;
+  bottom: 12px;
+  z-index: 10;
+  margin: 16px 0 4px;
+}
+
+.primaryAction .btn {
+  width: 100%;
+  padding: 16px;
+  font-size: 18px;
+}
+
+.inviteCode {
+  font-size: 40px;
+  font-weight: 800;
+  letter-spacing: 10px;
+  padding-left: 10px;
+  font-variant-numeric: tabular-nums;
+  margin: 8px 0;
+}
+
+.center {
+  text-align: center;
+}
+
+/* Dark mode (2026-11-17): the filled code box tint goes dark. */
+/* Dark-mode polish (2026-11-17, UI worker): the light #FEF2F2 boxes
+ * carry inherited --ink text, which flips to near-white in dark mode
+ * and goes invisible on the pale tint — they get the dark tint
+ * instead. .error keeps its light box in light mode only; in dark it
+ * joins the tint so the dark-red text is replaced by ember-light. */
+:global(html.dark) .codeBoxes input.filled { background: #3A151A; }
+:global(html.dark) .eyebrow { color: var(--ember-light); }
+:global(html.dark) .ageBox { background: #3A151A; }
+:global(html.dark) .error { background: #3A151A; color: var(--ember-light); }

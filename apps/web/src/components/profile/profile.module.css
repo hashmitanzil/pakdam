@@ -1,0 +1,311 @@
+/* Profile / leaderboard — Pakdam redesign (2026-11-17). */
+
+.hero h1 {
+  font-size: 30px;
+  margin: 8px 0 4px;
+}
+
+.hero p {
+  color: var(--muted);
+  margin: 4px 0 12px;
+}
+
+.sectionTitle {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.sectionSub {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 0 0 12px;
+}
+
+.statGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.stat {
+  background: #FEF2F2;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.stat .statLabel {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.stat .statValue {
+  font-size: 22px;
+  font-weight: 800;
+}
+
+.optinBox {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: #FEF2F2;
+  border: 2px solid var(--red);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0;
+}
+
+.optinBox input {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  margin-top: 2px;
+  accent-color: var(--ember);
+}
+
+.gameList {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+}
+
+.gameList li {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+
+.gameList li:last-child {
+  border-bottom: 0;
+}
+
+.openBadge {
+  display: inline-block;
+  background: #FEF3C7;
+  color: #78350F;
+  border: 2px solid var(--warn);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.rulesBox {
+  background: #FEF2F2;
+  border: 2px solid var(--red);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin: 12px 0;
+}
+
+.rulesBox h3 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.rulesBox ul {
+  margin: 6px 0;
+  padding-left: 20px;
+}
+
+.rulesBox li {
+  margin: 4px 0;
+  font-size: 14px;
+}
+
+.pointsTable {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 8px 0;
+  font-size: 14px;
+}
+
+.pointsTable th,
+.pointsTable td {
+  border-bottom: 1px solid var(--line);
+  padding: 8px 6px;
+  text-align: left;
+  vertical-align: top;
+}
+
+.pointsTable th {
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--muted);
+}
+
+.friendList {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+}
+
+.friendList li {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+
+.friendList li:last-child {
+  border-bottom: 0;
+}
+
+.friendBadge {
+  display: inline-block;
+  background: #FEE2E2;
+  color: var(--red-dark);
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.demoNote {
+  background: #FEF3C7;
+  border: 2px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0;
+  font-size: 14px;
+}
+
+.demoCode {
+  font-size: 22px;
+  letter-spacing: 4px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Shareable round card — clean layout, moments and counts only. */
+.shareCard {
+  background: #FFF7F5;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0;
+}
+
+.shareBanner {
+  background: var(--red-dark);
+  color: #fff;
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.shareBanner strong {
+  display: block;
+  font-size: 20px;
+  margin-bottom: 2px;
+}
+
+.shareBanner span {
+  font-size: 14px;
+  opacity: 0.92;
+}
+
+.shareTiles {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0 4px;
+}
+
+.shareTile {
+  flex: 1;
+  min-width: 96px;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  text-align: center;
+}
+
+.shareTileValue {
+  font-size: 28px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+}
+
+.shareTileLabel {
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.shareMoments {
+  margin: 8px 0;
+  padding-left: 20px;
+  font-size: 14px;
+  display: grid;
+  gap: 4px;
+}
+
+.shareText {
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  font: inherit;
+  font-size: 14px;
+  margin: 8px 0;
+}
+
+/* Danger zone — delete my local data. */
+.dangerZone {
+  border: 2px solid var(--danger);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin: 12px 0;
+  background: #FEF2F2;
+}
+
+.dangerZone h3 {
+  margin: 0 0 4px;
+  font-size: 16px;
+  color: var(--red-dark);
+}
+
+/* "Stored on this device only" — honest guest-local label. */
+.localNote {
+  display: inline-block;
+  background: #FEE2E2;
+  color: var(--red-dark);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 13px;
+  font-weight: 800;
+  margin: 0 0 8px;
+}
+
+/* Dark mode (2026-11-17): light fills go dark; red-dark / brown text
+ * on the tinted badges goes light. */
+/* Dark-mode polish (2026-11-17, UI worker): the light #FEF2F2 boxes
+ * (.stat, .optinBox, .rulesBox) and the amber #FEF3C7 .demoNote carry
+ * inherited --ink text, which flips to near-white in dark mode and
+ * goes invisible on the pale tint — they get dark tints instead.
+ * .dangerZone joins the dark tint so its already-overridden
+ * ember-light h3 stays readable (it was ~2:1 on the pale pink). */
+:global(html.dark) .shareCard { background: var(--paper); }
+:global(html.dark) .shareTile { background: var(--surface); }
+:global(html.dark) .shareText { background: var(--surface); }
+:global(html.dark) .openBadge { background: #451A03; color: #FDE68A; }
+:global(html.dark) .friendBadge { background: #3A151A; color: var(--ember-light); }
+:global(html.dark) .localNote { background: #3A151A; color: var(--ember-light); }
+:global(html.dark) .dangerZone h3 { color: var(--ember-light); }
+:global(html.dark) .stat { background: #3A151A; }
+:global(html.dark) .optinBox { background: #3A151A; }
+:global(html.dark) .rulesBox { background: #3A151A; }
+:global(html.dark) .demoNote { background: #451A03; }
+:global(html.dark) .dangerZone { background: #3A151A; }

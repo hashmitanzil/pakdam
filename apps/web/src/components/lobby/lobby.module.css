@@ -1,0 +1,669 @@
+/* Lobby / join / safety styles — Pakdam redesign (2026-11-17).
+   Uses the global tokens in styles/tokens.css (var(--ember), --red-dark,
+   --line, --paper, --ink, --muted, --ok, --warn, --radius). Status is
+   always icon + word, never colour alone; roles are shape + letter. */
+
+.hero {
+  text-align: center;
+  padding: 8px 0 4px;
+}
+
+.hero h1 {
+  font-size: 30px;
+  margin: 8px 0 4px;
+  letter-spacing: -0.5px;
+}
+
+.hero p {
+  color: var(--muted);
+  margin: 4px 0 12px;
+}
+
+.eyebrow {
+  display: inline-block;
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  color: var(--red-dark);
+}
+
+/* --- Big room code --- */
+.codeHero {
+  background: var(--red-dark);
+  color: #fff;
+  border-radius: var(--radius);
+  padding: 16px;
+  margin: 12px 0;
+  text-align: center;
+}
+
+.codeHero .codeLabel {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+  opacity: 0.9;
+}
+
+.codeHero .codeValue {
+  font-size: 40px;
+  font-weight: 800;
+  letter-spacing: 10px;
+  font-variant-numeric: tabular-nums;
+  margin: 4px 0 8px;
+  padding-left: 10px; /* balance the letter-spacing */
+}
+
+.codeHero .codeActions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.codeHero button {
+  background: #fff;
+  color: var(--red-dark);
+  border: 0;
+  border-radius: 999px;
+  padding: 10px 16px;
+  font-weight: 800;
+  cursor: pointer;
+  min-height: 48px;
+}
+
+.codeHero .copiedNote {
+  font-size: 14px;
+  margin: 8px 0 0;
+  opacity: 0.95;
+}
+
+/* --- 6-box code entry ---
+ *  Fixed 48px boxes overflow at 320px and at 130% zoom on a 390px
+ *  phone (~300px effective width: 6×48 + 5×8 gaps = 328px > 268px of
+ *  content). The boxes flex down and share the row instead, capped
+ *  at 48px so they never grow past thumb size on wide screens. */
+.codeBoxes {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin: 12px 0 4px;
+}
+
+.codeBoxes input {
+  flex: 1 1 0;
+  min-width: 0;
+  max-width: 48px;
+  height: 60px;
+  text-align: center;
+  font-size: 28px;
+  font-weight: 800;
+  text-transform: uppercase;
+  border: 2px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.codeBoxes input:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+  border-color: var(--ember);
+}
+
+.codeBoxes input.filled {
+  border-color: var(--ember);
+  background: #FEE2E2;
+}
+
+/* --- Section cards --- */
+.sectionTitle {
+  font-size: 18px;
+  margin: 0 0 4px;
+}
+
+.sectionSub {
+  color: var(--muted);
+  font-size: 14px;
+  margin: 0 0 12px;
+}
+
+/* --- Roster --- */
+.roster {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+}
+
+.rosterRow {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 12px 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rosterRow:last-child {
+  border-bottom: 0;
+}
+
+.avatar {
+  flex: 0 0 auto;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background: var(--red-dark);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  font-size: 17px;
+}
+
+.avatarMe {
+  background: var(--ember);
+  outline: 3px solid #FECACA;
+}
+
+.rosterMain {
+  flex: 1;
+  min-width: 0;
+}
+
+.rosterName {
+  font-weight: 800;
+  font-size: 16px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+
+.rosterMeta {
+  color: var(--muted);
+  font-size: 14px;
+  margin-top: 2px;
+}
+
+.rosterState {
+  font-weight: 700;
+  white-space: nowrap;
+  font-size: 14px;
+}
+
+.rosterStateReady {
+  color: var(--ok);
+}
+
+.rosterStateWaiting {
+  color: var(--warn);
+}
+
+.rosterStateSuspended {
+  color: var(--ember-dark);
+}
+
+.removeBtn {
+  background: #fff;
+  color: var(--red-dark);
+  border: 2px solid var(--red);
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-weight: 700;
+  cursor: pointer;
+  min-height: 48px;
+  flex: 0 0 auto;
+}
+
+/* --- Readiness checklist --- */
+.progressBar {
+  height: 10px;
+  border-radius: 999px;
+  background: #FEE2E2;
+  overflow: hidden;
+  margin: 8px 0 4px;
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--ember);
+  border-radius: 999px;
+}
+
+.checkList {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+}
+
+.checkRow {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.checkRow:last-child {
+  border-bottom: 0;
+}
+
+.checkIcon {
+  flex: 0 0 auto;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 800;
+  border: 2px solid var(--line);
+  background: #fff;
+}
+
+.checkIconPass {
+  background: #F0FDF4;
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.checkIconFail {
+  background: #FEF2F2;
+  border-color: var(--ember);
+  color: var(--ember-dark);
+}
+
+.checkBody {
+  flex: 1;
+}
+
+.checkLabel {
+  font-weight: 800;
+}
+
+.checkDetail {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.ackBox {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  background: #FEF2F2;
+  border: 2px solid var(--red);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0;
+}
+
+.ackBox input {
+  width: 24px;
+  height: 24px;
+  flex: 0 0 auto;
+  margin-top: 2px;
+  accent-color: var(--ember);
+}
+
+/* --- Role preview --- */
+.roleGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin: 8px 0;
+}
+
+@media (max-width: 480px) {
+  .roleGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.roleCard {
+  border: 2px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+  background: var(--surface);
+}
+
+.roleCard h3 {
+  margin: 0 0 4px;
+  font-size: 16px;
+}
+
+.roleCard p {
+  margin: 4px 0;
+  font-size: 14px;
+  color: var(--muted);
+}
+
+/* --- Match facts --- */
+.factGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 8px 0;
+}
+
+/* At ~300px of effective width (390px phone at 130% zoom) two
+ * ~130px fact cells squeeze values like "Every 30 min" — stack. */
+@media (max-width: 380px) {
+  .factGrid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.fact {
+  background: #FEF2F2;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+
+.fact .factLabel {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.fact .factValue {
+  font-size: 18px;
+  font-weight: 800;
+}
+
+/* --- Safety strip --- */
+.safetyStrip {
+  border: 2px solid var(--red);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0;
+  background: #FEF2F2;
+}
+
+.safetyButtons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.safetyButtons button {
+  flex: 1;
+  min-width: 120px;
+  min-height: 52px;
+  border-radius: var(--radius);
+  border: 2px solid var(--red);
+  background: #fff;
+  color: var(--red-dark);
+  font-weight: 800;
+  cursor: pointer;
+  font-size: 15px;
+}
+
+.safetyButtons button.dangerBtn {
+  background: var(--alert);
+  border-color: var(--alert);
+  color: #fff;
+}
+
+.safetyButtons button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.holdBtn {
+  position: relative;
+  overflow: hidden;
+}
+
+.holdProgress {
+  position: absolute;
+  left: 0;
+  bottom: 0;
+  height: 6px;
+  background: var(--ember);
+}
+
+.sosAlert {
+  background: var(--alert);
+  color: #fff;
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0;
+  font-weight: 700;
+}
+
+.sosAlert p {
+  margin: 4px 0;
+}
+
+/* --- Events --- */
+.eventList {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0;
+  max-height: 220px;
+  overflow-y: auto;
+}
+
+.eventList li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+
+.eventList li:last-child {
+  border-bottom: 0;
+}
+
+.eventTime {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Primary action / thumb zone --- */
+.primaryAction {
+  position: sticky;
+  bottom: 12px;
+  z-index: 10;
+  margin: 16px 0 4px;
+}
+
+.primaryAction .btn {
+  width: 100%;
+  padding: 16px;
+  font-size: 18px;
+}
+
+.center {
+  text-align: center;
+}
+
+/* --- Summary strip: zone · hunters · ping · duration (from real settings) --- */
+.summaryStrip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+  margin: 12px 0;
+}
+
+@media (max-width: 560px) {
+  .summaryStrip {
+    grid-template-columns: 1fr 1fr;
+  }
+}
+
+.summaryItem {
+  background: var(--red-dark);
+  color: #fff;
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  text-align: center;
+}
+
+.summaryItem .summaryLabel {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  opacity: 0.85;
+}
+
+.summaryItem .summaryValue {
+  font-size: 18px;
+  font-weight: 800;
+  margin-top: 2px;
+}
+
+/* --- "Need 2+ players" start gate --- */
+.needPlayers {
+  background: #FEF3C7;
+  border: 2px solid var(--warn);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin: 12px 0;
+  text-align: center;
+}
+
+.needPlayers strong {
+  color: #78350F;
+  font-size: 17px;
+  letter-spacing: 0.5px;
+}
+
+.needPlayers p {
+  margin: 4px 0 0;
+  color: #78350F;
+  font-size: 14px;
+}
+
+.needPlayersReady {
+  background: #F0FDF4;
+  border-color: var(--ok);
+}
+
+.needPlayersReady strong,
+.needPlayersReady p {
+  color: var(--ok);
+}
+
+.blockedBadge {
+  display: inline-block;
+  font-size: 12px;
+  font-weight: 800;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 2px solid var(--ember);
+  color: var(--ember-dark);
+  background: #FEF2F2;
+}
+
+.rosterNameBtn {
+  background: none;
+  border: 0;
+  padding: 0 4px;
+  min-height: 48px;
+  display: inline-flex;
+  align-items: center;
+  font: inherit;
+  font-weight: 800;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+.rosterNameBtn:hover {
+  color: var(--red-dark);
+}
+
+/* --- Bottom sheet (host settings / report-block) --- */
+.sheetOverlay {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: rgba(26, 14, 14, 0.55);
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding: 0;
+}
+
+.sheet {
+  background: var(--surface);
+  border-radius: var(--radius-lg, 20px) var(--radius-lg, 20px) 0 0;
+  padding: 20px 16px calc(20px + env(safe-area-inset-bottom, 0px));
+  width: 100%;
+  max-width: 720px;
+  max-height: 88vh;
+  overflow-y: auto;
+  box-shadow: 0 -8px 32px rgba(26, 14, 14, 0.35);
+}
+
+.sheetActions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 12px 0;
+}
+
+.settingsList {
+  margin: 8px 0;
+  display: grid;
+  gap: 0;
+}
+
+.settingsList > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.settingsList > div:last-child {
+  border-bottom: 0;
+}
+
+.settingsList dt {
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+
+.settingsList dd {
+  margin: 0;
+  text-align: right;
+  color: var(--muted);
+}
+
+
+/* Dark mode (2026-11-17): white buttons / check icon go dark; red-dark
+ * text goes ember-light. */
+/* Dark-mode polish (2026-11-17, UI worker): (a) the lobby code boxes
+ * had NO filled-state override — #FEE2E2 fill + near-white --ink text
+ * in dark mode was invisible; (b) the light #FEF2F2 boxes carry
+ * inherited --ink text, invisible on the pale tint in dark mode, so
+ * they get the dark tint; (c) --ok flips to light green #86EFAC in
+ * dark mode, which is invisible on the light-green #F0FDF4 pass /
+ * ready boxes — those become dark green with pale-green text;
+ * (d) the amber #FEF3C7 need-players box gets the dark amber tint
+ * with pale-amber text; (e) --ember-dark / --red-dark text on the
+ * dark surface goes ember-light. */
+:global(html.dark) .codeHero button { background: var(--surface); color: var(--ember-light); }
+:global(html.dark) .removeBtn { background: var(--surface); color: var(--ember-light); }
+:global(html.dark) .checkIcon { background: var(--surface); }
+:global(html.dark) .safetyButtons button { background: var(--surface); color: var(--ember-light); }
+:global(html.dark) .codeBoxes input.filled { background: #3A151A; }
+:global(html.dark) .eyebrow { color: var(--ember-light); }
+:global(html.dark) .checkIconPass { background: #14532D; color: #BBF7D0; border-color: var(--ok); }
+:global(html.dark) .fact { background: #3A151A; }
+:global(html.dark) .ackBox { background: #3A151A; }
+:global(html.dark) .safetyStrip { background: #3A151A; }
+:global(html.dark) .needPlayers { background: #451A03; }
+:global(html.dark) .needPlayers strong, :global(html.dark) .needPlayers p { color: #FDE68A; }
+:global(html.dark) .needPlayersReady { background: #14532D; }
+:global(html.dark) .needPlayersReady strong, :global(html.dark) .needPlayersReady p { color: #BBF7D0; }
+:global(html.dark) .rosterStateSuspended { color: var(--ember-light); }
+:global(html.dark) .rosterNameBtn:hover { color: var(--ember-light); }

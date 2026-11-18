@@ -1,0 +1,33 @@
+{
+  "name": "pakdam",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.34.9",
+  "description": "Pakdam — real-world GPS hide-and-seek, web PWA Phase 0 (foreground-only). Forge Mission 001 starter codebase.",
+  "workspaces": [
+    "apps/*",
+    "packages/*",
+    "workers"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=apps/web",
+    "build": "npm run build --workspace=packages/shared && npm run build --workspace=packages/engine && npm run build --workspace=workers && npm run build --workspace=apps/web",
+    "typecheck": "npm run typecheck --workspace=packages/shared && npm run typecheck --workspace=packages/engine && npm run typecheck --workspace=workers && npm run typecheck --workspace=apps/web",
+    "test": "npm run build --workspace=packages/shared && npm run build --workspace=packages/engine && npm run build --workspace=workers && npm test --workspace=packages/engine && npm test --workspace=workers",
+    "test:vitest": "vitest run",
+    "test:web": "bash scripts/test-web-lib.sh",
+    "lint": "eslint ."
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.1",
+    "@types/node": "^24.19.2",
+    "eslint": "^9.39.1",
+    "eslint-plugin-react-hooks": "^6.1.1",
+    "typescript": "5.9",
+    "typescript-eslint": "^8.46.0",
+    "vitest": "^5.1.0"
+  }
+}

@@ -1,0 +1,321 @@
+/* Live-game HUD styles (Worker 3, 2026-11-17). Scoped to the hud/
+   components only — the shared tokens.css classes (.hud, .safety,
+   .thumb-zone) are untouched. Team encoding is shape + letter + words,
+   never colour alone; the colour-blind theme only changes hues. */
+
+.hudBar {
+  position: sticky;
+  top: 0;
+  z-index: 15;
+  background: var(--red-dark);
+  color: #fff;
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 12px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.hudTop {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 10px;
+  width: 100%;
+}
+
+.hudLabel {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  opacity: 0.9;
+}
+
+.hudTime {
+  display: inline-block;
+  font-variant-numeric: tabular-nums;
+  font-weight: 800;
+  font-size: 40px;
+  line-height: 1.05;
+  letter-spacing: -0.5px;
+}
+
+/* Phone / 130% zoom: at ~300px of effective width the 40px timer plus
+ * the Pause + SOS buttons crowd each other — shrink the timer so the
+ * safety buttons keep a full row to themselves. */
+@media (max-width: 480px) {
+  .hudTime {
+    font-size: 32px;
+  }
+}
+
+.hudTimeAlmost {
+  border-bottom: 3px solid #fca5a5;
+}
+
+.hudPhase {
+  font-size: 13px;
+  font-weight: 700;
+  margin-top: 2px;
+}
+
+.hudMode {
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 2px;
+  opacity: 0.92;
+}
+
+.hudSafety {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.hudSafety button {
+  min-height: 48px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  border: 2px solid #fff;
+  background: transparent;
+  color: #fff;
+  font-weight: 800;
+  cursor: pointer;
+}
+
+.hudSafety button.sos {
+  background: var(--alert);
+  padding: 10px 18px;
+}
+
+.hudGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  width: 100%;
+}
+
+/* HUD goes 2-up on phones (Runners chip spans the full row) and 3-up
+ * on tablet/desktop, so the bar gets shorter instead of taller as the
+ * screen widens. At ~300px of effective width (390px phone at 130%
+ * zoom) two ~130px chips crowd — stack to one column instead. */
+.hudRunners {
+  grid-column: span 2;
+}
+
+@media (min-width: 768px) {
+  .hudGrid {
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .hudRunners {
+    grid-column: auto;
+  }
+}
+
+@media (max-width: 380px) {
+  .hudGrid {
+    grid-template-columns: 1fr;
+  }
+  .hudRunners {
+    grid-column: auto;
+  }
+}
+
+.hudChip {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+  background: #fff7f5;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px 10px;
+  color: var(--ink);
+}
+
+.hudChipLabel {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.hudChipValue {
+  font-size: 17px;
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.hudChipNote {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.hudRunners {
+  width: 100%;
+  overflow-wrap: break-word;
+}
+
+.hudBarFill {
+  height: 12px;
+  border-radius: 999px;
+  background: var(--line);
+  overflow: hidden;
+  margin-top: 6px;
+}
+
+.hudBarFill > div {
+  height: 100%;
+  background: var(--ember);
+  border-radius: 999px;
+}
+
+.dotsList {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dotsRow {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--line);
+  font-size: 14px;
+}
+
+.dotsName {
+  font-weight: 800;
+}
+
+.dotsAge {
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.tabs {
+  display: flex;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.tabs button {
+  flex: 1;
+  min-height: 52px;
+  border-radius: var(--radius);
+  font-weight: 800;
+  cursor: pointer;
+  background: #fff;
+  color: var(--red-dark);
+  border: 2px solid var(--red);
+}
+
+.tabs button[aria-selected='true'] {
+  background: var(--ember);
+  color: #fff;
+  border-color: var(--ember);
+}
+
+/* Four tabs in one row at ~300px of effective width (390px phone at
+ * 130% zoom): each tab is ~60px wide, so shrink the label and the gap
+ * instead of letting "Radio" / "More" wrap to two lines. */
+@media (max-width: 380px) {
+  .tabs {
+    gap: 6px;
+  }
+  .tabs button {
+    font-size: 14px;
+    padding: 0 4px;
+    min-width: 0;
+  }
+}
+
+.moreSheet {
+  border: 2px solid var(--ember);
+  border-radius: var(--radius);
+  padding: 12px;
+  margin: 0 0 12px;
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.moreSheet h2 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.holdButton {
+  width: 100%;
+  min-height: 56px;
+  border-radius: var(--radius);
+  border: 2px solid var(--red);
+  background: #fff;
+  color: var(--red-dark);
+  font-weight: 800;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+  touch-action: none;
+  user-select: none;
+}
+
+.holdButton > span {
+  position: relative;
+  z-index: 1;
+}
+
+.holdProgress {
+  position: absolute;
+  inset: 0;
+  width: 0%;
+  background: #fecaca;
+}
+
+.holdDone {
+  background: #f0fdf4;
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.trailCard {
+  background: var(--red-dark);
+  color: #fff;
+  border-radius: var(--radius);
+  padding: 16px;
+  margin: 12px 0;
+}
+
+.trailCard pre {
+  white-space: pre-wrap;
+  font: inherit;
+  margin: 0 0 12px;
+}
+
+.trailCard button {
+  min-height: 48px;
+}
+
+/* Dark mode (2026-11-17): light fills go dark; red-dark text goes
+ * ember-light so it stays readable on the dark surface. The QR frame
+ * is not here. Selected tab / HUD bar are already dark/red. */
+/* Dark-mode polish (2026-11-17, UI worker): --ok flips to light green
+ * #86EFAC in dark mode, which is invisible on the light-green #f0fdf4
+ * hold-done fill — it becomes dark green with pale-green text. */
+:global(html.dark) .hudChip { background: var(--paper); }
+:global(html.dark) .tabs button { background: var(--surface); color: var(--ember-light); }
+:global(html.dark) .tabs button[aria-selected='true'] { background: var(--ember); color: #fff; }
+:global(html.dark) .holdButton { background: var(--surface); color: var(--ember-light); }
+:global(html.dark) .holdDone { background: #14532D; color: #BBF7D0; border-color: var(--ok); }
