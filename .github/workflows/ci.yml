@@ -63,6 +63,18 @@ jobs:
       - name: Lint
         run: pnpm run lint
 
+      - name: Build shared + engine (typecheck needs their dist)
+        # dist/ is gitignored, so a clean checkout has no
+        # packages/shared/dist or packages/engine/dist — and
+        # @pakdam/shared + @pakdam/engine resolve their types from
+        # dist/index.d.ts. Without this step, typecheck fails on a
+        # clean checkout with "Cannot find module '@pakdam/shared'"
+        # in every engine/workers/web file (plus knock-on errors
+        # like modes.ts TS2322), even though the same tree passes
+        # locally where dist already exists. Shared first: the
+        # engine build imports shared's dist.
+        run: pnpm --filter @pakdam/shared run build && pnpm --filter @pakdam/engine run build
+
       - name: Typecheck (all 4 workspaces)
         run: pnpm run typecheck
 
