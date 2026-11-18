@@ -212,6 +212,7 @@ export const roomConfigSchema = z.object({
   finalSizePercent: z.number().nullable().optional(),
   showPingHistory: z.boolean().optional(),
   zone: zoneConfigSchema,
+  zoneShape: z.enum(['circle', 'draw']).optional(), // FIX 2026-11-18: the web app always sends zoneShape (draftToConfig); strict() rejected every lobby create without it ("Unrecognized key: zoneShape"). Optional so older clients still pass.
   safeAreas: z.array(geoPolygonSchema),
   noGoAreas: z.array(geoPolygonSchema),
   selectedHunterIds: z.array(z.string()),
