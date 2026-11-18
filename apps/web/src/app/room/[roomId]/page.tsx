@@ -256,7 +256,15 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
       return;
     }
     socketRef.current = socket;
-    void fetch(`${url}/v1/rooms/${roomId}?playerId=${encodeURIComponent(session.playerId)}`)
+    // FIX 2026-11-18: the Worker requires the seat's reconnect token
+    // (Authorization: Bearer) for GET room state — playerId alone
+    // 400s ("reconnectToken is required"), and the lobby showed
+    // "Could not reach the live server" for every room. The token
+    // helper (fetchLiveRoomState) already does this; this raw fetch
+    // bypassed it. Proven live: same GET with the Bearer token → 200.
+    void fetch(`${url}/v1/rooms/${roomId}?playerId=${encodeURIComponent(session.playerId)}`, {
+      headers: { Authorization: `Bearer ${reconnectToken}` },
+    })
       .then(async (r) => {
         if (!r.ok) throw new Error(r.status === 404 ? 'NOT_FOUND' : `HTTP_${r.status}`);
         const j = await r.json() as { room: Room; players: PlayerView[]; version: number };

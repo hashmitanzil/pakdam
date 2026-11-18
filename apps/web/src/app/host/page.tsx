@@ -91,7 +91,12 @@ export default function HostPage() {
       const failed: string[] = [];
       for (const s of sessions) {
         try {
-          const r = await fetch(`${url}/v1/rooms/${s.roomId}?playerId=${encodeURIComponent(s.playerId)}`);
+          // FIX 2026-11-18: the Worker requires the seat's reconnect
+          // token (Authorization: Bearer) for GET room state — playerId
+          // alone 400s, so every live room silently landed in `failed`.
+          const r = await fetch(`${url}/v1/rooms/${s.roomId}?playerId=${encodeURIComponent(s.playerId)}`, {
+            headers: { Authorization: `Bearer ${s.reconnectToken}` },
+          });
           if (!r.ok) { failed.push(s.roomId); continue; }
           const j = await r.json() as { room: Room; players: PlayerView[]; version: number };
           rows.push({ roomId: s.roomId, room: j.room, players: j.players });

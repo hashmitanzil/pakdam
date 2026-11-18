@@ -67,8 +67,13 @@ function saveLiveSeat(roomId: string, seat: LiveSeat): void {
   sessionStorage.setItem(seatKey(roomId), JSON.stringify(seat));
 }
 interface LiveStateResponse { room: Room; players: PlayerView[]; version: number }
-async function fetchLiveState(apiUrl: string, roomId: string, playerId: string): Promise<LiveStateResponse> {
-  const r = await fetch(`${apiUrl}/v1/rooms/${roomId}?playerId=${encodeURIComponent(playerId)}`);
+async function fetchLiveState(apiUrl: string, roomId: string, playerId: string, reconnectToken?: string): Promise<LiveStateResponse> {
+  // FIX 2026-11-18: the Worker requires the seat's reconnect token
+  // (Authorization: Bearer) for GET room state — playerId alone 400s
+  // ("reconnectToken is required"), so results never loaded.
+  const r = await fetch(`${apiUrl}/v1/rooms/${roomId}?playerId=${encodeURIComponent(playerId)}`, reconnectToken
+    ? { headers: { Authorization: `Bearer ${reconnectToken}` } }
+    : undefined);
   if (!r.ok) {
     if (r.status === 404) throw new Error('The live room was not found, or this device is not a player in it (404).');
     throw new Error(`Live results are unavailable (${r.status}) — check your connection and try again.`);
@@ -133,11 +138,11 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
     const apiUrl = getWorkerUrl();
     if (!apiUrl) return;
     let cancelled = false;
-    void fetchLiveState(apiUrl, roomId, playerIdForFetch)
+    void fetchLiveState(apiUrl, roomId, playerIdForFetch, seat?.reconnectToken)
       .then((s) => { if (!cancelled) { setLiveRoom(s.room); setLivePlayers(s.players); setLiveError(''); } })
       .catch((e: unknown) => { if (!cancelled) setLiveError(e instanceof Error ? e.message : 'Live results are unavailable.'); });
     return () => { cancelled = true; };
-  }, [roomId, liveMode, playerIdForFetch]);
+  }, [roomId, liveMode, playerIdForFetch, seat?.reconnectToken]);
 
   useEffect(() => {
     if (liveMode !== true || !seat) return;
