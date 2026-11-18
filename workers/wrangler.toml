@@ -28,4 +28,4 @@ ENVIRONMENT = "dev"
 # and must NEVER appear in this file — set it with
 # `npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY` (see
 # docs/CLOUDFLARE-SETUP.md §9).
-SUPABASE_URL = ""
+SUPABASE_URL = "https://gcgakeslhfmilicokdtp.supabase.co" # FIX 2026-11-18: was "" — every plain `wrangler deploy` wiped the --var value set on 2026-11-18 14:54, silently turning Supabase persistence off (DO stays the authority, nothing fails, but match results are not saved). The URL is public (same as the web app's NEXT_PUBLIC_SUPABASE_URL), so it belongs here permanently; only the service role KEY stays a secret.
