@@ -178,7 +178,7 @@ const err = (message: string, status: number): Response => json({ error: message
 const CORS_PREFLIGHT_HEADERS: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Headers': 'Content-Type, Authorization', // FIX 2026-11-18: the lobby/results/host pages send Authorization: Bearer (seat token) — a non-safelisted header, so the browser preflights it; without Authorization listed here the preflight failed and every such request was blocked ("Could not reach the live server").
   'Access-Control-Max-Age': '86400',
 };
 
