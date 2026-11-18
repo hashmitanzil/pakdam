@@ -149,7 +149,16 @@ jobs:
         # refuses to boot (next.config.ts guard) and the whole e2e
         # run would be 0/x. The step env below covers both the
         # explicit server start and the Playwright webServer fallback.
-        timeout-minutes: 45
+        # NOTE 2026-11-18: raised from 45 after the first green-build CI
+        # run timed out here with all pre-flight gates passed — the
+        # full 6-project matrix (170 executions, workers=1) legitimately
+        # runs past 45 min because many specs carry 60–300 s test
+        # timeouts (brutal-phone 300 s, catch-results 180 s, host-setup
+        # / join-lobby / live-hud 120 s) for real-time waits (geolocation,
+        # countdowns, map loads) on a 2-core runner. This is a timeout
+        # budget fix, not a suite change: same one invocation, same
+        # matrix, same workers=1, same JSON reporter.
+        timeout-minutes: 120
         working-directory: apps/web
         run: |
           # (a) Kill anything on port 3105 first — reuseExistingServer
