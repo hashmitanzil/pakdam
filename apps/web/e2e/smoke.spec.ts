@@ -8,7 +8,7 @@
 // Run: `npx playwright test --config apps/web/playwright.config.ts`
 // (config starts `next start` on port 3105 from the production build).
 import { test, expect, type Page } from '@playwright/test';
-import { addRealPlayers } from './helpers';
+import { addRealPlayers, clickPresetChip } from './helpers';
 
 const ROOM_KEY = 'pakdam.demo.rooms.v1';
 
@@ -70,7 +70,7 @@ test('full loop: create -> join -> lobby -> start -> play -> catch -> results', 
   // Standard preset (2 Hunters) so 5 players split 2 Hunters / 3 Runners.
   // The default draft already has 2 Hunters; Standard pins it explicitly.
   await page.goto('/create');
-  await page.getByLabel(/Standard/).check();
+  await clickPresetChip(page, 'Standard');
   // Step the head start down to 30 s (as helpers.createLobby does):
   // the Standard preset is 3 min, and the play assertions below wait
   // at most 60 s for ACTIVE.
@@ -86,8 +86,10 @@ test('full loop: create -> join -> lobby -> start -> play -> catch -> results', 
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.getByRole('button', { name: /Use my location/ }).click();
   // No coordinates are shown anywhere (founder rule, 2026-11-17) — the
-  // centre reads "set", never numbers.
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  // centre reads "set", never numbers. The old "Zone centre: set"
+  // status line was removed in the simplification round (§5c); the
+  // centre-set evidence now is the "Location found" status line.
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   await page.getByLabel(/I have checked the venue/i).check();
   await page.getByLabel(/I will be on site/i).check();
   await page.getByRole('button', { name: /CREATE LOBBY/ }).click();
@@ -259,7 +261,7 @@ test('no-zone game: play page shows no NaN and the no-zone banner', async ({ pag
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(e.message));
   await page.goto('/create');
-  await page.getByLabel(/Standard/).check();
+  await clickPresetChip(page, 'Standard');
   await page.getByLabel(/codename/i).fill('No Zone Host');
   // Step the head start down to 30 s (as helpers.createLobby does):
   // the Standard preset is 3 min, and the play assertion below waits

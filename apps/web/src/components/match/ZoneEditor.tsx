@@ -5,8 +5,7 @@ import type { GeoPolygon } from '@pakdam/shared';
 import { ZONE_RADIUS_UI_MAX_M, ZONE_RADIUS_MIN_M, ZONE_RADIUS_STEP_M, ZONE_AUTO_CENTRE_MAX_ACCURACY_M } from '@pakdam/shared';
 import { circlePolygon } from '@pakdam/engine';
 import { formatDistance } from '../match/freshness';
-import { checkLocationPermission, coarseFixMessage, getBestCoarseFix, getCurrentFix, LOCATION_DENIED_HELP, locationPrecisionLabel, retryLocation, type ForegroundFix, type LocationProgress } from '@/lib/geolocation';
-import { Button } from '@/components/ui/button';
+import { checkLocationPermission, coarseFixMessage, getCurrentFix, LOCATION_DENIED_HELP, locationPrecisionLabel, type ForegroundFix, type LocationProgress } from '@/lib/geolocation';
 
 const MapView = dynamic(() => import('../map/MapView'), { ssr: false });
 
@@ -26,8 +25,7 @@ const MapView = dynamic(() => import('../map/MapView'), { ssr: false });
  *  Keyboard: arrow keys move the centre, + / − change the radius,
  *  U undoes the last change — every change is announced. Zone presets
  *  are saved by name in localStorage (a saved zone shape, not a place
- *  name). Sizes are calibration OPEN — the radius suggestion is a
- *  starting point, not a measured value. */
+ *  name). */
 export interface ZoneDraft {
   centreLat: number | null;
   centreLng: number | null;
@@ -39,9 +37,8 @@ const PRESET_KEY = 'pakdam.zone-presets.v1';
 const STEP_DEG = 0.0005; // ~55 m per arrow press — labelled on screen
 const NO_GO_RADIUS_M = 25; // each drawn no-go circle, ~50 m across
 
-/** Starting size suggestion from player count — a starting point only,
- *  NOT a measured value. The host checks the circle against the real
- *  ground and adjusts the slider. */
+/** Zone radius from player count. Kept as a helper only; it is not
+ *  shown anywhere in the host-setup UI. */
 export function suggestedRadiusMeters(totalPlayers: number): number {
   return Math.min(1000, Math.max(200, 200 + 25 * (totalPlayers - 3)));
 }
@@ -60,14 +57,10 @@ export function zoneDraftToBoundary(d: ZoneDraft): GeoPolygon {
 }
 
 export default function ZoneEditor({
-  value, onChange, suggestedRadius, totalPlayers,
+  value, onChange,
 }: {
   value: ZoneDraft;
   onChange: (d: ZoneDraft) => void;
-  /** Radius (m) suggested for the current player count — the "reset to
-   *  suggested size" target, shown next to the slider. */
-  suggestedRadius: number;
-  totalPlayers: number;
 }) {
   const [history, setHistory] = useState<ZoneDraft[]>([]);
   const [announce, setAnnounce] = useState('');
@@ -84,10 +77,6 @@ export default function ZoneEditor({
    *  so the host sees which method is being tried instead of a
    *  static spinner. */
   const [locStage, setLocStage] = useState<string | null>(null);
-  /** The best coarse fix the chain saw (too coarse to auto-centre).
-   *  Offered as "Use this approximate spot" — the host may CHOOSE
-   *  it as a hand-placed pin, never applied silently. */
-  const [approxFix, setApproxFix] = useState<ForegroundFix | null>(null);
   const [noGoMode, setNoGoMode] = useState(false);
   const mapRef = useRef<HTMLDivElement>(null);
 
@@ -118,28 +107,22 @@ export default function ZoneEditor({
     setLocState('error');
     setLocError(msg);
     setAnnounce(msg);
-    // A coarse best fix is kept for the "Use this approximate spot"
-    // offer — the host may choose it, it is never applied silently.
-    const coarse = getBestCoarseFix();
-    setApproxFix(coarse && coarse.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M ? coarse : null);
   }, []);
 
-  /** Run one location attempt through `getter` (getCurrentFix or
-   *  retryLocation). The staged chain fails over from one method to
-   *  the next automatically; onProgress reports the best accuracy
-   *  AND the stage, so the host watches GPS refining live. */
+  /** Run one location attempt. The staged chain fails over from one
+   *  method to the next automatically; onProgress reports the best
+   *  accuracy AND the stage, so the host watches GPS refining live. */
   const runLocation = useCallback((getter: (onProgress: LocationProgress) => Promise<ForegroundFix>) => {
     setLocState('locating');
     setLocError('');
     setLocBest(null);
     setLocStage(null);
-    setApproxFix(null);
     getter((best, stage) => { setLocBest(best); if (stage) setLocStage(stage); })
       .then((fix) => {
         // Defence in depth for the founder's ±50 m auto-centre rule:
         // a fix coarser than ±50 m must NOT become the zone centre.
         if (fix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
-          handleLocError(coarseFixMessage(fix.accuracyMeters));
+          handleLocError(coarseFixMessage());
           return;
         }
         setLocAccuracy(fix.accuracyMeters);
@@ -155,23 +138,6 @@ export default function ZoneEditor({
   }, [apply, handleLocError, value]);
 
   const useMyLocation = useCallback(() => runLocation(getCurrentFix), [runLocation]);
-  /** Manual retry: force-resets every busy flag in the chain and
-   *  restarts from the permission check. */
-  const retryLoc = useCallback(() => runLocation(retryLocation), [runLocation]);
-  /** The host chose the coarse fix as a hand-placed pin. Never a GPS
-   *  claim: locState goes back to 'idle' (no "✓ Location found"
-   *  line) and the centre is labelled hand-placed by the announce. */
-  const useApproximateSpot = useCallback(() => {
-    if (!approxFix) return;
-    const f = approxFix;
-    setLocState('idle');
-    setLocError('');
-    setApproxFix(null);
-    apply(
-      { ...value, centreLat: f.lat, centreLng: f.lng },
-      `Placed at your approximate location (±${Math.round(f.accuracyMeters)} m — GPS could not do better). Drag the pin to your exact spot.`,
-    );
-  }, [apply, approxFix, value]);
 
   // Auto-locate on mount when no centre is set yet. Permission is
   // checked FIRST: when location is already denied, the chain is
@@ -256,7 +222,7 @@ export default function ZoneEditor({
   return (
     <div className="card">
       <h2>Step 2 — Play zone</h2>
-      <p>Start from where you are standing. The zone is a circle on a real map — no place name to type. Your GPS sets the centre, and the size is suggested from your player count.</p>
+      <p>Start from where you are standing. The zone is a circle on a real map — no place name to type. Your GPS sets the centre.</p>
 
       <p>
         <button type="button" className="btn btn-lg" onClick={useMyLocation} disabled={locState === 'locating'}>
@@ -267,15 +233,7 @@ export default function ZoneEditor({
       {locState === 'ok' && locAccuracy != null ? <p role="status">✓ Location found — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m). The map is centred where you are standing.</p> : null}
       {locState === 'error' ? (
         <div className="banner" role="alert">
-          <strong>Location unavailable.</strong> {locError} Tap the map to place the zone where you are standing.
-          {' '}
-          <Button variant="secondary" size="sm" onClick={retryLoc}>Retry location</Button>
-          {approxFix ? (
-            <>
-              {' '}
-              <button type="button" className="btn btn-secondary" onClick={useApproximateSpot}>Use this approximate spot (±{Math.round(approxFix.accuracyMeters)} m)</button>
-            </>
-          ) : null}
+          {locError}
         </div>
       ) : null}
       {!centreSet ? <p className="small">No centre yet. Tap “Use my location” above, or tap anywhere on the map to drop the zone there. Nothing is centred on a guessed place.</p> : null}
@@ -293,9 +251,8 @@ export default function ZoneEditor({
           zoneBoundary={zoneDraftToBoundary(value)} noGoAreas={value.noGoAreas}
           onMapClick={onMapClick} keyboardPan={false}
         />
-        <p><strong>Zone centre:</strong> {centreSet ? 'set' : 'not set yet'}</p>
         <p><strong>Zone size:</strong> about {formatDistance(value.radiusMeters * 2)} across (radius {formatDistance(value.radiusMeters)})</p>
-        <p className="small">Tap the map to move the centre{noGoMode ? ' — no-go mode is on, so taps add no-go areas instead' : ''}. Keyboard: arrow keys move the centre (~55 m per press), + / − change the radius by 50 m, U undoes.</p>
+        <p className="small">Tap the map to move the centre. Arrow keys move it, + / − resize.</p>
         <p aria-live="polite" className="small">{announce}</p>
       </div>
 
@@ -309,24 +266,21 @@ export default function ZoneEditor({
       <input
         id="zone-radius" type="range" min={ZONE_RADIUS_MIN_M} max={Math.max(ZONE_RADIUS_UI_MAX_M, value.radiusMeters)} step={ZONE_RADIUS_STEP_M} value={value.radiusMeters}
         onChange={(e) => apply({ ...value, radiusMeters: Number(e.target.value) }, `Zone size changed — about ${formatDistance(Number(e.target.value) * 2)} across.`)}
-        style={{ width: '100%', accentColor: '#B91C1C', height: 44 }}
+        style={{ width: '100%', accentColor: '#B91C1C', height: 48 }}
         aria-describedby="zone-radius-hint"
       />
-      <div style={{ display: 'flex', justifyContent: 'space-between' }} className="small"><span>200 m across</span><span>10 km across (slider range — no maximum)</span></div>
+      <div style={{ display: 'flex', justifyContent: 'space-between' }} className="small"><span>200 m across</span><span>10 km across</span></div>
       <p id="zone-radius-hint" className="small">
         Radius {formatDistance(value.radiusMeters)} — about {formatDistance(value.radiusMeters * 2)} across.
-        Suggested for {totalPlayers} players: about {formatDistance(suggestedRadius * 2)} across.
-        The suggestion is a starting point, not a measured value — sizes are calibration OPEN, so check the circle against the real ground before you create the room.
       </p>
       <p>
         <button type="button" className="btn btn-secondary" onClick={() => apply({ ...value, radiusMeters: Math.max(ZONE_RADIUS_MIN_M, value.radiusMeters - ZONE_RADIUS_STEP_M) }, `Radius decreased to ${Math.max(ZONE_RADIUS_MIN_M, value.radiusMeters - ZONE_RADIUS_STEP_M)} metres.`)}>− 50 m</button>{' '}
-        <button type="button" className="btn btn-secondary" onClick={() => apply({ ...value, radiusMeters: value.radiusMeters + ZONE_RADIUS_STEP_M }, `Radius increased to ${value.radiusMeters + ZONE_RADIUS_STEP_M} metres.`)}>+ 50 m</button>{' '}
-        <button type="button" className="btn btn-secondary" onClick={() => apply({ ...value, radiusMeters: suggestedRadius }, 'Zone size reset to the suggested size.')}>Reset to suggested size</button>
+        <button type="button" className="btn btn-secondary" onClick={() => apply({ ...value, radiusMeters: value.radiusMeters + ZONE_RADIUS_STEP_M }, `Radius increased to ${value.radiusMeters + ZONE_RADIUS_STEP_M} metres.`)}>+ 50 m</button>
       </p>
       <p><button type="button" className="btn btn-secondary" onClick={undo} disabled={history.length === 0}>Undo last map change (U)</button></p>
 
       <h3>No-go areas</h3>
-      <p className="small">Draw the places players must stay out of — roads, water, private land, construction. Turn on no-go mode, then tap the map to drop a no-go circle. Each circle is about 50 m across. They are drawn shapes on the map — not a typed list of names.</p>
+      <p className="small">Tap the map to drop a no-go circle. Players must stay out.</p>
       <p>
         <button type="button" className="btn btn-secondary" aria-pressed={noGoMode} onClick={() => setNoGoMode((m) => !m)}>
           {noGoMode ? 'No-go mode: ON — tap the map to add a no-go area' : 'Add no-go areas on the map'}

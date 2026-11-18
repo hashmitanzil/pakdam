@@ -25,7 +25,7 @@
   font-weight: 800;
   letter-spacing: 2px;
   text-transform: uppercase;
-  color: var(--red-dark);
+  color: var(--ember-light);
 }
 
 /* --- Big room code --- */
@@ -55,6 +55,17 @@
   padding-left: 10px; /* balance the letter-spacing */
 }
 
+/* At 130% zoom on a 360px phone the hero inner width is ~213px and
+ * the 6-letter code at 40px/10px spacing is ~204px — 9px of spare
+ * room. Shrink the code so it can never clip. */
+@media (max-width: 380px) {
+  .codeHero .codeValue {
+    font-size: 34px;
+    letter-spacing: 6px;
+    padding-left: 6px;
+  }
+}
+
 .codeHero .codeActions {
   display: flex;
   gap: 8px;
@@ -63,8 +74,8 @@
 }
 
 .codeHero button {
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   border: 0;
   border-radius: 999px;
   padding: 10px 16px;
@@ -114,7 +125,7 @@
 
 .codeBoxes input.filled {
   border-color: var(--ember);
-  background: #FEE2E2;
+  background: #3A151A;
 }
 
 /* --- Section cards --- */
@@ -202,12 +213,12 @@
 }
 
 .rosterStateSuspended {
-  color: var(--ember-dark);
+  color: var(--ember-light);
 }
 
 .removeBtn {
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   border: 2px solid var(--red);
   border-radius: 999px;
   padding: 8px 12px;
@@ -260,13 +271,13 @@
   justify-content: center;
   font-weight: 800;
   border: 2px solid var(--line);
-  background: #fff;
+  background: var(--surface);
 }
 
 .checkIconPass {
-  background: #F0FDF4;
+  background: #14532D;
   border-color: var(--ok);
-  color: var(--ok);
+  color: #BBF7D0;
 }
 
 .checkIconFail {
@@ -292,7 +303,7 @@
   display: flex;
   gap: 10px;
   align-items: flex-start;
-  background: #FEF2F2;
+  background: #3A151A;
   border: 2px solid var(--red);
   border-radius: var(--radius);
   padding: 12px;
@@ -356,7 +367,7 @@
 }
 
 .fact {
-  background: #FEF2F2;
+  background: #3A151A;
   border-radius: var(--radius);
   padding: 10px 12px;
 }
@@ -380,7 +391,7 @@
   border-radius: var(--radius);
   padding: 12px;
   margin: 12px 0;
-  background: #FEF2F2;
+  background: #3A151A;
 }
 
 .safetyButtons {
@@ -395,8 +406,8 @@
   min-height: 52px;
   border-radius: var(--radius);
   border: 2px solid var(--red);
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   font-weight: 800;
   cursor: pointer;
   font-size: 15px;
@@ -463,11 +474,20 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* --- Primary action / thumb zone --- */
+/* --- Primary action / thumb zone ---
+ *  2026-11-18 fix (Defect 2): this was `position: sticky; bottom:
+ *  12px`, which pulled the whole block — I'm-ready button, "You
+ *  are ready…" paragraph, Leave / Switch buttons, "You are playing
+ *  as…" paragraph — up to the bottom of the viewport at scroll 0,
+ *  where it floated OVER the room-code hero and the summary strip
+ *  at 360px (measured overlaps up to 158x37px, visible as garbled
+ *  text-on-text in the full-page screenshot). A sticky block that
+ *  tall (~300px at 360px) can never float over content without
+ *  covering it, so it is now plain in-flow content: it sits in its
+ *  own place after the readiness checklist, buttons and paragraphs
+ *  stack with normal spacing, zero overlap at any scroll position.
+ *  Layout only — no text or behaviour changed. */
 .primaryAction {
-  position: sticky;
-  bottom: 12px;
-  z-index: 10;
   margin: 16px 0 4px;
 }
 
@@ -519,7 +539,7 @@
 
 /* --- "Need 2+ players" start gate --- */
 .needPlayers {
-  background: #FEF3C7;
+  background: #451A03;
   border: 2px solid var(--warn);
   border-radius: var(--radius);
   padding: 12px 14px;
@@ -528,25 +548,25 @@
 }
 
 .needPlayers strong {
-  color: #78350F;
+  color: #FDE68A;
   font-size: 17px;
   letter-spacing: 0.5px;
 }
 
 .needPlayers p {
   margin: 4px 0 0;
-  color: #78350F;
+  color: #FDE68A;
   font-size: 14px;
 }
 
 .needPlayersReady {
-  background: #F0FDF4;
+  background: #14532D;
   border-color: var(--ok);
 }
 
 .needPlayersReady strong,
 .needPlayersReady p {
-  color: var(--ok);
+  color: #BBF7D0;
 }
 
 .blockedBadge {
@@ -576,7 +596,7 @@
 }
 
 .rosterNameBtn:hover {
-  color: var(--red-dark);
+  color: var(--ember-light);
 }
 
 /* --- Bottom sheet (host settings / report-block) --- */
@@ -639,31 +659,3 @@
 }
 
 
-/* Dark mode (2026-11-17): white buttons / check icon go dark; red-dark
- * text goes ember-light. */
-/* Dark-mode polish (2026-11-17, UI worker): (a) the lobby code boxes
- * had NO filled-state override — #FEE2E2 fill + near-white --ink text
- * in dark mode was invisible; (b) the light #FEF2F2 boxes carry
- * inherited --ink text, invisible on the pale tint in dark mode, so
- * they get the dark tint; (c) --ok flips to light green #86EFAC in
- * dark mode, which is invisible on the light-green #F0FDF4 pass /
- * ready boxes — those become dark green with pale-green text;
- * (d) the amber #FEF3C7 need-players box gets the dark amber tint
- * with pale-amber text; (e) --ember-dark / --red-dark text on the
- * dark surface goes ember-light. */
-:global(html.dark) .codeHero button { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .removeBtn { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .checkIcon { background: var(--surface); }
-:global(html.dark) .safetyButtons button { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .codeBoxes input.filled { background: #3A151A; }
-:global(html.dark) .eyebrow { color: var(--ember-light); }
-:global(html.dark) .checkIconPass { background: #14532D; color: #BBF7D0; border-color: var(--ok); }
-:global(html.dark) .fact { background: #3A151A; }
-:global(html.dark) .ackBox { background: #3A151A; }
-:global(html.dark) .safetyStrip { background: #3A151A; }
-:global(html.dark) .needPlayers { background: #451A03; }
-:global(html.dark) .needPlayers strong, :global(html.dark) .needPlayers p { color: #FDE68A; }
-:global(html.dark) .needPlayersReady { background: #14532D; }
-:global(html.dark) .needPlayersReady strong, :global(html.dark) .needPlayersReady p { color: #BBF7D0; }
-:global(html.dark) .rosterStateSuspended { color: var(--ember-light); }
-:global(html.dark) .rosterNameBtn:hover { color: var(--ember-light); }

@@ -26,6 +26,11 @@
 
 .qrFrame img {
   display: block;
+  /* The QR is generated at 220px; the card inner width at 130% zoom
+   * on a 360px phone is ~213px, so a fixed 220px image overflows
+   * the card. Scale down instead of spilling. */
+  max-width: 100%;
+  height: auto;
 }
 
 .qrExpiry {
@@ -34,11 +39,9 @@
 }
 
 .qrExpiryExpired {
-  color: var(--ember-dark);
+  color: var(--ember-light);
 }
 
-/* Dark mode (2026-11-17, UI worker): the expired label is --ember-dark
- * (#991B1B) text on the dark surface — invisible. It goes ember-light.
- * The .qrFrame stays WHITE in every theme on purpose: a QR code needs
- * a white quiet zone to scan. */
-:global(html.dark) .qrExpiryExpired { color: var(--ember-light); }
+/* The expired label is ember-light on the dark surface. The .qrFrame
+ * stays WHITE in every theme on purpose: a QR code needs a white
+ * quiet zone to scan. */

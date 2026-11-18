@@ -32,6 +32,14 @@
 -- after 0001 + 0003, and verifies the functions there. The deploy
 -- migration set is 0001 + 0003 + 0004 (0002 RLS is deferred until
 -- auth closes — see supabase/migrations-deferred/README.md).
+-- FIX 2026-11-18: ST_Contains is geometry-only — it does NOT exist
+-- for geography, so the first live run failed at line 91 with
+-- ERROR 42883. Both point checks now use ST_Covers(geography,
+-- geography), which PostGIS documents for exactly this case
+-- ("For geography only Polygon covers point is supported").
+-- ST_Covers also counts a point exactly ON the boundary as inside,
+-- which is the right call for a game zone (standing on the line
+-- is not "outside").
 
 create extension if not exists postgis;
 
@@ -88,7 +96,7 @@ returns boolean
 language sql stable as $$
   select
     case when zone_polygon(p_room_id) is null then null
-    else ST_Contains(
+    else ST_Covers(
       zone_polygon(p_room_id),
       ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography)
     end;
@@ -103,7 +111,7 @@ language sql stable as $$
   select exists (
     select 1 from restricted_areas
     where room_id = p_room_id
-      and ST_Contains(area, ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography)
+      and ST_Covers(area, ST_SetSRID(ST_MakePoint(p_lng, p_lat), 4326)::geography)
   );
 $$;
 

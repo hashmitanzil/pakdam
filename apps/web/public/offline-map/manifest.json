@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-11-17T14:27:29.699Z",
+  "generatedAt": "2026-11-18T08:12:16.895500Z",
   "format": "raster-esri",
   "bbox": {
     "minLat": 23.325,
@@ -13,45 +13,50 @@
   ],
   "tileTemplate": "/offline-map/tiles/{z}/{x}/{y}.jpg",
   "tiles": {
-    "total": 808,
-    "downloaded": 808,
+    "total": 1038,
+    "downloaded": 1038,
     "skipped": 0,
     "perZoom": {
       "12": {
-        "total": 2,
-        "downloaded": 2,
-        "skipped": 0
-      },
-      "13": {
-        "total": 6,
-        "downloaded": 6,
-        "skipped": 0
-      },
-      "14": {
         "total": 12,
         "downloaded": 12,
         "skipped": 0
       },
+      "13": {
+        "total": 20,
+        "downloaded": 20,
+        "skipped": 0
+      },
+      "14": {
+        "total": 30,
+        "downloaded": 30,
+        "skipped": 0
+      },
       "15": {
-        "total": 48,
-        "downloaded": 48,
+        "total": 80,
+        "downloaded": 80,
         "skipped": 0
       },
       "16": {
-        "total": 168,
-        "downloaded": 168,
+        "total": 224,
+        "downloaded": 224,
         "skipped": 0
       },
       "17": {
-        "total": 572,
-        "downloaded": 572,
+        "total": 672,
+        "downloaded": 672,
         "skipped": 0
       }
     }
   },
   "bytes": {
-    "downloaded": 11875846,
+    "downloaded": 15278488,
     "skipped": 0
   },
-  "failed": []
+  "failed": [],
+  "halo": {
+    "added": 230,
+    "addedAt": "2026-11-18T08:12:16.895500Z",
+    "note": "1-tile halo around each zoom's original rectangle so the initial viewport never requests a missing tile (z14 y=7096 404 fix, 2026-11-18). Bbox/zooms unchanged."
+  }
 }

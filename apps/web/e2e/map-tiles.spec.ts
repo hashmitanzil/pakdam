@@ -8,23 +8,27 @@
 //  (1) tile requests go ONLY to the bundled pack
 //      (/offline-map/tiles/{z}/{x}/{y}.jpg — served by Next.js from
 //      apps/web/public/offline-map/), return HTTP 200, no tile
-//      request fails, and the app's own "The offline map tiles could
-//      not be loaded" banner stays hidden; when every tile fails the
-//      banner MUST appear instead (the honest degraded state). No
-//      external tile host is ever requested: OpenFreeMap / Esri /
-//      OSM / CARTO / Google are all gone from the runtime map.
+//      request fails, and the removed "The offline map tiles could
+//      not be loaded" banner stays gone (deleted per simplification
+//      plan §5c, 2026-11-18 — when every tile fails there is no
+//      banner any more, the tile assertions below fail outright
+//      instead of expecting a degraded state). No external tile
+//      host is ever requested: OpenFreeMap / Esri / OSM / CARTO /
+//      Google are all gone from the runtime map.
 //  (2) Use-my-location granted → YOU marker + centring; denied →
-//      honest denied state WITH Android/iOS enable steps.
+//      the one short line ("Location is off — allow it in your
+//      browser settings, then tap the map to place the zone."), no
+//      Android/iOS enable steps (simplification §5b).
 //  (3) No numbered test markers 1–4 on Circle setup / play maps.
 //  (4) Phone-width clipping: header, helper text, map controls.
 //  (5) Mode switch Circle ⇄ Draw clears every corner marker.
 //  (6) Live play: outside-zone banner and HUD do not hide under the
 //      sticky header.
 //
-// OFFLINE PACK (verified on disk, 2026-11-17 —
-// apps/web/scripts/download-offline-map.mjs): 808 bundled Esri
+// OFFLINE PACK (verified on disk, 2026-11-18 —
+// apps/web/scripts/download-offline-map.mjs): 1,038 bundled Esri
 // World Street Map raster JPEG tiles, zooms 12–17, bbox
-// 23.325–23.38 N / 85.285–85.355 E (Doranda + Hinoo), ~13 MB,
+// 23.325–23.38 N / 85.285–85.355 E (Doranda + Hinoo), ~15 MB,
 // served by the raster style public/offline-map/style.json +
 // manifest.json. A sample tile (16/48301/28392.jpg) was visually
 // verified to paint real Ranchi streets. This REPLACED the earlier
@@ -45,8 +49,10 @@
 //    Draw corners should keep their numbers at all.
 //  - The denied state takes up to ~20 s (geolocation timeout is 15 s).
 //    The denied banner renders LOCATION_DENIED_HELP (geolocation.ts),
-//    which carries both the Android and the iPhone enable steps, so
-//    the denied test below asserts them as present.
+//    which is the short §5b line now ("Location is off — allow
+//    it in your browser settings, then tap the map to place the
+//    zone."), with no Android/iPhone enable steps, so the denied
+//    test below asserts that short line instead.
 import { test, expect, type Page } from '@playwright/test';
 import { expectNoOverflow, startMatch } from './helpers';
 
@@ -106,8 +112,11 @@ function logTiles(where: string, t: TileLog): void {
 }
 
 /** Wait 15 s (the founder's window), then demand painted tiles:
- *  HTTP 200 tile responses and no failures; when tiles fail the
- *  app's own degraded banner must appear instead of a silent grey. */
+ *  HTTP 200 tile responses and no failures. The old degraded
+ *  banner ("The offline map tiles could not be loaded") was
+ *  deleted per simplification plan §5c, so when nothing paints
+ *  there is no banner to expect — the 200-count assertion below
+ *  fails outright instead. */
 async function assertTilesPaint(page: Page, t: TileLog, where: string): Promise<void> {
   await page.waitForTimeout(15_000);
   logTiles(where, t);
@@ -115,25 +124,20 @@ async function assertTilesPaint(page: Page, t: TileLog, where: string): Promise<
   // Non-200s fail the test. The pack is local files: a 404 from any
   // path is a real tile failure (a tile missing from the bundle).
   const bad = t.hits.filter((h) => h.status !== 200);
-  if (ok === 0) {
-    // Nothing painted: the honest degraded state must surface.
-    await expect(
-      page.getByText(/The offline map tiles could not be loaded/),
-      `${where}: every tile failed (${t.fails.length} network-failed, ${bad.length} HTTP non-200) yet the app shows no "The offline map tiles could not be loaded" degraded state — the map fails silently grey`,
-    ).toBeVisible({ timeout: 10_000 });
-  }
   expect(ok, `${where}: expected tile requests to return HTTP 200 (got ${t.hits.length} responses, ${ok} OK, ${t.fails.length} network-failed)`).toBeGreaterThan(0);
   expect(bad, `${where}: tile requests must not return HTTP errors`).toEqual([]);
   await expect(page.getByText(/The offline map tiles could not be loaded/)).toHaveCount(0);
   expect(t.consoleTileErrors, `${where}: console must not carry tile errors — ${t.consoleTileErrors.slice(0, 2).join(' | ')}`).toEqual([]);
 }
 
-/** Check a preset radio only if it is not already applied (the
- *  controlled radio's onChange re-renders the draft; a redundant
- *  click can race it). */
+/** Click a preset chip only if it is not already selected (the
+ *  chips are buttons with aria-pressed, not radios — presets
+ *  became chips in the simplification round, 2026-11-18; the old
+ *  getByLabel(...).check() timed out on a button). */
 async function checkPreset(page: Page, name: RegExp): Promise<void> {
-  const radio = page.getByLabel(name);
-  if (!(await radio.isChecked())) await radio.check();
+  const chip = page.getByRole('button', { name });
+  if ((await chip.getAttribute('aria-pressed')) !== 'true') await chip.click();
+  await expect(chip).toHaveAttribute('aria-pressed', 'true');
 }
 
 /** No numbered markers 1–4 inside any map container on this page. */
@@ -155,7 +159,10 @@ test('map tiles paint on host setup (PlayAreaMap) after 15 s', async ({ page, co
   // button and do nothing.
   await expect(page.locator(MAP_CANVAS).first()).toBeVisible({ timeout: 30_000 });
   await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  // The old "Zone centre: set" status line was removed in the
+  // simplification round (§5c) — the centre-set evidence now is
+  // the "Location found — … (GPS accuracy ±N m)" status line.
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   const canvas = page.locator(MAP_CANVAS).first();
   await expect(canvas).toBeVisible({ timeout: 30_000 });
   // Marker + overflow checks first: they do not need tiles, so they
@@ -190,7 +197,6 @@ test('Use my location granted: YOU marker appears and map centres on the fix', a
   // and "(GPS accuracy …)", so the old /Location found — GPS
   // accuracy ±/i could never match (S-4, Meera re-review #2).
   await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
   // The red YOU marker is a DOM marker inside the map box (a
   // MapLibre marker on the offline map).
   const marker = page.locator(YOU_MARKER).first();
@@ -206,7 +212,7 @@ test('Use my location granted: YOU marker appears and map centres on the fix', a
   expect(dy, `YOU marker must be vertically centred (off by ${Math.round(dy)}px)`).toBeLessThanOrEqual(80);
 });
 
-test('Use my location denied: honest denied state with Android/iOS steps, no silent default', async ({ page }) => {
+test('Use my location denied: honest denied state with one short line, no silent default', async ({ page }) => {
   test.setTimeout(90_000);
   // Fresh context, no geolocation grant: the browser denies it.
   await page.goto('/create');
@@ -216,15 +222,15 @@ test('Use my location denied: honest denied state with Android/iOS steps, no sil
   await page.getByRole('button', { name: /Use my location/ }).click();
   // The denied callback can take the full 15 s geolocation timeout
   // to arrive in headless Chromium — wait up to 30 s for the banner.
-  const banner = page.getByRole('alert', { name: /Location unavailable/ });
+  // Simplification §5b: the denied state is ONE short line
+  // ("Location is off — allow it in your browser settings, then tap
+  // the map to place the zone.") — the old Android/iOS enable steps
+  // were removed, so this test asserts the short line and that no OS
+  // steps appear, instead of asserting them as present.
+  const banner = page.getByRole('alert');
   await expect(banner).toBeVisible({ timeout: 30_000 });
-  // The banner's own words are "location permission is denied" (not
-  // "permission denied" with nothing between) — match the real text.
-  await expect(banner).toContainText(/Location permission is denied|Location unavailable/);
-  // The fix must tell the player HOW to enable it on their phone —
-  // Android and iOS steps, not a generic "browser settings".
-  await expect(banner, 'DEFECT (location): denied state must carry Android enable steps').toContainText(/Android/i);
-  await expect(banner, 'DEFECT (location): denied state must carry iOS / iPhone enable steps').toContainText(/iOS|iPhone/i);
+  await expect(banner).toContainText(/Location is off — allow it in your browser settings|GPS is too rough here/);
+  await expect(banner, 'DEFECT (location): denied state must not carry Android/iOS enable steps').not.toContainText(/Android|iOS|iPhone/);
   // No silent default spot: nothing is centred on a guess.
   await expect(page.getByText(/No centre yet/)).toBeVisible();
   // CREATE LOBBY is never silently disabled (founder bug fix (a)):
@@ -244,7 +250,7 @@ test('no numbered test markers 1–4 on the default Circle setup map', async ({ 
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('Circle Host');
   await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   // Default shape is Circle: no corner markers of any kind.
   await assertNoNumberedMarkers(page, 'Circle setup map');
   // NOTE: Draw mode numbers its corners by design (PlayAreaMap
@@ -314,14 +320,16 @@ test('mode switch: Draw → Circle clears every corner marker; back to Draw star
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('Switch Host');
   await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   // The centre pin is synced only after the map exists; wait for it
   // (a slow map load would otherwise read 0 before the map is ready).
   await expect(page.locator(YOU_MARKER).first()).toBeVisible({ timeout: 30_000 });
   const corners = page.locator('[aria-label^="Corner "]');
   // Circle is the default: no corner markers at all.
   await expect(corners).toHaveCount(0);
-  await expect(page.getByText(/Zone centre:/)).toBeVisible();
+  // Circle mode shows the "Zone size:" summary line (the old
+  // "Zone centre:" status line was removed in §5c).
+  await expect(page.getByText(/Zone size:/)).toBeVisible();
   // Switch to Draw: 6 corners appear, with the Drawn-zone summary.
   await page.getByRole('radio', { name: /Draw/ }).check();
   await expect(corners).toHaveCount(6);
@@ -331,14 +339,14 @@ test('mode switch: Draw → Circle clears every corner marker; back to Draw star
   await page.getByRole('radio', { name: /Circle/ }).check();
   await expect(corners).toHaveCount(0);
   await expect(page.getByText(/Drawn zone:/)).toHaveCount(0);
-  await expect(page.getByText(/Zone centre:/)).toBeVisible();
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   await expect(page.getByText(/Zone size:/)).toBeVisible();
   // Back to Draw: starts clean with a fresh regular polygon — the
   // circle is gone, 6 corners again, Drawn-zone summary back.
   await page.getByRole('radio', { name: /Draw/ }).check();
   await expect(corners).toHaveCount(6);
   await expect(page.getByText(/Drawn zone:/)).toBeVisible();
-  await expect(page.getByText(/Zone centre:/)).toHaveCount(0);
+  await expect(page.getByText(/Zone size:/)).toHaveCount(0);
 });
 
 test('live play: outside-zone banner and HUD do not hide under the sticky header', async ({ page, context }) => {
@@ -360,21 +368,20 @@ test('live play: outside-zone banner and HUD do not hide under the sticky header
   // sticky header, never under it. (The banner depends on the
   // geolocation watch delivering the moved fix; if it does not arrive
   // within 15 s the HUD assertion above is still the strict check.)
-  await context.setGeolocation({ latitude: 23.4, longitude: 85.33 });
+  await context.setGeolocation({ latitude: 23.42, longitude: 85.33 });
   const banner = page.getByText(/Get back inside the zone/);
   try {
     await expect(banner.first()).toBeVisible({ timeout: 15_000 });
     const bannerBox = await banner.first().boundingBox();
     expect(bannerBox, 'outside-zone banner must have a box').not.toBeNull();
     expect(bannerBox!.y, 'outside-zone banner must start below the sticky header').toBeGreaterThanOrEqual(headerBottom - 1);
-    // The moved fix (23.4, 85.33) is also OUTSIDE the downloaded map
-    // area (the bbox tops out at 23.38 N), so the play map must show
-    // the outside-area message — the brief's exact words, "Map
-    // downloaded for Ranchi only" (OUTSIDE_MAP_AREA_MESSAGE,
+    // The moved fix (23.42, 85.33) is also OUTSIDE the downloaded map
+    // area (the bbox tops out at 23.38 N), so the play map must
+    // show the outside-area message (OUTSIDE_MAP_AREA_MESSAGE,
     // MapLibreMapView.tsx). Plain words only: no lat/lng, no
     // fallback, no switcher, no reload. It rides the same fix as
     // the zone banner above, so it appears with it.
-    await expect(page.getByText(/Map downloaded for Ranchi only/)).toBeVisible();
+    await expect(page.getByText(/Offline map: downloaded area only/)).toBeVisible();
   } catch {
     console.log('OUTSIDE-ZONE banner did not appear after moving the fix outside — HUD check above still stands; watch delivery in headless Chromium is the suspect, not the header layout.');
   }

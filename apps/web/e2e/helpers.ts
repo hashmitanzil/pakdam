@@ -53,6 +53,17 @@ export async function setPlayer(page: Page, playerId: string): Promise<void> {
 /** Create a lobby through the real host-setup UI. Defaults: Standard
  *  preset, codename "Test Host", GPS centre 23.36, 85.33 (mocked).
  *  Returns the room ids + the host page (already on the lobby). */
+/** Click a preset chip (a button with aria-pressed) unless it is
+ *  already selected; then assert it is selected. Presets became
+ *  chips in the simplification round (2026-11-18) — the old
+ *  getByLabel(...).check() timed out, because a button is not a
+ *  radio and has no checked state. */
+export async function clickPresetChip(page: Page, name: string): Promise<void> {
+  const chip = page.getByRole('button', { name, exact: true });
+  if ((await chip.getAttribute('aria-pressed')) !== 'true') await chip.click();
+  await expect(chip).toHaveAttribute('aria-pressed', 'true');
+}
+
 export async function createLobby(
   page: Page,
   context: BrowserContext,
@@ -67,18 +78,10 @@ export async function createLobby(
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.goto('/create');
   if (opts.preset) {
-    // The preset radio is a controlled input whose onChange re-renders
-    // the whole draft; a click can race that re-render ("clicking the
-    // checkbox did not change its state"). Skip the click when the
-    // preset is already applied, else retry once via the label.
-    const radio = page.getByLabel(new RegExp(opts.preset));
-    if (!(await radio.isChecked())) {
-      await radio.check().catch(async () => {
-        await page.waitForTimeout(500);
-        await page.locator('label', { hasText: new RegExp(opts.preset) }).first().click();
-        await expect(radio).toBeChecked({ timeout: 5_000 });
-      });
-    }
+    // Presets are chips (buttons with aria-pressed), not radios —
+    // simplification round, 2026-11-18. Skip the click when the
+    // preset is already applied.
+    await clickPresetChip(page, opts.preset);
   }
   // Head start is the CONFIGURED value (3 min in every preset) — the
   // play page honours it exactly, so the suite uses a short 30 s head
@@ -90,7 +93,10 @@ export async function createLobby(
   await page.getByLabel(/codename/i).fill(opts.codename ?? 'Test Host');
   if (opts.configureDraft) await opts.configureDraft(page);
   await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  // The old "Zone centre: set" status line was removed in the
+  // simplification round (§5c) — the centre-set evidence now is
+  // the "Location found — … (GPS accuracy ±N m)" status line.
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   await page.getByLabel(/I have checked the venue/i).check();
   await page.getByLabel(/I will be on site/i).check();
   await page.getByRole('button', { name: /CREATE LOBBY/ }).click();

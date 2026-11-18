@@ -1,6 +1,5 @@
 'use client';
 import { useState } from 'react';
-import ThemeControls from '@/components/match/ThemeControls';
 import HoldToReveal from './HoldToReveal';
 import styles from './hud.module.css';
 
@@ -10,9 +9,8 @@ export type PlayView = 'map' | 'radar' | 'radio';
  * Bottom tabs (Worker 3, 2026-11-17) — SCRAM-style Map / Radio / … .
  * One thumb-reachable row: Map, Radar (compass + hot/cold, the walking
  * view), Radio. "…" opens the More sheet: safety (pause, SOS, I'm safe),
- * hold-to-reveal, colour-blind theme, and Leave. The map-style toggle
- * itself lives on the map; the theme toggle lives here so it is reachable
- * from every tab.
+ * hold-to-reveal, and Leave. There is no theme toggle any more
+ * (2026-11-18, simplification): Pakdam has one dark theme.
  */
 export default function BottomTabs({
   view,
@@ -58,13 +56,13 @@ export default function BottomTabs({
             {t.icon} {t.label}
           </button>
         ))}
-        <button type="button" aria-expanded={moreOpen} aria-label="More options — safety, settings, leave" onClick={() => setMoreOpen((o) => !o)}>
+        <button type="button" aria-expanded={moreOpen} aria-label="More options — safety, leave" onClick={() => setMoreOpen((o) => !o)}>
           ⋯ More
         </button>
       </div>
       {moreOpen ? (
         <div className={styles.moreSheet} role="region" aria-label="More options">
-          <h2>More — safety &amp; settings</h2>
+          <h2>More — safety</h2>
           <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button type="button" className="btn btn-secondary" style={{ flex: 1, minHeight: 52 }} onClick={onPause}>
               {paused ? '▶ Resume game' : '❚❚ Safety pause'}
@@ -82,7 +80,6 @@ export default function BottomTabs({
             on. SOS shares your position with the host and pauses the match — Pakdam is NOT an emergency
             service. If you are in danger, call your local emergency number.
           </p>
-          <ThemeControls />
           <button
             type="button"
             className="btn btn-secondary"

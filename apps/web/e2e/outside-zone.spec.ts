@@ -112,12 +112,12 @@ test('outside zone: no fix shows the "needs your location" banner state', async 
   await context.clearPermissions();
   await page.reload();
   await expect(page.getByText(/Zone check needs your location/i)).toBeVisible({ timeout: 30_000 });
-  // The real denial text is "location permission is denied" (not
-  // "permission denied" with nothing between) — see
-  // LOCATION_DENIED_HELP (lib/geolocation.ts), rendered via locError
-  // on the play page. The old /Location permission denied/i could
-  // never match it (S-3, Meera re-review #2).
-  await expect(page.getByText(/Location permission is denied/i)).toBeVisible();
+  // The real denial text is the one short §5b line, "Location is
+  // off — allow it in your browser settings, then tap the map to
+  // place the zone." (LOCATION_DENIED_HELP, lib/geolocation.ts),
+  // rendered via locError on the play page. The old
+  // /Location permission is denied/i could never match it.
+  await expect(page.getByText(/Location is off — allow it in your browser settings/i)).toBeVisible();
 });
 
 test('outside zone: poor GPS accuracy pauses the countdown; it resumes when accuracy recovers', async ({ page, context }) => {

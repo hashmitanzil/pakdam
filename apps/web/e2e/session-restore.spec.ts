@@ -31,7 +31,10 @@ test('(a) Create with no zone centre explains instead of silently doing nothing,
   // places nothing).
   await expect(page.locator('.mapbox .maplibregl-canvas').first()).toBeVisible({ timeout: 30_000 });
   await page.locator('.mapbox').click({ position: { x: 180, y: 160 } });
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  // Tapping the map places the centre by hand (no GPS fix here) —
+  // the old "Zone centre: set" line was removed in §5c; the
+  // hand-placed evidence is the "Placed by hand on the map" line.
+  await expect(page.getByText(/Placed by hand on the map/)).toBeVisible();
   await page.getByLabel(/I have checked the venue/i).check();
   await page.getByLabel(/I will be on site/i).check();
   await page.getByRole('button', { name: /CREATE LOBBY/ }).click();

@@ -2,12 +2,11 @@
 import { useEffect, useRef, useState } from 'react';
 import type { GeoPolygon } from '@pakdam/shared';
 import { ZONE_RADIUS_MIN_M, ZONE_RADIUS_STEP_M, ZONE_AUTO_CENTRE_MAX_ACCURACY_M } from '@pakdam/shared';
-import { checkLocationPermission, coarseFixMessage, getBestCoarseFix, getCurrentFix, LOCATION_DENIED_HELP, locationPrecisionLabel, retryLocation, type ForegroundFix, type LocationProgress } from '@/lib/geolocation';
+import { checkLocationPermission, coarseFixMessage, getCurrentFix, LOCATION_DENIED_HELP, locationPrecisionLabel, type ForegroundFix, type LocationProgress } from '@/lib/geolocation';
 import { formatDistance, haversineMeters, polygonCentroid } from '@/components/match/freshness';
 import { circlePolygon, scalePolygonTowardCentroid } from '@/components/match/ZoneEditor';
-import { Button } from '@/components/ui/button';
 import {
-  loadMapLibre, OFFLINE_STYLE_URL, OFFLINE_MAP_ATTRIBUTION,
+  loadMapLibre, isWebGLSupported, OFFLINE_STYLE_URL,
   OFFLINE_MAP_CENTRE, OFFLINE_MAP_INITIAL_ZOOM, OFFLINE_MAP_MIN_ZOOM,
   OFFLINE_MAP_MAX_ZOOM, OFFLINE_MAP_MAX_BOUNDS,
   OUTSIDE_MAP_AREA_MESSAGE, isInsideOfflineMap,
@@ -115,10 +114,6 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
    *  so the host sees which method is being tried instead of a
    *  static spinner. */
   const [locStage, setLocStage] = useState<string | null>(null);
-  /** The best coarse fix the chain saw (too coarse to auto-centre).
-   *  Offered as "Use this approximate spot" — the host may CHOOSE
-   *  it as a hand-placed pin, never applied silently. */
-  const [approxFix, setApproxFix] = useState<ForegroundFix | null>(null);
   /** Where the zone centre came from: a real GPS fix ('gps'), or
    *  placed by hand on the map ('placed' — tap or arrow keys). The
    *  centre is NEVER presented as the user's real location unless it
@@ -134,10 +129,6 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   // steppers with their own reset). Capped at 20 entries.
   const drawHistoryRef = useRef<GeoPolygon[]>([]);
   const lastDragEndRef = useRef(0);
-  /** The bundled style file failed to load (missing/corrupt pack).
-   *  Shown honestly, no retry button — there is no other map to
-   *  retry with, by founder decision. */
-  const [mapError, setMapError] = useState(false);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   /** Key of the zone the camera was last fitted to (centre +
    *  radius + shape). The fit runs when this changes — including
@@ -305,7 +296,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     if (!draw && p.centreLat != null && p.centreLng != null) {
       const el = document.createElement('div');
       el.title = 'Zone centre pin — drag to move it to your exact spot';
-      el.innerHTML = '<span style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);background:#B91C1C;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.4);"><span style="width:10px;height:10px;border-radius:50%;background:#fff;"></span></span>';
+      el.innerHTML = '<span style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);background:#B91C1C;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.4);"><span style="width:12px;height:12px;border-radius:50%;background:#fff;"></span></span>';
       const marker = new lib.Marker({ element: el, draggable: true, anchor: 'bottom' }).setLngLat([p.centreLng, p.centreLat]).addTo(map);
       marker.on('dragend', () => {
         const ll = marker.getLngLat();
@@ -321,7 +312,10 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       poly.forEach((pt, i) => {
         const selected = selectedCornerRef.current === i;
         const el = document.createElement('div');
-        el.innerHTML = `<span role="button" aria-label="Corner ${i + 1} of ${poly.length}${selected ? ' — selected' : ''}. Drag to move, tap to select." style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50%;border:3px solid #B91C1C;background:${selected ? '#B91C1C' : '#fff'};color:${selected ? '#fff' : '#B91C1C'};font-weight:800;font-size:13px;cursor:grab;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">${i + 1}</span>`;
+        // 48 px touch target (corner drag must work by touch at
+        // 360 px); touch-action none so a finger drag moves the
+        // corner instead of panning the map.
+        el.innerHTML = `<span role="button" aria-label="Corner ${i + 1} of ${poly.length}${selected ? ' — selected' : ''}. Drag to move, tap to select." style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50%;border:3px solid #B91C1C;background:${selected ? '#B91C1C' : '#fff'};color:${selected ? '#fff' : '#B91C1C'};font-weight:800;font-size:15px;cursor:grab;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">${i + 1}</span>`;
         const marker = new lib.Marker({ element: el, draggable: true }).setLngLat([pt.lng, pt.lat]).addTo(map);
         marker.on('dragend', () => {
           lastDragEndRef.current = Date.now();
@@ -343,7 +337,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       const centre = polygonCentroid(poly);
       if (centre) {
         const el = document.createElement('div');
-        el.innerHTML = '<span role="button" aria-label="Drag to move the whole zone." style="display:flex;align-items:center;justify-content:center;width:34px;height:34px;border-radius:10px;border:2px solid #fff;background:#B91C1C;color:#fff;font-weight:800;font-size:18px;cursor:move;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">✥</span>';
+        el.innerHTML = '<span role="button" aria-label="Drag to move the whole zone." style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:10px;border:2px solid #fff;background:#B91C1C;color:#fff;font-weight:800;font-size:18px;cursor:move;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">✥</span>';
         const marker = new lib.Marker({ element: el, draggable: true }).setLngLat([centre.lng, centre.lat]).addTo(map);
         marker.on('dragend', () => {
           const ll = marker.getLngLat();
@@ -364,11 +358,15 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       try {
         lib = await loadMapLibre();
       } catch {
-        if (!cancelled) setMapError(true);
         return;
       }
       if (cancelled || !ref.current) return;
-      if (!lib.supported()) { setMapError(true); return; }
+      // Real WebGL probe (loadMapLibre already checks too). The old
+      // `lib.supported()` call sat OUTSIDE try/catch and threw a
+      // TypeError on every device — MapLibre v5 has no such export.
+      // Without WebGL there is no map to draw; the zone is still
+      // settable from the steppers below.
+      if (!isWebGLSupported()) { return; }
       libRef.current = lib;
       const centre: [number, number] = value.centreLat != null && value.centreLng != null
         ? [value.centreLng, value.centreLat] : BBOX_CENTRE;
@@ -387,7 +385,6 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
           trackResize: true,
         });
       } catch {
-        if (!cancelled) setMapError(true);
         return;
       }
       mapRef.current = map;
@@ -406,17 +403,6 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
           onChangeRef.current({ ...p, centreLat: e.lngLat.lat, centreLng: e.lngLat.lng });
           setCentreSource('placed');
           setAnnounce('Zone centre moved — placed by hand on the map, not a GPS fix.');
-        }
-      });
-      let preLoadErrors = 0;
-      map.on('error', () => {
-        // The bundled raster tiles failed. A single bad tile
-        // mid-session is not fatal; only a pack that NEVER loads is
-        // an honest error — 3 errors before the style loads means
-        // the tile pack is missing or corrupt.
-        if (!styleLoadedRef.current) {
-          preLoadErrors += 1;
-          if (preLoadErrors >= 3) setMapError(true);
         }
       });
       map.on('style.load', () => {
@@ -482,42 +468,25 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     fitToZone(map, value);
   }, [fitSignal]);
 
-  /** Apply a fix as the zone centre. `source` 'gps' = a real GPS fix
-   *  (labelled with its accuracy); 'approximate' = the host CHOSE the
-   *  coarse fix as a hand-placed pin (labelled approximate, never
-   *  presented as their real location — centreSource 'placed'). */
-  const applyFix = (fix: ForegroundFix, source: 'gps' | 'approximate') => {
-    setCentreSource(source === 'gps' ? 'gps' : 'placed');
+  /** Apply a GPS fix as the zone centre. Only a real GPS fix ever
+   *  reaches here — a fix coarser than ±50 m never auto-centres the
+   *  zone (the caller rejects it); the host places the pin by hand. */
+  const applyFix = (fix: ForegroundFix) => {
+    setCentreSource('gps');
     const p = propsRef.current;
-    if (source === 'gps') {
-      if (p.zoneShape === 'draw' && p.drawnBoundary && p.drawnBoundary.length >= 3) {
-        // Move the whole drawn shape so its middle sits where the host stands.
-        const old = polygonCentroid(p.drawnBoundary);
-        const next = old ? translatePolygon(p.drawnBoundary, fix.lat - old.lat, fix.lng - old.lng) : p.drawnBoundary;
-        onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng, drawnBoundary: next });
-        setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. The drawn zone moved to where you are standing.`);
-      } else if (p.zoneShape === 'draw') {
-        // No shape yet: place the centre and draw the starting shape.
-        onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng, drawnBoundary: circlePolygon(fix.lat, fix.lng, p.radiusMeters, DRAW_DEFAULT_CORNERS) });
-        setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. Zone centre set to where you are standing.`);
-      } else {
-        onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng });
-        setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. Zone centre set to where you are standing.`);
-      }
+    if (p.zoneShape === 'draw' && p.drawnBoundary && p.drawnBoundary.length >= 3) {
+      // Move the whole drawn shape so its middle sits where the host stands.
+      const old = polygonCentroid(p.drawnBoundary);
+      const next = old ? translatePolygon(p.drawnBoundary, fix.lat - old.lat, fix.lng - old.lng) : p.drawnBoundary;
+      onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng, drawnBoundary: next });
+      setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. The drawn zone moved to where you are standing.`);
+    } else if (p.zoneShape === 'draw') {
+      // No shape yet: place the centre and draw the starting shape.
+      onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng, drawnBoundary: circlePolygon(fix.lat, fix.lng, p.radiusMeters, DRAW_DEFAULT_CORNERS) });
+      setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. Zone centre set to where you are standing.`);
     } else {
-      const note = `Placed at your approximate location (±${Math.round(fix.accuracyMeters)} m — GPS could not do better). Drag the pin to your exact spot.`;
-      if (p.zoneShape === 'draw' && p.drawnBoundary && p.drawnBoundary.length >= 3) {
-        const old = polygonCentroid(p.drawnBoundary);
-        const next = old ? translatePolygon(p.drawnBoundary, fix.lat - old.lat, fix.lng - old.lng) : p.drawnBoundary;
-        onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng, drawnBoundary: next });
-        setAnnounce(`${note} The drawn zone moved there.`);
-      } else if (p.zoneShape === 'draw') {
-        onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng, drawnBoundary: circlePolygon(fix.lat, fix.lng, p.radiusMeters, DRAW_DEFAULT_CORNERS) });
-        setAnnounce(`${note} Zone centre placed there.`);
-      } else {
-        onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng });
-        setAnnounce(`${note} Zone centre placed there.`);
-      }
+      onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng });
+      setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. Zone centre set to where you are standing.`);
     }
   };
 
@@ -525,16 +494,11 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     setLocState('error');
     setLocError(msg);
     setAnnounce(msg);
-    // A coarse best fix is kept for the "Use this approximate spot"
-    // offer — the host may choose it, it is never applied silently.
-    const coarse = getBestCoarseFix();
-    setApproxFix(coarse && coarse.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M ? coarse : null);
   };
 
-  /** Run one location attempt through `getter` (getCurrentFix or
-   *  retryLocation). getCurrentFix runs the staged chain (watch →
-   *  one-shot → low accuracy → cached), so a hanging method fails
-   *  over to the next automatically; onProgress reports the best
+  /** Run one location attempt. getCurrentFix runs the staged chain
+   *  (watch → one-shot → low accuracy → cached), so a hanging method
+   *  fails over to the next automatically; onProgress reports the best
    *  accuracy AND the stage, so the host watches GPS refining live
    *  instead of a static spinner. */
   const runLocation = (getter: (onProgress: LocationProgress) => Promise<ForegroundFix>) => {
@@ -542,41 +506,25 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     setLocError('');
     setLocBest(null);
     setLocStage(null);
-    setApproxFix(null);
     getter((best, stage) => { setLocBest(best); if (stage) setLocStage(stage); })
       .then((fix) => {
         // Defence in depth for the founder's ±50 m auto-centre rule:
         // even if a fix somehow arrives here coarser than ±50 m, it
         // must NOT become the zone centre — the host places the pin.
         if (fix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
-          handleLocError(coarseFixMessage(fix.accuracyMeters));
+          handleLocError(coarseFixMessage());
           return;
         }
         setLocAccuracy(fix.accuracyMeters);
         setLocBest(null);
         setLocStage(null);
         setLocState('ok');
-        applyFix(fix, 'gps');
+        applyFix(fix);
       })
       .catch((msg: string) => handleLocError(msg));
   };
 
   const useMyLocation = () => runLocation(getCurrentFix);
-  /** Manual retry: force-resets every busy flag in the chain
-   *  (attempt token, watch id, best fix) and restarts from the
-   *  permission check. */
-  const retryLoc = () => runLocation(retryLocation);
-  /** The host chose the coarse fix as a hand-placed pin. Never a
-   *  GPS claim: locState goes back to 'idle' (no "✓ Location
-   *  found" line) and the centre is labelled hand-placed. */
-  const useApproximateSpot = () => {
-    if (!approxFix) return;
-    const f = approxFix;
-    setLocState('idle');
-    setLocError('');
-    setApproxFix(null);
-    applyFix(f, 'approximate');
-  };
 
   // Founder rule (2026-11-17): the zone centre is the host's real GPS
   // location — request it on load and centre there. Until a fix
@@ -671,15 +619,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       {locState === 'ok' && locAccuracy != null ? <p role="status">✓ Location found — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m). The map is centred where you are standing.</p> : null}
       {locState === 'error' ? (
         <div className="banner" role="alert">
-          <strong>Location unavailable.</strong> {locError} Tap the map to place the zone where you are standing, or drag the centre pin to your exact spot.
-          {' '}
-          <Button variant="secondary" size="sm" onClick={retryLoc}>Retry location</Button>
-          {approxFix ? (
-            <>
-              {' '}
-              <button type="button" className="btn btn-secondary" onClick={useApproximateSpot}>Use this approximate spot (±{Math.round(approxFix.accuracyMeters)} m)</button>
-            </>
-          ) : null}
+          {locError}
         </div>
       ) : null}
       {!centreSet ? <p className="small">No centre yet. Tap “Use my location” above, or tap anywhere on the map to drop the zone there. Nothing is centred on a guessed place.</p> : null}
@@ -696,27 +636,20 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       >
         <div ref={ref} style={{ width: '100%', height: '100%' }} aria-hidden="true" />
         <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', flexDirection: 'column', gap: 6, zIndex: 5 }} role="group" aria-label="Map zoom controls">
-          <button type="button" className="btn btn-secondary" style={{ minWidth: 44, minHeight: 44, padding: '8px 12px' }} onClick={() => zoomBy(1)} aria-label="Zoom in, centred on the zone centre">+</button>
-          <button type="button" className="btn btn-secondary" style={{ minWidth: 44, minHeight: 44, padding: '8px 12px' }} onClick={() => zoomBy(-1)} aria-label="Zoom out, centred on the zone centre">−</button>
-          <button type="button" className="btn btn-secondary" style={{ minWidth: 44, minHeight: 44, padding: '8px 12px' }} onClick={centreOnPin} aria-label="Centre the map on the zone centre">◎</button>
+          <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '8px 12px' }} onClick={() => zoomBy(1)} aria-label="Zoom in, centred on the zone centre">+</button>
+          <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '8px 12px' }} onClick={() => zoomBy(-1)} aria-label="Zoom out, centred on the zone centre">−</button>
+          <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '8px 12px' }} onClick={centreOnPin} aria-label="Centre the map on the zone centre">◎</button>
         </div>
       </div>
-      {mapError ? (
-        <div className="banner" role="alert">
-          <strong>The offline map tiles could not be loaded.</strong> The bundled offline map may be missing from this build. The zone and markers on the map still work.
-        </div>
-      ) : null}
       {centreOutsideArea ? (
         <p className="small" role="status">{OUTSIDE_MAP_AREA_MESSAGE}</p>
       ) : null}
-      <p className="small">Map data {OFFLINE_MAP_ATTRIBUTION}. Offline map — downloaded and bundled in the app; no live map service.</p>
       {isDraw ? (
         <>
           <p><strong>Drawn zone:</strong> {drawn ? `${drawn.length} corners · about ${formatDistance(drawSize)} across` : 'not drawn yet — use your location to place the starting shape'}</p>
-          <p><strong>Zone centre:</strong> {drawn ? 'set (middle of the drawn shape — drag the ✥ marker to move the whole zone)' : 'not set yet'}</p>
           {drawn && centreSource === 'gps' && locAccuracy != null ? <p className="small">GPS fix — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m).</p> : null}
           {drawn && centreSource === 'placed' ? <p className="small">Placed by hand on the map — not a GPS fix. Tap “Use my location” for your real position.</p> : null}
-          <p className="small">Drag a numbered corner to reshape the zone. Drag the ✥ marker in the middle to move the whole zone. Tap a corner to select it, then remove it below. Keyboard: arrow keys move the whole zone, + / − change the size by ~100 m across, U undoes.</p>
+          <p className="small">Drag a numbered corner to reshape the zone. Arrow keys move it, + / − resize.</p>
           <p style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
             <button type="button" className="btn btn-secondary" disabled={selectedCorner === null || !drawn || drawn.length <= 3} onClick={() => {
               if (selectedCorner === null || !drawn) return;
@@ -731,18 +664,17 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
         </>
       ) : (
         <>
-          <p><strong>Zone centre:</strong> {centreSet ? (centreSource === 'gps' ? 'set — from your GPS location' : centreSource === 'placed' ? 'set — placed by hand on the map' : 'set') : 'not set yet'}</p>
           {centreSet && centreSource === 'gps' && locAccuracy != null ? <p className="small">GPS fix — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m).</p> : null}
           {centreSet && centreSource === 'placed' ? <p className="small">Placed by hand on the map — not a GPS fix. Tap “Use my location” for your real position.</p> : null}
           {centreSet && centreSource === null ? <p className="small">Centre set before this screen opened — tap “Use my location” to confirm it against your real GPS position.</p> : null}
           <p><strong>Zone size:</strong> about {formatDistance(value.radiusMeters * 2)} across (radius {formatDistance(value.radiusMeters)})</p>
-          <p className="small">Tap the map to move the centre{noGoMode ? ' — no-go mode is on, so taps add no-go areas instead' : ''}. Keyboard: arrow keys move the centre (~55 m per press), + / − change the radius by 50 m.</p>
+          <p className="small">Tap the map to move the centre. Arrow keys move it, + / − resize.</p>
         </>
       )}
       <p aria-live="polite" className="small">{announce}</p>
 
       <h3>No-go areas</h3>
-      <p className="small">Draw the places players must stay out of — roads, water, private land, construction. Turn on no-go mode, then tap the map to drop a no-go circle. Each circle is about 50 m across. They are drawn shapes on the map — not a typed list of names.</p>
+      <p className="small">Tap the map to drop a no-go circle. Players must stay out.</p>
       <p>
         <button type="button" className="btn btn-secondary" aria-pressed={noGoMode} onClick={() => setNoGoMode((m) => !m)}>
           {noGoMode ? 'No-go mode: ON — tap the map to add a no-go area' : 'Add no-go areas on the map'}

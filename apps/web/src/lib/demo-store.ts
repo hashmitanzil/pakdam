@@ -421,13 +421,9 @@ export function requestCatch(roomId: string, hunterId: string, runnerId: string,
   dr.catchExpiresAtMs[c.catchId] = tok.expiresAtMs;
   if (opts?.idempotencyKey) catchIdempotency.set(`${roomId}:${opts.idempotencyKey}`, c.catchId);
   dr.catches.push(c);
-  if (!dr.room.config.catchConfirmationRequired) {
-    // Host turned Runner confirmation off: the tag counts at once. The
-    // Runner may still dispute it afterwards (dispute is never disabled).
-    Object.assign(c, { state: 'confirmed' as const, confirmedAt: new Date(nowMs).toISOString() });
-    applyConfirmedCatch(dr, c);
-    dr.events.push({ at: new Date(nowMs).toISOString(), text: `Catch counted at once — Runner confirmation is off in this room's rules` });
-  }
+  // Runner confirmation is ALWAYS required (founder-corrected catch
+  // flow, 2026-11-17): a tag never counts at once — the catch stays
+  // pending until the Runner confirms or disputes it.
   save(all); return c;
 }
 /** Shared tail of a confirmed catch: apply the mode rule (out vs turn)

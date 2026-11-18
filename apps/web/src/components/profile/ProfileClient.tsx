@@ -534,7 +534,7 @@ export default function ProfileClient() {
       </section>
 
       <h2>Accessibility settings</h2>
-      <p>Large text, high contrast, colour-blind theme, and map style live on the <a href="/accessibility">Accessibility page</a>.</p>
+      <p>Large text and high contrast live on the <a href="/accessibility">Accessibility page</a>.</p>
       <p><a href="/safety">Safety</a> · <a href="/help">Help</a> · <a href="/grievance">Grievance</a></p>
     </div>
   );

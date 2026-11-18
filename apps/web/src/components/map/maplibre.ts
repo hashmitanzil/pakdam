@@ -8,8 +8,8 @@
  *  later task.
  *
  *  LANDED APPROACH (2026-11-17, reconciliation): bundled Esri World
- *  Street Map raster tiles — 808 JPEG tiles, zooms 12–17, bbox
- *  23.325–23.38 N / 85.285–85.355 E, 13 MB, served from
+ *  Street Map raster tiles — 1,038 JPEG tiles, zooms 12–17, bbox
+ *  23.325–23.38 N / 85.285–85.355 E, ~15 MB, served from
  *  `public/offline-map/tiles/{z}/{x}/{y}.jpg` via the MapLibre
  *  raster style `public/offline-map/style.json`. A sample tile
  *  (16/48301/28392.jpg) was visually verified to paint REAL Ranchi
@@ -21,6 +21,43 @@
  *  The raster style needs no glyphs, no pmtiles.js, no basemaps.js
  *  — just MapLibre GL JS (vendored) + local JPEG tiles.
  *
+ *  EXPANSION DEFERRED (2026-11-18): the founder said this pack was
+ *  too tight and asked for a wider bbox (23.30–23.405 / 85.26–85.38
+ *  at z12–16, z17 capped to an extended core). The wider pack was
+ *  fully planned (1,918 tiles — fetch script
+ *  `apps/web/scripts/fetch-expanded-tiles.py`, per-zoom counts in
+ *  the verifier) and the code was updated for it, but the VM's
+ *  EPERM wave blocked ALL exec writes for 25+ minutes, so not one
+ *  new tile could be downloaded before the 3:55 pm ship cutoff.
+ *  The expansion was reverted to this 1,038-tile pack for the
+ *  shipped zip; the wider pack follows as the immediate next
+ *  delivery once the wave clears — re-run the fetch script, then
+ *  restore the wide bbox / 1,918 counts (they were reverted here,
+ *  in `download-offline-map.mjs`, `constants.ts`, `MapLibreMapView`
+ *  and the e2e spec header — grep for "EXPANSION DEFERRED").
+ *
+ *  AREA LABELS (2026-11-18): the Esri tiles do NOT render "Doranda"
+ *  or "Hinoo" as area labels at any zoom (verified by reading the
+ *  tiles: Esri labels streets and colonies — Hindpiri, Harmu
+ *  Housing Colony, Upkar Nagar — never the two locality names).
+ *  So the map draws its own labels: `OFFLINE_AREA_LABELS` below,
+ *  rendered as HTML markers by `MapLibreMapView` (the raster style
+ *  has no glyphs, so a symbol layer cannot draw text — HTML
+ *  markers are the only text path). Coordinates were fixed from
+ *  the tiles themselves: Doranda sits on the Sersa Stadium /
+ *  Station Road tile (z15 24151/14197, lng 85.3308–85.3418, lat
+ *  23.3423–23.3523); Hinoo sits on the Upkar Nagar / Delatoli
+ *  tile (z16 48298/28393, lng 85.3077–85.3132, lat 23.3513–
+ *  23.3563). Doranda is south-east of Hinoo, as the founder
+ *  described. Label positions are the tile centres.
+ *
+ *  HALO (2026-11-18, map fix): the pack carries a 1-tile halo
+ *  around every zoom's rectangle (1,038 tiles total, up from 808),
+ *  so the initial viewport never requests a tile just outside the
+ *  pack (the old pack 404'd on z14 y=7096 at the viewport edge).
+ *  The halo only fills viewport edges; it does not extend the
+ *  playable area, which is the bbox below.
+ *
  *  SPARE (NOT a live path): `public/offline-map/ranchi.pmtiles`
  *  (2,226,722 B) and `public/offline-map/vendor/pmtiles.js` /
  *  `basemaps.js` remain on disk as a documented spare only. Nothing
@@ -30,14 +67,26 @@
  *  tiles ever fail to load, the view shows the plain out-of-area /
  *  failed message and the pin flow carries the game.
  *
- *  Refreshing the map later: re-download the Esri tiles for the
- *  same bbox/zooms (see `apps/web/scripts/download-offline-map.mjs`,
- *  which verifies the raster pack) and replace `tiles/` +
- *  `style.json` + `manifest.json` together. */
+ *  Refreshing the map later: re-run
+ *  `apps/web/scripts/fetch-expanded-tiles.py` (downloads the Esri
+ *  tiles for the wide bbox at z12–16 + the z17 core, verifies every
+ *  tile, and rewrites `manifest.json`) and replace `tiles/` +
+ *  `manifest.json` together. `apps/web/scripts/download-offline-map.mjs`
+ *  verifies the staged pack on disk (bbox, per-zoom counts,
+ *  manifest agreement). */
 
 export const OFFLINE_MAP_BBOX = {
   minLat: 23.325, maxLat: 23.38, minLng: 85.285, maxLng: 85.355,
 } as const;
+/** App-drawn area labels (see header: the Esri tiles never render
+ *  these names). Positions are the centres of the tiles that show
+ *  each locality — Doranda: z15 24151/14197 (Sersa Stadium /
+ *  Station Road); Hinoo: z16 48298/28393 (Upkar Nagar / Delatoli).
+ *  [lng, lat]. Rendered by MapLibreMapView as HTML markers. */
+export const OFFLINE_AREA_LABELS: { name: string; lngLat: [number, number] }[] = [
+  { name: 'Doranda', lngLat: [85.336, 23.347] },
+  { name: 'Hinoo', lngLat: [85.311, 23.353] },
+] as const;
 /** Attribution for the bundled Esri World Street Map tiles (as in
  *  `public/offline-map/style.json`). */
 export const OFFLINE_MAP_ATTRIBUTION = '© Esri, HERE, Garmin, OpenStreetMap contributors, and the GIS user community';
@@ -134,13 +183,16 @@ export interface MapLibreMarker {
   remove(): void;
   setPopup(popup: MapLibrePopup): this;
   on(event: 'dragend', handler: () => void): this;
+  /** The marker's wrapper element in the map container — used to
+   *  set pointer-events:none on the app-drawn area labels so taps
+   *  pass through to the map (zone placement). */
+  getElement(): HTMLElement;
 }
 export interface MapLibrePopup {
   setText(text: string): this;
   setHTML(html: string): this;
 }
 export interface MapLibreLib {
-  supported(): boolean;
   Map: new (opts: {
     container: HTMLElement;
     style: string | Record<string, unknown>;
@@ -189,11 +241,31 @@ function loadStylesheet(href: string): void {
   document.head.appendChild(link);
 }
 
+/** REAL WebGL capability check — the thing `lib.supported()` used
+ *  to pretend to be. The vendored MapLibre v5 bundle has NO
+ *  `supported` export (verified 2026-11-18: `window.maplibregl`
+ *  exposes Map/Marker/Popup but `supported` is `undefined`), so
+ *  gating on it killed the map on EVERY device while blaming the
+ *  library. This helper probes a throwaway canvas instead:
+ *  `webgl2` first, then `webgl`. Callers use it where a no-WebGL
+ *  honest error is needed — never as a library-load check. */
+export function isWebGLSupported(): boolean {
+  if (typeof document === 'undefined') return false;
+  try {
+    const canvas = document.createElement('canvas');
+    return !!(canvas.getContext('webgl2') || canvas.getContext('webgl'));
+  } catch {
+    return false;
+  }
+}
+
 /** Returns the MapLibre library (vendored script only). Throws when
  *  the vendored script is missing — the caller shows an honest
  *  error. There is no CDN and no alternate map provider, by founder
  *  decision. Only maplibre-gl.js is loaded: the raster style needs
- *  no pmtiles.js, basemaps.js or glyphs. */
+ *  no pmtiles.js, basemaps.js or glyphs. A browser with no WebGL
+ *  throws a distinct, honest error (the map genuinely cannot draw
+ *  without WebGL) — it is NOT reported as a missing library. */
 export async function loadMapLibre(): Promise<MapLibreLib> {
   if (cachedLib) return cachedLib;
   if (loadPromise) return loadPromise;
@@ -201,8 +273,11 @@ export async function loadMapLibre(): Promise<MapLibreLib> {
     loadStylesheet(MAPLIBRE_CSS_URL);
     await loadScript(MAPLIBRE_JS_URL);
     const lib = window.maplibregl;
-    if (!lib || !lib.Map || typeof lib.supported !== 'function') {
+    if (!lib || !lib.Map) {
       throw new Error('Offline MapLibre library failed to load (vendored script missing or corrupt)');
+    }
+    if (!isWebGLSupported()) {
+      throw new Error('WebGL is not available in this browser — the offline map needs WebGL to draw tiles');
     }
     cachedLib = lib;
     return lib;

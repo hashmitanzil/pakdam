@@ -122,7 +122,7 @@ export default function ReadinessChecklist({ players, meId, roomId, mode = 'demo
         setRunning(false);
       },
       (err) => {
-        setGps({ status: 'fail', detail: err.code === 1 ? 'Location is off — tap to allow it in your browser, then tap Retry.' : 'Location unavailable — check GPS and try again.' });
+        setGps({ status: 'fail', detail: err.code === 1 ? 'Location is off — allow it in your browser settings, then tap Retry.' : 'GPS is too rough here — try again.' });
         setPerm((p) => (err.code === 1 ? 'fail' : p));
         setRunning(false);
       },

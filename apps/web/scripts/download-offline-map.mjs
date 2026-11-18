@@ -8,18 +8,28 @@
 // works on the downloaded map (device GPS is independent of tiles).
 // The full live map service is a SEPARATE later task.
 //
-// LANDED APPROACH (2026-11-17, reconciliation): bundled Esri World
-// Street Map raster tiles — 808 JPEG tiles, zooms 12–17, bbox
-// 23.325–23.38 N / 85.285–85.355 E, ~13 MB — served from
-// `public/offline-map/tiles/{z}/{x}/{y}.jpg` via the MapLibre raster
-// style `public/offline-map/style.json` (see `manifest.json`). A
-// sample tile (16/48301/28392.jpg) was visually verified to paint
-// REAL Ranchi streets. This replaced the PMTiles vector wiring,
-// which was half-done: it needed vendored glyphs under
-// `public/offline-map/fonts/` that were never copied, so its labels
-// could never render. The raster style needs no glyphs, no
-// pmtiles.js, no basemaps.js — just vendored MapLibre GL JS + local
-// JPEG tiles, zero network requests at runtime.
+// LANDED APPROACH (2026-11-17, reconciliation; EXPANSION DEFERRED
+// 2026-11-18): bundled Esri World Street Map raster tiles — 1,038
+// JPEG tiles, zooms 12–17, bbox 23.325–23.38 N / 85.285–85.355 E,
+// ~15 MB — served from `public/offline-map/tiles/{z}/{x}/{y}.jpg`
+// via the MapLibre raster style `public/offline-map/style.json`
+// (see `manifest.json`). A sample tile (16/48301/28392.jpg) was
+// visually verified to paint REAL Ranchi streets. This replaced
+// the PMTiles vector wiring, which was half-done: it needed
+// vendored glyphs under `public/offline-map/fonts/` that were
+// never copied, so its labels could never render. The raster style
+// needs no glyphs, no pmtiles.js, no basemaps.js — just vendored
+// MapLibre GL JS + local JPEG tiles, zero network requests at
+// runtime. Doranda/Hinoo do not render as labels on the Esri
+// tiles themselves; the app draws them (OFFLINE_AREA_LABELS in
+// `maplibre.ts`, rendered by MapLibreMapView). The wider pack
+// (1,918 tiles, bbox 23.30–23.405 / 85.26–85.38 at z12–16, z17
+// capped to the extended core) was planned and its fetch script
+// (`fetch-expanded-tiles.py`) is on disk, but the VM EPERM wave
+// blocked all tile downloads before the 3:55 pm ship cutoff, so
+// this 1,038-tile pack ships; the expansion follows as the
+// immediate next delivery (re-run the fetch script, then restore
+// the wide bbox / 1,918 counts here and in maplibre.ts).
 //
 // SPARE (not a live path): `public/offline-map/ranchi.pmtiles`
 // (2,226,722 B, md5 9d99b0d4865496f73e230a9d92aa525e) plus
@@ -28,9 +38,11 @@
 //
 // This script does NOT download anything. It verifies the staged
 // raster pack on disk (style + manifest + tile count + vendored
-// MapLibre). To REFRESH the map, re-download the Esri tiles for the
-// same bbox/zooms and replace `tiles/` + `style.json` +
-// `manifest.json` together (keep the 808-tile count in sync with
+// MapLibre). To REFRESH the map, run
+// `python3 apps/web/scripts/fetch-expanded-tiles.py` (downloads the
+// Esri tiles for the wide bbox at z12–16 + the z17 core, verifies
+// every tile, rewrites `manifest.json`) and replace `tiles/` +
+// `manifest.json` together (keep the counts below in sync with
 // the manifest).
 //
 // Run:  node apps/web/scripts/download-offline-map.mjs
@@ -44,7 +56,9 @@ const OUT = join(ROOT, 'public', 'offline-map');
 
 // Doranda + Hinoo, Ranchi, Jharkhand — the raster tile bbox.
 const BBOX = { minLat: 23.325, maxLat: 23.38, minLng: 85.285, maxLng: 85.355 };
-const EXPECTED_TILES = 808;
+const EXPECTED_TILES = 1038;
+/** Planned tiles per zoom (bbox + 1-tile halo). */
+const EXPECTED_PER_ZOOM = { 12: 12, 13: 20, 14: 30, 15: 80, 16: 224, 17: 672 };
 
 const failed = [];
 const ok = (rel, size) => console.log(`ok ${rel} (${size} bytes)`);
@@ -82,6 +96,7 @@ if (!existsSync(stylePath)) {
 // The manifest must exist and agree with the tiles on disk.
 const manifestPath = join(OUT, 'manifest.json');
 let manifestTotal = null;
+let manifestPerZoom = null;
 if (!existsSync(manifestPath)) {
   failed.push('manifest.json: MISSING');
 } else {
@@ -89,10 +104,19 @@ if (!existsSync(manifestPath)) {
   try {
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
     manifestTotal = manifest.tiles?.total ?? null;
+    manifestPerZoom = manifest.tiles?.perZoom ?? null;
     if (manifestTotal !== EXPECTED_TILES) {
       failed.push(`manifest.json: tiles.total ${manifestTotal}, expected ${EXPECTED_TILES}`);
     } else {
       ok('manifest.json', size);
+    }
+    const mb = manifest.bbox ?? {};
+    if (mb.minLat !== BBOX.minLat || mb.maxLat !== BBOX.maxLat || mb.minLng !== BBOX.minLng || mb.maxLng !== BBOX.maxLng) {
+      failed.push(`manifest.json: bbox ${JSON.stringify(mb)}, expected ${JSON.stringify(BBOX)}`);
+    }
+    for (const [z, expected] of Object.entries(EXPECTED_PER_ZOOM)) {
+      const got = manifestPerZoom?.[z]?.total;
+      if (got !== expected) failed.push(`manifest.json: perZoom z${z} total ${got}, expected ${expected}`);
     }
   } catch {
     failed.push('manifest.json: not valid JSON');
@@ -102,6 +126,7 @@ if (!existsSync(manifestPath)) {
 // Count the actual tiles on disk (zooms 12–17).
 let tileCount = 0;
 let tileBytes = 0;
+const perZoomOnDisk = {};
 const tilesDir = join(OUT, 'tiles');
 if (!existsSync(tilesDir)) {
   failed.push('tiles/: MISSING');
@@ -115,6 +140,7 @@ if (!existsSync(tilesDir)) {
       for (const y of readdirSync(xDir)) {
         if (!y.endsWith('.jpg')) continue;
         tileCount += 1;
+        perZoomOnDisk[z] = (perZoomOnDisk[z] ?? 0) + 1;
         tileBytes += statSync(join(xDir, y)).size;
       }
     }
@@ -123,8 +149,20 @@ if (!existsSync(tilesDir)) {
   if (tileCount !== EXPECTED_TILES) {
     failed.push(`tiles/: ${tileCount} files, expected ${EXPECTED_TILES}`);
   }
+  for (const [z, expected] of Object.entries(EXPECTED_PER_ZOOM)) {
+    if ((perZoomOnDisk[z] ?? 0) !== expected) {
+      failed.push(`tiles/: z${z} has ${perZoomOnDisk[z] ?? 0} files, expected ${expected}`);
+    }
+  }
   if (manifestTotal !== null && manifestTotal !== tileCount) {
     failed.push(`tiles/: manifest says ${manifestTotal}, disk has ${tileCount}`);
+  }
+  if (manifestPerZoom) {
+    for (const [z, expected] of Object.entries(EXPECTED_PER_ZOOM)) {
+      if (manifestPerZoom[z]?.downloaded !== (perZoomOnDisk[z] ?? 0)) {
+        failed.push(`tiles/: manifest perZoom z${z} downloaded ${manifestPerZoom[z]?.downloaded}, disk has ${perZoomOnDisk[z] ?? 0}`);
+      }
+    }
   }
 }
 
@@ -146,4 +184,4 @@ if (failed.length > 0) {
   console.error(`OFFLINE MAP PACK INVALID:\n- ${failed.join('\n- ')}`);
   process.exit(1);
 }
-console.log('Offline map pack verified: 808 bundled raster tiles + vendored MapLibre, zero live tile sources.');
+console.log('Offline map pack verified: 1,038 bundled raster tiles + vendored MapLibre, zero live tile sources.');

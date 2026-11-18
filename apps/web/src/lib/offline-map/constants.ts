@@ -2,7 +2,7 @@
  *
  *  READ FIRST — what is live vs what this module is:
  *  The live map view (`MapLibreMapView`) uses the BUNDLED ESRI
- *  RASTER tiles (`public/offline-map/tiles/`, 808 JPEGs, zooms
+ *  RASTER tiles (`public/offline-map/tiles/`, 1,038 JPEGs, zooms
  *  12–17, bbox 23.325–23.38 N / 85.285–85.355 E), by the
  *  2026-11-17 reconciliation recorded in `maplibre.ts`: the
  *  PMTiles wiring was half-done and its vendored glyphs were never

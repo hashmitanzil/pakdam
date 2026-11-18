@@ -1,8 +1,6 @@
 import type { Metadata, Viewport } from 'next';
-import Script from 'next/script';
 import AccessibilityProvider from './accessibility/AccessibilityProvider';
 import TopBar from '@/components/ui/TopBar';
-import ThemeControls from '@/components/match/ThemeControls';
 import SwRegister from '@/components/ui/SwRegister';
 import '@/styles/tokens.css';
 export const metadata: Metadata = {
@@ -17,23 +15,15 @@ export const viewport: Viewport = { themeColor: '#7F1D1D', width: 'device-width'
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" suppressHydrationWarning>
-      {/* Dark mode before first paint (2026-11-17, UI worker): the `dark`
-       * class used to be applied only in a client useEffect, so every
-       * visit with dark mode on flashed light first. This blocking
-       * beforeInteractive script reads the same pakdam.dark-mode key
-       * and adds the class while the page is still parsing, before
-       * React hydrates. suppressHydrationWarning on <html> is the
-       * standard companion: the server renders without the class and
-       * the client legitimately has it before hydration. */}
-      <Script id="pakdam-theme-init" strategy="beforeInteractive">
-        {`try{if(localStorage.getItem('pakdam.dark-mode')==='on'){document.documentElement.classList.add('dark')}}catch(e){}`}
-      </Script>
+      {/* One dark theme (2026-11-18, simplification): the dark tokens are
+       * the base tokens in tokens.css — no light theme, no toggle, no
+       * theme-init script, so a light flash on first paint is
+       * impossible. suppressHydrationWarning stays: the
+       * AccessibilityProvider applies large-text / high-contrast to
+       * <html> in a client effect, which the server cannot know. */}
       <body>
         <AccessibilityProvider>
         <TopBar />
-        <nav aria-label="Accessibility settings" className="a11y-bar">
-          <ThemeControls />
-        </nav>
         <SwRegister />
         <main>{children}</main>
         <footer className="site-footer">

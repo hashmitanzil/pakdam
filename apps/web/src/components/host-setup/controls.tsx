@@ -1,13 +1,14 @@
 'use client';
 import type { CSSProperties, ReactNode } from 'react';
+import styles from './host-setup.module.css';
 
-const rowStyle: CSSProperties = {
-  display: 'flex', gap: 12, alignItems: 'flex-start', justifyContent: 'space-between',
-  flexWrap: 'wrap',
-  padding: '14px 0', borderBottom: '1px solid var(--line, #E8CFCF)',
-};
-const textStyle: CSSProperties = { flex: 1, minWidth: 0 };
 const hintStyle: CSSProperties = { margin: '4px 0 0', fontSize: 14, lineHeight: 1.45, color: '#5B4A4A' };
+
+/** Row layout lives in host-setup.module.css (.stepperRow /
+ *  .stepperRowText): the text column has a 180px flex basis and the
+ *  row stacks vertically below 480px, so a long stepper value can
+ *  never squeeze the label down to a column of single letters
+ *  (Defect 1, 2026-11-18 — Zone size measured 11px wide at 360px). */
 
 export function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -32,14 +33,14 @@ export function StepperRow({ label, hint, steps, value, display, onChange, disab
     if (next !== undefined && next !== value) onChange(next);
   };
   return (
-    <div style={rowStyle}>
-      <div style={textStyle}>
+    <div className={styles.stepperRow}>
+      <div className={styles.stepperRowText}>
         <strong style={{ display: 'block', fontSize: 16 }}>{label}</strong>
         {hint ? <p style={hintStyle}>{hint}</p> : null}
       </div>
-      <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }} role="group" aria-label={ariaLabel ?? label}>
+      <div className={styles.stepperControls} role="group" aria-label={ariaLabel ?? label}>
         <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '10px 12px' }} onClick={() => go(-1)} disabled={disabled || cur <= 0} aria-label={`Decrease ${label}`}>−</button>
-        <output style={{ minWidth: 76, textAlign: 'center', fontWeight: 700, fontSize: 16 }} aria-live="polite">{display}</output>
+        <output className={styles.stepperOutput} aria-live="polite">{display}</output>
         <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '10px 12px' }} onClick={() => go(1)} disabled={disabled || cur >= steps.length - 1} aria-label={`Increase ${label}`}>+</button>
       </div>
     </div>
@@ -54,8 +55,8 @@ export function ToggleRow({ label, hint, checked, onChange, disabled }: {
   label: string; hint?: string; checked: boolean; onChange: (v: boolean) => void; disabled?: boolean;
 }) {
   return (
-    <div style={rowStyle}>
-      <div style={textStyle}>
+    <div className={styles.stepperRow}>
+      <div className={styles.stepperRowText}>
         <strong style={{ display: 'block', fontSize: 16 }}>{label}</strong>
         {hint ? <p style={hintStyle}>{hint}</p> : null}
       </div>
@@ -65,12 +66,12 @@ export function ToggleRow({ label, hint, checked, onChange, disabled }: {
           type="button" role="switch" aria-checked={checked} aria-label={label}
           disabled={disabled} onClick={() => onChange(!checked)}
         style={{
-          flexShrink: 0, width: 64, height: 44, borderRadius: 999, border: 0, cursor: disabled ? 'not-allowed' : 'pointer',
+          flexShrink: 0, width: 64, height: 48, borderRadius: 999, border: 0, cursor: disabled ? 'not-allowed' : 'pointer',
           background: checked ? '#B91C1C' : '#C9B8B8', position: 'relative', padding: 0, opacity: disabled ? 0.55 : 1,
         }}
       >
         <span style={{
-          position: 'absolute', top: 4, left: checked ? 24 : 4, width: 36, height: 36,
+          position: 'absolute', top: 6, left: checked ? 24 : 4, width: 36, height: 36,
           borderRadius: '50%', background: '#fff', transition: 'left 0.15s ease',
           boxShadow: '0 1px 3px rgba(0,0,0,0.3)',
         }} />

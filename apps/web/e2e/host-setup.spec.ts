@@ -8,14 +8,14 @@
 // NO Find-a-Room / public listing, NO Zombie or Breach mode.
 // Two modes are playable (Classic / Infection).
 import { test, expect } from '@playwright/test';
-import { createLobby, roomState, setPlayer, ROOM_KEY } from './helpers';
+import { clickPresetChip, createLobby, roomState, setPlayer, ROOM_KEY } from './helpers';
 
 test('host setup: every stepper and toggle moves the live summary strip', async ({ page, context }) => {
   test.setTimeout(120_000);
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.goto('/create');
-  await page.getByLabel(/Standard/).check();
+  await clickPresetChip(page, 'Standard');
   await page.getByLabel(/codename/i).fill('Test Host');
 
   // Default Standard draft: 500 m radius (1.0 km across), 2 Hunters,
@@ -34,19 +34,22 @@ test('host setup: every stepper and toggle moves the live summary strip', async 
   await page.getByRole('radio', { name: /^Infection/ }).check();
   await expect(page.getByRole('radio', { name: /^Infection/ })).toBeChecked();
 
-  // --- Play area: radius stepper, then slider to 1500 m radius
-  // (no cap — the radius is unlimited past 1 km). ---
-  await page.getByRole('button', { name: /Increase Radius/ }).click();
+  // --- Play area: Zone size stepper (no slider on /create — the
+  // slider lives only in the lobby Zone Editor; the old
+  // #zone-radius slider fill + "Radius 1.5 km" lines are gone). ---
+  await page.getByRole('button', { name: /Increase Zone size/ }).click();
   await expect(page.getByText(/1\.1 km zone . 2 hunters/i).first()).toBeVisible();
-  // Slider to 1500 m radius: zone grows to 3.0 km across (formatDistance).
-  await page.locator('#zone-radius').fill('1500');
-  await expect(page.getByText(/3\.0 km zone . 2 hunters/i).first()).toBeVisible();
-  await expect(page.getByText(/Radius 1\.5 km — about 3\.0 km across/i)).toBeVisible();
-  await expect(page.getByText(/Radius at least 100 m, no maximum/i)).toBeVisible();
+  await expect(page.getByRole('group', { name: 'Zone size' }).locator('output')).toHaveText('about 1.1 km across');
+  // The "Radius at least 100 m, no maximum" line was removed in
+  // simplification §5c — assert the removed text stays gone.
+  await expect(page.getByText(/Radius at least 100 m, no maximum/i)).toHaveCount(0);
 
   // --- Draw mode: corners stepper appears, size-across line updates. ---
   await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  // The old "Zone centre: set" status line was removed in the
+  // simplification round (§5c) — the centre-set evidence now is
+  // the "Location found — … (GPS accuracy ±N m)" status line.
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   await page.getByRole('radio', { name: /Draw/ }).check();
   // "6 corners" also appears in the map's "Drawn zone: 6 corners"
   // line, so assert the Corners stepper's own output exactly.
@@ -140,7 +143,7 @@ test('host setup: every stepper and toggle moves the live summary strip', async 
 test('host setup: play zone off disables ping + shrink and needs no centre', async ({ page }) => {
   test.setTimeout(60_000);
   await page.goto('/create');
-  await page.getByLabel(/Standard/).check();
+  await clickPresetChip(page, 'Standard');
   await page.getByLabel(/codename/i).fill('No Zone Host');
   await page.getByRole('switch', { name: 'Play zone' }).click();
   await expect(page.getByRole('switch', { name: 'Play zone' })).toHaveAttribute('aria-checked', 'false');

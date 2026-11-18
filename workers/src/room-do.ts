@@ -1594,31 +1594,11 @@ function applyGameCommand(
         serverSeq: s.serverSeq + 1,
       };
       const logged = logEvent(next, 'catch.request', playerId, nowMs);
-      // QA 2026-11-17 (GL-07): the host's catchConfirmationRequired
-      // flag was ignored server-side — the catch always stayed
-      // pending. When confirmation is OFF the tag counts at once
-      // (the Runner may still dispute it afterwards is NOT yet
-      // supported — see GL-07b in the QA report).
-      if (s.room.config.catchConfirmationRequired === false) {
-        const auto = resolveCatch(catchEvent, 'confirm', nowIso);
-        const confirmedState: RoomDoState = {
-          ...logged,
-          catches: logged.catches.map((x) => (x.catchId === catchId ? auto : x)),
-          activeCatchIds: logged.activeCatchIds.filter((id) => id !== catchId),
-        };
-        const withTag = logGameEvent(confirmedState, createGameEvent('PLAYER_TAGGED', s.room.roomId, playerId, {
-          runnerId, hunterId: playerId, catchId, method: 'no-confirmation',
-        }));
-        const finalState = applyConfirmedCatchToState(withTag, auto, s.room.hostPlayerId, nowMs);
-        const replies: WsServerMessage[] = [
-          msg('catch.requested', { catch: toCatchView(catchEvent), serverSeq: next.serverSeq } as never, next.serverSeq),
-          msg('catch.confirmed', { catch: toCatchView(auto), serverSeq: finalState.serverSeq } as never, finalState.serverSeq),
-        ];
-        if (finalState.room.phase === 'COMPLETED' && finalState.room.result) {
-          replies.push(msg('match.completed', { result: finalState.room.result, serverSeq: finalState.serverSeq } as never, finalState.serverSeq));
-        }
-        return { state: finalState, replies, issuedCatchToken: { catchId, runnerPlayerId: runnerId, token: token.raw } };
-      }
+      // Runner confirmation is ALWAYS required (founder-corrected
+      // catch flow, 2026-11-17): a tag never counts at once. The
+      // catch stays pending until the Runner confirms (QR scan or
+      // manual confirm) or disputes it — there is no
+      // catchConfirmationRequired=false path anywhere in the app.
       return {
         state: logged,
         replies: [msg('catch.requested', { catch: toCatchView(catchEvent), serverSeq: next.serverSeq } as never, next.serverSeq)],

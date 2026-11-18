@@ -18,7 +18,7 @@
 }
 
 .voiceNote {
-  background: #FEF2F2;
+  background: #3A151A;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   padding: 8px 12px;
@@ -34,6 +34,13 @@
   background: var(--surface);
 }
 
+/* Walkie-talkie channel header — the channel name + who hears it,
+ * always at the top of the voice panel, before the talk button. */
+.voiceChannel {
+  font-size: 15px;
+  margin: 0 0 8px;
+}
+
 .voiceRow {
   display: flex;
   gap: 8px;
@@ -47,8 +54,8 @@
   min-height: 64px;
   border-radius: var(--radius);
   border: 2px solid var(--red);
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   font-weight: 800;
   font-size: 16px;
   cursor: pointer;
@@ -71,7 +78,7 @@
   min-height: 64px;
   border-radius: var(--radius);
   border: 2px solid var(--line);
-  background: #fff;
+  background: var(--surface);
   color: var(--ink);
   font-weight: 700;
   cursor: pointer;
@@ -99,7 +106,7 @@
 
 .messageMine {
   align-self: flex-end;
-  background: #FEE2E2;
+  background: #3A151A;
   border-color: var(--ember);
 }
 
@@ -133,14 +140,14 @@
 }
 
 .reportRow button {
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   border: 2px solid var(--red);
   border-radius: 999px;
   padding: 6px 12px;
   font-weight: 700;
   cursor: pointer;
-  min-height: 40px;
+  min-height: 48px;
 }
 
 .quickRow {
@@ -151,14 +158,14 @@
 }
 
 .quickChip {
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   border: 2px solid var(--red);
   border-radius: 999px;
   padding: 8px 14px;
   font-weight: 700;
   cursor: pointer;
-  min-height: 40px;
+  min-height: 48px;
   font-size: 14px;
 }
 
@@ -179,25 +186,11 @@
   border: 2px solid var(--line);
   border-radius: var(--radius);
   margin: 0;
+  background: var(--surface);
+  color: var(--ink);
 }
 
 .composer button {
   flex: 0 0 auto;
 }
 
-/* Dark mode (2026-11-17): white chips/buttons go dark; red-dark text
- * goes ember-light. */
-/* Dark-mode polish (2026-11-17, UI worker): the light #FEF2F2 voice
- * note and #FEE2E2 own-message bubble carry inherited --ink text,
- * which flips to near-white in dark mode and goes invisible on the
- * pale tint — they get the dark tint. The composer input had no
- * background/color of its own, so it gets the dark surface + ink
- * explicitly instead of relying on the browser default. */
-:global(html.dark) .reportRow button { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .quickChip { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .voiceNote { background: #3A151A; }
-:global(html.dark) .messageMine { background: #3A151A; }
-:global(html.dark) .composer input { background: var(--surface); color: var(--ink); }
-:global(html.dark) .pttButton { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .pttTalking { background: var(--red); color: #fff; }
-:global(html.dark) .muteButton { background: var(--surface); color: var(--ink); }

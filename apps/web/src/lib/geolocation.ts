@@ -13,7 +13,7 @@
  *  is now rejected (or, at the end of the chain, a fix accurate to ±50 m or
  *  better is accepted — the founder's auto-centre limit,
  *  ZONE_AUTO_CENTRE_MAX_ACCURACY_M — still a real GPS/WiFi fix, never a
- *  city-level one) and the rejection states how far off GPS is, with
+ *  city-level one) and the rejection is one short line, with
  *  tap-to-place / drag-the-pin as the fallback.
  *
  *  Staged chain (founder steer, 2026-11-17 — "try ALL types of approach",
@@ -33,20 +33,17 @@
  *  maximumAge is 0 for stages 1–3 (no cached fix); stage 4 is the
  *  ONLY stage that accepts a cached fix, and only within ±50 m —
  *  and its `at` timestamp is the fix's own time, so freshness labels
- *  show its true age. retryLocation() force-resets every busy flag
- *  (attempt token, watch id, best fix) and restarts the chain from
- *  the permission check. If the browser blocks geolocation entirely
+ *  show its true age. If the browser blocks geolocation entirely
  *  (permission denied, or the prompt never appears and every stage
- *  times out), the chain rejects with plain language and the UI
+ *  times out), the chain rejects with one short plain line and the UI
  *  makes tap-the-map the primary path — the game stays playable
  *  with zero GPS. */
 import { classifyAccuracy, CALIBRATION_OPEN, ZONE_AUTO_CENTRE_MAX_ACCURACY_M } from '@pakdam/shared';
 export interface ForegroundFix { lat: number; lng: number; accuracyMeters: number; quality: 'good' | 'fair' | 'poor'; at: string }
-/** How to turn location back on, shown verbatim when permission is
- *  denied (founder decision, 2026-11-17 — the old "enable it in your
- *  browser settings" told the player nothing useful). */
+/** Permission denied: one short line. No step-by-step OS
+ *  instructions in the UI (simplification, 2026-11-18). */
 export const LOCATION_DENIED_HELP =
-  'Location unavailable — location permission is denied. To turn it on: Android — Settings → Apps → Pakdam → Permissions → Location → "Allow while using the app", and switch Precise location on. iPhone — Settings → Pakdam → Location → "While Using the App", and switch Precise Location on. Then try again — or tap the map to place the zone where you are standing.';
+  'Location is off — allow it in your browser settings, then tap the map to place the zone.';
 
 /** A fix is good enough to centre a zone on: within the "good" tier
  *  (CALIBRATION_OPEN.accuracyGoodMaxM, 10 m). */
@@ -135,10 +132,9 @@ const REUSED_FIX_MAX_AGE_MS = 30_000;
  *  button would spin on "Finding your location…" forever). If no good
  *  fix arrives by the watchdog, the best fix seen is accepted only
  *  when it is accurate to ±50 m or better (the founder's auto-centre
- *  limit); a coarser fix is rejected with coarseFixMessage — how far
- *  off GPS is, in km when it is kilometres — so the host places the
- *  pin by hand instead of getting a zone kilometres from where they
- *  stand. `onProgress` reports the best accuracy seen so far while
+ *  limit); a coarser fix is rejected with one short line — so the
+ *  host places the pin by hand instead of getting a zone kilometres
+ *  from where they stand. `onProgress` reports the best accuracy seen so far while
  *  the fix refines, so the UI shows live progress, never a static
  *  spinner. */
 /** The fix's own timestamp, as an ISO string — so a cached fix
@@ -171,16 +167,6 @@ export async function checkLocationPermission(): Promise<'granted' | 'prompt' | 
   }
 }
 
-/** The best (most accurate) fix the latest attempt saw, even when it
- *  was too coarse to centre a zone on. The UI reads it after a
- *  rejection and offers "Use this approximate spot" — the host may
- *  CHOOSE the coarse fix as a hand-placed pin (labelled approximate),
- *  but it is never applied silently. Cleared by retryLocation(). */
-let lastBestCoarse: ForegroundFix | null = null;
-export function getBestCoarseFix(): ForegroundFix | null {
-  return lastBestCoarse;
-}
-
 /** Global deadline for one chain run: every stage has its own
  *  timeout, and this deadline is the backstop — after 45 s the chain
  *  settles with the best fix seen (if within ±50 m) or the timeout
@@ -189,38 +175,27 @@ const CHAIN_DEADLINE_MS = 45_000;
 /** A cached fix is accepted only when it is at most this old. */
 const CACHED_FIX_MAX_AGE_MS = 5 * 60 * 1000;
 
+/** GPS failure: one short plain line (simplification, 2026-11-18).
+ *  No method list, no accuracy number, no OS instructions — the
+ *  host taps the map to place the zone. */
 export const LOCATION_TIMEOUT_HELP =
-  'Location unavailable. The phone did not return a location — every GPS method was tried (high-accuracy watch, one-shot GPS, standard GPS, and the last known location). Location may be off, or the phone may have no GPS fix indoors. Android — Settings → Apps → Pakdam → Permissions → Location → "Allow while using the app", and switch Precise location on. iPhone — Settings → Pakdam → Location → "While Using the App", and switch Precise Location on. Then try again — or tap the map to place the zone where you are standing.';
+  'GPS is too rough here — tap the map to place the zone.';
 /** Plain-language rejection for a fix too coarse to centre a zone on
  *  (founder rule, 2026-11-17 — never auto-centre on worse than ±50 m):
- *  states how far off GPS is, in km when it is kilometres, and tells
- *  the host to place the pin by hand instead. */
-export function coarseFixMessage(accuracyM: number): string {
-  const off = accuracyM >= 1000
-    ? `GPS is off by ~${(accuracyM / 1000).toFixed(1)} km`
-    : `GPS accuracy is still ±${Math.round(accuracyM)} m — every GPS method was tried`;
-  return `${off} — too coarse to centre the zone on (a zone needs a fix accurate to ±${ZONE_AUTO_CENTRE_MAX_ACCURACY_M} m or better). Drag the pin to your exact spot: tap the map to place the zone where you are standing, or drag the centre pin.`;
+ *  one short line, same as the timeout help. */
+export function coarseFixMessage(): string {
+  return LOCATION_TIMEOUT_HELP;
 }
 
 export type LocationProgress = (bestAccuracyM: number | null, stage?: string) => void;
 
-/** Attempt token: every getCurrentFix / retryLocation call bumps it,
- *  and a superseded attempt's callbacks become no-ops — so a second
- *  "Use my location" tap (or a Retry) cancels the first attempt
- *  instead of stacking two chains that fight over the UI. */
+/** Attempt token: every getCurrentFix call bumps it, and a
+ *  superseded attempt's callbacks become no-ops — so a second
+ *  "Use my location" tap cancels the first attempt instead of
+ *  stacking two chains that fight over the UI. */
 let attemptId = 0;
 
 export function getCurrentFix(onProgress?: LocationProgress): Promise<ForegroundFix> {
-  return runFixChain(onProgress);
-}
-
-/** Manual retry: force-resets every busy flag — the attempt token
- *  (cancelling any in-flight chain), the watch id, the best fix —
- *  and restarts the chain from the permission check. The UI's
- *  "Retry location" button calls this; it never reuses a stale
- *  attempt's state. */
-export function retryLocation(onProgress?: LocationProgress): Promise<ForegroundFix> {
-  lastBestCoarse = null;
   return runFixChain(onProgress);
 }
 
@@ -268,7 +243,7 @@ function runFixChain(onProgress?: LocationProgress): Promise<ForegroundFix> {
     };
     const settleWithBest = () => {
       if (best && best.accuracyMeters <= ZONE_AUTO_CENTRE_MAX_ACCURACY_M) finish(best);
-      else fail(best ? coarseFixMessage(best.accuracyMeters) : LOCATION_TIMEOUT_HELP);
+      else fail(best ? coarseFixMessage() : LOCATION_TIMEOUT_HELP);
     };
     const deadline = setTimeout(() => {
       if (!alive()) return;
@@ -283,7 +258,6 @@ function runFixChain(onProgress?: LocationProgress): Promise<ForegroundFix> {
     const noteDelivered = (f: ForegroundFix): boolean => {
       if (!best || f.accuracyMeters < best.accuracyMeters) {
         best = f;
-        lastBestCoarse = f;
         onProgress?.(best.accuracyMeters, stage);
       }
       if (lastDelivered && lastDelivered.lat === f.lat && lastDelivered.lng === f.lng && lastDelivered.accuracyMeters === f.accuracyMeters) {
@@ -411,9 +385,7 @@ function runFixChain(onProgress?: LocationProgress): Promise<ForegroundFix> {
       if (s4 === 'good' && best) { finish(best); return; }
 
       // End of the chain: best within ±50 m wins; a coarser best is
-      // rejected with its accuracy (and kept in getBestCoarseFix for
-      // the "use this approximate spot" offer); nothing at all is
-      // the timeout help.
+      // rejected with one short line; nothing at all is the timeout help.
       settleWithBest();
     })();
   });

@@ -1,6 +1,6 @@
 'use client';
 import {
-  CALIBRATION_OPEN, DEFAULT_HOST_TOGGLES, ZONE_RADIUS_DEFAULT_M, ZONE_RADIUS_UI_MAX_M,
+  DEFAULT_HOST_TOGGLES, ZONE_RADIUS_DEFAULT_M, ZONE_RADIUS_UI_MAX_M,
   ZONE_RADIUS_MIN_M, ZONE_RADIUS_STEP_M, suggestZoneRadiusMeters, validateRules,
 } from '@pakdam/shared';
 import type { GeoPolygon, HouseRulePreset, HouseRules, RoomConfig } from '@pakdam/shared';
@@ -26,7 +26,8 @@ import { formatDistance, polygonCentroid } from '@/components/match/freshness';
  *   The slider / stepper list tops out at ZONE_RADIUS_UI_MAX_M
  *   (10 km) as a convenience range only — the + controls keep
  *   growing past it and validation never caps the size.
- * - Hunters (Balance OFF): 1 up to players − 1
+ * - Hunters (Balance OFF): 1 up to half the room cap — never more
+ *  Hunters than Runners (hunterCount <= maxPlayers / 2).
  * All numeric values inside these ranges are calibration OPEN.
  */
 export interface HostSetupDraft extends HouseRules {
@@ -57,12 +58,18 @@ export const SHRINK_STEPS_MIN = [1, 3, 10, 20, 30, 60] as const;
  *  current radius is already larger (see HostSetupForm). */
 export const RADIUS_BOUNDS = { min: ZONE_RADIUS_MIN_M, max: ZONE_RADIUS_UI_MAX_M, step: ZONE_RADIUS_STEP_M, def: ZONE_RADIUS_DEFAULT_M } as const;
 
-/** The create screen's starting point: Manhunt/Classic, 6 players,
+/** The create screen's starting point: Manhunt/Classic, room cap 30
+ *  players (the founder-decided limit, 2026-11-17 — min 3, max 30;
+ *  there is no "expected players" sizing input; Hunter balance
+ *  follows the roster at match start),
  *  Balance ON, Random draw ON, 30 min, 3 min head start, ping every
- *  3 min, shrink on every 10 min, 500 m zone, code-only. */
+ *  3 min, shrink on every 10 min, 500 m zone, code-only.
+ *  Runner confirmation is ALWAYS on (fixed decided rule, not a
+ *  host option): catchConfirmationRequired is forced true in every
+ *  draft path below (default, presets, config round-trip). */
 export function defaultDraft(): HostSetupDraft {
   return {
-    mode: 'classic', teamAssignment: 'random', maxPlayers: 6, hunterCount: 2,
+    mode: 'classic', teamAssignment: 'random', maxPlayers: 30, hunterCount: 2,
     durationSeconds: 1800, headStartSeconds: 180, pingIntervalSeconds: 180,
     zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: 600,
     catchConfirmationRequired: true,
@@ -112,12 +119,35 @@ export function scaleDrawnToDiameter(poly: GeoPolygon, targetDiameterMeters: num
   return scalePolygonTowardCentroid(poly, targetDiameterMeters / current);
 }
 
-/** Effective Hunter count for a draft: Balance ON reads the
+/** Manual Hunter cap: never more Hunters than Runners. The host's
+ *  manual stepper is bounded by the room cap, not by the roster
+ *  (unknown at setup time): hunters <= maxPlayers - hunters, i.e.
+ *  at most half the cap — 15 for a 30-player room. The match-start
+ *  code clamps again to the roster that actually joined
+ *  (rosterSize - 1), so a short roster can never start with more
+ *  Hunters than Runners either. */
+export function maxManualHunterCount(maxPlayers: number): number {
+  return Math.max(1, Math.floor(maxPlayers / 2));
+}
+
+/** Effective Hunter count for a draft, from the ROSTER that actually
+ *  joined — never from a pre-set player count. Balance ON reads the
  *  provisional table from the roster size at match start; otherwise
- *  the host's stepper value. */
-export function effectiveHunterCount(d: Pick<HostSetupDraft, 'balanceHunters' | 'maxPlayers' | 'hunterCount' | 'mode'>): number {
-  const n = d.balanceHunters ? balancedHunterCount(d.maxPlayers) : d.hunterCount;
-  return Math.max(1, Math.min(n, d.maxPlayers - 1));
+ *  the host's stepper value, clamped so Hunters never outnumber
+ *  Runners in that roster. Callers without a roster (create screen,
+ *  lobby sheet) must use balancedHunterRange for the preview instead
+ *  of passing the room cap in as if it were a roster. */
+export function effectiveHunterCount(d: Pick<HostSetupDraft, 'balanceHunters' | 'hunterCount'>, rosterSize: number): number {
+  const n = d.balanceHunters ? balancedHunterCount(rosterSize) : d.hunterCount;
+  return Math.max(1, Math.min(n, rosterSize - 1));
+}
+
+/** The Hunter-count range Balance produces as the roster grows to
+ *  the room cap: 1 Hunter for a 3–4 player roster, up to 5 for
+ *  25–30. The preview range, not a single count — the single number
+ *  only exists once the roster is known (effectiveHunterCount). */
+export function balancedHunterRange(maxPlayers: number): { min: number; max: number } {
+  return { min: balancedHunterCount(3), max: balancedHunterCount(Math.max(3, maxPlayers)) };
 }
 
 /** Mode rules, applied wherever a draft is rebuilt from stored
@@ -149,18 +179,24 @@ export function formatPing(s: number): string {
  *  lobby shows under the room code ("500m zone · 1 hunter · 30s pulse
  *  · 15m" style). */
 export function roomSummaryStrip(d: HostSetupDraft): string {
-  const hunters = effectiveHunterCount(d);
+  // Balance ON: no single Hunter count exists before the roster
+  // joins — show the range Balance produces (1 for 3–4 players, up
+  // to 5 for 25–30), never a count derived from the room cap.
+  const range = balancedHunterRange(d.maxPlayers);
+  const hunters = d.balanceHunters
+    ? `${range.min}–${range.max} hunters`
+    : `${d.hunterCount} hunter${d.hunterCount === 1 ? '' : 's'}`;
   const ping = d.pingIntervalSeconds === 0 ? 'no pings' : `${formatSecondsShort(d.pingIntervalSeconds)} pulse`;
   const zone = !d.playZoneEnabled
     ? 'no zone'
     : d.zoneShape === 'draw' && d.drawnBoundary
       ? `${formatDistance(zoneDiameterMeters(d.drawnBoundary))} custom zone`
       : `${formatDistance(d.radiusMeters * 2)} zone`;
-  return `${zone} · ${hunters} hunter${hunters === 1 ? '' : 's'} · ${ping} · ${formatMinutes(d.durationSeconds / 60)}`;
+  return `${zone} · ${hunters} · ${ping} · ${formatMinutes(d.durationSeconds / 60)}`;
 }
 
-/** Suggested radius for the current player count, labelled as a
- *  suggestion wherever it is shown (formula lives in shared). */
+/** Suggested radius for a player count. Kept for compatibility;
+ *  it is no longer shown anywhere in the host-setup UI. */
 export function suggestedRadiusFor(d: Pick<HostSetupDraft, 'maxPlayers'>): number {
   return suggestZoneRadiusMeters(d.maxPlayers);
 }
@@ -241,7 +277,11 @@ export function draftToConfig(d: HostSetupDraft, opts: { hostOnSiteConfirmed: bo
     hunterCount: d.hunterCount, durationSeconds: d.durationSeconds,
     headStartSeconds: d.headStartSeconds, pingIntervalSeconds: d.pingIntervalSeconds,
     zoneShrinkEnabled: d.zoneShrinkEnabled, zoneShrinkIntervalSeconds: d.zoneShrinkIntervalSeconds,
-    catchConfirmationRequired: d.catchConfirmationRequired,
+    // Fixed decided rule: runner confirmation is always on. The
+    // draft never carries false here, so no behaviour switch
+    // downstream (demo store / worker) can ever see it off from a
+    // room built or edited in host setup.
+    catchConfirmationRequired: true,
     balanceHunters: d.balanceHunters, randomDraw: d.randomDraw,
     showPingHistory: d.showPingHistory,
     playZoneEnabled: d.playZoneEnabled, huntersCanTalk: d.huntersCanTalk,
@@ -279,7 +319,9 @@ export function draftFromConfig(c: RoomConfig): HostSetupDraft {
     hunterCount: c.hunterCount, durationSeconds: c.durationSeconds,
     headStartSeconds: c.headStartSeconds, pingIntervalSeconds: c.pingIntervalSeconds,
     zoneShrinkEnabled: c.zoneShrinkEnabled, zoneShrinkIntervalSeconds: c.zoneShrinkIntervalSeconds,
-    catchConfirmationRequired: c.catchConfirmationRequired,
+    // Fixed decided rule: always on, even if a stored config from
+    // before this change had it off.
+    catchConfirmationRequired: true,
     balanceHunters: c.balanceHunters, randomDraw: c.randomDraw,
     showPingHistory: c.showPingHistory,
     playZoneEnabled: c.playZoneEnabled ?? true, huntersCanTalk: c.huntersCanTalk ?? true,
@@ -298,21 +340,49 @@ export function draftFromConfig(c: RoomConfig): HostSetupDraft {
 }
 
 // --- Built-in presets (Quick / Standard / Big Park) ---
+// Decided defaults, hardcoded here — NOT read from CALIBRATION_OPEN,
+// which resolves differently (quick 30 min, standard 60 min) and
+// would show the wrong defaults. Standard is the create screen's
+// default: 30 min match, 3 min head start, ping every 3 min.
+// Quick follows the SCRAM video: 15 min, 2 min head start, ping
+// every 1 min. Big Park shares Standard's timings on a bigger zone
+// (its values were never shown in the video).
 export type BuiltInPresetId = 'quick' | 'standard' | 'big-park';
 export const BUILT_INS: Record<BuiltInPresetId, { label: string; blurb: string; rules: Omit<HouseRules, 'maxPlayers'>; radiusMeters: number }> = {
   quick: {
-    label: 'Quick', blurb: 'The Phase 0 default — a short, sharp game', radiusMeters: 500,
-    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 1, durationSeconds: CALIBRATION_OPEN.quickPresetDurationSeconds, headStartSeconds: CALIBRATION_OPEN.headStartSeconds, pingIntervalSeconds: CALIBRATION_OPEN.pingIntervalSeconds, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: CALIBRATION_OPEN.zoneShrinkIntervalSeconds, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
+    label: 'Quick', blurb: 'A short, sharp 15-minute game', radiusMeters: 500,
+    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 1, durationSeconds: 900, headStartSeconds: 120, pingIntervalSeconds: 60, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: 600, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
   },
   standard: {
     label: 'Standard', blurb: 'A full game with room to hide', radiusMeters: 500,
-    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 2, durationSeconds: CALIBRATION_OPEN.standardDurationSeconds, headStartSeconds: CALIBRATION_OPEN.headStartSeconds, pingIntervalSeconds: CALIBRATION_OPEN.pingIntervalSeconds, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: CALIBRATION_OPEN.zoneShrinkIntervalSeconds, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
+    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 2, durationSeconds: 1800, headStartSeconds: 180, pingIntervalSeconds: 180, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: 600, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
   },
   'big-park': {
     label: 'Big Park', blurb: 'A bigger ground, more Hunters', radiusMeters: 1000,
-    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 3, durationSeconds: CALIBRATION_OPEN.standardDurationSeconds, headStartSeconds: CALIBRATION_OPEN.headStartSeconds, pingIntervalSeconds: CALIBRATION_OPEN.pingIntervalSeconds, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: CALIBRATION_OPEN.zoneShrinkIntervalSeconds, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
+    rules: { mode: 'classic', teamAssignment: 'random', hunterCount: 3, durationSeconds: 1800, headStartSeconds: 180, pingIntervalSeconds: 180, zoneShrinkEnabled: true, zoneShrinkIntervalSeconds: 600, catchConfirmationRequired: true, ...DEFAULT_HOST_TOGGLES },
   },
 };
+
+/** Which built-in preset a draft matches, or 'custom' when it matches
+ *  none — used for the preset chips' initial selection (create screen
+ *  starts on Standard; the lobby sheet starts on whatever the room
+ *  already matches). */
+export function presetIdForDraft(d: HostSetupDraft): BuiltInPresetId | 'custom' {
+  for (const id of Object.keys(BUILT_INS) as BuiltInPresetId[]) {
+    const b = BUILT_INS[id];
+    if (
+      d.mode === b.rules.mode
+      && d.durationSeconds === b.rules.durationSeconds
+      && d.headStartSeconds === b.rules.headStartSeconds
+      && d.pingIntervalSeconds === b.rules.pingIntervalSeconds
+      && d.hunterCount === b.rules.hunterCount
+      && d.radiusMeters === b.radiusMeters
+      && d.zoneShrinkEnabled === b.rules.zoneShrinkEnabled
+      && d.zoneShrinkIntervalSeconds === b.rules.zoneShrinkIntervalSeconds
+    ) return id;
+  }
+  return 'custom';
+}
 
 // --- House-rule presets on this device (localStorage) ---
 export const HOUSE_PRESETS_KEY = 'pakdam.house-presets.v1';
@@ -338,13 +408,15 @@ export function applyPresetToDraft(d: HostSetupDraft, p: HouseRulePreset): HostS
   return {
     ...d,
     ...applyModeRules(r),
+    // Runner confirmation is a fixed rule, never a preset value.
+    catchConfirmationRequired: true,
     balanceHunters: r.balanceHunters ?? DEFAULT_HOST_TOGGLES.balanceHunters,
     randomDraw: r.randomDraw ?? DEFAULT_HOST_TOGGLES.randomDraw,
     showPingHistory: r.showPingHistory ?? DEFAULT_HOST_TOGGLES.showPingHistory,
     playZoneEnabled: r.playZoneEnabled ?? d.playZoneEnabled,
     huntersCanTalk: r.huntersCanTalk ?? d.huntersCanTalk,
     finalSizePercent: r.finalSizePercent ?? d.finalSizePercent,
-    hunterCount: Math.min(r.hunterCount, r.maxPlayers - 1),
+    hunterCount: Math.min(r.hunterCount, maxManualHunterCount(r.maxPlayers)),
     radiusMeters: p.radiusMeters ?? d.radiusMeters,
   };
 }

@@ -88,8 +88,8 @@ export default function CreatePage() {
   return (
     <div>
       <h1>Create a game — host setup</h1>
-      <p>The game starts from where you are standing — no place name to type. Your GPS sets the centre, the map shows the zone, and the size is suggested from your player count.</p>
-      <p className="small">Every rule below is yours to set — no hidden defaults. Your codename is stored on this device only. Guest-only for now: no account, no sign-in — you join with a display name and a room code. All parameters are calibration placeholders, not measured values. Everything is free: no payment, no membership, no paywall.</p>
+      <p>The game starts from where you are standing — no place name to type. Your GPS sets the centre, the map shows the zone, and you set the size on the map.</p>
+      <p className="small">Every rule below is yours to set — no hidden defaults. Your codename is stored on this device only. Guest-only for now: no account, no sign-in — you join with a display name and a room code. Everything is free: no payment, no membership, no paywall.</p>
       {live
         ? <p className="small"><strong>Live game</strong> — your lobby is created on the Pakdam game server, and other players join it from their own devices.</p>
         : <p className="small"><strong>Demo game</strong> — played on this device only, not connected to a game server. Set the game server address to create a live game.</p>}

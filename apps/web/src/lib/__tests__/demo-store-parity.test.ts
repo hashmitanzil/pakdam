@@ -186,6 +186,23 @@ test('demo catch: only a Hunter may request, only while ACTIVE, one pending clai
   assert.equal(getRoom(roomId, T0 + 73_000)!.catches.length, 1);
 });
 
+test('demo catch: catchConfirmationRequired=false does NOT count the tag at once — Runner confirmation is always required', () => {
+  // The auto-confirm branch was removed (simplification round,
+  // 2026-11-18): even a stored config with the flag off must leave
+  // the catch pending until the Runner confirms it.
+  const { roomId } = startRoom(makeConfig({ balanceHunters: false, hunterCount: 2, catchConfirmationRequired: false }));
+  toHeadStart(roomId);
+  toActive(roomId, T0 + 60_000);
+  const r = roles(roomId, T0 + 60_000);
+  const c = requestCatch(roomId, r.hunters[0]!, r.runners[0]!, { nowMs: T0 + 70_000 });
+  assert.equal(c.state, 'awaiting-confirmation');
+  assert.equal(getRoom(roomId, T0 + 70_000)!.room.phase, 'ACTIVE');
+  assert.equal(getRoom(roomId, T0 + 70_000)!.players.find((p) => p.playerId === r.runners[0]!)!.matchRole, 'runner');
+  // The Runner can still confirm it manually — the claim is live.
+  confirmCatch(roomId, c.catchId, 'manual-confirm', r.runners[0]!, T0 + 71_000);
+  assert.equal(getRoom(roomId, T0 + 71_000)!.catches[0]!.state, 'confirmed');
+});
+
 test('demo catch: no request while HEAD_START, no second claim on an already-caught Runner', () => {
   const { roomId } = startRoom(makeConfig());
   toHeadStart(roomId);

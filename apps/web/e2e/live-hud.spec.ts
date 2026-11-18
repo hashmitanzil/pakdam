@@ -213,47 +213,34 @@ test('safety pause, SOS and Get help from the play screen', async ({ page, conte
   await expect(page.getByText(/Which help do you need/i)).toBeVisible();
 });
 
-test('appearance: colour-blind theme + Dark mode in the More sheet; no Map style setting', async ({ page, context }) => {
+test('appearance: one dark theme — no colour-blind theme, no Dark mode toggle anywhere', async ({ page, context }) => {
   test.setTimeout(120_000);
   await startMatch(page, context, { pickHunters: 'host' });
   await page.getByRole('button', { name: /More options/ }).click();
   const sheet = page.getByRole('region', { name: 'More options' });
   await expect(sheet).toBeVisible();
-  const theme = sheet.getByLabel(/Colour-blind theme/);
-  await expect(theme).not.toBeChecked();
-  await theme.check();
-  // Worker 4 fix (2026-11-18): the await belongs INSIDE expect —
-  // page.evaluate returns a Promise, and `await expect(promise)`
-  // awaits the (synchronous) assertion, so expect compared the
-  // Promise object itself (`received Promise {}`) and could never
-  // pass. `expect(await page.evaluate(...))` awaits the value first.
-  expect(await page.evaluate(() => document.documentElement.classList.contains('cb-theme'))).toBe(true);
-  expect(await page.evaluate(() => localStorage.getItem('pakdam.colorblind-theme'))).toBe('on');
-
-  // Dark mode EXISTS now (2026-11-17): a second switch on the same
-  // ThemeControls strip — key pakdam.dark-mode, toggles the `dark`
-  // class on <html>. Toggle it on and back off here, in the sheet.
-  const dark = sheet.getByLabel(/Dark mode/);
-  await expect(dark).not.toBeChecked();
-  await dark.check();
-  expect(await page.evaluate(() => document.documentElement.classList.contains('dark'))).toBe(true);
-  expect(await page.evaluate(() => localStorage.getItem('pakdam.dark-mode'))).toBe('on');
-  await dark.uncheck();
+  // Simplification §5a (2026-11-18): ONE dark theme — the
+  // colour-blind theme and the Dark mode toggle were removed
+  // everywhere. The old test toggled them here and asserted the
+  // `cb-theme` / `dark` classes and localStorage keys; now the
+  // test asserts the controls are gone from the More sheet and
+  // from /accessibility, and that no theme classes/keys appear.
+  await expect(sheet.getByLabel(/Colour-blind theme/)).toHaveCount(0);
+  await expect(sheet.getByLabel(/Dark mode/)).toHaveCount(0);
+  expect(await page.evaluate(() => document.documentElement.classList.contains('cb-theme'))).toBe(false);
   expect(await page.evaluate(() => document.documentElement.classList.contains('dark'))).toBe(false);
-  expect(await page.evaluate(() => localStorage.getItem('pakdam.dark-mode'))).toBe('off');
+  expect(await page.evaluate(() => localStorage.getItem('pakdam.colorblind-theme'))).toBeNull();
+  expect(await page.evaluate(() => localStorage.getItem('pakdam.dark-mode'))).toBeNull();
 
-  // The same Dark mode switch lives on /accessibility, with Large
-  // text / High contrast / Colour-blind theme. There is NO map Dark
-  // style and no "Map style" setting any more (one-map decision,
-  // 2026-11-17): the map is one bundled offline map with no style
-  // switcher. (Two "Dark mode" / "Colour-blind theme" checkboxes
-  // match on this page — the settings card plus the layout strip —
-  // so assert the first of each.)
+  // The same controls are gone from /accessibility too (Large text
+  // / High contrast stay). There is NO map Dark style and no
+  // "Map style" setting any more (one-map decision, 2026-11-17):
+  // the map is one bundled offline map with no style switcher.
   await page.goto('/accessibility');
   await expect(page.getByRole('heading', { name: /Accessibility/ })).toBeVisible();
   await expect(page.getByLabel(/Large text/)).toBeVisible();
   await expect(page.getByLabel(/High contrast/)).toBeVisible();
-  await expect(page.getByLabel(/Colour-blind theme/).first()).toBeVisible();
-  await expect(page.getByLabel(/Dark mode/).first()).toBeVisible();
+  await expect(page.getByLabel(/Colour-blind theme/)).toHaveCount(0);
+  await expect(page.getByLabel(/Dark mode/)).toHaveCount(0);
   await expect(page.getByLabel(/Map style/)).toHaveCount(0);
 });

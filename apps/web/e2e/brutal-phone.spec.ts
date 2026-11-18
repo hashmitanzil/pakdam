@@ -9,7 +9,7 @@
 // phones, desktop keeps the tab row).
 // Runs ONLY on the brutal-phone project (390x844, touch).
 import { test, expect, type BrowserContext, type Page } from '@playwright/test';
-import { addRealPlayers, expectNoOverflow, roomState, setPlayer } from './helpers';
+import { addRealPlayers, clickPresetChip, expectNoOverflow, roomState, setPlayer } from './helpers';
 
 const KEY_ROUTES = [
   '/', '/create', '/join', '/host',
@@ -195,7 +195,7 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.goto('/create');
-  await page.getByLabel(/Standard/).check();
+  await clickPresetChip(page, 'Standard');
   // Step the head start down to 30 s (as helpers.createLobby does):
   // the Standard preset is 3 min, and the play assertions below wait
   // at most 60 s for ACTIVE.
@@ -204,7 +204,10 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   await expect(page.getByRole('group', { name: 'Head start' }).locator('output')).toHaveText('30s');
   await page.getByLabel(/codename/i).fill('Brutal Host');
   await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  // The old "Zone centre: set" status line was removed in the
+  // simplification round (§5c) — the centre-set evidence now is
+  // the "Location found — … (GPS accuracy ±N m)" status line.
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   const setupCanvas = page.locator('.mapbox .maplibregl-canvas').first();
   await expect(setupCanvas).toBeVisible({ timeout: 30_000 });
   const setupBox = await setupCanvas.boundingBox();
@@ -217,8 +220,8 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   // -> "1 h" (Standard is 60 min, not 30).
   await expect(page.getByText(/1\.0 km zone . 2 hunters . 3 min pulse . 1 h/i).first()).toBeVisible();
   // Steppers + toggles on phone width.
-  await page.getByRole('button', { name: /Increase Radius/ }).click();
-  await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('550 m');
+  await page.getByRole('button', { name: /Increase Zone size/ }).click();
+  await expect(page.getByRole('group', { name: 'Zone size' }).locator('output')).toHaveText('about 1.1 km across');
   await page.getByRole('switch', { name: 'Show ping history' }).click();
   await expect(page.getByRole('switch', { name: 'Show ping history' })).toHaveAttribute('aria-checked', 'true');
   await expectNoOverflow(page, 'create @390px');

@@ -4,12 +4,19 @@
 //   Exactness comes from a MANUAL fallback the host controls: tap the
 //   map to set the centre, drag the centre pin. No coordinates are
 //   shown anywhere (founder rule, 2026-11-17) — the centre reads
-//   "set", never numbers.
+//   "placed by hand", never numbers.
 // - NEVER auto-centre a zone on a fix worse than ±50 m. A coarser fix
-//   is rejected with "GPS is off by ~X km — drag the pin to your exact
-//   spot" and the zone stays un-centred — never a default spot.
+//   is rejected with the one short line "GPS is too rough here — tap
+//   the map to place the zone." (simplification §5b, 2026-11-18 — the
+//   old "GPS is off by ~X km — too coarse…" message is gone) and the
+//   zone stays un-centred — never a default spot.
 // - "Use my location" refines as GPS locks (live best-accuracy readout)
 //   and GPS accuracy in metres is shown at all times.
+// - The old "Zone centre: set …" / "Zone centre: not set yet" status
+//   lines were removed in simplification §5c. Centre-set evidence
+//   now is the "Location found — … (GPS accuracy ±N m)" status line
+//   (GPS fix) or the "Placed by hand on the map" line (hand-placed);
+//   the un-centred state reads "No centre yet."
 //
 // RECONSTRUCTED 2026-11-17: this file was truncated to 0 bytes by the
 // VM's EPERM write flapping and rebuilt from the run-2 Playwright
@@ -28,17 +35,17 @@ test('coarse GPS (±2.5 km) never centres the zone — km message, manual pin fa
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('Test Host');
   // Auto-locate on load waits for a good fix; the staged location
-  // chain rejects the 2.5 km fix with the founder's message (the
+  // chain rejects the 2.5 km fix with the one short line (the
   // chain short-circuits when consecutive methods return the same
   // coarse fix, so the message lands in ~12 s, well inside 30 s).
-  await expect(page.getByText(/GPS is off by ~2\.5 km — too coarse to centre the zone on/i)).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByText(/Zone centre: not set yet/)).toBeVisible();
+  await expect(page.getByText(/GPS is too rough here — tap the map to place the zone/i)).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText(/No centre yet/)).toBeVisible();
   // Manual fallback: tap the map to place the zone by hand. Wait for
   // the map canvas first (hydration gate — a tap before MapLibre
   // mounts lands on an empty container and places nothing).
   await expect(page.locator('.mapbox .maplibregl-canvas').first()).toBeVisible({ timeout: 30_000 });
   await page.locator('.mapbox').click({ position: { x: 180, y: 160 } });
-  await expect(page.getByText(/Zone centre: not set yet/)).toHaveCount(0);
+  await expect(page.getByText(/No centre yet/)).toHaveCount(0);
   await expect(page.getByText(/Placed by hand on the map/)).toBeVisible();
 });
 
@@ -53,7 +60,7 @@ test('"Use my location" refines live — best accuracy shown while waiting, then
   // GPS locks: accuracy 8 m — the good fix centres the zone.
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33, accuracy: 8 });
   await expect(page.getByText(/GPS accuracy ±8 m/i)).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByText(/Zone centre: set — from your GPS location/)).toBeVisible();
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±8 m\)/i).first()).toBeVisible();
 });
 
 test('centre pin can be moved by hand — arrow keys move the centre (no coordinates shown)', async ({ page, context }) => {
@@ -62,14 +69,16 @@ test('centre pin can be moved by hand — arrow keys move the centre (no coordin
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33, accuracy: 8 });
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('Test Host');
-  await expect(page.getByText(/Zone centre: set — from your GPS location/)).toBeVisible();
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±8 m\)/i).first()).toBeVisible();
   // Arrow keys move the centre ~55 m per press — the hand-placed
   // position is exact, and the panel says so without showing numbers.
   // Focus the map region (a click would move the centre first, so
   // focus without clicking).
   await page.locator('.mapbox').focus();
   await page.keyboard.press('ArrowUp');
-  await expect(page.getByText(/Zone centre: set — placed by hand on the map/)).toBeVisible();
+  // Arrow keys move the centre by hand without an announce line —
+  // the evidence is the hand-placed label plus the Zone size line.
+  await expect(page.getByText(/Zone size:/)).toBeVisible();
   await expect(page.getByText(/Placed by hand on the map/)).toBeVisible();
 });
 
@@ -79,7 +88,7 @@ test('centre pin drags — dragging the red pin moves the zone centre', async ({
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33, accuracy: 8 });
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('Test Host');
-  await expect(page.getByText(/Zone centre: set — from your GPS location/)).toBeVisible();
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±8 m\)/i).first()).toBeVisible();
   const pin = page.locator('.mapbox .maplibregl-marker').first();
   await expect(pin).toBeVisible();
   const box = await pin.boundingBox();
@@ -95,6 +104,6 @@ test('centre pin drags — dragging the red pin moves the zone centre', async ({
   const boxAfter = await pin.boundingBox();
   expect(boxAfter).not.toBeNull();
   expect(boxAfter!.x, 'pin must have moved east on screen').toBeGreaterThan(box!.x + 20);
-  await expect(page.getByText(/Zone centre: set — placed by hand on the map/)).toBeVisible();
+  await expect(page.getByText(/Centre pin dragged to your exact spot/)).toBeVisible();
   await expect(page.getByText(/Placed by hand on the map/)).toBeVisible();
 });

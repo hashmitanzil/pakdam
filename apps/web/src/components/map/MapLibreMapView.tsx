@@ -1,12 +1,12 @@
 'use client';
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef } from 'react';
 import { ZONE_AUTO_CENTRE_MAX_ACCURACY_M } from '@pakdam/shared';
 import { formatAgeAgo, haversineMeters, polygonCentroid } from '@/components/match/freshness';
 import { locationPrecisionLabel } from '@/lib/geolocation';
 import {
-  loadMapLibre, OFFLINE_STYLE_URL, OFFLINE_MAP_ATTRIBUTION,
+  loadMapLibre, isWebGLSupported, OFFLINE_STYLE_URL,
   OFFLINE_MAP_CENTRE, OFFLINE_MAP_INITIAL_ZOOM, OFFLINE_MAP_MIN_ZOOM,
-  OFFLINE_MAP_MAX_ZOOM, OFFLINE_MAP_MAX_BOUNDS, OFFLINE_MAP_AREA_MESSAGE,
+  OFFLINE_MAP_MAX_ZOOM, OFFLINE_MAP_MAX_BOUNDS, OFFLINE_AREA_LABELS,
   OUTSIDE_MAP_AREA_MESSAGE, isInsideOfflineMap,
   polygonToGeoJSON, circlePolygon, featureCollection,
   type MapLibreLib, type MapLibreMap, type MapLibreMarker,
@@ -19,11 +19,13 @@ import type { MapViewProps, OverlayProps } from './types';
  *  Hinoo, Ranchi, Jharkhand, for now. NO fallback / switcher /
  *  reload. The full live map service is a SEPARATE later task.
  *
- *  The bundle is `apps/web/public/offline-map/`: 808 bundled Esri
- *  World Street Map raster tiles (zooms 12–17, Doranda + Hinoo)
- *  served by the raster style `public/offline-map/style.json`,
- *  rendered by vendored MapLibre v5 (`public/offline-map/vendor/`)
- *  — zero network requests at runtime. If the bundled tiles cannot
+ *  The bundle is `apps/web/public/offline-map/`: 1,038 bundled Esri
+ *  World Street Map raster tiles (zooms 12–17, Doranda + Hinoo,
+ *  bbox 23.325–23.38 N / 85.285–85.355 E) served by the raster style
+ *  `public/offline-map/style.json`, rendered by vendored MapLibre v5
+ *  (`public/offline-map/vendor/`) — zero network requests at runtime.
+ *  (Wider pack deferred 2026-11-18 — see `maplibre.ts`, EXPANSION
+ *  DEFERRED. The app-drawn Doranda/Hinoo labels below ARE landed.) If the bundled tiles cannot
  *  be loaded, the view says so honestly — there is no alternate map
  *  provider to fall back to, by founder decision. If WebGL is
  *  unavailable or a vendored library fails to load, `onInitFailed`
@@ -90,9 +92,10 @@ export function MapLibreMapView({
   const propsRef = useRef<OverlayProps & { onMapClick?: (lat: number, lng: number) => void }>({ lat, lng, accuracyM, label, zoneBoundary, nextZoneBoundary, pingArea, pingAreas, pingHistoryOn, noGoAreas, onMapClick });
   propsRef.current = { lat, lng, accuracyM, label, zoneBoundary, nextZoneBoundary, pingArea, pingAreas, pingHistoryOn, noGoAreas, onMapClick };
   /** The bundled style file failed to load (missing/corrupt pack).
-   *  Shown honestly, no retry button — there is no other map to
-   *  retry with, by founder decision. The zone, markers and match
-   *  controls below still work. */  const [mapError, setMapError] = useState(false);
+   *  There is no other map to retry with, by founder decision — the
+   *  failure is reported up through onInitFailed instead, and the
+   *  parent shows the one short WebGL line. The zone, markers and
+   *  match controls below still work. */
   const failedRef = useRef(false);
   const fail = () => { if (!failedRef.current) { failedRef.current = true; onInitFailed?.(); } };
 
@@ -134,6 +137,24 @@ export function MapLibreMapView({
     // both themes, so they stay readable either way.
     for (const m of markersRef.current) m.remove();
     markersRef.current = [];
+    // App-drawn area labels FIRST, so they render beneath every pin
+    // and chip: the Esri tiles never render "Doranda" or "Hinoo"
+    // (verified by reading the tiles, 2026-11-18), so the map draws
+    // the names itself from OFFLINE_AREA_LABELS (maplibre.ts — tile-
+    // verified positions). A raster style has no glyphs, so a symbol
+    // layer cannot draw text; HTML markers are the only text path.
+    // pointer-events:none on the marker wrapper AND the label, so a
+    // tap on the name still reaches the map (zone placement) instead
+    // of being swallowed by the label. Dark text + white halo: the
+    // raster tiles are light in both themes, so this reads either way.
+    for (const a of OFFLINE_AREA_LABELS) {
+      const el = document.createElement('div');
+      el.setAttribute('aria-hidden', 'true');
+      el.innerHTML = `<span style="pointer-events:none;user-select:none;white-space:nowrap;font-size:13px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#1F2937;text-shadow:0 0 3px #FFFFFF,0 0 6px #FFFFFF,0 1px 2px rgba(255,255,255,0.9);">${a.name}</span>`;
+      const labelMarker = new lib.Marker({ element: el }).setLngLat(a.lngLat).addTo(map);
+      labelMarker.getElement().style.pointerEvents = 'none';
+      markersRef.current.push(labelMarker);
+    }
     if (p.pingAreas) {
       for (const a of p.pingAreas) {
         const el = document.createElement('div');
@@ -221,7 +242,11 @@ export function MapLibreMapView({
         return;
       }
       if (cancelled || !ref.current) return;
-      if (!lib.supported()) { fail(); return; }
+      // Real WebGL probe (loadMapLibre already checks too — this is
+      // defence in depth before constructing the map). The old
+      // `lib.supported()` call was the bug: MapLibre v5 has no such
+      // export, so it threw on every device.
+      if (!isWebGLSupported()) { fail(); return; }
       libRef.current = lib;
       // Never start the camera outside the downloaded tile area:
       // a fix outside the pack has no tiles under it, so the map
@@ -249,17 +274,6 @@ export function MapLibreMapView({
       }
       mapRef.current = map;
       map.on('click', (e) => { if (e.lngLat) propsRef.current.onMapClick?.(e.lngLat.lat, e.lngLat.lng); });
-      let preLoadErrors = 0;
-      map.on('error', () => {
-        // The bundled raster tiles failed. A single bad tile
-        // mid-session is not fatal (the map keeps working); only a
-        // pack that NEVER loads is an honest error — 3 errors before
-        // the style loads means the tile pack is missing or corrupt.
-        if (!styleLoadedRef.current) {
-          preLoadErrors += 1;
-          if (preLoadErrors >= 3) setMapError(true);
-        }
-      });
       map.on('style.load', () => {
         styleLoadedRef.current = true;
         ensureSourcesAndLayers(map);
@@ -329,16 +343,11 @@ export function MapLibreMapView({
       <div style={{ position: 'relative' }}>
         <div ref={ref} className="mapbox" aria-label="Game map" />
         <div style={{ position: 'absolute', top: 8, right: 8, display: 'flex', flexDirection: 'column', gap: 6, zIndex: 5 }} role="group" aria-label="Map zoom controls">
-          <button type="button" className="btn btn-secondary" style={{ minWidth: 44, minHeight: 44, padding: '8px 12px' }} onClick={() => zoomBy(1)} aria-label="Zoom in, centred on your location">+</button>
-          <button type="button" className="btn btn-secondary" style={{ minWidth: 44, minHeight: 44, padding: '8px 12px' }} onClick={() => zoomBy(-1)} aria-label="Zoom out, centred on your location">−</button>
-          <button type="button" className="btn btn-secondary" style={{ minWidth: 44, minHeight: 44, padding: '8px 12px' }} onClick={centreOnPin} aria-label="Centre the map on your location">◎</button>
+          <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '8px 12px' }} onClick={() => zoomBy(1)} aria-label="Zoom in, centred on your location">+</button>
+          <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '8px 12px' }} onClick={() => zoomBy(-1)} aria-label="Zoom out, centred on your location">−</button>
+          <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '8px 12px' }} onClick={centreOnPin} aria-label="Centre the map on your location">◎</button>
         </div>
       </div>
-      {mapError ? (
-        <div className="banner" role="alert">
-          <strong>The offline map tiles could not be loaded.</strong> The bundled map may be missing from this build. The zone, markers and match controls below still work.
-        </div>
-      ) : null}
       {outsideArea ? (
         <p className="small" role="status">{OUTSIDE_MAP_AREA_MESSAGE}</p>
       ) : null}
@@ -348,11 +357,6 @@ export function MapLibreMapView({
         {noGoAreas && noGoAreas.length > 0 ? ` Dark red hatched ${noGoAreas.length === 1 ? 'area' : 'areas'}: no-go — players must stay out.` : ''}
         {pingArea ? ` Shaded blue area: ${pingArea.label} — a coarse ping area, never an exact pin.` : ''}
         {pingAreas && pingAreas.length > 0 ? ` Shaded blue areas: ${pingAreas.map((a) => `${a.name} (${formatAgeAgo(a.reportedAt)})`).join(', ')} — coarse ping areas with offset centres and wide radii, never exact pins. A ping stays until the next ping replaces it — the age counts up.${pingHistoryOn ? ' Earlier pings stay visible (dimmer) because Show ping history is on.' : ' Only the latest ping shows — Show ping history is off.'}` : ''}
-        {' '}Map data {OFFLINE_MAP_ATTRIBUTION}. {OFFLINE_MAP_AREA_MESSAGE}; no live map service.
-      </p>
-      <p className="small">
-        Map style respects the colour-blind theme (Hunters ◆ H solid · Runners ▲ R hatched — shape and
-        letter never change). Your own position is an uncertainty area, never a false-precision dot.
       </p>
     </div>
   );

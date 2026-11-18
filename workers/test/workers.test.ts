@@ -553,20 +553,21 @@ test('SEC-07: location.update stores only the seven LocationFix fields — clien
 
 // --- BACKEND QA 2026-11-17 (BE-07..BE-09 regressions) ---
 
-test('BE-07: catch.request with catchConfirmationRequired=false counts the tag at once (no Zod throw)', () => {
-  // The auto-confirm path used to log PLAYER_TAGGED with method
-  // 'no-confirmation', which the strict event schema rejected — the
-  // whole WS handler threw ZodError and the catch silently died.
+test('BE-07: catch.request with catchConfirmationRequired=false does NOT count the tag at once — Runner confirmation is always required', () => {
+  // The auto-confirm path was removed (simplification round,
+  // 2026-11-18): runner confirmation is a fixed rule, not a switch.
+  // Even a stored config with the flag off must leave the catch
+  // pending until the Runner confirms it.
   const state = { ...mkState(), room: { ...mkRoom(), config: { catchConfirmationRequired: false } as never } };
   const res = send(state, 'h1', 'catch.request', { runnerId: 'r1' }, 'cmd-be07');
   assert.equal(errCode(res), null);
-  assert.equal(res.replies.some((r) => r.type === 'catch.confirmed'), true);
-  assert.equal(res.state.catches[0]?.state, 'confirmed');
-  const tagged = res.state.gameEventLog.find((e) => (e as { type?: string }).type === 'PLAYER_TAGGED') as { payload?: { method?: string } } | undefined;
-  assert.equal(tagged?.payload?.method, 'no-confirmation');
-  // Only one Runner: the win rule completes the match at once.
-  assert.equal(res.state.room.phase, 'COMPLETED');
-  assert.equal(res.state.room.result?.outcome, 'hunters-win');
+  assert.equal(res.replies.some((r) => r.type === 'catch.confirmed'), false);
+  assert.equal(res.replies.some((r) => r.type === 'catch.requested'), true);
+  assert.equal(res.state.catches[0]?.state, 'requested');
+  assert.equal(res.state.gameEventLog.some((e) => (e as { type?: string }).type === 'PLAYER_TAGGED'), false);
+  // The single Runner is only claimed, not caught: the match stays live.
+  assert.equal(res.state.room.phase, 'ACTIVE');
+  assert.equal(res.state.room.result, null);
 });
 
 test('BE-08: outside-zone countdown does not run in the LOBBY, and freezes across a safety pause', () => {
@@ -817,12 +818,14 @@ test('GL-06/GL-09: catches only while ACTIVE — not in HEAD_START, not after CO
   assert.equal(errCode(send(done, 'r1', 'catch.confirm', { catchId: req.issuedCatchToken!.catchId, qrToken: req.issuedCatchToken!.token }, 'gl-09-2')), 'INVALID_STATE');
 });
 
-test('GL-07: catchConfirmationRequired=false counts the tag at once', () => {
+test('GL-07: catchConfirmationRequired=false does NOT count the tag at once — Runner confirmation is always required', () => {
   const state = mkTimedState('ACTIVE', [], { catchConfirmationRequired: false });
   const req = send(state, 'h1', 'catch.request', { runnerId: 'r1' }, 'gl-07-1');
   assert.equal(errCode(req), null);
-  assert.equal(req.state.catches[0]?.state, 'confirmed');
-  assert.equal(req.replies.some((r) => r.type === 'catch.confirmed'), true);
+  assert.equal(req.state.catches[0]?.state, 'requested');
+  assert.equal(req.replies.some((r) => r.type === 'catch.confirmed'), false);
+  assert.equal(req.replies.some((r) => r.type === 'catch.requested'), true);
+  assert.equal(req.state.room.phase, 'ACTIVE');
 });
 
 test('GL-08: safety resume returns to the phase the match was paused from', () => {

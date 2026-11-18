@@ -16,11 +16,11 @@
   font-weight: 800;
   letter-spacing: 2px;
   text-transform: uppercase;
-  color: var(--red-dark);
+  color: var(--ember-light);
 }
 
 .rulesBox {
-  background: #FEF2F2;
+  background: #3A151A;
   border: 2px solid var(--red);
   border-radius: var(--radius);
   padding: 12px 14px;
@@ -45,16 +45,15 @@
   margin: 16px 0 8px;
 }
 
-.tab,
-.tabActive {
+.tab {
   border: 2px solid var(--red);
   border-radius: 999px;
   padding: 10px 18px;
   font-weight: 800;
   cursor: pointer;
-  min-height: 44px;
-  background: #fff;
-  color: var(--red-dark);
+  min-height: 48px;
+  background: var(--surface);
+  color: var(--ember-light);
 }
 
 .tabActive {
@@ -82,7 +81,7 @@
 }
 
 .boardRowMe {
-  background: #FEE2E2;
+  background: #3A151A;
   border-radius: var(--radius);
 }
 
@@ -109,20 +108,20 @@
 }
 
 .reportBtn {
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   border: 2px solid var(--red);
   border-radius: 999px;
   padding: 8px 12px;
   font-weight: 700;
   cursor: pointer;
-  min-height: 40px;
+  min-height: 48px;
   flex: 0 0 auto;
 }
 
 /* Live season countdown — one line under the season heading. */
 .countdown {
-  background: #FEE2E2;
+  background: #3A151A;
   border: 2px solid var(--red);
   border-radius: var(--radius);
   padding: 10px 12px;
@@ -131,7 +130,7 @@
 }
 
 .countdown strong {
-  color: var(--red-dark);
+  color: var(--ember-light);
 }
 
 /* Empty state — shown when the viewer is opted out. One primary action. */
@@ -166,17 +165,3 @@
   margin: 4px 0 12px;
 }
 
-/* Dark mode (2026-11-17): white tabs/buttons go dark; red-dark text
- * goes ember-light. */
-/* Dark-mode polish (2026-11-17, UI worker): the light #FEE2E2/#FEF2F2
- * boxes carry inherited --ink text, which flips to near-white in dark
- * mode and goes invisible on the pale tint — they get the dark tint
- * instead, and the countdown's red-dark strong goes ember-light. */
-:global(html.dark) .tab { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .tabActive { background: var(--ember); color: #fff; }
-:global(html.dark) .reportBtn { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .eyebrow { color: var(--ember-light); }
-:global(html.dark) .rulesBox { background: #3A151A; }
-:global(html.dark) .boardRowMe { background: #3A151A; }
-:global(html.dark) .countdown { background: #3A151A; }
-:global(html.dark) .countdown strong { color: var(--ember-light); }

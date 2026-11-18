@@ -239,7 +239,17 @@ export default function TeamRadio({
 
   const quickMessages: readonly string[] =
     scope === 'hunters' ? HUNTER_QUICK_MESSAGES : scope === 'runners' ? RUNNER_QUICK_MESSAGES : QUICK_MESSAGES;
-  const scopeLabel = scope === 'lobby' ? 'Lobby radio' : scope === 'hunters' ? 'Hunter radio ◆ H' : 'Runner radio ▲ R';
+  const scopeLabel = scope === 'lobby' ? 'Lobby radio' : scope === 'hunters' ? 'Hunters channel ◆ H' : 'Runners channel ▲ R';
+  /** Walkie-talkie channel header (voice panel): the channel name and
+   *  who hears it, in plain words — a hunter must see at a glance
+   *  that voice goes to Hunters only. */
+  const channelLabel = scope === 'hunters' ? 'Hunters channel' : scope === 'runners' ? 'Runners channel' : 'Lobby radio';
+  const channelAudience =
+    scope === 'hunters'
+      ? 'Voice goes to Hunters only — Runners never hear it.'
+      : scope === 'runners'
+        ? 'Voice goes to Runners only — Hunters never hear it.'
+        : '';
   const scopeNote =
     scope === 'lobby'
       ? 'Everyone in this lobby can read these messages. Once the game starts, radio becomes team-only: Hunters and Runners each get their own channel.'
@@ -325,22 +335,35 @@ export default function TeamRadio({
         <p role="status"><strong>Hunters’ radio is off in this game.</strong> The host turned it off — Hunters cannot send voice or text radio messages. Runners can still use theirs.</p>
       ) : (
         <div className={styles.voicePanel} aria-label="Voice radio">
+          <p className={styles.voiceChannel}>
+            <span aria-hidden="true">🔊</span> <strong>{channelLabel}</strong>
+            {channelAudience ? ` — ${channelAudience}` : ''}
+            {voiceInfo?.muted ? ' · Muted 🔇' : ''}
+          </p>
           {voiceInfo && voiceInfo.status !== 'off' ? (
             <>
               <p role="status" className="small">
                 {voiceInfo.status === 'talking'
                   ? `🎙️ Talking to your team… ${burstRemainingSeconds ?? 10}s left in this burst (max 10s).`
                   : voiceInfo.status === 'ready'
-                    ? `Voice on — hold the button to talk to your team. Connected: ${voiceInfo.connectedPeerIds.length} of ${voice?.teammates.length ?? 0} teammate${(voice?.teammates.length ?? 0) === 1 ? '' : 's'}.${voiceInfo.detail ? ` ${voiceInfo.detail}` : ''}`
+                    ? `Voice on — hold the button to talk to your team.${voiceInfo.failedPeerIds.length === 0 && voiceInfo.detail ? ` ${voiceInfo.detail}` : ''}`
                     : voiceInfo.status === 'failed' || voiceInfo.status === 'unavailable'
-                      ? `Voice unavailable — ${voiceInfo.detail}`
+                      ? `Voice didn't connect — text radio still works.`
                       : 'Voice on.'}
               </p>
+              {(voiceInfo.status === 'failed' || voiceInfo.status === 'unavailable') && voiceInfo.detail ? (
+                <p className="small">{voiceInfo.detail}</p>
+              ) : null}
+              {voiceInfo.status === 'ready' || voiceInfo.status === 'talking' ? (
+                <p className="small">
+                  Connected: {voiceInfo.connectedPeerIds.length} of {voice?.teammates.length ?? 0} teammate
+                  {(voice?.teammates.length ?? 0) === 1 ? '' : 's'}.
+                </p>
+              ) : null}
               {voiceInfo.failedPeerIds.length > 0 ? (
                 <p className="small">
-                  Couldn’t connect voice directly to {voiceInfo.failedPeerIds.length} teammate
-                  {voiceInfo.failedPeerIds.length === 1 ? '' : 's'} (their network blocks direct calls).
-                  Text radio below still reaches them.
+                  Voice didn’t connect to {voiceInfo.failedPeerIds.length} teammate
+                  {voiceInfo.failedPeerIds.length === 1 ? '' : 's'} — text radio still works.
                 </p>
               ) : null}
               <div className={styles.voiceRow}>

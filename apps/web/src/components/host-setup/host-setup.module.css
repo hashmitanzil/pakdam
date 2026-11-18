@@ -1,0 +1,73 @@
+/* Host-setup controls — responsive rules (2026-11-18, Wave 2).
+   The StepperRow − / value / + group is a fixed-width flex item:
+   at 360px the card inner width is 296px and at 130% zoom it is
+   ~213px, while the longest values ("75% of the starting size",
+   "about 20.0 km across") make the group ~300px wide — wider than
+   the card, so the + button was clipped (html/body overflow-x is
+   clipped, not scrolled). Below 480px the group may wrap and the
+   value flexes and wraps to two lines instead of overflowing; the
+   buttons stay 48px and stay on one row with the value. Above
+   480px the base rules reproduce the previous inline styles
+   exactly, so desktop layout does not change.
+   2026-11-18 fix (Defect 1): the label/hint column could collapse
+   to ~11px wide at 360px — a column of single letters — because
+   the text column was `flex: 1; min-width: 0` (basis 0, free to
+   shrink to nothing) while the long Zone-size value
+   ("about 1.0 km across") let the controls claim the whole row.
+   The text column now has a 180px flex basis, so the controls wrap
+   BELOW the label instead of squeezing it; and below 480px the
+   whole row stacks vertically (label full-width on top, controls
+   underneath), so no stepper label can ever collapse again. */
+
+.stepperRow {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  padding: 14px 0;
+  border-bottom: 1px solid var(--line, #E8CFCF);
+}
+
+.stepperRowText {
+  flex: 1 1 180px;
+  min-width: 0;
+}
+
+.stepperControls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.stepperOutput {
+  min-width: 76px;
+  text-align: center;
+  font-weight: 700;
+  font-size: 16px;
+}
+
+@media (max-width: 480px) {
+  .stepperRow {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+  }
+  .stepperRowText {
+    flex: 1 1 auto;
+    width: 100%;
+  }
+  .stepperControls {
+    flex-wrap: wrap;
+    justify-content: flex-start;
+    flex-shrink: 1;
+    min-width: 0;
+    max-width: 100%;
+  }
+  .stepperOutput {
+    min-width: 0;
+    flex: 1 1 72px;
+    overflow-wrap: break-word;
+  }
+}

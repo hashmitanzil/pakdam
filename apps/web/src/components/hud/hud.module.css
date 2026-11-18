@@ -1,7 +1,8 @@
 /* Live-game HUD styles (Worker 3, 2026-11-17). Scoped to the hud/
    components only — the shared tokens.css classes (.hud, .safety,
    .thumb-zone) are untouched. Team encoding is shape + letter + words,
-   never colour alone; the colour-blind theme only changes hues. */
+   never colour alone. Pakdam has one dark theme; teams are also
+   shown by shape + letter, never by colour alone. */
 
 .hudBar {
   position: sticky;
@@ -129,11 +130,12 @@
   flex-direction: column;
   gap: 0;
   min-width: 0;
-  background: #fff7f5;
+  background: var(--paper);
   border: 1px solid var(--line);
   border-radius: 10px;
   padding: 8px 10px;
   color: var(--ink);
+  overflow-wrap: break-word;
 }
 
 .hudChipLabel {
@@ -196,6 +198,8 @@
 
 .dotsName {
   font-weight: 800;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .dotsAge {
@@ -216,8 +220,8 @@
   border-radius: var(--radius);
   font-weight: 800;
   cursor: pointer;
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   border: 2px solid var(--red);
 }
 
@@ -262,8 +266,8 @@
   min-height: 56px;
   border-radius: var(--radius);
   border: 2px solid var(--red);
-  background: #fff;
-  color: var(--red-dark);
+  background: var(--surface);
+  color: var(--ember-light);
   font-weight: 800;
   cursor: pointer;
   position: relative;
@@ -285,9 +289,9 @@
 }
 
 .holdDone {
-  background: #f0fdf4;
+  background: #14532D;
   border-color: var(--ok);
-  color: var(--ok);
+  color: #BBF7D0;
 }
 
 .trailCard {
@@ -308,14 +312,3 @@
   min-height: 48px;
 }
 
-/* Dark mode (2026-11-17): light fills go dark; red-dark text goes
- * ember-light so it stays readable on the dark surface. The QR frame
- * is not here. Selected tab / HUD bar are already dark/red. */
-/* Dark-mode polish (2026-11-17, UI worker): --ok flips to light green
- * #86EFAC in dark mode, which is invisible on the light-green #f0fdf4
- * hold-done fill — it becomes dark green with pale-green text. */
-:global(html.dark) .hudChip { background: var(--paper); }
-:global(html.dark) .tabs button { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .tabs button[aria-selected='true'] { background: var(--ember); color: #fff; }
-:global(html.dark) .holdButton { background: var(--surface); color: var(--ember-light); }
-:global(html.dark) .holdDone { background: #14532D; color: #BBF7D0; border-color: var(--ok); }

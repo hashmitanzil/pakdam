@@ -38,7 +38,7 @@ export default function AllSafeCheck({ players, meId }: { players: Player[]; meI
             <strong>{p.displayName}</strong>
             <span>— {safe[p.playerId] ? '✓ Safe — confirmed' : 'Not confirmed yet'}</span>
             {meId === p.playerId && !safe[p.playerId] ? (
-              <button type="button" className="btn btn-secondary" style={{ minHeight: 44 }} onClick={() => markSafe(p.playerId)}>I’m safe</button>
+              <button type="button" className="btn btn-secondary" style={{ minHeight: 48 }} onClick={() => markSafe(p.playerId)}>I’m safe</button>
             ) : null}
           </li>
         ))}

@@ -5,7 +5,7 @@ import AccessibilitySettings from '@/components/accessibility/AccessibilitySetti
 export const metadata: Metadata = {
   title: 'Accessibility — Pakdam accessibility statement and settings',
   description:
-    'Pakdam accessibility statement (WCAG 2.2 AA target) and display settings for this device: large text, high contrast, colour-blind theme, and map style.',
+    'Pakdam accessibility statement (WCAG 2.2 AA target) and display settings for this device: large text and high contrast.',
   alternates: { canonical: '/accessibility' },
 };
 
@@ -15,7 +15,7 @@ export default function AccessibilityPage() {
       <PageHero
         kicker="Accessibility"
         title="Play it your way."
-        lede="Four settings, on this device, in plain words. Turn one on and the whole site changes with it — no account needed."
+        lede="Two settings, on this device, in plain words. Turn one on and the whole site changes with it — no account needed."
       />
 
       <section className="journey-card" aria-labelledby="what-each-does">
@@ -29,18 +29,12 @@ export default function AccessibilityPage() {
             <strong>High contrast</strong> — sharpens the difference between
             words and the background, so text stands out more.
           </li>
-          <li>
-            <strong>Colour-blind theme</strong> — changes the colours so
-            nothing important is told by colour alone. Team colours, pings
-            and safety buttons stay readable without relying on red versus
-            green.
-          </li>
         </ul>
         <p>
           Your choices are saved on this device and apply across the whole
-          site, on every page. They stay saved between visits. There is also
-          a colour-blind switch in the bar at the top of every page — it
-          controls the same setting.
+          site, on every page. They stay saved between visits. Teams are
+          always shown by shape and letter as well as colour — Hunters
+          ◆ H, Runners ▲ R — so nothing important is told by colour alone.
         </p>
       </section>
 

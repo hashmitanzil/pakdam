@@ -48,12 +48,15 @@ test('mobile: host setup fits — steppers usable, sticky CREATE LOBBY reachable
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('Mobile Host');
   await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Zone centre: set/)).toBeVisible();
+  // The old "Zone centre: set" status line was removed in the
+  // simplification round (§5c) — the centre-set evidence now is
+  // the "Location found — … (GPS accuracy ±N m)" status line.
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   await expectNoOverflow(page, '/create (top)');
 
   // Stepper buttons are tappable and change the value.
-  await page.getByRole('button', { name: /Increase Radius/ }).click();
-  await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('550 m');
+  await page.getByRole('button', { name: /Increase Zone size/ }).click();
+  await expect(page.getByRole('group', { name: 'Zone size' }).locator('output')).toHaveText('about 1.1 km across');
   await expectNoOverflow(page, '/create (after stepper)');
 
   // Sticky bar: CREATE LOBBY stays in the viewport at the bottom even

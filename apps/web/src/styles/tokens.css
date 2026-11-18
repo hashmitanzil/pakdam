@@ -1,105 +1,52 @@
 /* Pakdam red palette — PROPOSED (docs/DECISIONS.md). WCAG pairings must be measured in M00.
    Do NOT use white body text on #D92B2B (~4.0:1). Use dark text on light, white on #7A1212.
    v2.1 tokens (07): ember #B91C1C (white 6.47:1), ember-deep #7F1D1D, alert #DC2626
-   (white 4.83:1), focus #1D4ED8. Brand red only — no green/lime brand colours.
+   (white 4.83:1), focus #93C5FD on dark. Brand red only — no green/lime brand colours.
    The --ok token is the §7 semantic success signal only, always paired with a ✓
-   icon and the word "Done"/"Confirmed", never colour alone, never a team colour. */
+   icon and the word "Done"/"Confirmed", never colour alone, never a team colour.
+   ONE dark theme (2026-11-18, simplification): these dark values ARE the base —
+   there is no light theme, no toggle, no `dark` class. Because the base
+   stylesheet is dark, a light flash on first paint is impossible.
+   Team encoding never changes: Hunters stay ◆ "H" solid, Runners stay
+   ▲ "R" hatched — shape + letter + words, never colour alone. */
 :root {
-  color-scheme: light;
+  color-scheme: dark;
   --red: #D92B2B; --red-dark: #7A1212; --red-deep: #A81E1E;
   --ember: #B91C1C; --ember-deep: #7F1D1D; --ember-dark: #991B1B; --alert: #DC2626;
-  --focus: #1D4ED8; --hunter: #1D4ED8; --runner: #9A3412;
-  --ink: #1A0E0E; --paper: #FFF7F5; --surface: #FFFFFF; --surface-muted: #F8F7F5; --muted: #6B4A4A;
-  --line: #E8CFCF; --ok: #166534; --warn: #92400E; --danger: #D92B2B;
+  --focus: #93C5FD; --hunter: #1D4ED8; --runner: #9A3412;
+  --ink: #F5E6E6; --paper: #1A0B0D; --surface: #2A1216; --surface-muted: #2A1216; --muted: #D8AFAF;
+  --line: #4A2229; --ok: #86EFAC; --warn: #FCD34D; --danger: #D92B2B;
   --radius: 12px;
 }
-/* Colour-blind theme (07 §8): hues change, encoding does not — Hunters stay
-   ◆ "H" solid, Runners stay ▲ "R" hatched, in both themes. */
-html.cb-theme {
-  --hunter: #172554; --runner: #78350F;
-  --paper: #FFFBEB; --line: #A8A29E;
-}
-/* Dark mode (2026-11-17): one switch, persisted (key pakdam.dark-mode),
- * toggles the `dark` class on <html>. Surfaces, ink and muted text flip
- * through the tokens above, so every class built on them follows. The
- * few hardcoded light fills below are overridden here; team encoding
- * never changes (Hunter ◆ "H" solid, Runner ▲ "R" hatched) and the
- * QR frame stays white in every theme (a QR needs a white quiet zone).
- * Dark hero / footer / safety-strip bands are already dark, so they
- * are left alone. */
-html.dark {
-  color-scheme: dark;
-  --ink: #F5E6E6; --paper: #1A0B0D; --surface: #2A1216; --surface-muted: #2A1216; --muted: #D8AFAF;
-  --line: #4A2229; --ok: #86EFAC; --warn: #FCD34D; --focus: #93C5FD;
-}
-html.dark .btn-secondary { background: var(--surface); color: var(--ember-light); }
-html.dark .banner { background: #3A151A; }
-html.dark .banner strong { color: var(--ember-light); }
-html.dark .tag { background: #3A151A; color: var(--ember-light); }
-html.dark .callout { background: #3A151A; }
-html.dark .callout strong { color: var(--ember-light); }
-html.dark .input { background: var(--surface); color: var(--ink); }
-html.dark a { color: var(--ember-light); }
-html.dark .topbar a { color: #fff; }
-html.dark .topbar .topbar-cta { color: var(--red-dark); }
-html.dark .safety button { background: var(--surface); color: var(--ember-light); }
-html.dark .safety button.danger { background: var(--alert); color: #fff; }
-html.dark .tier-active { background: #3A151A; }
-html.dark .steps li[aria-current="step"] { background: #3A151A; }
-html.dark .radar-dial { background: radial-gradient(circle, #2A1216 0%, #3A151A 100%); }
-html.dark .zone-editor-map { background: #2A1216; }
-html.dark .claim-confirmed { background: #14532D; color: #BBF7D0; border-color: var(--ok); }
-html.dark .claim-disputed { background: #451A03; color: #FDE68A; }
-html.dark .claim-expired { background: #3A151A; color: #FECACA; border-color: #F87171; }
-html.dark .claim-rejected { background: #3A151A; color: #FECACA; border-color: #F87171; }
-html.dark .mode-preview-card-deferred { background: #2A1216; }
-html.dark .mode-status-deferred { background: #374151; color: #F3F4F6; }
-html.dark .mode-status-planned { background: #3A151A; color: var(--ember-light); }
-html.dark .skeleton { background: #4A2229; }
-html.dark .journey-card ol li::before { background: #3A151A; color: var(--ember-light); }
-html.dark .mobile-menu-section a.active { background: #3A151A; }
-html.dark .mobile-menu-close { background: var(--surface); }
-html.dark .faq-item summary:hover { background: #2A1216; }
-html.dark .trust-item { background: #2A1216; }
-html.dark p[role="alert"], html.dark .error-text { background: #3A151A; color: var(--ember-light); }
-html.dark p[role="alert"] strong, html.dark .error-text strong { color: var(--ember-light); }
-/* Dark-mode polish (2026-11-17, UI worker): --ember / --ember-dark /
- * --red-dark are NOT redefined above on purpose — they are also button
- * backgrounds with white text (white on #B91C1C is 6.5:1; white on
- * #F87171 would be ~2.6:1). The text-only uses get light overrides
- * here instead, so nothing goes invisible on the dark paper. */
-html.dark .section-kicker { color: var(--ember-light); }
-html.dark .faq-item summary::after { color: var(--ember-light); }
-html.dark .player-suspended { color: var(--ember-light); }
-/* Map backdrop: the .mapbox frame and the MapLibre canvas behind the
- * bundled offline tiles. The tiles themselves are the bundled light
- * style (no dark tile set exists); this only keeps the frame / the
- * loading area from flashing white in dark mode. */
-html.dark .mapbox { background: #1A0B0D; }
-html.dark .maplibregl-map, html.dark .maplibregl-canvas-container { background: #1A0B0D; }
+/* The QR frame stays white in every theme (a QR needs a white quiet zone). */
+/* --ember / --ember-dark / --red-dark are button backgrounds with white
+ * text (white on #B91C1C is 6.5:1; white on #F87171 would be ~2.6:1), so
+ * they are NOT redefined as light tokens — the text-only uses above
+ * reference --ember-light instead, so nothing goes invisible on the
+ * dark paper. */
 * { box-sizing: border-box; }
 body { margin: 0; font-family: system-ui, -apple-system, 'Segoe UI', sans-serif; background: var(--paper); color: var(--ink); line-height: 1.5; }
-a { color: var(--red-dark); }
+a { color: var(--ember-light); }
 button, input, select, textarea { font: inherit; }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 .btn { display: inline-block; background: var(--ember); color: #fff; border: 0; border-radius: var(--radius); padding: 12px 20px; font-weight: 700; cursor: pointer; text-decoration: none; }
 .btn:disabled { opacity: 0.55; cursor: not-allowed; }
-.btn-secondary { background: #fff; color: var(--red-dark); border: 2px solid var(--red); }
+.btn-secondary { background: var(--surface); color: var(--ember-light); border: 2px solid var(--red); }
 .btn-dark { background: var(--red-dark); color: #fff; }
 .btn-danger { background: var(--alert); color: #fff; }
 .card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; margin: 12px 0; }
-.banner { background: #FDECEC; border: 2px solid var(--red); border-radius: var(--radius); padding: 12px; margin: 12px 0; }
-.banner strong { color: var(--red-dark); }
-.input { width: 100%; padding: 12px; border: 2px solid var(--line); border-radius: var(--radius); margin: 6px 0 12px; }
+.banner { background: #3A151A; border: 2px solid var(--red); border-radius: var(--radius); padding: 12px; margin: 12px 0; }
+.banner strong { color: var(--ember-light); }
+.input { width: 100%; padding: 12px; border: 2px solid var(--line); border-radius: var(--radius); margin: 6px 0 12px; background: var(--surface); color: var(--ink); }
 .label { font-weight: 700; display: block; margin-top: 8px; }
 .topbar { background: var(--red-dark); color: #fff; padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
 .topbar a { color: #fff; text-decoration: none; font-weight: 800; font-size: 20px; }
-.theme-toggle { color: #fff; font-size: 14px; }
-.theme-toggle input { margin-right: 6px; }
 main { max-width: 720px; margin: 0 auto; padding: 16px; }
-.mapbox { height: 320px; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); }
+.mapbox { height: 320px; border-radius: var(--radius); overflow: hidden; border: 1px solid var(--line); background: #1A0B0D; }
+/* MapLibre canvas behind the bundled offline tiles — dark frame / loading area, never white. */
+.maplibregl-map, .maplibregl-canvas-container { background: #1A0B0D; }
 .safety { position: sticky; bottom: 0; background: var(--surface); border-top: 2px solid var(--red); padding: 10px; display: flex; gap: 8px; flex-wrap: wrap; z-index: 20; }
-.safety button { flex: 1; min-width: 90px; min-height: 48px; padding: 12px 8px; border-radius: var(--radius); border: 2px solid var(--red); background: #fff; color: var(--red-dark); font-weight: 800; cursor: pointer; }
+.safety button { flex: 1; min-width: 90px; min-height: 48px; padding: 12px 8px; border-radius: var(--radius); border: 2px solid var(--red); background: var(--surface); color: var(--ember-light); font-weight: 800; cursor: pointer; }
 .safety button.danger { background: var(--alert); color: #fff; }
 .small { color: var(--muted); font-size: 14px; }
 /** Landing "Questions?" links: flex items that wrap cleanly at 390px.
@@ -108,7 +55,7 @@ main { max-width: 720px; margin: 0 auto; padding: 16px; }
  *  check) see the links overlapping each other. As flex items each
  *  link keeps its own box. */
 .questions-links { display: flex; flex-wrap: wrap; gap: 2px 10px; align-items: baseline; }
-.tag { display: inline-block; background: #FDECEC; color: var(--red-dark); border-radius: 999px; padding: 2px 10px; font-size: 13px; font-weight: 700; }
+.tag { display: inline-block; background: #3A151A; color: var(--ember-light); border-radius: 999px; padding: 2px 10px; font-size: 13px; font-weight: 700; }
 /* Floating top HUD (24 S05): server timer, phase, players still free, next ping, zone state. */
 .hud { position: sticky; top: 0; z-index: 15; background: var(--surface); border: 2px solid var(--ember); border-radius: var(--radius); padding: 10px 12px; margin: 12px 0; display: flex; flex-wrap: wrap; gap: 4px 18px; align-items: baseline; }
 .hud .hud-timer { font-size: 28px; font-variant-numeric: tabular-nums; font-weight: 800; }
@@ -124,35 +71,35 @@ main { max-width: 720px; margin: 0 auto; padding: 16px; }
 .marker-hollow { background: transparent; opacity: 0.55; border-style: dashed; }
 .player-row { margin: 6px 0; }
 .player-stale, .player-unknown { color: var(--muted); }
-.player-suspended { color: var(--ember-dark); }
+.player-suspended { color: var(--ember-light); }
 .tier-list { list-style: none; padding: 0; margin: 8px 0; }
 .tier-list li { padding: 4px 8px; border-radius: 6px; }
-.tier-active { background: #FEE2E2; font-weight: 800; border: 2px solid var(--ember); }
-.radar-dial { position: relative; width: 180px; height: 180px; margin: 12px auto; border: 3px solid var(--ember); border-radius: 50%; background: radial-gradient(circle, #fff 0%, #FEE2E2 100%); }
+.tier-active { background: #3A151A; font-weight: 800; border: 2px solid var(--ember); }
+.radar-dial { position: relative; width: 180px; height: 180px; margin: 12px auto; border: 3px solid var(--ember); border-radius: 50%; background: radial-gradient(circle, #2A1216 0%, #3A151A 100%); }
 .radar-needle { position: absolute; left: 50%; top: 50%; margin-left: -12px; margin-top: -80px; font-size: 24px; color: var(--ember-deep); transform-origin: 12px 80px; }
 .radar-centre { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); font-weight: 800; }
 .toolbar .signal-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .zone-panel { border-left: 6px solid var(--ember); }
-.zone-editor-map { border: 2px solid var(--ember); border-radius: var(--radius); padding: 12px; background: #FEF2F2; }
+.zone-editor-map { border: 2px solid var(--ember); border-radius: var(--radius); padding: 12px; background: #2A1216; }
 .zone-editor-map:focus-visible { outline: 3px solid var(--focus); }
 .claim-state { font-weight: 800; padding: 4px 10px; border-radius: 999px; border: 2px solid var(--ember); display: inline-block; }
-.claim-confirmed { background: #F0FDF4; border-color: var(--ok); color: var(--ok); }
-.claim-disputed { background: #FEF3C7; border-color: var(--warn); color: #78350F; }
-.claim-expired { background: #FDECEC; border-color: #B91C1C; color: #7F1D1D; }
-.claim-rejected { background: #FDECEC; border-color: #B91C1C; color: #7F1D1D; }
-/* Results scoreboard card — theme tokens, so the light fill follows
- * dark mode (the old inline #FFF7F5 + inherited ink was invisible
- * on the dark surface). Light values equal the old inline ones. */
+.claim-confirmed { background: #14532D; color: #BBF7D0; border-color: var(--ok); }
+.claim-disputed { background: #451A03; color: #FDE68A; border-color: var(--warn); }
+.claim-expired { background: #3A151A; color: #FECACA; border-color: #F87171; }
+.claim-rejected { background: #3A151A; color: #FECACA; border-color: #F87171; }
+/* Results scoreboard card — theme tokens, so the fill follows the
+ * single dark theme (the old inline #FFF7F5 + inherited ink was
+ * invisible on the dark surface). */
 .score-card { flex: 1; min-width: 120px; background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 12px; text-align: center; color: var(--ink); }
 .score-card .score-label { font-size: 12px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
 .steps { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; }
 .steps li { padding: 6px 10px; border: 2px solid var(--line); border-radius: 999px; }
-.steps li[aria-current="step"] { border-color: var(--ember); background: #FEE2E2; font-weight: 800; }
+.steps li[aria-current="step"] { border-color: var(--ember); background: #3A151A; font-weight: 800; }
 @media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
 
 /* ============================================================
    PAKDAM LANDING DESIGN SYSTEM — MASTERPIECE REDESIGN 2026-11-17
-   Dark hero + ember red, mobile-first, thumb-zone, colour-blind safe.
+   Dark hero + ember red, mobile-first, thumb-zone, shape + letter safe.
    Everything below EXTENDS the tokens above; game-screen classes
    (.hud, .safety, .mapbox, .team-marker, …) are untouched.
    Contrast (calculated from hex values, to be confirmed by measurement in M00): white on #B91C1C 6.5:1 · white on
@@ -229,12 +176,8 @@ main:has(> .subpage) { max-width: 880px; }
 .mobile-menu-section ul { list-style: none; margin: 0; padding: 0; }
 .mobile-menu-section a { display: flex; align-items: center; min-height: 48px; padding: 12px; border-radius: var(--radius-md); color: var(--ink); text-decoration: none; font-size: 16px; font-weight: 600; border-left: 4px solid transparent; }
 .mobile-menu-section a:hover { background: var(--paper); }
-.mobile-menu-section a.active { background: #FEE2E2; border-left-color: var(--ember); font-weight: 800; }
+.mobile-menu-section a.active { background: #3A151A; border-left-color: var(--ember); font-weight: 800; }
 .mobile-menu-foot { margin-top: 20px; }
-
-/* Accessibility settings strip under the top bar. */
-.a11y-bar { background: var(--night); padding: 6px 16px; color: #fff; }
-.a11y-bar .theme-toggle { color: #fff; }
 
 /* ---------- Buttons ---------- */
 .btn { min-height: 48px; display: inline-flex; align-items: center; justify-content: center; gap: 8px; transition: transform 0.12s ease, box-shadow 0.12s ease, background 0.12s ease; }
@@ -263,7 +206,7 @@ main:has(> .subpage) { max-width: 880px; }
 
 /* ---------- Sections ---------- */
 .section { margin: var(--space-10) 0; }
-.section-kicker { color: var(--ember); font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; font-size: 13px; margin: 0 0 var(--space-2); }
+.section-kicker { color: var(--ember-light); font-weight: 800; letter-spacing: 0.12em; text-transform: uppercase; font-size: 13px; margin: 0 0 var(--space-2); }
 .section-title { font-size: var(--font-h2); line-height: 1.15; letter-spacing: -0.01em; margin: 0 0 var(--space-3); }
 .section-lede { font-size: var(--font-lede); color: var(--muted); max-width: 60ch; margin: 0 0 var(--space-5); }
 
@@ -295,7 +238,7 @@ main:has(> .subpage) { max-width: 880px; }
 .trust-strip { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); }
 @media (max-width: 760px) { .trust-strip { grid-template-columns: 1fr 1fr; } }
 @media (max-width: 480px) { .trust-strip { grid-template-columns: 1fr; } }
-.trust-item { display: flex; gap: 12px; align-items: flex-start; background: var(--paper-2); border: 1px solid var(--line); border-radius: var(--radius-md); padding: var(--space-4); }
+.trust-item { display: flex; gap: 12px; align-items: flex-start; background: #2A1216; border: 1px solid var(--line); border-radius: var(--radius-md); padding: var(--space-4); }
 .trust-item .trust-icon { flex: none; display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 10px; background: #FEE2E2; color: var(--red-dark); font-weight: 800; font-size: 18px; }
 .trust-item strong { display: block; }
 .trust-item p { margin: 2px 0 0; color: var(--muted); font-size: 14px; }
@@ -326,7 +269,7 @@ main:has(> .subpage) { max-width: 880px; }
 .journey-card h2, .journey-card h3 { margin-top: 0; }
 .journey-card ol { counter-reset: journey; list-style: none; padding: 0; display: grid; gap: var(--space-3); }
 .journey-card ol li { counter-increment: journey; display: grid; grid-template-columns: 40px 1fr; gap: 12px; align-items: start; }
-.journey-card ol li::before { content: counter(journey); display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 50%; background: #FEE2E2; color: var(--red-dark); font-weight: 800; }
+.journey-card ol li::before { content: counter(journey); display: inline-flex; align-items: center; justify-content: center; width: 36px; height: 36px; border-radius: 50%; background: #3A151A; color: var(--ember-light); font-weight: 800; }
 .mode-card { background: var(--surface); border: 2px solid var(--ember); border-radius: var(--radius-lg); padding: var(--space-5); margin: var(--space-4) 0; box-shadow: var(--shadow-sm); }
 .mode-card-muted { border-color: var(--line); }
 .safety-grid { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
@@ -334,12 +277,12 @@ main:has(> .subpage) { max-width: 880px; }
 .faq-item { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius-md); margin: 0 0 var(--space-3); overflow: hidden; }
 .faq-item summary { cursor: pointer; padding: var(--space-4) var(--space-5); font-weight: 800; font-size: 17px; min-height: 56px; display: flex; align-items: center; list-style: none; }
 .faq-item summary::-webkit-details-marker { display: none; }
-.faq-item summary::after { content: "+"; margin-left: auto; color: var(--ember); font-size: 24px; font-weight: 800; flex: none; padding-left: 12px; }
+.faq-item summary::after { content: "+"; margin-left: auto; color: var(--ember-light); font-size: 24px; font-weight: 800; flex: none; padding-left: 12px; }
 .faq-item[open ] summary::after { content: "−"; }
-.faq-item summary:hover { background: var(--paper-2); }
+.faq-item summary:hover { background: #2A1216; }
 .faq-item p { padding: 0 var(--space-5) var(--space-4); margin: 0; color: var(--muted); }
-.callout { background: #FDECEC; border: 2px solid var(--red); border-radius: var(--radius-md); padding: var(--space-4); margin: var(--space-4) 0; }
-.callout strong { color: var(--red-dark); }
+.callout { background: #3A151A; border: 2px solid var(--red); border-radius: var(--radius-md); padding: var(--space-4); margin: var(--space-4) 0; }
+.callout strong { color: var(--ember-light); }
 .callout-dark { background: var(--night); border-color: var(--night-line); color: #F5E6E6; }
 .callout-dark strong { color: var(--ember-light); }
 .cta-row { display: flex; gap: 12px; flex-wrap: wrap; margin: var(--space-5) 0; }
@@ -381,9 +324,9 @@ html, body { overflow-x: clip; }
 .mode-preview-card .pick-cta { margin-top: auto; padding-top: var(--space-3); }
 .mode-status { display: inline-flex; align-items: center; gap: 6px; align-self: flex-start; font-size: 13px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; border-radius: var(--radius-pill); padding: 4px 12px; }
 .mode-status-live { background: var(--ember); color: #fff; }
-.mode-preview-card-deferred { border: 1px dashed var(--line); background: var(--surface-muted, #F8F7F5); }
-.mode-status-deferred { background: #E5E7EB; color: #374151; border: 1px solid var(--line); }
-.mode-status-planned { background: #FEE2E2; color: var(--red-dark); border: 1px solid var(--line); }
+.mode-preview-card-deferred { border: 1px dashed var(--line); background: #2A1216; }
+.mode-status-deferred { background: #374151; color: #F3F4F6; border: 1px solid var(--line); }
+.mode-status-planned { background: #3A151A; color: var(--ember-light); border: 1px solid var(--line); }
 
 /* Safety strip (landing) — dark band, plain-language safety facts. */
 .safety-strip { background: var(--night); color: #F5E6E6; border-radius: var(--radius-xl); padding: clamp(24px, 4vw, 40px); }
@@ -401,7 +344,7 @@ html, body { overflow-x: clip; }
    Tap targets, plain-language errors, 130% zoom / narrow-phone safety.
    Only extends the system above; no earlier rule is changed except the
    two-column modes grid (only Classic + Infection are live — a 3-col
-   grid left an empty third column). Colour-blind encoding unchanged:
+   grid left an empty third column). Team encoding unchanged:
    Hunter ◆ "H" solid, Runner ▲ "R" — shape + letter + words. */
 
 /* Two live modes, two cards — no empty third column on desktop. */
@@ -423,10 +366,10 @@ input[type="range"] { min-height: 48px; }
  * small print a player can miss. .error-text is the same style
  * for alerts that also need the class hook. */
 p[role="alert"], .error-text {
-  background: #FDECEC; border: 2px solid var(--red, #D92B2B); border-radius: var(--radius, 12px);
-  padding: 12px 14px; margin: 12px 0; color: var(--red-dark, #7A1212); font-weight: 600;
+  background: #3A151A; border: 2px solid var(--red, #D92B2B); border-radius: var(--radius, 12px);
+  padding: 12px 14px; margin: 12px 0; color: var(--ember-light); font-weight: 600;
 }
-p[role="alert"] strong, .error-text strong { color: var(--red-dark, #7A1212); }
+p[role="alert"] strong, .error-text strong { color: var(--ember-light); }
 
 /* No overflow or clipping at 130% zoom / 320px phones: long words
  * (codes, links) wrap inside cards and banners instead of spilling.
@@ -464,7 +407,7 @@ button, a { touch-action: manipulation; }
 
 /* Loading skeletons: visibly a waiting state, never a blank page.
  * The global reduced-motion rule above already kills animation. */
-.skeleton { height: 16px; border-radius: 8px; background: #F3D9D9; margin: 10px 0; }
+.skeleton { height: 16px; border-radius: 8px; background: #4A2229; margin: 10px 0; }
 .skeleton-lg { height: 52px; border-radius: 12px; }
 .skeleton-sm { height: 12px; }
 
@@ -474,7 +417,7 @@ label:has(input:focus-visible) { outline: 3px solid var(--focus); outline-offset
 
 /* Switch state in words, not colour/position alone: the toggle knob
  * already moves, but the word next to it reads at a glance and is
- * colour-blind safe. */
+ * safe without relying on colour. */
 .toggle-state { font-weight: 800; font-size: 15px; color: var(--ink); min-width: 30px; text-align: center; }
 
 /* Skip link on the live game screen: a real 44px thumb target, not

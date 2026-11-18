@@ -81,7 +81,7 @@ export default function CatchPanel({
                   <button
                     type="button"
                     className="btn btn-secondary"
-                    style={{ minHeight: 44 }}
+                    style={{ minHeight: 48 }}
                     onClick={() => onConfirmCatch(c.catchId)}
                   >
                     Host: confirm this catch
