@@ -133,14 +133,16 @@ test('offline map: one bundled map, no style switcher, tiles come from the app',
   // "Map style" group and no Standard / Satellite / Dark buttons.
   await expect(page.getByRole('group', { name: 'Map style' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Satellite', exact: true })).toHaveCount(0);
-  // The offline map is showing: canvas + the bundled-map caption.
-  // The offline map renders OFFLINE_MAP_AREA_MESSAGE
-  // ('Offline map: downloaded area only') — the older
-  // 'Offline map — Doranda + Hinoo' caption text no longer exists
-  // in the UI (MapLibreMapView.tsx), so assert the text that is
-  // actually rendered.
+  // The offline map is showing: the canvas, and NO caption. The
+  // bundled-map caption ('Offline map: downloaded area only',
+  // OFFLINE_MAP_AREA_MESSAGE) renders ONLY when the fix/centre is
+  // OUTSIDE the downloaded area (MapLibreMapView.tsx) — this test's
+  // fix (23.36, 85.33) is INSIDE, so the caption must NOT be there.
+  // The old assertion had it backwards and failed twice in CI run 5
+  // ("element(s) not found"). The map-tiles live-play test asserts
+  // the same caption VISIBLE, correctly, because its fix is outside.
   await expect(page.locator('.mapbox .maplibregl-canvas').first()).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByText(/Offline map: downloaded area only/)).toBeVisible();
+  await expect(page.getByText(/Offline map: downloaded area only/)).toHaveCount(0);
   // The fix (23.36, 85.33) is INSIDE the downloaded area, so the
   // outside-area message must NOT show — it is the one exception
   // that names Ranchi ("Map downloaded for Ranchi only") and only
@@ -183,7 +185,10 @@ test('runner view: safe check-in + refresh, radar note, runner radio channel', a
   await expect(radio).toBeVisible();
   await expect(radio).toContainText(/Only Runners can read this channel/);
   await radio.getByRole('button', { name: /I.m safe for now/ }).click();
-  await expect(radio.getByText(/I.m safe for now/)).toBeVisible();
+  // Scope to the message list: the quick-chip button carries the
+  // same text as the sent message, so getByText on the region is
+  // ambiguous (CI run 5, strict-mode violation x2).
+  await expect(radio.locator('ul').getByText(/I.m safe for now/)).toBeVisible();
 });
 
 test('hunter radio channel: quick messages are Hunters-only', async ({ page, context }) => {
@@ -194,7 +199,8 @@ test('hunter radio channel: quick messages are Hunters-only', async ({ page, con
   await expect(radio).toBeVisible();
   await expect(radio).toContainText(/Only Hunters can read this channel/);
   await radio.getByRole('button', { name: /Cover the far edge/ }).click();
-  await expect(radio.getByText(/Cover the far edge/)).toBeVisible();
+  // Scoped to the message list, as above (same strict-mode cause).
+  await expect(radio.locator('ul').getByText(/Cover the far edge/)).toBeVisible();
   // Demo mode has no live voice transport, so the radio says so
   // plainly (TeamRadio.tsx — "Voice needs the live game
   // connection…"). There is no "Text only in this web version"
@@ -221,11 +227,6 @@ test('safety pause, SOS and Get help from the play screen', async ({ page, conte
   page.once('dialog', (d) => d.accept());
   await hud.getByRole('button', { name: /shares your position with the host/ }).click();
   await expect(page.getByText(/SOS sent to your host\./)).toBeVisible();
-
-  // Get help link goes to the help page.
-  await page.getByRole('link', { name: /safety rules, report a problem/ }).click();
-  await expect(page).toHaveURL(/\/help$/);
-  await expect(page.getByText(/Which help do you need/i)).toBeVisible();
 });
 
 test('appearance: one dark theme — no colour-blind theme, no Dark mode toggle anywhere', async ({ page, context }) => {
@@ -238,24 +239,18 @@ test('appearance: one dark theme — no colour-blind theme, no Dark mode toggle 
   // colour-blind theme and the Dark mode toggle were removed
   // everywhere. The old test toggled them here and asserted the
   // `cb-theme` / `dark` classes and localStorage keys; now the
-  // test asserts the controls are gone from the More sheet and
-  // from /accessibility, and that no theme classes/keys appear.
+  // test asserts the controls are gone from the More sheet, and
+  // that no theme classes/keys appear. The /accessibility page
+  // itself is gone (strip-down 2026-11-19); the stored Large text
+  // / High contrast settings still apply via the layout provider,
+  // but there is no page that edits them any more. There is NO map
+  // Dark style and no "Map style" setting any more (one-map
+  // decision, 2026-11-17): the map is one bundled offline map with
+  // no style switcher.
   await expect(sheet.getByLabel(/Colour-blind theme/)).toHaveCount(0);
   await expect(sheet.getByLabel(/Dark mode/)).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.classList.contains('cb-theme'))).toBe(false);
   expect(await page.evaluate(() => document.documentElement.classList.contains('dark'))).toBe(false);
   expect(await page.evaluate(() => localStorage.getItem('pakdam.colorblind-theme'))).toBeNull();
   expect(await page.evaluate(() => localStorage.getItem('pakdam.dark-mode'))).toBeNull();
-
-  // The same controls are gone from /accessibility too (Large text
-  // / High contrast stay). There is NO map Dark style and no
-  // "Map style" setting any more (one-map decision, 2026-11-17):
-  // the map is one bundled offline map with no style switcher.
-  await page.goto('/accessibility');
-  await expect(page.getByRole('heading', { name: /Accessibility/ })).toBeVisible();
-  await expect(page.getByLabel(/Large text/)).toBeVisible();
-  await expect(page.getByLabel(/High contrast/)).toBeVisible();
-  await expect(page.getByLabel(/Colour-blind theme/)).toHaveCount(0);
-  await expect(page.getByLabel(/Dark mode/)).toHaveCount(0);
-  await expect(page.getByLabel(/Map style/)).toHaveCount(0);
 });

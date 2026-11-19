@@ -97,6 +97,12 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   const mapRef = useRef<MapLibreMap | null>(null);
   const libRef = useRef<MapLibreLib | null>(null);
   const markersRef = useRef<MapLibreMarker[]>([]);
+  // True while the host is mid-drag on a marker. The sync effect
+  // below runs after EVERY render and rebuilds all markers — without
+  // this guard it destroys the marker being dragged and snaps it back
+  // to the stored centre (the pin-drag test caught exactly that:
+  // mid-drag the pin read at its start position, not +80 px).
+  const draggingRef = useRef(false);
   const loadedRef = useRef(false);
   const styleLoadedRef = useRef(false);
   const propsRef = useRef(value);
@@ -282,7 +288,13 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     set(SOURCE_IDS.accuracy, p.centreLat != null && p.centreLng != null && accuracyM != null && accuracyM > 0
       ? circleGeoJSON(p.centreLat, p.centreLng, accuracyM) : featureCollection([]));
 
-    // Markers are rebuilt each sync (cheap: a pin + a few corners).
+    // Markers are rebuilt each sync (cheap: a pin + a few corners)
+    // — UNLESS a drag is in progress. Rebuilding mid-drag destroys
+    // the marker being dragged and snaps it back to the stored centre;
+    // the dragend handler commits the new position, which triggers the
+    // next sync with the drag over. GeoJSON sources above already
+    // updated; only the marker rebuild is skipped here.
+    if (draggingRef.current) return;
     for (const m of markersRef.current) m.remove();
     markersRef.current = [];
     // Circle centre pin (circle mode only) — DRAGGABLE: the host can
@@ -292,9 +304,11 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     if (!draw && p.centreLat != null && p.centreLng != null) {
       const el = document.createElement('div');
       el.title = 'Zone centre pin — drag to move it to your exact spot';
-      el.innerHTML = '<span style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);background:#B91C1C;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.4);"><span style="width:12px;height:12px;border-radius:50%;background:#fff;"></span></span>';
+      el.innerHTML = '<span style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);background:#B91C1C;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,0.4);touch-action:none;"><span style="width:12px;height:12px;border-radius:50%;background:#fff;"></span></span>';
       const marker = new lib.Marker({ element: el, draggable: true, anchor: 'bottom' }).setLngLat([p.centreLng, p.centreLat]).addTo(map);
+      marker.on('dragstart', () => { draggingRef.current = true; });
       marker.on('dragend', () => {
+        draggingRef.current = false;
         const ll = marker.getLngLat();
         onChangeRef.current({ ...propsRef.current, centreLat: ll.lat, centreLng: ll.lng });
         setCentreSource('placed');
@@ -313,7 +327,9 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
         // corner instead of panning the map.
         el.innerHTML = `<span role="button" aria-label="Corner ${i + 1} of ${poly.length}${selected ? ' — selected' : ''}. Drag to move, tap to select." style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50%;border:3px solid #B91C1C;background:${selected ? '#B91C1C' : '#fff'};color:${selected ? '#fff' : '#B91C1C'};font-weight:800;font-size:15px;cursor:grab;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">${i + 1}</span>`;
         const marker = new lib.Marker({ element: el, draggable: true }).setLngLat([pt.lng, pt.lat]).addTo(map);
+        marker.on('dragstart', () => { draggingRef.current = true; });
         marker.on('dragend', () => {
+          draggingRef.current = false;
           lastDragEndRef.current = Date.now();
           const ll = marker.getLngLat();
           const cur = propsRef.current.drawnBoundary;
@@ -335,7 +351,9 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
         const el = document.createElement('div');
         el.innerHTML = '<span role="button" aria-label="Drag to move the whole zone." style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:10px;border:2px solid #fff;background:#B91C1C;color:#fff;font-weight:800;font-size:18px;cursor:move;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">✥</span>';
         const marker = new lib.Marker({ element: el, draggable: true }).setLngLat([centre.lng, centre.lat]).addTo(map);
+        marker.on('dragstart', () => { draggingRef.current = true; });
         marker.on('dragend', () => {
+          draggingRef.current = false;
           const ll = marker.getLngLat();
           const cur = propsRef.current.drawnBoundary;
           const old = cur ? polygonCentroid(cur) : null;

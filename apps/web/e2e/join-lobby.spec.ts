@@ -185,25 +185,17 @@ test('lobby: Tell everyone (hold 2 s) shares position; lobby radio sends', async
   await guest.close();
 });
 
-test('get help page explains the three kinds of help; profile has friends + opt-in board', async ({ page }) => {
+test('leaderboard opt-in lives on the leaderboard page and persists on this device', async ({ page }) => {
   test.setTimeout(60_000);
-  await page.goto('/help');
-  await expect(page.getByRole('heading', { name: /Stuck\? Start here/ })).toBeVisible();
-  await expect(page.getByText(/Which help do you need/i)).toBeVisible();
-  await expect(page.getByRole('link', { name: /Grievance page/ }).first()).toBeVisible();
-
-  await page.goto('/profile');
-  await expect(page.getByText(/guest-only for now: no account, no sign-in/i).first()).toBeVisible();
-  await expect(page.getByRole('heading', { name: /Friends/ })).toBeVisible();
-  await expect(page.getByText(/People you add from players you have actually played with/i)).toBeVisible();
-  await expect(page.getByRole('heading', { name: /Played with — last 7 days/ })).toBeVisible();
-  // Opt-in leaderboard: off by default, persists on this device.
-  const optin = page.getByLabel(/Show me on the monthly leaderboard/i);
-  await expect(optin).not.toBeChecked();
-  await optin.check();
+  await page.goto('/leaderboards');
+  await expect(page.getByRole('heading', { name: /Monthly leaderboard/ })).toBeVisible();
+  // Opt-in: off by default, persists on this device.
+  await page.getByRole('button', { name: /Join the leaderboard/ }).click();
   await expect(page.getByText(/You are opted in for/)).toBeVisible();
   const stored = await page.evaluate(() => localStorage.getItem('pakdam.leaderboard.optin'));
   expect(stored).toBe('yes');
-  await page.goto('/leaderboards');
-  await expect(page.getByRole('heading', { name: /Monthly leaderboard/ })).toBeVisible();
+  // Board name and country are edited here now (strip-down 2026-11-19:
+  // the /profile page is gone, so the form lives on this page).
+  await expect(page.getByLabel(/Display name/)).toBeVisible();
+  await expect(page.getByLabel(/Country/)).toBeVisible();
 });

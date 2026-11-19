@@ -19,7 +19,7 @@ export default function SafetyControls({
         {onSafe ? <button type="button" onClick={onSafe} aria-label="I'm safe — check in with the host" style={{ minHeight: 52 }}>✓ I’m safe</button> : null}
         <button type="button" onClick={onLeave} aria-label="Leave game — stops sharing your location" style={{ minHeight: 52 }}>Leave / Stop sharing</button>
       </div>
-      <p className="small">Safety pause, SOS, “I’m safe” and Leave work only while this app is open and your screen is on. {SOS_COPY} <a href="/help">Get help — safety rules, report a problem, or file a grievance</a>.</p>
+      <p className="small">Safety pause, SOS, “I’m safe” and Leave work only while this app is open and your screen is on. {SOS_COPY}</p>
     </div>
   );
 }

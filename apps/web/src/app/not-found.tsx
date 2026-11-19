@@ -18,7 +18,7 @@ export default function NotFound() {
         <p>
           <Link className="btn" href="/">Back to home</Link>{' '}
           <Link className="btn btn-secondary" href="/join">Join a Game</Link>{' '}
-          <Link className="btn btn-secondary" href="/create">Host a Game</Link>
+          <Link className="btn btn-secondary" href="/create/mode">Host a Game</Link>
         </p>
         <p className="small">If you followed a room link, check the room code with your host — rooms are private and invite-only, so a wrong code will not find a game.</p>
       </div>

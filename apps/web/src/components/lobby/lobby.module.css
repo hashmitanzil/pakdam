@@ -537,6 +537,32 @@
   margin-top: 2px;
 }
 
+/* --- Compact summary strip: one tappable line, "500m zone · 1 hunter
+ *  · 30s pulse · 10 min" — same tokens as the old four-cell strip
+ *  (var(--red-dark), white), no new colours. A <button> so tapping
+ *  it opens the Game Settings sheet; it wraps as one line of text
+ *  and never clips at 390px. */
+.summaryStripButton {
+  display: block;
+  width: 100%;
+  background: var(--red-dark);
+  color: #fff;
+  border: 0;
+  border-radius: var(--radius);
+  padding: 12px 14px;
+  margin: 12px 0;
+  text-align: center;
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1.4;
+  cursor: pointer;
+}
+
+.summaryStripButton:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
 /* --- "Need 2+ players" start gate --- */
 .needPlayers {
   background: #451A03;

@@ -182,7 +182,11 @@ export interface MapLibreMarker {
   addTo(map: MapLibreMap): this;
   remove(): void;
   setPopup(popup: MapLibrePopup): this;
-  on(event: 'dragend', handler: () => void): this;
+  // Marker drag events (MapLibre v5): dragstart fires when a drag
+  // begins, dragend when it ends. PlayAreaMap uses dragstart to
+  // guard the marker rebuild so a drag in progress is never snapped
+  // back to the stored centre.
+  on(event: 'dragstart' | 'drag' | 'dragend', handler: () => void): this;
   /** The marker's wrapper element in the map container — used to
    *  set pointer-events:none on the app-drawn area labels so taps
    *  pass through to the map (zone placement). */

@@ -156,7 +156,7 @@ export default function HostPage() {
       <h1>Host dashboard</h1>
       <p className="small">Hosts see only permitted room state — never hidden player coordinates. Rooms are listed by room code, not by a place name — the game starts from the host&apos;s location on the map.</p>
       {mode === 'demo' ? <div className="banner" role="status"><strong>Demo</strong> — rooms stored on this device only, not on a server. Set NEXT_PUBLIC_WORKER_URL at build time to see live rooms.</div> : null}
-      {rooms.length === 0 ? <p>No rooms yet. <a href="/create">Create one</a>.</p> : null}
+      {rooms.length === 0 ? <p>No rooms yet. <a href="/create/mode">Create one</a>.</p> : null}
       {rooms.map((dr) => (
         <div className="card" key={dr.room.roomId}>
           <h2>Room {dr.room.roomCode}</h2>

@@ -23,14 +23,12 @@ export default function ModePicker() {
         <h2 id="mode-classic">Classic</h2>
         <p><strong>Classic Manhunt</strong> — Hunters chase, Runners survive. Tagged Runners are out and watch live.</p>
         <p><a className="btn btn-lg" href="/create?mode=classic">Choose Classic</a></p>
-        <p><a href="/game-modes">How to play</a></p>
       </article>
 
       <article className="card" aria-labelledby="mode-infection">
         <h2 id="mode-infection">Infection</h2>
         <p><strong>Infection</strong> — Hunters chase, Runners survive. Tagged Runners join the Hunters.</p>
         <p><a className="btn btn-lg" href="/create?mode=infection">Choose Infection</a></p>
-        <p><a href="/game-modes">How to play</a></p>
       </article>
 
       <p className="small">Both modes are free — no payment, no membership, no paywall. 3–30 players, 18+, private invite-only by room code.</p>

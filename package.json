@@ -2,7 +2,7 @@
   "name": "pakdam",
   "private": true,
   "version": "0.1.0",
-  "packageManager": "pnpm@10.34.9",
+  "packageManager": "pnpm@12.21.0",
   "description": "Pakdam — real-world GPS hide-and-seek, web PWA Phase 0 (foreground-only). Forge Mission 001 starter codebase.",
   "workspaces": [
     "apps/*",

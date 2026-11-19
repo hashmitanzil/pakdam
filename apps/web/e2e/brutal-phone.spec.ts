@@ -13,7 +13,7 @@ import { addRealPlayers, expectNoOverflow, roomState, setPlayer } from './helper
 
 const KEY_ROUTES = [
   '/', '/create', '/join', '/host',
-  '/leaderboards', '/profile', '/safety', '/how-it-works', '/game-modes',
+  '/leaderboards',
 ];
 
 interface ErrorBucket { consoleErrors: string[]; pageErrors: string[] }
@@ -112,10 +112,10 @@ test('brutal: every key route fits at 390px — no overflow, no overlap, no tiny
 test('brutal: hamburger menu on phones; desktop keeps normal tabs', async ({ page, browser }) => {
   test.setTimeout(120_000);
   // The current-section highlight only exists on a page the menu
-  // links to — /safety is in the menu ("Safety"), / is not (the menu
-  // has no Home link), so open it from /safety.
-  await page.goto('/safety');
-  await expect(page.getByRole('heading', { name: /The game stops for safety/i })).toBeVisible();
+  // links to — /join is in the menu ("Join a Game"), / is not (the
+  // menu has no Home link), so open it from /join.
+  await page.goto('/join');
+  await expect(page.getByRole('heading', { name: /Join a game/ })).toBeVisible();
   const menuBtn = page.getByRole('button', { name: /menu/i });
   // The hamburger is built (TopBar): the button opens #mobile-menu.
   await expect(menuBtn, 'no hamburger menu button on phones — TopBar still renders the full desktop nav row at 390px').toBeVisible();
@@ -124,13 +124,13 @@ test('brutal: hamburger menu on phones; desktop keeps normal tabs', async ({ pag
   // display:none on phones but still matches a role query.
   const menu = page.locator('#mobile-menu');
   await expect(menu).toBeVisible();
-  for (const name of ['How it works', 'Game modes', 'Safety', 'FAQ', 'Help', 'Host a Game', 'File a grievance']) {
+  for (const name of ['Host a Game', 'Join a Game']) {
     await expect(menu.getByRole('link', { name }).first()).toBeVisible();
   }
   // Current section highlighted: exactly one aria-current in the menu.
   const current = menu.locator('a[aria-current="page"]');
   await expect(current, 'current section is not highlighted in the menu').toHaveCount(1);
-  await expect(current.first()).toContainText(/Safety/);
+  await expect(current.first()).toContainText(/Join a Game/);
   // Tap to close — through the panel's own Close button, not the
   // hamburger. Once the menu is open its fixed panel (right 320px,
   // z-index 61) covers the hamburger in the sticky header (z-40),
@@ -142,13 +142,16 @@ test('brutal: hamburger menu on phones; desktop keeps normal tabs', async ({ pag
   await expect(menu).toHaveCount(0);
   await expect(menuBtn).toBeFocused();
 
-  // Desktop keeps the normal tab row — no hamburger at 1280px.
+  // Desktop keeps the normal tab row — no hamburger at 1280px. The
+  // tab row is just the Host a Game CTA now (strip-down 2026-11-19):
+  // the info-page links are gone and must not come back.
   const desktop = await browser.newContext({ viewport: { width: 1280, height: 720 } });
   const desktopPage = await desktop.newPage();
   await desktopPage.goto('/');
   await expect(desktopPage.getByRole('button', { name: /menu/i })).toHaveCount(0);
+  await expect(desktopPage.getByRole('link', { name: 'Host a Game', exact: true }).first()).toBeVisible();
   for (const name of ['How it works', 'Game modes', 'Safety', 'FAQ', 'Help']) {
-    await expect(desktopPage.getByRole('link', { name, exact: true })).toBeVisible();
+    await expect(desktopPage.getByRole('link', { name, exact: true })).toHaveCount(0);
   }
   await desktop.close();
 });
@@ -299,7 +302,9 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   const others = before!.players.filter((p) => p.playerId !== hostId);
   for (const id of [hostId, others[0]!.playerId]) {
     const name = before!.players.find((p) => p.playerId === id)!.displayName;
-    await page.getByLabel(new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).check();
+    // Scope to the checkbox (see outside-zone.spec.ts): the roster
+    // name button and the Remove button carry the same name.
+    await page.getByRole('checkbox', { name: new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) }).check();
   }
   await page.getByRole('button', { name: /Save Hunters/i }).click();
   await expect(page.getByText(/Saved Hunters:/)).toBeVisible();

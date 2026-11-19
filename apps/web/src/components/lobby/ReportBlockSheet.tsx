@@ -53,10 +53,6 @@ export default function ReportBlockSheet({
           <div role="status">
             <p>{done}</p>
             <p>
-              <a href="/grievance">File a formal grievance (Rule 20)</a> if this is a complaint about conduct or a
-              decision, not just a report in this game.
-            </p>
-            <p>
               <button type="button" className="btn" onClick={onClose}>
                 Done
               </button>

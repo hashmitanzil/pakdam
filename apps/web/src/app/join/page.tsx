@@ -175,8 +175,7 @@ export default function JoinPage() {
         <label className={styles.ageBox}>
           <input type="checkbox" required checked={ageChecked} onChange={(e) => setAgeChecked(e.target.checked)} />
           <span>
-            <strong>I am 18 or older</strong>, and I have read the{' '}
-            <Link href="/safety">safety briefing</Link>. Pakdam is 18+ only.
+            <strong>I am 18 or older</strong>, and I have read the safety briefing in the host setup. Pakdam is 18+ only.
           </span>
         </label>
 

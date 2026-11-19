@@ -102,7 +102,7 @@ export function MapLibreMapView({
   const ensureSourcesAndLayers = (map: MapLibreMap) => {
     const add = (id: string, sourceId: string, kind: string, paint: Record<string, unknown>, layout?: Record<string, unknown>) => {
       if (!map.getSource(sourceId)) map.addSource(sourceId, { type: 'geojson', data: featureCollection([]) });
-      if (!map.getLayer(id)) map.addLayer({ id, type: kind, source: sourceId, paint, layout });
+      if (!map.getLayer(id)) map.addLayer({ id, type: kind, source: sourceId, paint, layout: layout ?? {} });
     };
     // The zone ring must read as a RING at street zoom, not a faint
     // wash: a white halo under a thick red line, over a stronger

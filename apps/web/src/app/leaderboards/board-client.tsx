@@ -1,6 +1,5 @@
 'use client';
 import { useEffect, useMemo, useState } from 'react';
-import Link from 'next/link';
 import { listRooms, currentPlayerId, type DemoRoom } from '@/lib/demo-store';
 import { isLiveTransportEnabled } from '@/lib/websocket';
 import { seasonBoard, toScoringRoom, POINTS_RULES } from '@/components/profile/leaderboard';
@@ -46,6 +45,12 @@ export default function BoardClient() {
   const [optedIn, setOptedIn] = useState(false);
   const [myName, setMyName] = useState('');
   const [myCountry, setMyCountry] = useState('');
+  // Board details form (2026-11-19 strip-down): the page that edited
+  // the board name/country is gone, so the form lives here and
+  // writes the same localStorage keys the board already reads.
+  const [nameDraft, setNameDraft] = useState('');
+  const [countryDraft, setCountryDraft] = useState('');
+  const [detailsSaved, setDetailsSaved] = useState('');
   const [tab, setTab] = useState<'world' | 'country'>('world');
   const [reportTarget, setReportTarget] = useState<string | null>(null);
   const [reportDone, setReportDone] = useState('');
@@ -56,6 +61,8 @@ export default function BoardClient() {
     setOptedIn(localStorage.getItem(OPTIN_KEY) === 'yes');
     setMyName(localStorage.getItem(DISPLAY_NAME_KEY) ?? '');
     setMyCountry(localStorage.getItem(COUNTRY_KEY) ?? '');
+    setNameDraft(localStorage.getItem(DISPLAY_NAME_KEY) ?? '');
+    setCountryDraft(localStorage.getItem(COUNTRY_KEY) ?? '');
     setLoaded(true);
   }, []);
 
@@ -106,6 +113,16 @@ export default function BoardClient() {
   function setOptin(next: boolean) {
     setOptedIn(next);
     localStorage.setItem(OPTIN_KEY, next ? 'yes' : 'no');
+  }
+
+  function saveDetails() {
+    const n = nameDraft.trim().slice(0, 30);
+    const c = countryDraft.trim().slice(0, 60);
+    localStorage.setItem(DISPLAY_NAME_KEY, n);
+    localStorage.setItem(COUNTRY_KEY, c);
+    setMyName(n);
+    setMyCountry(c);
+    setDetailsSaved('Saved — the board shows this name and country.');
   }
 
   const handleReportFiled = (report: { subjectName: string; reason: ReportReason; detail: string; blocked: boolean }) => {
@@ -173,6 +190,16 @@ export default function BoardClient() {
         <p>Loading…</p>
       ) : (
         <>
+          <div className="card" aria-label="Your board details">
+            <h2 style={{ marginTop: 0 }}>Your board name and country</h2>
+            <p className="small">The board shows this display name and country only. Stored on this device only.</p>
+            <label className="label" htmlFor="board-name">Display name</label>
+            <input id="board-name" className="input" value={nameDraft} maxLength={30} onChange={(e) => setNameDraft(e.target.value)} placeholder="What should the board call you?" autoComplete="nickname" />
+            <label className="label" htmlFor="board-country">Country</label>
+            <input id="board-country" className="input" value={countryDraft} maxLength={60} onChange={(e) => setCountryDraft(e.target.value)} placeholder="Country for the country board" autoComplete="country-name" />
+            <p><button type="button" className="btn" onClick={saveDetails}>Save name and country</button></p>
+            {detailsSaved ? <p role="status">{detailsSaved}</p> : null}
+          </div>
           {liveConfigured ? (
             <div className="banner" role="status">
               <strong>Demo board — live leaderboard not available yet.</strong>
@@ -198,8 +225,8 @@ export default function BoardClient() {
               </p>
               <p className="small">
                 No account needed — this is guest-only for now. A future sign-in will let you keep your points across
-                devices; until then your board place lives on this device only. Prefer the full settings?{' '}
-                <Link href="/profile">Change this in your profile</Link>.
+                devices; until then your board place lives on this device only. Your display name and country are set
+                in the form above — they are what the board shows.
               </p>
             </div>
           ) : (
@@ -210,7 +237,7 @@ export default function BoardClient() {
                   ? ` — you are #${myRank} on the world board with ${myPoints} points.`
                   : ' — no finished matches on this device yet this season, so you have 0 points.'}
               </strong>{' '}
-              <Link href="/profile">Change this in your profile</Link> or{' '}
+              Change your name or country in the form above, or{' '}
               <button
                 type="button"
                 className="btn btn-secondary"
@@ -272,7 +299,7 @@ export default function BoardClient() {
 
               {tab === 'country' && !myCountry.trim() ? (
                 <p className="banner">
-                  Set your country in your <Link href="/profile">profile</Link> to see your country board.
+                  Set your country in the form above to see your country board.
                 </p>
               ) : countryRows.length === 0 ? (
                 <div className="card" role="status">
@@ -329,9 +356,8 @@ export default function BoardClient() {
           {reportDone ? <p role="status">{reportDone}</p> : null}
           <p className="small">
             {liveConfigured
-              ? 'The live leaderboard needs a server route that does not exist yet (GET /v1/leaderboard, opt-in only, display name + points + country). Until it exists, the board only covers games on this device. Report abuse from the board — a report goes to the host/moderation queue, and a formal complaint goes to the '
-              : 'The board only covers games on this device. A real board is served from the server, with the same rules: opt-in only, display name + points + country, no locations, no game times. Report abuse from the board — a report goes to the host/moderation queue, and a formal complaint goes to the '}
-            <Link href="/grievance">grievance page (Rule 20)</Link>.
+              ? 'The live leaderboard needs a server route that does not exist yet (GET /v1/leaderboard, opt-in only, display name + points + country). Until it exists, the board only covers games on this device. Report abuse from the board — a report goes to the host/moderation queue, and a formal complaint goes to the host in person.'
+              : 'The board only covers games on this device. A real board is served from the server, with the same rules: opt-in only, display name + points + country, no locations, no game times. Report abuse from the board — a report goes to the host/moderation queue, and a formal complaint goes to the host in person.'}
           </p>
         </>
       )}

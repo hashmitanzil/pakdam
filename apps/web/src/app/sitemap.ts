@@ -10,13 +10,11 @@ const LAST_MOD = new Date('2026-11-16');
 
 const PUBLIC_ROUTES = [
   '/',
- '/how-it-works', '/game-modes', '/about', '/contact', '/faq',
-  '/grievance', '/accessibility', '/safety', '/legal', '/install', '/help',
 ] as const;
 
 export default function sitemap(): MetadataRoute.Sitemap {
-  // Public pages only: no app routes (/create, /join, /room, /host),
-  // no /admin, no /profile (personal surface), no grievance submissions.
+  // Home only (2026-11-19 strip-down): the info pages are gone and the
+  // app routes (/create, /join, /room, /host) are not public content.
   return PUBLIC_ROUTES.map((route) => ({
     url: `${SITE_URL}${route}`,
     lastModified: LAST_MOD,

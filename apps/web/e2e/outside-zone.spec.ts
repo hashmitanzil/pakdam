@@ -36,8 +36,12 @@ test('outside zone: countdown appears, ticks down, player is ejected at 0', asyn
   await page.getByRole('button', { name: /Switch to host-picked Hunters/i }).click();
   const before = await roomState(page);
   const extras = before!.players.filter((p) => p.playerId !== hostId && p.displayName !== 'Guest Runner');
-  await page.getByLabel(new RegExp(extras[0]!.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).check();
-  await page.getByLabel(new RegExp(extras[1]!.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).check();
+  // Scope to the checkbox: getByLabel(/Guest Two/) is ambiguous —
+  // the roster name button ("Report or block Guest Two"), the Remove
+  // button and the picker checkbox all carry that name (CI run 5,
+  // strict-mode violation x4). The checkbox is the picker.
+  await page.getByRole('checkbox', { name: new RegExp(extras[0]!.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) }).check();
+  await page.getByRole('checkbox', { name: new RegExp(extras[1]!.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) }).check();
   await page.getByRole('button', { name: /Save Hunters/i }).click();
   await expect(page.getByText(/Saved Hunters:/)).toBeVisible();
 
@@ -141,8 +145,9 @@ test('outside zone: poor GPS accuracy pauses the countdown; it resumes when accu
   await page.getByRole('button', { name: /Switch to host-picked Hunters/i }).click();
   const before = await roomState(page);
   const extras = before!.players.filter((p) => p.playerId !== hostId && p.displayName !== 'Guest Runner');
-  await page.getByLabel(new RegExp(extras[0]!.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).check();
-  await page.getByLabel(new RegExp(extras[1]!.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).check();
+  // Scoped to the checkbox (see the first test in this file).
+  await page.getByRole('checkbox', { name: new RegExp(extras[0]!.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) }).check();
+  await page.getByRole('checkbox', { name: new RegExp(extras[1]!.displayName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')) }).check();
   await page.getByRole('button', { name: /Save Hunters/i }).click();
   await expect(page.getByText(/Saved Hunters:/)).toBeVisible();
 

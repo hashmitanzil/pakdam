@@ -10,7 +10,7 @@ import { expectNoOverflow, overflowProbe, startMatch } from './helpers';
 
 const KEY_ROUTES = [
   '/', '/create', '/join', '/host',
-  '/leaderboards', '/profile', '/safety', '/how-it-works', '/game-modes',
+  '/leaderboards',
 ];
 
 test('responsive: key routes have no horizontal overflow at this width', async ({ page }) => {
@@ -55,7 +55,7 @@ test('responsive: hamburger menu on phones, tab row on desktop', async ({ page }
   const size = page.viewportSize();
   const width = size?.width ?? 0;
   const isPhone = width < 768;
-  await page.goto('/safety');
+  await page.goto('/join');
   await expect(page.getByRole('heading').first()).toBeVisible();
 
   if (!isPhone) {
@@ -78,14 +78,11 @@ test('responsive: hamburger menu on phones, tab row on desktop', async ({ page }
   const menu = page.locator('#mobile-menu');
   await expect(menu).toBeVisible();
   await expect(menu.getByRole('heading', { name: 'Play' })).toBeVisible();
-  await expect(menu.getByRole('heading', { name: 'Trust & safety' })).toBeVisible();
-  await expect(menu.getByRole('heading', { name: 'About' })).toBeVisible();
   await expect(menu.getByRole('link', { name: 'Host a Game' }).first()).toBeVisible();
   await expect(menu.getByRole('link', { name: 'Join a Game' })).toBeVisible();
-  await expect(menu.getByRole('link', { name: 'File a grievance' })).toBeVisible();
   const current = menu.locator('a[aria-current="page"]');
   await expect(current).toHaveCount(1);
-  await expect(current).toContainText('Safety');
+  await expect(current).toContainText('Join a Game');
 
   // Escape closes and returns focus to the hamburger button.
   await page.keyboard.press('Escape');
@@ -102,10 +99,10 @@ test('responsive: hamburger menu on phones, tab row on desktop', async ({ page }
   // Following a link navigates and closes the menu.
   await menuButton.click();
   await expect(menu).toBeVisible();
-  await menu.getByRole('link', { name: 'How it works' }).click();
-  await expect(page).toHaveURL(/\/how-it-works/);
+  await menu.getByRole('link', { name: 'Host a Game' }).first().click();
+  await expect(page).toHaveURL(/\/create\/mode/);
   await expect(menu).toHaveCount(0);
-  await expectNoOverflow(page, `/how-it-works @${width}px (after menu navigation)`);
+  await expectNoOverflow(page, `/create/mode @${width}px (after menu navigation)`);
 });
 
 test('responsive: live play page fits — tab bar fits, thumb zone reachable', async ({ page, context }) => {

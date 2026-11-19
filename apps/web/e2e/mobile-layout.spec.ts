@@ -27,8 +27,8 @@ async function smallTapTargets(page: import('@playwright/test').Page): Promise<s
   });
 }
 
-test('mobile: landing, create, join and game-modes have no horizontal overflow', async ({ page }) => {
-  for (const route of ['/', '/create', '/join', '/game-modes']) {
+test('mobile: landing, create and join have no horizontal overflow', async ({ page }) => {
+  for (const route of ['/', '/create', '/join']) {
     await page.goto(route);
     await expect(page.getByRole('heading').first()).toBeVisible();
     await expectNoOverflow(page, route);

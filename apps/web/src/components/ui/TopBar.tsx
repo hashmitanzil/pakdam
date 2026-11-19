@@ -14,43 +14,20 @@ import { usePathname } from 'next/navigation';
  * No dead space on phones: the header is one row — brand + menu.
  */
 
-const MAIN_LINKS = [
-  { href: '/how-it-works', label: 'How it works' },
-  { href: '/game-modes', label: 'Game modes' },
-  { href: '/safety', label: 'Safety' },
-  { href: '/faq', label: 'FAQ' },
-  { href: '/help', label: 'Help' },
-];
+/** Desktop tab row — stripped 2026-11-19 (personal game): the info
+ *  pages (How it works, Game modes, Safety, FAQ, Help) are gone, so
+ *  the tab row is empty and only the Host a Game CTA remains. */
+const MAIN_LINKS: { href: string; label: string }[] = [];
 
+/** Mobile menu — stripped 2026-11-19 (personal game): only the two
+ *  core flows remain (Host a Game, Join a Game). The Trust & safety
+ *  and About sections are gone with their pages. */
 const MENU_SECTIONS: { heading: string; links: { href: string; label: string }[] }[] = [
   {
     heading: 'Play',
     links: [
       { href: '/create/mode', label: 'Host a Game' },
       { href: '/join', label: 'Join a Game' },
-      { href: '/how-it-works', label: 'How it works' },
-      { href: '/game-modes', label: 'Game modes' },
-      { href: '/install', label: 'Install the PWA' },
-    ],
-  },
-  {
-    heading: 'Trust & safety',
-    links: [
-      { href: '/safety', label: 'Safety' },
-      { href: '/faq', label: 'FAQ' },
-      { href: '/help', label: 'Help & support' },
-      { href: '/grievance', label: 'File a grievance' },
-      { href: '/accessibility', label: 'Accessibility' },
-    ],
-  },
-  {
-    heading: 'About',
-    links: [
-      { href: '/about', label: 'About Pakdam' },
-      { href: '/contact', label: 'Contact' },
-      { href: '/legal', label: 'Terms & privacy' },
-      { href: '/profile', label: 'Your profile' },
-      { href: '/admin', label: 'Admin (Staff)' },
     ],
   },
 ];

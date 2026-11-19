@@ -485,7 +485,7 @@ function DemoResults({ dr, me, offline, roomId }: { dr: DemoRoom; me: string | n
       {/* One primary action first, then the exits: the thing most
           players want after results is another game, not leaving. */}
       <p>
-        <a className="btn" href="/create">Play again — start a fresh game</a>{' '}
+        <a className="btn" href="/create/mode">Play again — start a fresh game</a>{' '}
         <a className="btn btn-secondary" href="/">Back to home</a>{' '}
         <button type="button" className="btn btn-secondary" onClick={() => { if (!window.confirm('Leave now? Your results stay recorded for this match, but you will leave the room.')) return; if (me) leaveRoom(roomId, me); window.location.href = '/'; }}>Leave</button>
       </p>

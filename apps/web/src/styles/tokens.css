@@ -313,12 +313,17 @@ main:has(> .subpage) { max-width: 880px; }
  * every control scrollIntoView parked at the viewport bottom, so
  * Playwright clicks on the preset chips / switches / steppers
  * retried until the test timed out (CI dbfaffd: 4 host-setup +
- * 1 responsive timeout, landscape only). 240px parks a 48px
+ * 1 responsive timeout, landscape only). CI run 5 added the same
+ * failure at the TOP: at 800x360 the sticky header wraps to two
+ * rows (~108-116px) while scroll-padding-top was only 76px, so a
+ * scrolled-into-view stepper landed UNDER the header and the
+ * header's "Host a Game" link intercepted the click. 124px clears
+ * a wrapped two-row header with margin; 240px parks a 48px
  * control's centre at 96px from the top — clear of the 60px header
  * and of a bottom bar up to ~264px tall. It also helps real
  * keyboard users: a focused control no longer slides under the
  * sticky bar. */
-html { scroll-padding-top: 76px; scroll-padding-bottom: 240px; }
+html { scroll-padding-top: 124px; scroll-padding-bottom: 240px; }
 html, body { overflow-x: clip; }
 
 .trust-strip-4 { grid-template-columns: repeat(4, 1fr); }

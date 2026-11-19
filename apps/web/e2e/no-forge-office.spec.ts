@@ -10,7 +10,7 @@ import { test, expect } from '@playwright/test';
 const KEY_ROUTES = [
   '/',
  '/create', '/join', '/host',
-  '/leaderboards', '/profile', '/safety', '/how-it-works', '/game-modes',
+  '/leaderboards',
 ];
 
 const FORGE_PATTERNS = [
@@ -36,16 +36,14 @@ test('no Forge Office surface on any key player-facing route', async ({ page }) 
   }
 });
 
-test('landing nav + footer link inventory has no Forge entry', async ({ page }) => {
+test('top bar has no Forge entry, and there is no footer at all', async ({ page }) => {
   await page.goto('/');
-  // The real navigation tabs are present and Forge-free.
-  for (const name of ['How it works', 'Game modes', 'Safety', 'FAQ', 'Help', 'Host a Game']) {
-    await expect(page.getByRole('link', { name, exact: false }).first()).toBeVisible();
-  }
+  // The real navigation is present and Forge-free: brand + Host a
+  // Game CTA only (strip-down 2026-11-19 — the info-page links are gone).
+  await expect(page.getByRole('link', { name: /Host a Game/ }).first()).toBeVisible();
   const navLinks = await page.locator('header nav a, header a').allInnerTexts();
   expect(navLinks.join(' | ')).not.toMatch(/Forge/i);
-  const footerLinks = await page.locator('footer a').allInnerTexts();
-  expect(footerLinks.join(' | ')).not.toMatch(/Forge/i);
-  expect(footerLinks.join(' | ')).toMatch(/Host a Game/);
-  expect(footerLinks.join(' | ')).toMatch(/Join a Game/);
+  // The footer was removed in the strip-down: no footer element, no
+  // footer links at all — so no Forge entry can hide there either.
+  await expect(page.locator('footer')).toHaveCount(0);
 });

@@ -115,8 +115,7 @@ export default function JoinCodePage({ params }: { params: Promise<{ code: strin
         <label className={styles.ageBox}>
           <input type="checkbox" required checked={ageChecked} onChange={(e) => setAgeChecked(e.target.checked)} />
           <span>
-            <strong>I am 18 or older</strong>, and I have read the{' '}
-            <Link href="/safety">safety briefing</Link>. Pakdam is 18+ only.
+            <strong>I am 18 or older</strong>, and I have read the safety briefing in the host setup. Pakdam is 18+ only.
           </span>
         </label>
         <div className="banner"><strong>Foreground-only:</strong> keep this app open and your screen on while you play. Location, safety pause, SOS and Leave stop working if you lock your phone or switch apps.</div>
@@ -129,8 +128,6 @@ export default function JoinCodePage({ params }: { params: Promise<{ code: strin
         <span className="small">Wrong code? </span>
         <span className={styles.footerLinks}>
           <Link href="/join">Type a different code</Link>
-          <span aria-hidden="true">·</span>
-          <Link href="/how-it-works">How it works</Link>
         </span>
       </p>
     </div>

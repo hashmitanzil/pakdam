@@ -39,17 +39,6 @@ test('landing loads and shows the foreground-only warning', async ({ page }) => 
   await expect(page.getByRole('link', { name: /Join a Game/ }).first()).toBeVisible();
 });
 
-test('game modes lists the two pilot modes and the free statement', async ({ page }) => {
-  await page.goto('/game-modes');
-  await expect(page.getByRole('heading', { name: /Classic Manhunt/ })).toBeVisible();
-  await expect(page.getByRole('heading', { name: /Infection/ })).toBeVisible();
-  // Breach and Zombie are later, not now — no cards, no disabled buttons.
-  await expect(page.getByRole('heading', { name: /Zombie/ })).toHaveCount(0);
-  await expect(page.getByRole('heading', { name: /Breach/ })).toHaveCount(0);
-  await expect(page.getByText(/Everything is free/i).first()).toBeVisible();
-  await expect(page.getByRole('link', { name: /Host a Game/ }).first()).toBeVisible();
-});
-
 test('join with an unknown code shows an error', async ({ page }) => {
   await page.goto('/join');
   await page.getByLabel(/Room code/i).fill('ZZZZZZ');
