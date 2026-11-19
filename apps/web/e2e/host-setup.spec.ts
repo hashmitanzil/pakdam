@@ -223,16 +223,10 @@ test('host setup: create lobby shows code, invite actions and summary strip', as
   // hunter — and the duration is compact "30m").
   const strip = page.getByRole('button', { name: /^Game settings:/ });
   await expect(strip).toContainText('500m zone · 1 hunter · 3m pulse · 30m');
-  // "This game" facts agree with the strip, in their own format:
-  // the fact grid uses the lobby's fmtMinutes ("30 min", "3 min",
-  // room/[roomId]/page.tsx:116) and the stored hunterCount (2) —
-  // never the strip's compact form.
-  const facts = page.getByRole('region', { name: 'Match setup' });
-  await expect(facts).toContainText('Match length');
-  await expect(facts).toContainText('30 min');
-  await expect(facts).toContainText('Ping every');
-  await expect(facts).toContainText('3 min');
-  await expect(facts).toContainText('Hunters');
+  // Lobby trim (2026-11-19): the "This game" facts grid is deleted —
+  // every fact already lives in the Game Settings sheet, and the
+  // summary strip above is the lobby's single source for the match
+  // settings (roomSummaryStrip: "500m zone · 1 hunter · 3m pulse · 30m").
   await expect(page.getByText(/Players \(1\/30\)/)).toBeVisible();
   await expect(page.getByText(/1 of at least 3 players in/i)).toBeVisible();
   await setPlayer(page, hostId);

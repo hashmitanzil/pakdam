@@ -2,8 +2,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Player } from '@pakdam/shared';
 import { hostCheckin } from '@/lib/demo-store';
-import { locationPrecisionLabel } from '@/lib/geolocation';
-import { lastReportedLabel } from '../match/freshness';
 import styles from './lobby.module.css';
 
 /** Pre-game readiness checklist (23 §5A, 24 S04). Per player:
@@ -56,7 +54,7 @@ export default function ReadinessChecklist({ players, meId, roomId, mode = 'demo
 }) {
   const me = players.find((p) => p.playerId === meId) ?? null;
   const [perm, setPerm] = useState<CheckStatus>('unknown');
-  const [gps, setGps] = useState<{ status: CheckStatus; detail: string }>({ status: 'unknown', detail: 'Not checked yet — tap “Run checks” to take a foreground fix.' });
+  const [gps, setGps] = useState<{ status: CheckStatus; detail: string }>({ status: 'unknown', detail: 'Not checked yet.' });
   const [wake, setWake] = useState<{ status: CheckStatus; detail: string }>({ status: 'unknown', detail: 'Not checked yet.' });
   const [online, setOnline] = useState<CheckStatus>(typeof navigator !== 'undefined' && navigator.onLine ? 'pass' : 'fail');
   const [ack, setAck] = useState(false);
@@ -91,8 +89,8 @@ export default function ReadinessChecklist({ players, meId, roomId, mode = 'demo
     // Wake Lock: supported on this browser?
     const wnav = navigator as Navigator & { wakeLock?: unknown };
     setWake(wnav.wakeLock
-      ? { status: 'pass', detail: 'Wake Lock is available on this browser — it is requested during play, but it is a convenience, never a guarantee. Keep your screen on.' }
-      : { status: 'fail', detail: 'Wake Lock is unavailable on this browser — keep your screen on yourself. Play still works.' });
+      ? { status: 'pass', detail: 'Available — keep your screen on.' }
+      : { status: 'fail', detail: 'Not on this browser — keep your screen on.' });
     // GPS quality: one foreground fix.
     if (!('geolocation' in navigator)) {
       setGps({ status: 'fail', detail: 'Geolocation is not available in this browser.' });
@@ -105,24 +103,21 @@ export default function ReadinessChecklist({ players, meId, roomId, mode = 'demo
         const acc = Math.round(pos.coords.accuracy);
         // Thresholds are calibration OPEN — the words follow the shared
         // classifier's placeholder bands (good ≤10 m, fair ≤25 m, poor ≤60 m).
-        // (D-M3) The detail also names the Precise / Approximate mode via
-        // locationPrecisionLabel — the same words as the create + play
-        // maps (good/fair ≤25 m is Precise, coarser is Approximate).
         // No fix yet / error states name no mode — it is never guessed.
         const quality = acc <= 10 ? 'good' : acc <= 25 ? 'fair' : 'poor';
         setGps({
           status: quality === 'poor' ? 'fail' : 'pass',
           detail: quality === 'good'
-            ? `Accuracy ~${acc} m — good enough. ${locationPrecisionLabel(acc)}`
+            ? `Accuracy ~${acc} m — good.`
             : quality === 'fair'
-              ? `Accuracy ~${acc} m — fair. Move outdoors if you can. ${locationPrecisionLabel(acc)}`
-              : `Accuracy poor (~${acc} m) — move outdoors and wait a moment. ${locationPrecisionLabel(acc)}`,
+              ? `Accuracy ~${acc} m — fair. Move outdoors.`
+              : `Accuracy poor (~${acc} m) — move outdoors.`,
         });
         setPerm('pass');
         setRunning(false);
       },
       (err) => {
-        setGps({ status: 'fail', detail: err.code === 1 ? 'Location is off — allow it in your browser settings, then tap Retry.' : 'GPS is too rough here — try again.' });
+        setGps({ status: 'fail', detail: err.code === 1 ? 'Location is off — allow it in settings, then Retry.' : 'GPS is too rough here — try again.' });
         setPerm((p) => (err.code === 1 ? 'fail' : p));
         setRunning(false);
       },
@@ -142,7 +137,6 @@ export default function ReadinessChecklist({ players, meId, roomId, mode = 'demo
     }
   };
 
-  const myChecksPass = perm === 'pass' && gps.status === 'pass' && online === 'pass';
   const checks: { status: CheckStatus }[] = [
     { status: perm },
     { status: gps.status },
@@ -155,7 +149,7 @@ export default function ReadinessChecklist({ players, meId, roomId, mode = 'demo
   return (
     <section className="card" aria-label="Pre-game readiness checklist">
       <h2 className={styles.sectionTitle}>Get ready to play</h2>
-      <p className={styles.sectionSub}>Five quick checks before the game can start. Nothing here shares your exact location — the host only sees whether each check passed.</p>
+      <p className={styles.sectionSub}>Five quick checks — nothing here shares your exact location.</p>
       {!me ? (
         <p>You are not signed in as a player on this device. Your own checklist runs on your own phone; the host sees each player’s ready state below.</p>
       ) : (
@@ -165,51 +159,34 @@ export default function ReadinessChecklist({ players, meId, roomId, mode = 'demo
             <div className={styles.progressFill} style={{ width: `${(passedCount / checks.length) * 100}%` }} />
           </div>
           <ul className={styles.checkList}>
-            <CheckRow label="Location permission" status={perm} detail={perm === 'pass' ? 'Granted.' : perm === 'fail' ? 'Denied — allow it in your browser settings, then tap Retry.' : 'Not confirmed yet — run the checks; on iOS Safari the browser asks when the fix is taken.'} />
+            <CheckRow label="Location permission" status={perm} detail={perm === 'pass' ? 'Granted.' : perm === 'fail' ? 'Denied — allow it in settings, then Retry.' : 'Not confirmed yet — run the checks.'} />
             <CheckRow label="GPS quality" status={gps.status} detail={gps.detail} />
             <CheckRow label="Screen-on / Wake Lock" status={wake.status} detail={wake.detail} />
             <CheckRow label="Network" status={online} detail={online === 'pass' ? 'Connected.' : 'Offline — you cannot start until you reconnect.'} />
-            <CheckRow label="Briefing confirmed" status={me.briefingConfirmed ? 'pass' : 'fail'} detail={me.briefingConfirmed ? 'You confirmed the rules and briefing.' : 'Not confirmed yet — tap “I’m ready” to confirm the briefing.'} />
+            <CheckRow label="Briefing confirmed" status={me.briefingConfirmed ? 'pass' : 'fail'} detail={me.briefingConfirmed ? 'Confirmed.' : 'Tap “I’m ready” to confirm.'} />
           </ul>
           <p><button type="button" className="btn btn-secondary" onClick={runChecks} disabled={running}>{running ? 'Running checks…' : 'Run checks / Retry'}</button></p>
           <h3>Before you play — read this</h3>
           <p>{PRE_MATCH_WARNING}</p>
           <label className={styles.ackBox}>
             <input type="checkbox" checked={ack} onChange={(e) => { if (e.target.checked) acknowledge(); else { setAck(false); localStorage.removeItem(ackKey); } }} />{' '}
-            <span><strong>I understand the rules and the screen-on warning.</strong><br /><span className="small">Every player must tick this before the game can start.</span></span>
+            <span><strong>I understand the rules and the screen-on warning.</strong></span>
           </label>
           {ack ? (
             <p role="status">
               {mode === 'live'
-                ? '✓ Acknowledged — kept on this device. The live server records your readiness when you tap “I’m ready”; this tick-box itself is not sent to the server.'
-                : '✓ Acknowledged — recorded in the room event log.'}
+                ? '✓ Acknowledged — on this device only.'
+                : '✓ Acknowledged.'}
             </p>
           ) : (
             <p className="small">
               {mode === 'live'
-                ? 'The host starts when everyone is ready; this tick-box is your own record.'
+                ? 'The host starts when everyone is ready.'
                 : 'Start stays disabled until every player has acknowledged.'}
             </p>
           )}
-          {!myChecksPass ? <p className="small">Your checks are not all passing yet — the host sees which item failed, not your raw location.</p> : null}
         </>
       )}
-      <h3>All players</h3>
-      <ul>
-        {players.map((p) => (
-          <li key={p.playerId}>
-            <strong>{p.displayName}</strong> {p.isHost ? <span className="tag">Host</span> : null} —{' '}
-            {p.connectionState === 'suspended'
-              ? `Suspended — location unknown · ${lastReportedLabel(p.lastFixAt)}`
-              : p.isReady
-                ? 'Ready (briefing confirmed)'
-                : 'Not ready yet'}{' '}
-            · {p.connectionState}
-            {p.playerId === meId && ack ? ' · warning acknowledged' : ''}
-          </li>
-        ))}
-      </ul>
-      <p className="small">The host may start without a player who is not ready (minimum 3 players). A player who returns is shown as “Back — re-checking” until this checklist passes again.</p>
     </section>
   );
 }

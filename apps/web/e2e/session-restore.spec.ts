@@ -68,10 +68,12 @@ test('(b) reload restores the room, the host seat and the guest seat', async ({ 
   // Reload the guest tab: the room and the guest seat come back.
   await guest.reload();
   await expect(guest).toHaveURL(`/room/${roomId}`);
-  // Same 5-way duplication as the invite-link test (roster row, "Your
-  // checks (Guest Runner)", "All players" <strong>, "You are playing
-  // as Guest Runner", the "joined" event log) — scope to the roster
-  // in the Players region, the proof the guest seat came back.
+  // The guest's name shows up in more than one place — roster row
+  // and "Your checks (Guest Runner)" — so a bare getByText violates
+  // strict mode. Scope to the roster in the Players region, the proof
+  // the guest seat came back. (Lobby trim 2026-11-19: the "All
+  // players" duplicate list and the "You are playing as …" note are
+  // deleted, and the event log hides when empty.)
   await expect(guest.getByRole('region', { name: 'Players' }).getByText(/Guest Runner/)).toBeVisible();
   const afterGuestReload = await roomState(guest);
   expect(afterGuestReload).not.toBeNull();

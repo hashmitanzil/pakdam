@@ -2,11 +2,9 @@
 import { use, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { getRoom, setPhase, toggleReady, hostCheckin, currentPlayerId, clearCurrentPlayerId, leaveRoom, setTeamAssignment, setSelectedHunters, updateRoomConfig } from '@/lib/demo-store';
-import { describeMode } from '@pakdam/engine';
 import { draftFromConfig, roomSummaryStrip } from '@/components/host-setup/draft';
 import Roster from '@/components/lobby/Roster';
 import ReadinessChecklist from '@/components/lobby/ReadinessChecklist';
-import { PRE_MATCH_WARNING } from '@/components/lobby/ReadinessChecklist';
 import LobbySafety, { type LobbyPause } from '@/components/lobby/LobbySafety';
 import ReportBlockSheet from '@/components/lobby/ReportBlockSheet';
 import HostSettingsSheet from '@/components/host-setup/HostSettingsSheet';
@@ -111,12 +109,6 @@ function appendRoomEvent(roomId: string, text: string): void {
   if (!dr) return;
   dr.events.push({ at: new Date().toISOString(), text });
   localStorage.setItem(DEMO_KEY, JSON.stringify(all));
-}
-
-function fmtMinutes(seconds: number): string {
-  if (seconds < 60) return `${seconds} sec`;
-  const m = seconds / 60;
-  return Number.isInteger(m) ? `${m} min` : `${m.toFixed(1)} min`;
 }
 
 function socketStateLabel(state: PakdamSocketState): string {
@@ -418,7 +410,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
   const me = mode === 'live' ? liveSession?.playerId ?? null : currentPlayerId();
   const isHost = room !== null && room.hostPlayerId === me;
   const mePlayer = players.find((p) => p.playerId === me) ?? null;
-  const acked = players.filter((p) => p.briefingConfirmed).length;
   // Selected teams: the host must have picked exactly hunterCount Hunters
   // before the game can start (Random needs no pick).
   const teamsReady = room !== null
@@ -750,6 +741,21 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
     router.push('/');
   };
 
+  // Leave room, from the header (wireframe 05-lobby: "Lobby LEAVE").
+  // Same confirm + seat handling as the old button below "I'm ready".
+  const handleLeave = () => {
+    if (mode === 'live') {
+      if (!window.confirm('Leave this room? You will leave the lobby — you can rejoin with the room code once live join is wired.')) return;
+      leaveLive();
+      return;
+    }
+    if (!window.confirm('Leave this room? You will leave the lobby — you can rejoin with the room code.')) return;
+    if (!mePlayer) return;
+    leaveRoom(roomId, mePlayer.playerId);
+    clearCurrentPlayerId();
+    router.push('/');
+  };
+
   const handlePauseChangeLive = (next: LobbyPause) => {
     const socket = socketRef.current;
     if (!socket) return;
@@ -877,21 +883,24 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
   return (
     <div>
       <div className={styles.hero}>
-        <span className={styles.eyebrow}>Pakdam · Lobby</span>
+        <span className={styles.heroSpacer} aria-hidden="true" />
         <h1>Lobby</h1>
-        <p>Everyone joins here first. Check in, get ready, and the host starts the game.</p>
+        {mePlayer ? (
+          <button type="button" className="btn btn-secondary" onClick={handleLeave}>Leave room</button>
+        ) : (
+          <span className={styles.heroSpacer} aria-hidden="true" />
+        )}
       </div>
 
       {mode === 'live' ? (
         <div className="banner" role="status">
-          <strong>Live lobby</strong> — players and readiness come from the game server, not this device.
-          {socketState !== 'connected' ? ` Connection: ${socketStateLabel(socketState)}${socketDetail ? ` — ${socketDetail}` : ''}.` : ''}
+          <strong>Live lobby</strong>{socketState === 'connected' ? ' · Connected' : ` · ${socketStateLabel(socketState)}${socketDetail ? ` — ${socketDetail}` : ''}.`}
           {socketState === 'reconnect-failed' ? (
             <> <button type="button" className="btn btn-secondary" onClick={() => void socketRef.current?.retry()}>Retry connection</button></>
           ) : null}
         </div>
       ) : (
-        <div className="banner" role="status"><strong>Demo lobby</strong> — stored only on this device, not on a server. Set NEXT_PUBLIC_WORKER_URL at build time to play live.</div>
+        <div className="banner" role="status"><strong>Demo lobby</strong> — stored only on this device.</div>
       )}
       {liveNotice ? <div className="banner" role="status">{liveNotice}</div> : null}
 
@@ -908,9 +917,9 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
         {copied ? <p className={styles.copiedNote} role="status">{copied}</p> : null}
         {shareNote && !copied ? <p className={styles.copiedNote} role="status">{shareNote}</p> : null}
         {mode === 'live' ? (
-          <p className={styles.copiedNote}>Share the code — no account needed to join. Live join by link is not wired yet, so the code is the way in for now. Phase: {room.phase} · Private — only people with the code can join.</p>
+          <p className={styles.copiedNote}>Share the code — no account needed to join.</p>
         ) : (
-          <p className={styles.copiedNote}>Share the code or the link — no account needed to join. Phase: {room.phase} · Private — only people with the code can join.</p>
+          <p className={styles.copiedNote}>Share the code or the link — no account needed to join.</p>
         )}
       </div>
 
@@ -961,9 +970,7 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
       <section className="card" aria-label="Players">
         <h2 className={styles.sectionTitle}>Players ({players.length}/{room.config.maxPlayers})</h2>
         <p className={styles.sectionSub}>
-          {readyCount} of {players.length} ready · Briefing confirmed: {acked} of {players.length} players.
-          Roles are decided by the host when the game starts — players do not pick their own side.
-          Tap a player’s name to report or block them.
+          {readyCount} of {players.length} ready.
         </p>
         {players.length === 0 ? <p>No players yet — share the invite link or room code.</p> : (
           <Roster players={players} meId={me} isHost={isHost} onRemove={isHost ? handleRemove : undefined} onReport={(_playerId, displayName) => setReportTarget(displayName)} />
@@ -971,39 +978,11 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
       </section>
 
       {offline ? <div className="banner" role="status"><strong>You are offline — reconnecting…</strong> The roster below is last-known, shown with last-seen times, never as live.</div> : null}
-      <div className="banner"><strong>Before you start:</strong> everyone must confirm the rules, the boundary and the safety briefing. Keep this app open and your screen on once the game starts.</div>
-      <div className="banner" role="note"><strong>Pre-match warning:</strong> {PRE_MATCH_WARNING}</div>
-
-      <section className="card" aria-label="Match setup">
-        <h2 className={styles.sectionTitle}>This game</h2>
-        <p className={styles.sectionSub}>Set by the host when the room was created. The play zone is set from the host’s location — there is no place name to remember.</p>
-        <div className={styles.factGrid}>
-          <div className={styles.fact}><div className={styles.factLabel}>Mode</div><div className={styles.factValue}>{describeMode(room.config.mode).label}</div></div>
-          <div className={styles.fact}><div className={styles.factLabel}>Players</div><div className={styles.factValue}>{players.length} / {room.config.maxPlayers}</div></div>
-          <div className={styles.fact}><div className={styles.factLabel}>Match length</div><div className={styles.factValue}>{fmtMinutes(room.config.durationSeconds)}</div></div>
-          <div className={styles.fact}><div className={styles.factLabel}>Head start</div><div className={styles.factValue}>{fmtMinutes(room.config.headStartSeconds)}</div></div>
-          <div className={styles.fact}><div className={styles.factLabel}>Ping every</div><div className={styles.factValue}>{room.config.pingIntervalSeconds === 0 ? 'No pings' : fmtMinutes(room.config.pingIntervalSeconds)}</div></div>
-          <div className={styles.fact}><div className={styles.factLabel}>Hunters</div><div className={styles.factValue}>{room.config.hunterCount}</div></div>
-          <div className={styles.fact}><div className={styles.factLabel}>Teams</div><div className={styles.factValue}>{room.config.teamAssignment === 'selected' ? 'Host picks' : 'Random'}</div></div>
-          <div className={styles.fact}><div className={styles.factLabel}>Zone shrink</div><div className={styles.factValue}>{room.config.zoneShrinkEnabled ? `Every ${fmtMinutes(room.config.zoneShrinkIntervalSeconds)}` : 'Off'}</div></div>
-        </div>
-      </section>
 
       <section className="card" aria-label="Role preview">
         <h2 className={styles.sectionTitle}>Your role is decided when the game starts</h2>
-        <p className={styles.sectionSub}>{room.config.teamAssignment === 'selected' ? 'The host picks the Hunters in the lobby below before starting — everyone else is a Runner.' : 'Nobody knows their side yet — not even the host. Hunters are picked when the game starts.'} Here is what each side does.</p>
-        <div className={styles.roleGrid}>
-          <div className={styles.roleCard}>
-            <h3>◆ H — Hunter</h3>
-            <p>You follow coarse pings: a rough area where a Runner was, never an exact pin.</p>
-            <p>When you find a Runner in person, they tap &ldquo;Got tagged&rdquo; and show you their QR — you scan it, and the catch only counts then. Or they confirm manually if your camera can&apos;t scan.</p>
-          </div>
-          <div className={styles.roleCard}>
-            <h3>▲ R — Runner</h3>
-            <p>You hide and outlast the clock. Hunters only ever see a rough area, never where you are now.</p>
-            <p>Nothing about you is shared exactly. A catch only counts when you tap &ldquo;Got tagged&rdquo; and show your QR for the Hunter to scan — or confirm it yourself if their camera can&apos;t scan.</p>
-          </div>
-        </div>
+        <p className={styles.sectionSub}>Hunter: follow rough pings, scan the Runner’s QR to catch.</p>
+        <p className={styles.sectionSub}>Runner: hide, outlast the clock — nothing exact is ever shared.</p>
       </section>
 
       <ReadinessChecklist
@@ -1036,22 +1015,11 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
               buttons let THIS tab leave or switch seats on purpose.
               Leaving keeps your seat listed as left — rejoin with the
               same display name to come back, host powers included. */}
-          {mode === 'live' ? (
-            <>
-              <p style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
-                <button type="button" className="btn btn-secondary" onClick={() => { if (!window.confirm('Leave this room? You will leave the lobby — you can rejoin with the room code once live join is wired.')) return; leaveLive(); }}>Leave room</button>
-              </p>
-              <p className={`small ${styles.center}`}>You are playing as {mePlayer.displayName}{mePlayer.isHost ? ' (host)' : ''} in this tab. Your seat is proved by the token saved on this device — another tab or phone cannot take your seat.</p>
-            </>
-          ) : (
-            <>
-              <p style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
-                <button type="button" className="btn btn-secondary" onClick={() => { if (!window.confirm('Leave this room? You will leave the lobby — you can rejoin with the room code.')) return; leaveRoom(roomId, mePlayer.playerId); clearCurrentPlayerId(); router.push('/'); }}>Leave room</button>
-                <button type="button" className="btn btn-secondary" onClick={() => { if (!window.confirm('Switch player? This tab will leave its current seat — you can rejoin with the room code.')) return; clearCurrentPlayerId(); router.push(`/join/${room.roomCode}`); }}>Switch player</button>
-              </p>
-              <p className={`small ${styles.center}`}>You are playing as {mePlayer.displayName}{mePlayer.isHost ? ' (host)' : ''} in this tab. Another player joining on their own tab or phone cannot take your seat.</p>
-            </>
-          )}
+          {mode === 'demo' ? (
+            <p style={{ display: 'flex', gap: 8, flexWrap: 'wrap', justifyContent: 'center' }}>
+              <button type="button" className="btn btn-secondary" onClick={() => { if (!window.confirm('Switch player? This tab will leave its current seat — you can rejoin with the room code.')) return; clearCurrentPlayerId(); router.push(`/join/${room.roomCode}`); }}>Switch player</button>
+            </p>
+          ) : null}
         </div>
       ) : mode === 'live' && snap ? (
         <div className={styles.primaryAction}>
@@ -1097,7 +1065,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
       {isHost ? (
         <div className="card">
           <h2>Host controls</h2>
-          <p className="small">You are the host. You can remove a player from the roster above, hold the start with a safety pause, and start the game when everyone is ready.</p>
           {mode === 'live' ? (
             <div>
               <h3>Teams — who is a Hunter?</h3>
@@ -1105,8 +1072,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
                 {room.config.teamAssignment === 'random'
                   ? 'Random: Hunters are picked when the game starts.'
                   : `Selected: pick exactly ${room.config.hunterCount} Hunter(s) below, then save.`}
-                {' '}Balance: {room.config.balanceHunters ? `on — the Hunter count is set from the roster at start (${room.config.hunterCount} now)` : `off — ${room.config.hunterCount} Hunter(s)`}.
-                Change the setup in Settings above, or pick the Hunters here.
               </p>
               <p><button type="button" className="btn btn-secondary" onClick={() => void switchTeamAssignmentLive()}>Switch to {room.config.teamAssignment === 'random' ? 'host-picked Hunters' : 'Random'}</button></p>
               {room.config.teamAssignment === 'selected' ? (
@@ -1125,7 +1090,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
               {room.config.teamAssignment === 'selected' && room.config.selectedHunterIds.length !== room.config.hunterCount ? (
                 <p role="alert">This room needs the host to pick exactly {room.config.hunterCount} Hunter(s) before it can start — pick them above and save.</p>
               ) : null}
-              <p className="small">Removing a player: use Remove on the roster above. The removed player leaves at once and can rejoin with the room code.</p>
             </div>
           ) : room.phase === 'LOBBY' ? (
             <div>
@@ -1163,22 +1127,26 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
             </>
           )}
           <p><button className="btn btn-secondary" onClick={() => { if (mode === 'live') hostCheckinLive(); else { hostCheckin(roomId, 'Lobby — all players accounted for'); setDr(getRoom(roomId)); } }}>Host check-in: lobby</button></p>
-          <h3>Host check-ins</h3>
-          {checkins.length === 0 ? <p>No check-ins yet.</p> : <ul>{checkins.map((c, i) => <li key={i}>{c}</li>)}</ul>}
+          {checkins.length === 0 ? null : (
+            <>
+              <h3>Host check-ins</h3>
+              <ul>{checkins.map((c, i) => <li key={i}>{c}</li>)}</ul>
+            </>
+          )}
         </div>
       ) : null}
 
-      <section className="card" aria-label="Room events">
-        <h2 className={styles.sectionTitle}>What has happened</h2>
-        {mode === 'live' ? <p className="small">Only events received while this tab was connected are shown — the server keeps the full log.</p> : null}
-        {events.length === 0 ? <p>No events yet.</p> : (
+      {events.length === 0 ? null : (
+        <section className="card" aria-label="Room events">
+          <h2 className={styles.sectionTitle}>What has happened</h2>
+          {mode === 'live' ? <p className="small">Only events received while this tab was connected are shown — the server keeps the full log.</p> : null}
           <ul className={styles.eventList}>
             {events.map((e, i) => (
               <li key={i}><span className={styles.eventTime}>{new Date(e.at).toLocaleTimeString()}</span> — {e.text}</li>
             ))}
           </ul>
-        )}
-      </section>
+        </section>
+      )}
 
       {reportTarget ? (
         <ReportBlockSheet

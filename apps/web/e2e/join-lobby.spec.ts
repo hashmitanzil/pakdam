@@ -34,13 +34,14 @@ test('guest join by invite link shows the code big and joins directly', async ({
   await guest.getByLabel(/18 or older/i).check();
   await guest.getByRole('button', { name: /Join lobby/i }).click();
   await expect(guest).toHaveURL(`/room/${roomId}`);
-  // The guest's name shows up in several places — roster row, "Your
-  // checks (Link Guest)", "You are playing as Link Guest", the room
-  // event log — so a bare getByText violates strict mode (5 matches).
-  // Scope to the roster, the proof the guest is in the room: the
-  // roster name div lives in the Players region (Roster.tsx, room
-  // page.tsx: the roster <section aria-label="Players">). The other
-  // four matches live in the checklist / event-log regions, not here.
+  // The guest's name shows up in more than one place — roster row
+  // and "Your checks (Link Guest)" — so a bare getByText violates
+  // strict mode. Scope to the roster, the proof the guest is in the
+  // room: the roster name div lives in the Players region (Roster.tsx,
+  // room page.tsx: the roster <section aria-label="Players">). (Lobby
+  // trim 2026-11-19: the "You are playing as …" note and the "All
+  // players" duplicate list are deleted, and the event log hides when
+  // empty, so those matches are gone.)
   await expect(guest.getByRole('region', { name: 'Players' }).getByText(/Link Guest/)).toBeVisible();
   await guest.close();
 
@@ -169,10 +170,12 @@ test('lobby: Tell everyone (hold 2 s) shares position; lobby radio sends', async
   await page.mouse.up();
   await expect(page.getByText(/Position shared with everyone/)).toBeVisible();
 
-  // Lobby radio: a quick message lands in the channel, team-only note shown.
+  // Lobby radio: a quick message lands in the channel. The scope note
+  // is one line now (lobby trim 2026-11-19): everyone in the lobby
+  // can read these messages.
   const radio = page.getByRole('region', { name: 'Lobby radio' });
   await expect(radio).toBeVisible();
-  await expect(radio).toContainText(/Once the game starts, radio becomes team-only/);
+  await expect(radio).toContainText(/Everyone in this lobby can read these messages/);
   await radio.getByRole('button', { name: /Let.s go!/ }).click();
   // The sent message lands in the message list (<ul>); the quick chip
   // with the same text sits outside it, in the "Quick messages" group

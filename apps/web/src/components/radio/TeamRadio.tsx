@@ -252,7 +252,7 @@ export default function TeamRadio({
         : '';
   const scopeNote =
     scope === 'lobby'
-      ? 'Everyone in this lobby can read these messages. Once the game starts, radio becomes team-only: Hunters and Runners each get their own channel.'
+      ? 'Everyone in this lobby can read these messages.'
       : scope === 'hunters'
         ? 'Only Hunters can read this channel. Runners never see it — and you never see theirs.'
         : 'Only Runners can read this channel. Hunters never see it — and you never see theirs.';
@@ -318,12 +318,14 @@ export default function TeamRadio({
     <section className={`card ${styles.radioCard}`} aria-label={scopeLabel}>
       <h2 className={styles.radioTitle}>📻 {scopeLabel}</h2>
       <p className={styles.radioSub}>{scopeNote}</p>
-      <p className={styles.voiceNote}>
-        <strong>Voice is peer-to-peer, no recording.</strong> Your voice goes straight to your own team
-        only — the other team never hears it, it is never recorded or stored, and there is no voice
-        server. Setup uses a free public STUN server only, so if your network blocks direct calls,
-        voice simply won’t connect and the text radio below still works.
-      </p>
+      {scope !== 'lobby' ? (
+        <p className={styles.voiceNote}>
+          <strong>Voice is peer-to-peer, no recording.</strong> Your voice goes straight to your own team
+          only — the other team never hears it, it is never recorded or stored, and there is no voice
+          server. Setup uses a free public STUN server only, so if your network blocks direct calls,
+          voice simply won’t connect and the text radio below still works.
+        </p>
+      ) : null}
       {scope === 'lobby' ? (
         <p className="small">Voice starts when teams are assigned at match start — until then, use the text radio below.</p>
       ) : !voiceAvailable ? (
@@ -498,11 +500,8 @@ export default function TeamRadio({
                 </button>
               </form>
               <p className="small">
-                {draft.length}/{MAX_TEXT} characters · Last {MAX_MESSAGES} messages kept
-                {isLiveText
-                  ? ` · Live — messages go to your team through the game server${liveText.connected ? '' : ' · reconnecting — messages sent now are discarded'}`
-                  : ' on this device · Messages stay in this browser and are never sent to a server.'}
-                {sentNote ? ` ${sentNote}` : ''}
+                {draft.length}/{MAX_TEXT}
+                {sentNote ? ` · ${sentNote}` : ''}
               </p>
             </>
           )}

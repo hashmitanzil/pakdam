@@ -83,7 +83,7 @@ export default function Roster({
                 {blocked ? <span className={styles.blockedBadge}>Blocked by you</span> : null}
               </div>
               <div className={styles.rosterMeta}>
-                Role decided by the host when the game starts · {fresh.label}
+                {fresh.label}
                 {p.suspensionCount > 0 ? ` · suspended ${p.suspensionCount}× before` : ''}
                 {p.ejectedAt ? ' · ejected — outside the play zone for 30 seconds' : ''}
               </div>

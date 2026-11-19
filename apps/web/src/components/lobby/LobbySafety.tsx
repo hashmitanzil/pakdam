@@ -84,7 +84,7 @@ export default function LobbySafety({
     <section className={styles.safetyStrip} aria-label="Safety controls">
       <h2 className={styles.sectionTitle}>Safety — always here</h2>
       <p className={styles.sectionSub}>
-        SOS, pause and Leave work only while this app is open and your screen is on. {SOS_COPY}
+        SOS alerts your host. Pakdam is NOT an emergency service — call your local emergency number if in danger.
       </p>
       {sosRaised ? (
         <div className={styles.sosAlert} role="alert">
@@ -152,11 +152,6 @@ export default function LobbySafety({
           <span className={styles.holdProgress} style={{ width: `${holdProgress}%` }} aria-hidden="true" />
         </button>
       </div>
-      <p className="small">
-        “Tell everyone in the game” shares your position with every player so they can find you if you are lost or need help.
-        Hold for 2 seconds so it cannot go off by accident. The reveal is written to the room event log;
-        the live broadcast is a production behaviour.
-      </p>
       {revealed ? <p role="status">✓ Shared — everyone in this game has been told your position. The reveal is in the room event log.</p> : null}
     </section>
   );

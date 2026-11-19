@@ -4,14 +4,25 @@
    always icon + word, never colour alone; roles are shape + letter. */
 
 .hero {
-  text-align: center;
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 8px 0 4px;
 }
 
 .hero h1 {
+  flex: 1;
+  text-align: center;
   font-size: 30px;
   margin: 8px 0 4px;
   letter-spacing: -0.5px;
+}
+
+/* Balances the header Leave button so "Lobby" stays centred
+ * (wireframe 05-lobby: "< Lobby LEAVE"). */
+.heroSpacer {
+  flex: 0 0 auto;
+  width: 96px;
 }
 
 .hero p {
@@ -202,6 +213,9 @@
   font-weight: 700;
   white-space: nowrap;
   font-size: 14px;
+  border: 2px solid currentColor;
+  border-radius: 999px;
+  padding: 4px 10px;
 }
 
 .rosterStateReady {
