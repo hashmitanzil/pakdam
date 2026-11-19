@@ -30,8 +30,30 @@
 // the coarse-message regex now matches the real message text
 // ("— too coarse to centre the zone on", not "— drag the pin").
 import { test, expect } from '@playwright/test';
+import {
+  assertNoPageErrors,
+  collectPageErrors,
+  detectOlaKey,
+  MISSING_KEY_TEXT,
+} from './helpers';
+
+/** True when the rendered app has an Ola Maps key (probed once per
+ *  file — see detectOlaKey in ./helpers). The map is Ola Maps now
+ *  (founder decision, 2026-11-19): no bundled tiles, no downloaded
+ *  area, no "downloaded area only" caption anywhere — the pin-drag /
+ *  GPS tests below need a constructed map, so they skip without a
+ *  key; the geolocation-only tests run in both modes. */
+let OLA_KEY_PRESENT = false;
+
+test.beforeAll(async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const probe = await ctx.newPage();
+  OLA_KEY_PRESENT = await detectOlaKey(probe);
+  await ctx.close();
+});
 
 test('coarse GPS (±2.5 km) never centres the zone — km message, manual pin fallback', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — tap-to-place needs a constructed map');
   test.setTimeout(120_000);
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33, accuracy: 2500 });
@@ -66,6 +88,27 @@ test('coarse GPS (±2.5 km) never centres the zone — km message, manual pin fa
   await expect(page.getByText(/Placed by hand on the map/)).toBeVisible();
 });
 
+test('no Ola key: coarse GPS (±2.5 km) still rejects the fix — rough banner, missing-key line, no crash', async ({ page, context }) => {
+  test.skip(OLA_KEY_PRESENT, 'an Ola key is configured — this test asserts the no-key graceful failure');
+  test.setTimeout(120_000);
+  const pageErrors = collectPageErrors(page);
+  await context.grantPermissions(['geolocation']);
+  await context.setGeolocation({ latitude: 23.36, longitude: 85.33, accuracy: 2500 });
+  await page.goto('/create');
+  await page.getByLabel(/codename/i).fill('Test Host');
+  // Same rejection as the keyed test above — the staged location
+  // chain is geolocation, not map — but without a key there is no
+  // map to tap, so this test stops at the banner: no hand-place
+  // fallback is possible until a key is configured.
+  const roughBanner = page.getByRole('region', { name: 'Play area' }).getByRole('alert');
+  await expect(roughBanner).toBeVisible({ timeout: 30_000 });
+  await expect(roughBanner).toContainText(/GPS is too rough here — tap the map to place the zone/i);
+  await expect(page.getByRole('region', { name: /tap the map to place the zone/i })).toBeVisible();
+  await expect(page.getByText(MISSING_KEY_TEXT).first()).toBeVisible();
+  await expect(page.locator('.mapbox .maplibregl-canvas')).toHaveCount(0);
+  assertNoPageErrors(pageErrors, 'no-key coarse GPS');
+});
+
 test('"Use my location" refines live — best accuracy shown while waiting, then the good fix lands', async ({ page, context }) => {
   test.setTimeout(120_000);
   await context.grantPermissions(['geolocation']);
@@ -86,6 +129,10 @@ test('"Use my location" refines live — best accuracy shown while waiting, then
 });
 
 test('centre pin can be moved by hand — arrow keys move the centre (no coordinates shown)', async ({ page, context }) => {
+  // Runs WITH and WITHOUT an Ola key by design: the arrow-key
+  // handler is React state on the .mapbox region (PlayAreaMap
+  // onKeyDown), not the MapLibre instance — the centre moves and the
+  // hand-placed label appears even when no map is constructed.
   test.setTimeout(120_000);
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33, accuracy: 8 });
@@ -107,6 +154,7 @@ test('centre pin can be moved by hand — arrow keys move the centre (no coordin
 });
 
 test('centre pin drags — dragging the red pin moves the zone centre', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — the centre pin needs a constructed map');
   test.setTimeout(120_000);
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33, accuracy: 8 });

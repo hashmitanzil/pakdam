@@ -4,25 +4,24 @@ import type { GeoPolygon } from '@pakdam/shared';
 import { ZONE_RADIUS_MIN_M, ZONE_RADIUS_STEP_M, ZONE_AUTO_CENTRE_MAX_ACCURACY_M } from '@pakdam/shared';
 import { checkLocationPermission, coarseFixMessage, getCurrentFix, LOCATION_DENIED_HELP, locationPrecisionLabel, type ForegroundFix, type LocationProgress } from '@/lib/geolocation';
 import { formatDistance, haversineMeters, polygonCentroid } from '@/components/match/freshness';
-import { circlePolygon, scalePolygonTowardCentroid } from '@/components/match/ZoneEditor';
+import { scalePolygonTowardCentroid } from '@/components/match/ZoneEditor';
+import { addDrawPoint, canApplyDraw, drawPointsEqual, undoDrawPoint } from './drawPoints';
 import {
-  loadMapLibre, isWebGLSupported, OFFLINE_STYLE_URL,
-  OFFLINE_MAP_CENTRE, OFFLINE_MAP_INITIAL_ZOOM, OFFLINE_MAP_MIN_ZOOM,
-  OFFLINE_MAP_MAX_ZOOM, OFFLINE_MAP_MAX_BOUNDS,
-  OUTSIDE_MAP_AREA_MESSAGE, isInsideOfflineMap,
+  loadMapLibre, isWebGLSupported, OLA_STYLE_URL,
+  MAP_INITIAL_CENTRE, OLA_MAP_INITIAL_ZOOM, OLA_MAP_MIN_ZOOM,
+  OLA_MAP_MAX_ZOOM, olaTransformRequest, isOlaConfigured,
   polygonToGeoJSON, circlePolygon as circleGeoJSON, featureCollection,
   type MapLibreLib, type MapLibreMap, type MapLibreMarker,
 } from '@/components/map/maplibre';
 
 /**
  * Play-area map (location-first host setup). A real MapLibre map on
- * the BUNDLED offline map (founder decision, 2026-11-17 19:34 IST):
- * ONE simple working map, downloaded offline and bundled in the app,
- * covering Doranda + Hinoo, Ranchi, Jharkhand, for now. NO fallback /
- * switcher / reload. The full live map service is a SEPARATE later
- * task. The editor is MapLibre — the same map as the play/result
+ * Ola Maps (founder decision, 2026-11-19): the offline tile pack is
+ * GONE — live Ola tiles, no downloaded area, no maxBounds, no
+ * outside-area guard or caption. NO fallback / switcher / reload.
+ * The editor is MapLibre — the same map as the play/result
  * maps — with the interactive editor pieces (draggable centre pin,
- * draggable corner + middle markers) built on MapLibre Markers.
+ * draggable numbered point + middle markers) built on MapLibre Markers.
  * The centre comes from the host's GPS ("Use my location"); when
  * GPS is off or denied, the host taps the map to place the zone
  * where they are standing. There is no area/place-name field: the
@@ -36,27 +35,32 @@ import {
  *
  * Two shapes (founder final take-list):
  * - Circle: a circle around the centre, sized by the radius stepper.
- * - Draw: a custom polygon. Corners are draggable markers on the map,
- *   the middle marker drags the whole zone, tapping a corner selects
- *   it and "− Remove corner" drops it (min 3 corners), Undo steps back
- *   through edits, Start again redraws a regular polygon. The polygon
- *   is stored in the room config as zone.boundary — the engine already
- *   enforces polygons (point-in-polygon), so a drawn zone is enforced
- *   exactly like a circle, including shrink phases (scaled copies).
+ * - Draw: tap-to-place (founder spec, 2026-11-19). NO default shape:
+ *   the host taps the map and a numbered point drops (1, 2, 3…); 3
+ *   taps enclose a triangle = the zone, a 4th tap makes 4 corners,
+ *   a 5th makes 5, open-ended. Placed points stay draggable to
+ *   fine-tune, the middle ✥ marker drags the whole draft. Undo
+ *   removes the last point, Redraw clears all points, DONE applies
+ *   the polygon — until DONE the points are a DRAFT: the room's
+ *   drawnBoundary (and the form's validation) only see the applied
+ *   shape. The polygon is stored in the room config as
+ *   zone.boundary — the engine already enforces polygons
+ *   (point-in-polygon), so a drawn zone is enforced exactly like a
+ *   circle, including shrink phases (scaled copies).
  * Mode switch (founder decision, 2026-11-17): switching to Circle
  * CLEARS the drawn shape entirely — the form nulls drawnBoundary, and
- * this component drops the Draw-only UI state (selected corner, undo
- * history) too, so no corner marker, polygon layer or stale undo entry
- * survives into Circle mode. Returning to Draw starts clean: the form
- * generates a fresh regular polygon around the centre.
+ * this component drops the draft too, so no point marker, polygon
+ * layer or stale draft survives into Circle mode. Returning to Draw
+ * starts clean: no points until the host taps.
+ * GPS in Draw mode sets the centre only — it never creates or moves
+ * the shape: the shape is where the host tapped it.
  */
 const STEP_DEG = 0.0005; // ~55 m per arrow press — labelled on screen
-const DRAW_DEFAULT_CORNERS = 6;
 
-/** Centre of the bundled area (Doranda) — the map starts here when
- *  no centre is set yet. There are no tiles for anywhere else, so a
- *  world view would be an empty background. */
-const BBOX_CENTRE: [number, number] = OFFLINE_MAP_CENTRE;
+/** Ranchi home area — the map starts here (MAP_INITIAL_CENTRE,
+ *  from @/components/map/maplibre) when no centre is set yet. The
+ *  map is world-wide, so this is a starting centre only, not a
+ *  boundary. */
 
 export interface PlayAreaValue {
   centreLat: number | null;
@@ -126,13 +130,14 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
    *  real GPS fix arrives (founder bug fix, 2026-11-17). */
   const [centreSource, setCentreSource] = useState<'gps' | 'placed' | null>(null);
   const [announce, setAnnounce] = useState('');
-  const [selectedCorner, setSelectedCorner] = useState<number | null>(null);
-  const selectedCornerRef = useRef<number | null>(null);
-  selectedCornerRef.current = selectedCorner;
-  // Undo history for Draw edits only (circle edits are single-value
-  // steppers with their own reset). Capped at 20 entries.
-  const drawHistoryRef = useRef<GeoPolygon[]>([]);
-  const lastDragEndRef = useRef(0);
+  // Draw draft: the tap-to-place points, local until DONE applies
+  // them (see commitDraft). The committed boundary lives in the
+  // form value (value.drawnBoundary); the draft follows it when it
+  // changes from outside (settings reopened, Radius stepper) — see
+  // the sync effect below. Taps and drags only touch the draft.
+  const [draftPoints, setDraftPoints] = useState<GeoPolygon>([]);
+  const draftRef = useRef<GeoPolygon>([]);
+  draftRef.current = draftPoints;
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   /** Key of the zone the camera was last fitted to (centre +
    *  radius + shape). The fit runs when this changes — including
@@ -148,10 +153,9 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   const isDraw = value.zoneShape === 'draw';
   const drawn = isDraw ? value.drawnBoundary : null;
 
-  // Mode switch to Circle: drop the Draw-only UI state (selected
-  // corner, undo history) so nothing drawn can survive the switch.
-  // The form already nulls drawnBoundary; the markers and polygon
-  // layer are removed by the overlay sync below.
+  // Mode switch to Circle: the draft is dropped (see the effect
+  // below) and the form already nulls drawnBoundary; the markers
+  // and polygon layer are removed by the overlay sync below.
   /** Fit the camera to the whole zone (drawn polygon's own box, or
    *  the circle around the centre). Records what it fitted, so a
    *  repeat call with the same zone is a no-op — the fit never
@@ -162,13 +166,20 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       : `circle:${p.centreLat?.toFixed(5) ?? 'null'},${p.centreLng?.toFixed(5) ?? 'null'},${p.radiusMeters}`;
     if (lastFittedRef.current === key) return;
     lastFittedRef.current = key;
-    if (p.zoneShape === 'draw' && p.drawnBoundary && p.drawnBoundary.length >= 3) {
-      const lats = p.drawnBoundary.map((pt) => pt.lat);
-      const lngs = p.drawnBoundary.map((pt) => pt.lng);
-      map.fitBounds(
-        [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
-        { padding: 40, maxZoom: 17 },
-      );
+    if (p.zoneShape === 'draw') {
+      // Draw with no shape yet: do NOT fall through to the circle
+      // fit — there is no circle to fit, and the camera must stay
+      // where the host is tapping. Callers pass the draft as
+      // drawnBoundary (see the sync effects), so this fits the
+      // draft polygon once it encloses.
+      if (p.drawnBoundary && p.drawnBoundary.length >= 3) {
+        const lats = p.drawnBoundary.map((pt) => pt.lat);
+        const lngs = p.drawnBoundary.map((pt) => pt.lng);
+        map.fitBounds(
+          [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
+          { padding: 40, maxZoom: 17 },
+        );
+      }
       return;
     }
     if (p.centreLat == null || p.centreLng == null) return;
@@ -183,12 +194,30 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     );
   };
 
-  /** Zoom anchor: the zone centre pin when set, else the drawn
-   *  shape's middle, else the current camera centre. Zooming on
-   *  the pin keeps the pin in view; zooming on the screen centre
-   *  drifted it off-screen (live check 2026-11-17). */
+  /** The value fitToZone should fit: in Draw mode the DRAFT polygon
+   *  (the shape being placed), not the committed boundary. */
+  const fitValue = (p: PlayAreaValue): PlayAreaValue =>
+    p.zoneShape === 'draw'
+      ? { ...p, drawnBoundary: draftRef.current.length >= 3 ? [...draftRef.current] : null }
+      : p;
+
+  /** Zoom anchor: in Draw mode the draft polygon's middle, else the
+   *  zone centre pin when set, else the drawn shape's middle, else
+   *  the current camera centre. Zooming on the pin keeps the pin in
+   *  view; zooming on the screen centre drifted it off-screen (live
+   *  check 2026-11-17). */
   const zoomAnchor = (): [number, number] => {
     const p = propsRef.current;
+    // Draw mode anchors on the draft polygon, not the centre pin:
+    // the shape is where the host tapped it, which may be nowhere
+    // near the GPS centre.
+    if (p.zoneShape === 'draw') {
+      const d = draftRef.current;
+      if (d.length >= 3) {
+        const c = polygonCentroid(d);
+        if (c) return [c.lng, c.lat];
+      }
+    }
     if (p.centreLat != null && p.centreLng != null) return [p.centreLng, p.centreLat];
     if (p.drawnBoundary && p.drawnBoundary.length >= 3) {
       const c = polygonCentroid(p.drawnBoundary);
@@ -199,12 +228,12 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       const c = map.getCenter();
       return [c.lng, c.lat];
     }
-    return BBOX_CENTRE;
+    return MAP_INITIAL_CENTRE;
   };
   const zoomBy = (dir: 1 | -1) => {
     const map = mapRef.current;
     if (!map) return;
-    const z = Math.min(OFFLINE_MAP_MAX_ZOOM, Math.max(OFFLINE_MAP_MIN_ZOOM, map.getZoom() + dir));
+    const z = Math.min(OLA_MAP_MAX_ZOOM, Math.max(OLA_MAP_MIN_ZOOM, map.getZoom() + dir));
     map.easeTo({ center: zoomAnchor(), zoom: z, duration: 300 });
   };
   const centreOnPin = () => {
@@ -213,44 +242,68 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     map.easeTo({ center: zoomAnchor(), zoom: Math.max(map.getZoom(), 15), duration: 300 });
   };
 
+  // Mode switch to Circle: drop the draft, so no point marker,
+  // polygon layer or stale draft survives into Circle mode. The
+  // form already nulls drawnBoundary; the overlay sync below
+  // removes the rest.
   useEffect(() => {
     if (value.zoneShape === 'circle') {
-      setSelectedCorner(null);
-      drawHistoryRef.current = [];
+      setDraftPoints([]);
     }
   }, [value.zoneShape]);
 
-  /** Commit a new drawn polygon: push the old one on the undo stack,
-   *  then report the change. Radius follows the polygon's size across. */
-  const commitDraw = (next: GeoPolygon | null, label: string) => {
-    const cur = propsRef.current.drawnBoundary;
-    if (cur) drawHistoryRef.current = [...drawHistoryRef.current.slice(-19), cur];
-    const dia = next ? polygonDiameterMeters(next) : 0;
-    onChangeRef.current({
-      ...propsRef.current,
-      drawnBoundary: next,
-      // No maximum (founder decision, 2026-11-17 — unlimited past
-      // 1 km): the radius follows the drawn size, uncapped.
-      radiusMeters: dia > 0 ? Math.round(Math.max(ZONE_RADIUS_MIN_M, dia / 2)) : propsRef.current.radiusMeters,
-    });
+  // Draw draft follows the committed boundary when it changes from
+  // OUTSIDE the draft (settings reopened on a saved Draw room, the
+  // Radius stepper scaling the applied shape). Taps and drags only
+  // touch the draft, so this never fights the host's placing.
+  useEffect(() => {
+    if (value.zoneShape === 'draw') {
+      setDraftPoints(value.drawnBoundary ? [...value.drawnBoundary] : []);
+    }
+  }, [value.drawnBoundary, value.zoneShape]);
+
+  /** Draft helpers (Draw only). Taps, drags and the arrow keys edit
+   *  the DRAFT — the form value is untouched until DONE applies it. */
+  const updateDraft = (next: GeoPolygon, label: string) => {
+    setDraftPoints(next);
     setAnnounce(label);
   };
 
+  /** Undo: remove the last placed point. Drags are not undone —
+   *  the founder's spec names Undo as "removes the last point". */
   const undoDraw = () => {
-    const prev = drawHistoryRef.current[drawHistoryRef.current.length - 1];
-    if (!prev) { setAnnounce('Nothing to undo.'); return; }
-    drawHistoryRef.current = drawHistoryRef.current.slice(0, -1);
-    setSelectedCorner(null);
-    onChangeRef.current({ ...propsRef.current, drawnBoundary: prev });
-    setAnnounce('Undid the last Draw change.');
+    const cur = draftRef.current;
+    if (cur.length === 0) { setAnnounce('Nothing to undo.'); return; }
+    const next = undoDrawPoint(cur);
+    setDraftPoints(next);
+    setAnnounce(next.length === 0
+      ? 'Point removed — no points left. Tap the map to place point 1.'
+      : `Point ${cur.length} removed — ${next.length} point${next.length === 1 ? '' : 's'} left.`);
   };
 
-  const startAgainDraw = () => {
-    const p = propsRef.current;
-    if (p.centreLat == null || p.centreLng == null) { setAnnounce('Set the zone centre first — use your location or tap the map.'); return; }
-    const corners = p.drawnBoundary?.length ?? DRAW_DEFAULT_CORNERS;
-    commitDraw(circlePolygon(p.centreLat, p.centreLng, p.radiusMeters, Math.max(3, corners)), `Started again — a regular ${Math.max(3, corners)}-corner shape around the centre. Drag the corners to shape it.`);
-    setSelectedCorner(null);
+  /** Redraw: clear every point and start over. */
+  const redrawDraw = () => {
+    setDraftPoints([]);
+    setAnnounce('Cleared — tap the map to place point 1.');
+  };
+
+  /** DONE: apply the draft as the room's drawn boundary. The radius
+   *  follows the polygon's size across (no maximum — founder
+   *  decision, 2026-11-17, unlimited past 1 km). Under 3 points
+   *  there is nothing to apply. */
+  const commitDraft = () => {
+    const pts = draftRef.current;
+    if (!canApplyDraw(pts)) {
+      setAnnounce(`Tap at least 3 points on the map first — ${pts.length} point${pts.length === 1 ? '' : 's'} cannot enclose an area.`);
+      return;
+    }
+    const dia = polygonDiameterMeters(pts);
+    onChangeRef.current({
+      ...propsRef.current,
+      drawnBoundary: [...pts],
+      radiusMeters: Math.round(Math.max(ZONE_RADIUS_MIN_M, dia / 2)),
+    });
+    setAnnounce(`Zone applied — ${pts.length} points, about ${formatDistance(dia)} across.`);
   };
 
   const ensureSourcesAndLayers = (map: MapLibreMap) => {
@@ -271,14 +324,20 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
 
   /** Rebuild every overlay from the live value: the zone (circle or
    *  drawn polygon), no-go areas, accuracy circle, centre pin, and —
-   *  Draw only — the draggable corner markers + the drag-the-middle
-   *  marker. GeoJSON sources are re-set and markers rebuilt on each
-   *  sync, so the map always matches the stored state exactly. */
+   *  Draw only — the draggable numbered point markers + the
+   *  drag-the-middle marker. In Draw mode the zone and markers render
+   *  the DRAFT (draftRef), not the committed boundary — the map shows
+   *  the shape being placed until DONE applies it. GeoJSON sources
+   *  are re-set and markers rebuilt on each sync, so the map always
+   *  matches the stored state exactly. */
   const syncOverlays = (map: MapLibreMap, lib: MapLibreLib, p: PlayAreaValue, accuracyM: number | null) => {
     const set = (id: string, data: Record<string, unknown>) => { map.getSource(id)?.setData(data); };
     const draw = p.zoneShape === 'draw';
+    // Draw renders the DRAFT, not the committed boundary — the zone
+    // on the map is the shape being placed, until DONE applies it.
+    const draft = draw ? draftRef.current : null;
     if (draw) {
-      set(SOURCE_IDS.zone, p.drawnBoundary && p.drawnBoundary.length >= 3 ? polygonToGeoJSON(p.drawnBoundary) : featureCollection([]));
+      set(SOURCE_IDS.zone, draft && draft.length >= 3 ? polygonToGeoJSON(draft) : featureCollection([]));
     } else if (p.centreLat != null && p.centreLng != null) {
       set(SOURCE_IDS.zone, circleGeoJSON(p.centreLat, p.centreLng, p.radiusMeters));
     } else {
@@ -316,37 +375,31 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       });
       markersRef.current.push(marker);
     }
-    // Draggable corner markers + the drag-the-middle marker (Draw only).
-    if (draw && p.drawnBoundary && p.drawnBoundary.length >= 3) {
-      const poly = p.drawnBoundary;
+    // Draggable numbered point markers + the drag-the-middle marker
+    // (Draw only). Points render from 1 — even a single placed point
+    // shows its marker, so the host sees every tap land. The middle
+    // marker appears once the draft encloses (3+ points).
+    if (draw && draft && draft.length >= 1) {
+      const poly = draft;
       poly.forEach((pt, i) => {
-        const selected = selectedCornerRef.current === i;
         const el = document.createElement('div');
-        // 48 px touch target (corner drag must work by touch at
+        // 48 px touch target (point drag must work by touch at
         // 360 px); touch-action none so a finger drag moves the
-        // corner instead of panning the map.
-        el.innerHTML = `<span role="button" aria-label="Corner ${i + 1} of ${poly.length}${selected ? ' — selected' : ''}. Drag to move, tap to select." style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50%;border:3px solid #B91C1C;background:${selected ? '#B91C1C' : '#fff'};color:${selected ? '#fff' : '#B91C1C'};font-weight:800;font-size:15px;cursor:grab;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">${i + 1}</span>`;
+        // point instead of panning the map.
+        el.innerHTML = `<span role="button" aria-label="Point ${i + 1} of ${poly.length} — drag to move." style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:50%;border:3px solid #B91C1C;background:#fff;color:#B91C1C;font-weight:800;font-size:15px;cursor:grab;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">${i + 1}</span>`;
         const marker = new lib.Marker({ element: el, draggable: true }).setLngLat([pt.lng, pt.lat]).addTo(map);
         marker.on('dragstart', () => { draggingRef.current = true; });
         marker.on('dragend', () => {
           draggingRef.current = false;
-          lastDragEndRef.current = Date.now();
           const ll = marker.getLngLat();
-          const cur = propsRef.current.drawnBoundary;
-          if (!cur) return;
+          const cur = draftRef.current;
           const next = cur.map((c, j) => (j === i ? { lat: ll.lat, lng: ll.lng } : c));
-          commitDraw(next, `Corner ${i + 1} moved.`);
-        });
-        el.addEventListener('click', () => {
-          // A click straight after a drag is the drag ending, not a tap.
-          if (Date.now() - lastDragEndRef.current < 250) return;
-          setSelectedCorner(i);
-          setAnnounce(`Corner ${i + 1} selected — tap “− Remove corner” to drop it, or drag it to move it.`);
+          updateDraft(next, `Point ${i + 1} moved.`);
         });
         markersRef.current.push(marker);
       });
-      // Middle marker: drag it to move the whole zone.
-      const centre = polygonCentroid(poly);
+      // Middle marker: drag it to move the whole draft.
+      const centre = poly.length >= 3 ? polygonCentroid(poly) : null;
       if (centre) {
         const el = document.createElement('div');
         el.innerHTML = '<span role="button" aria-label="Drag to move the whole zone." style="display:flex;align-items:center;justify-content:center;width:48px;height:48px;border-radius:10px;border:2px solid #fff;background:#B91C1C;color:#fff;font-weight:800;font-size:18px;cursor:move;box-shadow:0 1px 4px rgba(0,0,0,0.35);touch-action:none;">✥</span>';
@@ -355,10 +408,10 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
         marker.on('dragend', () => {
           draggingRef.current = false;
           const ll = marker.getLngLat();
-          const cur = propsRef.current.drawnBoundary;
-          const old = cur ? polygonCentroid(cur) : null;
-          if (!cur || !old) return;
-          commitDraw(translatePolygon(cur, ll.lat - old.lat, ll.lng - old.lng), 'Whole zone moved.');
+          const cur = draftRef.current;
+          const old = polygonCentroid(cur);
+          if (!old) return;
+          updateDraft(translatePolygon(cur, ll.lat - old.lat, ll.lng - old.lng), 'Whole zone moved.');
         });
         markersRef.current.push(marker);
       }
@@ -368,6 +421,10 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   useEffect(() => {
     let cancelled = false;
     (async () => {
+      // No Ola key configured — do NOT construct the map. The
+      // missing-key line renders below; the zone is still settable
+      // from the steppers / tap-to-place flow.
+      if (!isOlaConfigured()) return;
       let lib: MapLibreLib;
       try {
         lib = await loadMapLibre();
@@ -383,17 +440,17 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       if (!isWebGLSupported()) { return; }
       libRef.current = lib;
       const centre: [number, number] = value.centreLat != null && value.centreLng != null
-        ? [value.centreLng, value.centreLat] : BBOX_CENTRE;
+        ? [value.centreLng, value.centreLat] : MAP_INITIAL_CENTRE;
       let map: MapLibreMap;
       try {
         map = new lib.Map({
           container: ref.current,
-          style: OFFLINE_STYLE_URL,
+          style: OLA_STYLE_URL,
+          transformRequest: olaTransformRequest,
           center: centre,
-          zoom: value.centreLat != null ? 15 : OFFLINE_MAP_INITIAL_ZOOM,
-          minZoom: OFFLINE_MAP_MIN_ZOOM,
-          maxZoom: OFFLINE_MAP_MAX_ZOOM,
-          maxBounds: OFFLINE_MAP_MAX_BOUNDS,
+          zoom: value.centreLat != null ? 15 : OLA_MAP_INITIAL_ZOOM,
+          minZoom: OLA_MAP_MIN_ZOOM,
+          maxZoom: OLA_MAP_MAX_ZOOM,
           dragRotate: false,
           touchPitch: false,
           trackResize: true,
@@ -406,10 +463,19 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
         if (!e.lngLat) return;
         const p = propsRef.current;
         if (p.zoneShape === 'draw') {
-          // Draw mode: taps do not move anything — corners and the middle
-          // marker are dragged. Tapping only selects a corner (on the
-          // marker itself), never reshapes the zone by accident.
-          setAnnounce('Draw mode — drag a numbered corner to reshape the zone, or drag the ✥ marker in the middle to move the whole zone.');
+          // Draw mode: every tap drops a numbered point on the draft.
+          // 3 points enclose the zone; more taps add corners. The
+          // shape is only applied when the host taps DONE.
+          const next = addDrawPoint(draftRef.current, e.lngLat.lat, e.lngLat.lng);
+          setDraftPoints(next);
+          if (next.length < 3) {
+            setAnnounce(`Point ${next.length} placed — tap ${3 - next.length} more to enclose the zone.`);
+          } else {
+            setAnnounce(`Point ${next.length} placed — ${next.length} points enclose the zone. Drag a point to fine-tune, or tap DONE to apply it.`);
+          }
+          // Fit the camera to the new polygon the moment it first
+          // encloses, so the triangle is actually visible.
+          if (next.length === 3) fitToZone(map, { ...p, drawnBoundary: next });
         } else {
           onChangeRef.current({ ...p, centreLat: e.lngLat.lat, centreLng: e.lngLat.lng });
           setCentreSource('placed');
@@ -427,7 +493,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
         syncOverlays(map, lib, propsRef.current, null);
         // The centre may already be set (GPS landed before the map
         // finished loading): fit now, or the zone stays off-screen.
-        fitToZone(map, propsRef.current);
+        fitToZone(map, fitValue(propsRef.current));
       });
       // Container size changes leave the WebGL canvas at its old
       // size — blank or clipped — until resize() is called.
@@ -464,7 +530,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     // Centre/radius may have changed while the map was still
     // loading (fitSignal fired too early): fit here too, so the
     // zone is actually centred on the chosen centre.
-    fitToZone(map, value);
+    fitToZone(map, fitValue(value));
   });
 
   // Refit the camera to the whole zone when the host changes its size
@@ -476,7 +542,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !loadedRef.current) return;
-    fitToZone(map, value);
+    fitToZone(map, fitValue(value));
   }, [fitSignal]);
 
   /** Apply a GPS fix as the zone centre. Only a real GPS fix ever
@@ -485,20 +551,13 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   const applyFix = (fix: ForegroundFix) => {
     setCentreSource('gps');
     const p = propsRef.current;
-    if (p.zoneShape === 'draw' && p.drawnBoundary && p.drawnBoundary.length >= 3) {
-      // Move the whole drawn shape so its middle sits where the host stands.
-      const old = polygonCentroid(p.drawnBoundary);
-      const next = old ? translatePolygon(p.drawnBoundary, fix.lat - old.lat, fix.lng - old.lng) : p.drawnBoundary;
-      onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng, drawnBoundary: next });
-      setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. The drawn zone moved to where you are standing.`);
-    } else if (p.zoneShape === 'draw') {
-      // No shape yet: place the centre and draw the starting shape.
-      onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng, drawnBoundary: circlePolygon(fix.lat, fix.lng, p.radiusMeters, DRAW_DEFAULT_CORNERS) });
-      setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. Zone centre set to where you are standing.`);
-    } else {
-      onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng });
-      setAnnounce(`Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. Zone centre set to where you are standing.`);
-    }
+    // Draw mode: GPS sets the centre only — it never creates or
+    // moves the shape. The shape is where the host tapped it; moving
+    // it under them would fight the tap-to-place flow.
+    onChange({ ...p, centreLat: fix.lat, centreLng: fix.lng });
+    setAnnounce(p.zoneShape === 'draw'
+      ? `Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. Zone centre set to where you are standing. Tap the map to place the zone points.`
+      : `Your location found — GPS accuracy ±${Math.round(fix.accuracyMeters)} m. Zone centre set to where you are standing.`);
   };
 
   const handleLocError = (msg: string) => {
@@ -577,7 +636,7 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   const onKeyDown = (e: React.KeyboardEvent) => {
     const cLat = value.centreLat;
     const cLng = value.centreLng;
-    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') && (cLat == null || cLng == null)) {
+    if ((e.key === 'ArrowUp' || e.key === 'ArrowDown' || e.key === 'ArrowLeft' || e.key === 'ArrowRight') && (cLat == null || cLng == null) && value.zoneShape !== 'draw') {
       e.preventDefault();
       setAnnounce('Set the zone centre first — use your location or tap the map.');
       return;
@@ -589,8 +648,13 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       // Arrow keys move the zone by hand — the centre is no longer
       // the live GPS fix, so it is labelled as hand-placed.
       setCentreSource('placed');
-      if (value.zoneShape === 'draw' && value.drawnBoundary) {
-        commitDraw(translatePolygon(value.drawnBoundary, dLat, dLng), 'Whole zone moved.');
+      if (value.zoneShape === 'draw') {
+        // Draw points need no centre: arrows move the draft itself.
+        if (draftRef.current.length === 0) {
+          setAnnounce('Tap the map to place points first — there is no shape to move yet.');
+        } else {
+          updateDraft(translatePolygon(draftRef.current, dLat, dLng), 'Whole zone moved.');
+        }
       } else if (cLat != null && cLng != null) {
         onChange({ ...value, centreLat: cLat + dLat, centreLng: cLng + dLng });
       }
@@ -598,10 +662,15 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
     }
     if (e.key === '+' || e.key === '=') {
       e.preventDefault();
-      if (value.zoneShape === 'draw' && value.drawnBoundary) {
-        const dia = polygonDiameterMeters(value.drawnBoundary);
-        const target = dia + 100;
-        commitDraw(scalePolygonTowardCentroid(value.drawnBoundary, target / dia), 'Zone grew — about 100 m wider across.');
+      if (value.zoneShape === 'draw') {
+        const draft = draftRef.current;
+        if (draft.length < 3) {
+          setAnnounce('Tap at least 3 points first — there is no zone to grow yet.');
+        } else {
+          const dia = polygonDiameterMeters(draft);
+          const target = dia + 100;
+          updateDraft(scalePolygonTowardCentroid(draft, target / dia), 'Zone grew — about 100 m wider across.');
+        }
       } else {
         // No maximum (founder decision, 2026-11-17 — unlimited
         // past 1 km): + keeps growing the radius.
@@ -609,10 +678,15 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
       }
     } else if (e.key === '-' || e.key === '_') {
       e.preventDefault();
-      if (value.zoneShape === 'draw' && value.drawnBoundary) {
-        const dia = polygonDiameterMeters(value.drawnBoundary);
-        const target = Math.max(ZONE_RADIUS_MIN_M * 2, dia - 100);
-        commitDraw(scalePolygonTowardCentroid(value.drawnBoundary, target / dia), 'Zone shrank — about 100 m narrower across.');
+      if (value.zoneShape === 'draw') {
+        const draft = draftRef.current;
+        if (draft.length < 3) {
+          setAnnounce('Tap at least 3 points first — there is no zone to shrink yet.');
+        } else {
+          const dia = polygonDiameterMeters(draft);
+          const target = Math.max(ZONE_RADIUS_MIN_M * 2, dia - 100);
+          updateDraft(scalePolygonTowardCentroid(draft, target / dia), 'Zone shrank — about 100 m narrower across.');
+        }
       } else {
         onChange({ ...value, radiusMeters: Math.max(ZONE_RADIUS_MIN_M, value.radiusMeters - ZONE_RADIUS_STEP_M) });
       }
@@ -622,11 +696,10 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
   };
 
   const centreSet = value.centreLat != null && value.centreLng != null;
-  // The zone centre is outside the downloaded area: the pin still
-  // works, but no streets will show there. Plain words only — no
-  // fallback, no reload, no switcher.
-  const centreOutsideArea = centreSet && !isInsideOfflineMap(value.centreLat!, value.centreLng!);
-  const drawSize = drawn ? polygonDiameterMeters(drawn) : 0;
+  const drawSize = draftPoints.length >= 1 ? polygonDiameterMeters(draftPoints) : 0;
+  // True once the draft is exactly the applied shape — the status
+  // line says "zone applied" only then.
+  const draftApplied = drawPointsEqual(draftPoints, drawn);
 
   return (
     <div>
@@ -647,7 +720,11 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
         className="mapbox"
         role="region"
         aria-label={isDraw
-          ? (drawn ? `Drawn play zone — ${drawn.length} corners, about ${formatDistance(drawSize)} across.` : 'Drawn play zone — no shape yet. Use your location to place the starting shape.')
+          ? (draftPoints.length >= 3
+            ? `Drawn play zone — ${draftPoints.length} points, about ${formatDistance(drawSize)} across.${draftApplied ? ' Zone applied.' : ' Tap DONE to apply it.'}`
+            : draftPoints.length > 0
+              ? `Drawn play zone — ${draftPoints.length} point${draftPoints.length === 1 ? '' : 's'} placed. Tap the map to add more.`
+              : 'Drawn play zone — no points yet. Tap the map to place point 1.')
           : centreSet ? `Play zone map — centre set, about ${formatDistance(value.radiusMeters * 2)} across.` : 'Play zone map — tap the map to place the zone.'}
         tabIndex={0}
         onKeyDown={onKeyDown}
@@ -660,25 +737,23 @@ export default function PlayAreaMap({ value, onChange, fitSignal }: {
           <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '8px 12px' }} onClick={centreOnPin} aria-label="Centre the map on the zone centre">◎</button>
         </div>
       </div>
-      {centreOutsideArea ? (
-        <p className="small" role="status">{OUTSIDE_MAP_AREA_MESSAGE}</p>
-      ) : null}
+      {!isOlaConfigured() ? <p className="small" role="status">Map key not set — add NEXT_PUBLIC_OLA_MAPS_API_KEY in Vercel and redeploy.</p> : null}
       {isDraw ? (
         <>
-          <p><strong>Drawn zone:</strong> {drawn ? `${drawn.length} corners · about ${formatDistance(drawSize)} across` : 'not drawn yet — use your location to place the starting shape'}</p>
-          {drawn && centreSource === 'gps' && locAccuracy != null ? <p className="small">GPS fix — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m).</p> : null}
-          {drawn && centreSource === 'placed' ? <p className="small">Placed by hand on the map — not a GPS fix. Tap “Use my location” for your real position.</p> : null}
+          <p><strong>Drawn zone:</strong> {draftPoints.length === 0
+            ? 'not drawn yet — tap the map to place point 1'
+            : draftPoints.length < 3
+              ? `${draftPoints.length} point${draftPoints.length === 1 ? '' : 's'} placed — tap ${3 - draftPoints.length} more to enclose the zone`
+              : draftApplied
+                ? `${draftPoints.length} points · about ${formatDistance(drawSize)} across — zone applied`
+                : `${draftPoints.length} points · about ${formatDistance(drawSize)} across — tap DONE to apply the zone`}</p>
+          {centreSource === 'gps' && locAccuracy != null ? <p className="small">GPS fix — {locationPrecisionLabel(locAccuracy)} (GPS accuracy ±{Math.round(locAccuracy)} m).</p> : null}
+          {centreSource === 'placed' ? <p className="small">Placed by hand on the map — not a GPS fix. Tap “Use my location” for your real position.</p> : null}
           <p style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
-            <button type="button" className="btn btn-secondary" disabled={selectedCorner === null || !drawn || drawn.length <= 3} onClick={() => {
-              if (selectedCorner === null || !drawn) return;
-              const next = drawn.filter((_, j) => j !== selectedCorner);
-              setSelectedCorner(null);
-              commitDraw(next, `Corner ${selectedCorner + 1} removed — ${next.length} corners left.`);
-            }}>− Remove corner{selectedCorner !== null ? ` ${selectedCorner + 1}` : ''}</button>
-            <button type="button" className="btn btn-secondary" disabled={drawHistoryRef.current.length === 0} onClick={undoDraw}>Undo</button>
-            <button type="button" className="btn btn-secondary" disabled={!centreSet} onClick={startAgainDraw}>Start again</button>
+            <button type="button" className="btn btn-secondary" disabled={draftPoints.length === 0} onClick={undoDraw}>Undo</button>
+            <button type="button" className="btn btn-secondary" disabled={draftPoints.length === 0} onClick={redrawDraw}>Redraw</button>
+            <button type="button" className="btn" disabled={!canApplyDraw(draftPoints)} onClick={commitDraft}>Done</button>
           </p>
-          {selectedCorner !== null ? <p className="small" role="status">Corner {selectedCorner + 1} selected.</p> : null}
         </>
       ) : (
         <>

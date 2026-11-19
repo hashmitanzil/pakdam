@@ -1,145 +1,165 @@
 // Map tiles + location spec — TEXT/DOM assertions only, no screenshots.
-// Founder decision (2026-11-17 19:34 IST): ONE simple working map,
-// downloaded offline and bundled in the app, covering Doranda +
-// Hinoo, Ranchi, Jharkhand, for now. NO fallback / switcher /
-// reload. The full live map service is a SEPARATE later task.
+// Founder decision (2026-11-19): the bundled offline map is GONE —
+// the map is Ola Maps, fully: MapLibre GL JS + Ola Maps vector tiles
+// (`default-dark-standard`, world-wide), keyed by
+// NEXT_PUBLIC_OLA_MAPS_API_KEY. No bundled tiles, no maxBounds, no
+// downloaded-area guard, no fallback / switcher / reload.
+//
+// KEY SPLIT (this is the whole design of this file): CI has NO Ola
+// key, so the key is detected from the RENDERED page, never from env
+// (see detectOlaKey in ./helpers — it probes /create for the
+// missing-key line vs the map canvas, once per file in beforeAll).
+//   (a) NO key (CI): the map fails gracefully — the "Map key not
+//       set" message appears, the page does not crash (no uncaught
+//       exception), no api.olamaps.io request is ever made, and the
+//       game still works (geolocation, zone setup, match flow).
+//   (b) Key present: Ola tile/style requests go to api.olamaps.io,
+//       return HTTP 200, and EVERY one carries api_key (the style
+//       JSON's own URLs carry none — olaTransformRequest appends it);
+//       no other tile host is ever requested.
+// Tests that need a live map SKIP without a key; tests that do not
+// need the map run in both modes (denied state, numbered markers,
+// phone clipping, live-play HUD). The pin-drag / GPS-accuracy tests
+// live in map-accuracy.spec.ts with the same split.
 //
 // What the spec checks (no screenshots — gateway rule):
-//  (1) tile requests go ONLY to the bundled pack
-//      (/offline-map/tiles/{z}/{x}/{y}.jpg — served by Next.js from
-//      apps/web/public/offline-map/), return HTTP 200, no tile
-//      request fails, and the removed "The offline map tiles could
-//      not be loaded" banner stays gone (deleted per simplification
-//      plan §5c, 2026-11-18 — when every tile fails there is no
-//      banner any more, the tile assertions below fail outright
-//      instead of expecting a degraded state). No external tile
-//      host is ever requested: OpenFreeMap / Esri / OSM / CARTO /
-//      Google are all gone from the runtime map.
-//  (2) Use-my-location granted → YOU marker + centring; denied →
-//      NO banner and NO denied text at all on the setup screen
-//      (founder cleanup, 2026-11-18 — the denied-help line was
+//  (1) Ola tiles paint (key present) / graceful missing-key failure
+//      (no key) on host setup and on the live play map.
+//  (2) Use-my-location granted → YOU marker + centring (key only);
+//      denied → NO banner and NO denied text at all on the setup
+//      screen (founder cleanup, 2026-11-18 — the denied-help line was
 //      removed; the host just taps the map to place the zone), no
 //      Android/iOS enable steps.
-//  (3) No numbered test markers 1–4 on Circle setup / play maps.
+//  (3) No numbered test markers 1–4 on Circle setup / play maps
+//      (tap-to-place point markers appear only in Draw mode, only
+//      after the host taps the map).
 //  (4) Phone-width clipping: header, helper text, map controls.
-//  (5) Mode switch Circle ⇄ Draw clears every corner marker.
+//  (5) Draw tap-to-place: 3 taps enclose a triangle, Undo / Redraw /
+//      Done, point drag, and mode switch Circle ⇄ Draw clears every
+//      point marker (back to Draw starts clean, 0 points).
 //  (6) Live play: outside-zone banner and HUD do not hide under the
 //      sticky header.
 //
-// OFFLINE PACK (verified on disk, 2026-11-18 —
-// apps/web/scripts/download-offline-map.mjs): 1,038 bundled Esri
-// World Street Map raster JPEG tiles, zooms 12–17, bbox
-// 23.325–23.38 N / 85.285–85.355 E (Doranda + Hinoo), ~15 MB,
-// served by the raster style public/offline-map/style.json +
-// manifest.json. A sample tile (16/48301/28392.jpg) was visually
-// verified to paint real Ranchi streets. This REPLACED the earlier
-// PMTiles vector wiring (which needed vendored glyphs that were
-// never copied) and the older OpenFreeMap vector pack — there is
-// exactly one map, the raster tiles; no .pbf, no glyphs, no
-// pmtiles.js / basemaps.js at runtime.
 // In-page pixel sampling of the WebGL canvas (drawImage + readback)
 // is NOT viable: it returns blank (0 samples) even when the zone
 // circle and markers are painted, because the drawing buffer is
 // cleared after compositing. The network + banner + console trio
 // is the operative check; do not re-add a pixel gate.
-//  - The numbered 1–4 markers ARE the Draw-mode corner markers
-//    (PlayAreaMap renders corner numbers 1..N); they appear only in
-//    Draw mode and clear on switching to Circle (worker test below).
-//    The founder's "pink zone circle + 1–4" is Draw mode with its
-//    corners showing — the open question for the founder is whether
-//    Draw corners should keep their numbers at all.
+//  - The numbered 1–4 markers ARE the Draw-mode tap-to-place point
+//    markers (PlayAreaMap renders a numbered marker per tap, 1..N);
+//    they appear only in Draw mode, only after the host taps the map,
+//    and clear on switching to Circle (draw tests below). The
+//    founder's "pink zone circle + 1–4" is Draw mode with its points
+//    showing.
 //  - The denied state takes up to ~20 s (geolocation timeout is 15 s).
 //    The setup screen shows NO denied banner and NO denied text
 //    (founder cleanup, 2026-11-18 removed the denied-help line from
 //    the setup screen — the play page still shows it, via its own
 //    locError), so the denied test below asserts the absence of both
 //    instead of asserting the old short line.
-import { test, expect, type Page } from '@playwright/test';
-import { expectNoOverflow, startMatch } from './helpers';
+import { test, expect, type BrowserContext, type Page } from '@playwright/test';
+import {
+  assertNoPageErrors,
+  assertOlaTilesPaint,
+  collectOlaRequests,
+  collectPageErrors,
+  detectOlaKey,
+  MISSING_KEY_TEXT,
+  roomState,
+  startMatch,
+  waitForMapOrMissingKey,
+  expectNoOverflow,
+} from './helpers';
 
-interface TileHit { url: string; status: number }
-interface TileFail { url: string; error: string }
-interface TileLog { hits: TileHit[]; fails: TileFail[]; consoleTileErrors: string[] }
+/** True when the rendered app has an Ola Maps key (probed once per
+ *  file — see detectOlaKey). Key-gated tests skip without a key;
+ *  no-key tests skip with one. */
+let OLA_KEY_PRESENT = false;
+
+test.beforeAll(async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const probe = await ctx.newPage();
+  OLA_KEY_PRESENT = await detectOlaKey(probe);
+  await ctx.close();
+});
 
 /** The MapLibre WebGL canvas (the only map view — no Leaflet
- *  fallback, by founder decision 2026-11-17). */
+ *  fallback, by founder decision 2026-11-17). Only exists when an
+ *  Ola key is configured; without one the map is never constructed. */
 const MAP_CANVAS = '.mapbox .maplibregl-canvas';
 /** YOU marker: a MapLibre marker (the red pin). */
 const YOU_MARKER = '.mapbox .maplibregl-marker';
 
-/** Collect tile responses AND failed tile requests (a failed request
- *  fires no `response` event, so counting responses alone reads 0
- *  when every tile fails at the network layer). Also collects
- *  tile-related console errors. */
-function collectTiles(page: Page): TileLog {
-  const hits: TileHit[] = [];
-  const fails: TileFail[] = [];
-  const consoleTileErrors: string[] = [];
-  // The ONLY tile host the app may request: the bundled offline
-  // pack, served by Next.js from public/offline-map/. No external
-  // tile host (OpenFreeMap / Esri / OSM / CARTO / Google) may be
-  // requested at runtime — the map is offline by founder decision.
-  const TILE_HOST = /\/offline-map\/tiles\//;
-  page.on('response', (res) => {
-    if (TILE_HOST.test(res.url())) {
-      hits.push({ url: res.url(), status: res.status() });
-    }
-  });
-  page.on('requestfailed', (req) => {
-    if (TILE_HOST.test(req.url())) {
-      fails.push({ url: req.url(), error: req.failure()?.errorText ?? 'unknown' });
-    }
-  });
-  page.on('console', (msg) => {
-    if (msg.type() === 'error' && /offline-map|Failed to fetch/i.test(msg.text())) {
-      consoleTileErrors.push(msg.text().slice(0, 200));
-    }
-  });
-  return { hits, fails, consoleTileErrors };
-}
-
-function logTiles(where: string, t: TileLog): void {
-  const ok = t.hits.filter((h) => h.status === 200).length;
-  // Any non-200 is a tile failure of the painting layer — the pack
-  // is local files, so a 404 means a tile is missing from the bundle.
-  const bad = t.hits.filter((h) => h.status !== 200);
-  console.log(
-    `TILES ${where}: ${t.hits.length + t.fails.length} tile requests, ${ok} HTTP 200, ${bad.length} HTTP non-200, ${t.fails.length} network-failed` +
-      (t.fails.length ? ` — failures: ${[...new Set(t.fails.map((f) => f.error))].join(', ')}` : '') +
-      (bad.length ? ` — non-200: ${bad.map((b) => `${b.status} ${b.url.slice(0, 80)}`).join(' | ')}` : '') +
-      (t.hits.length ? ` — sample URL: ${t.hits[0]!.url.replace(/\/\d+\/\d+\/\d+\.jpg$/, '/{z}/{x}/{y}.jpg')}` : t.fails.length ? ' — NO TILE RESPONSES (all requests failed)' : ' — NO TILE REQUESTS AT ALL') +
-      (t.consoleTileErrors.length ? ` — console tile errors: ${t.consoleTileErrors.length}` : ''),
-  );
-}
-
-/** Wait 15 s (the founder's window), then demand painted tiles:
- *  HTTP 200 tile responses and no failures. The old degraded
- *  banner ("The offline map tiles could not be loaded") was
- *  deleted per simplification plan §5c, so when nothing paints
- *  there is no banner to expect — the 200-count assertion below
- *  fails outright instead. */
-async function assertTilesPaint(page: Page, t: TileLog, where: string): Promise<void> {
-  await page.waitForTimeout(15_000);
-  logTiles(where, t);
-  const ok = t.hits.filter((h) => h.status === 200).length;
-  // Non-200s fail the test. The pack is local files: a 404 from any
-  // path is a real tile failure (a tile missing from the bundle).
-  const bad = t.hits.filter((h) => h.status !== 200);
-  expect(ok, `${where}: expected tile requests to return HTTP 200 (got ${t.hits.length} responses, ${ok} OK, ${t.fails.length} network-failed)`).toBeGreaterThan(0);
-  expect(bad, `${where}: tile requests must not return HTTP errors`).toEqual([]);
-  await expect(page.getByText(/The offline map tiles could not be loaded/)).toHaveCount(0);
-  expect(t.consoleTileErrors, `${where}: console must not carry tile errors — ${t.consoleTileErrors.slice(0, 2).join(' | ')}`).toEqual([]);
-}
-
-/** No numbered markers 1–4 inside any map container on this page. */
+/** No numbered markers 1–4 inside any map container on this page.
+ *  The number text is the tap-placed point marker's own label, so
+ *  this helper is only used in Circle contexts — in Draw mode the
+ *  numbered point markers are expected (see the draw tests below). */
 async function assertNoNumberedMarkers(page: Page, where: string): Promise<void> {
   const markers = page.locator('.mapbox').getByText(/^[1-4]$/, { exact: true });
   await expect(markers, `${where}: numbered test markers 1–4 must not appear on a player-facing map`).toHaveCount(0);
 }
 
-test('map tiles paint on host setup (PlayAreaMap) after 15 s', async ({ page, context }) => {
+// --- Draw tap-to-place helpers (founder spec, 2026-11-19) ---
+// Draw starts with NO shape: the host taps the map and a numbered
+// point drops per tap (1, 2, 3…); 3 taps enclose a triangle = the
+// zone, a 4th tap makes 4 corners, open-ended. Taps/drags edit a
+// LOCAL draft; DONE applies it to the room (drawnBoundary) — until
+// DONE the form validation sees no zone. All draw tests need a
+// constructed map, so they skip without an Ola key.
+
+/** The draggable numbered point markers inside the map box. */
+const pointMarkers = (page: Page) => page.locator('.mapbox [aria-label^="Point "]');
+/** The middle ✥ marker — appears only at 3+ points, drags the
+ *  whole draft. */
+const middleMarker = (page: Page) => page.getByLabel(/Drag to move the whole zone/);
+
+/** Open /create with GPS granted, wait for the map canvas, switch
+ *  to Draw. Leaves the page in Draw mode with 0 points placed. */
+async function gotoDrawSetup(page: Page, context: BrowserContext, codename: string): Promise<void> {
+  await context.grantPermissions(['geolocation']);
+  await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
+  await page.goto('/create');
+  await page.getByLabel(/codename/i).fill(codename);
+  await page.getByRole('button', { name: /Use my location/ }).click();
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
+  await expect(page.locator(MAP_CANVAS).first()).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('radio', { name: /Draw/ }).check();
+}
+
+/** Tap the map at a position inside the visible map box. Positions
+ *  are spread across the box and away from the zoom controls
+ *  (top-right) and from points already placed, so a tap lands on
+ *  the map — not on an existing marker. */
+async function tapDrawPoint(page: Page, x: number, y: number): Promise<void> {
+  await page.locator('.mapbox').click({ position: { x, y } });
+}
+
+/** Read one marker's box from the page until two reads 200 ms apart
+ *  agree — the same settled-box pattern as the pin-drag test in
+ *  map-accuracy.spec.ts (PlayAreaMap rebuilds markers on each sync
+ *  and fitToZone flies the camera, so a single-shot boundingBox()
+ *  can catch a mid-swap element and return null). */
+async function settledMarkerBox(page: Page, selector: string): Promise<{ x: number; y: number; width: number; height: number }> {
+  const deadline = Date.now() + 30_000;
+  let prev: { x: number; y: number; width: number; height: number } | null = null;
+  while (Date.now() <= deadline) {
+    const cur = await page.evaluate((sel): { x: number; y: number; width: number; height: number } | null => {
+      const el = document.querySelector(sel);
+      if (!el) return null;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0 ? { x: r.x, y: r.y, width: r.width, height: r.height } : null;
+    }, selector);
+    if (cur && prev && Math.abs(cur.x - prev.x) < 1 && Math.abs(cur.y - prev.y) < 1) return cur;
+    prev = cur;
+    await page.waitForTimeout(200);
+  }
+  throw new Error(`marker box never settled for ${selector} (last: ${JSON.stringify(prev)})`);
+}
+
+test('Ola tiles paint on host setup (PlayAreaMap) after 15 s', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — Ola tile tests need NEXT_PUBLIC_OLA_MAPS_API_KEY');
   test.setTimeout(120_000);
-  const tiles = collectTiles(page);
+  const ola = collectOlaRequests(page);
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.goto('/create');
@@ -163,21 +183,66 @@ test('map tiles paint on host setup (PlayAreaMap) after 15 s', async ({ page, co
   // still run even when the tile assertion below fails.
   await assertNoNumberedMarkers(page, 'host-setup @create');
   await expectNoOverflow(page, 'host-setup @create');
-  await assertTilesPaint(page, tiles, 'host-setup @create');
+  await assertOlaTilesPaint(page, ola, 'host-setup @create');
 });
 
-test('map tiles paint on the live play map after 15 s', async ({ page, context }) => {
+test('Ola tiles paint on the live play map after 15 s', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — Ola tile tests need NEXT_PUBLIC_OLA_MAPS_API_KEY');
   test.setTimeout(180_000);
-  const tiles = collectTiles(page);
+  const ola = collectOlaRequests(page);
   await startMatch(page, context, { pickHunters: 'host' });
   const canvas = page.locator(MAP_CANVAS).first();
   await expect(canvas).toBeVisible({ timeout: 30_000 });
   await assertNoNumberedMarkers(page, 'play map');
   await expectNoOverflow(page, 'play map');
-  await assertTilesPaint(page, tiles, 'play map');
+  await assertOlaTilesPaint(page, ola, 'play map');
+});
+
+test('no Ola key: missing-key message on host setup, no crash, no Ola requests', async ({ page, context }) => {
+  test.skip(OLA_KEY_PRESENT, 'an Ola key is configured — this test asserts the no-key graceful failure');
+  test.setTimeout(120_000);
+  const pageErrors = collectPageErrors(page);
+  const ola = collectOlaRequests(page);
+  await context.grantPermissions(['geolocation']);
+  await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
+  await page.goto('/create');
+  await page.getByLabel(/codename/i).fill('No Key Host');
+  // The missing-key line (PlayAreaMap renders it when
+  // !isOlaConfigured()): the map is never constructed, so there is
+  // no canvas at all — and the game must not throw.
+  await expect(page.getByText(MISSING_KEY_TEXT).first()).toBeVisible();
+  await expect(page.locator(MAP_CANVAS)).toHaveCount(0);
+  // Let any late request settle, then prove the app never even tried
+  // to reach Ola: with no key there is nothing to authenticate.
+  await page.waitForTimeout(5_000);
+  expect(ola.hits, 'no-key: the app must make zero api.olamaps.io requests').toEqual([]);
+  expect(ola.fails, 'no-key: the app must make zero api.olamaps.io requests').toEqual([]);
+  // The setup still works without the map picture: geolocation lands
+  // and the centre is set — only the map picture is missing.
+  await page.getByRole('button', { name: /Use my location/ }).click();
+  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
+  assertNoPageErrors(pageErrors, 'no-key host setup');
+});
+
+test('no Ola key: missing-key banner on the live play map, no crash', async ({ page, context }) => {
+  test.skip(OLA_KEY_PRESENT, 'an Ola key is configured — this test asserts the no-key graceful failure');
+  test.setTimeout(180_000);
+  const pageErrors = collectPageErrors(page);
+  const ola = collectOlaRequests(page);
+  await startMatch(page, context, { pickHunters: 'host' });
+  // The play map's missing-key banner (MapView renders it when the
+  // map reports 'missing-key'): the game runs, the HUD shows the
+  // match, only the map picture is missing.
+  await expect(page.getByText(/Map key not set — add NEXT_PUBLIC_OLA_MAPS_API_KEY in Vercel \(Production \+ Preview\) and redeploy\. The game still works without the map picture\./)).toBeVisible();
+  await expect(page.locator(MAP_CANVAS)).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Match status' })).toContainText('Active — hunt on');
+  expect(ola.hits, 'no-key: the app must make zero api.olamaps.io requests').toEqual([]);
+  expect(ola.fails, 'no-key: the app must make zero api.olamaps.io requests').toEqual([]);
+  assertNoPageErrors(pageErrors, 'no-key play map');
 });
 
 test('Use my location granted: YOU marker appears and map centres on the fix', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — the YOU marker needs a constructed map');
   test.setTimeout(120_000);
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
@@ -192,7 +257,7 @@ test('Use my location granted: YOU marker appears and map centres on the fix', a
   // accuracy ±/i could never match (S-4, Meera re-review #2).
   await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   // The red YOU marker is a DOM marker inside the map box (a
-  // MapLibre marker on the offline map).
+  // MapLibre marker on the Ola map).
   const marker = page.locator(YOU_MARKER).first();
   await expect(marker).toBeVisible({ timeout: 15_000 });
   // Centred: the marker sits at (about) the middle of the map box.
@@ -211,8 +276,11 @@ test('Use my location denied: honest denied state with one short line, no silent
   // Fresh context, no geolocation grant: the browser denies it.
   await page.goto('/create');
   await page.getByLabel(/codename/i).fill('Denied Host');
-  // Hydration gate (see test 1): the click must land on a live button.
-  await expect(page.locator(MAP_CANVAS).first()).toBeVisible({ timeout: 30_000 });
+  // Hydration gate that works with AND without a key: the canvas
+  // when a key is configured, the missing-key line when it is not —
+  // a click before hydration lands on an unhydrated button and does
+  // nothing, either way.
+  await waitForMapOrMissingKey(page);
   await page.getByRole('button', { name: /Use my location/ }).click();
   // Founder cleanup, 2026-11-18: the denied-help line ("Location is
   // off — allow it in your browser settings, then tap the map to
@@ -259,14 +327,14 @@ test('no numbered test markers 1–4 on the default Circle setup map', async ({ 
   await page.getByLabel(/codename/i).fill('Circle Host');
   await page.getByRole('button', { name: /Use my location/ }).click();
   await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
-  // Default shape is Circle: no corner markers of any kind.
+  // Default shape is Circle: no point markers of any kind.
   await assertNoNumberedMarkers(page, 'Circle setup map');
-  // NOTE: Draw mode numbers its corners by design (PlayAreaMap
-  // renders corner markers labelled 1..N) — that is the only
-  // numbered-marker code in the app, and it must only appear after
-  // the host explicitly switches to Draw. The founder's screenshot
-  // showed 1–4 on a pink zone map, which is Draw mode with its
-  // corners showing.
+  // NOTE: Draw mode numbers its tap-placed points by design
+  // (PlayAreaMap renders a numbered marker per tap, 1..N) — that
+  // is the only numbered-marker code in the app, and it must only
+  // appear after the host explicitly switches to Draw AND taps the
+  // map. The founder's screenshot showed 1–4 on a pink zone map,
+  // which is Draw mode with its points showing.
   await expectNoOverflow(page, 'Circle setup map');
 });
 
@@ -285,7 +353,11 @@ test('phone-width clipping: header, helper text and map controls stay inside the
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await phone.goto('/create');
   await phone.getByLabel(/codename/i).fill('Clip Host');
-  await expect(phone.locator(MAP_CANVAS).first()).toBeVisible({ timeout: 30_000 });
+  // With a key the map canvas must appear; without one the
+  // missing-key line appears instead — either proves hydration, and
+  // the header/helper checks below run in both modes. Only the map
+  // controls check needs a constructed map.
+  await waitForMapOrMissingKey(phone);
   const innerWidth = await phone.evaluate(() => window.innerWidth);
   expect(innerWidth, 'phone viewport is 390px wide').toBe(390);
   const header = phone.locator('header').first();
@@ -313,53 +385,183 @@ test('phone-width clipping: header, helper text and map controls stay inside the
   const helperTop1 = (await helper.boundingBox())!.y;
   expect(helperTop1, 'helper text must start below the sticky header after scrolling').toBeGreaterThanOrEqual(headerBottom - 1);
   // Every map control (zoom, attribution) sits inside the viewport —
-  // MapLibre controls on the offline map.
-  const mapControls = phone.locator('.mapbox button, .mapbox .maplibregl-ctrl-attrib button');
-  const count = await mapControls.count();
-  expect(count, 'map must expose controls on a phone').toBeGreaterThan(0);
-  for (let i = 0; i < count; i++) {
-    const box = await mapControls.nth(i).boundingBox();
-    if (!box) continue;
-    expect(box.x, `map control ${i} must not clip off the left edge`).toBeGreaterThanOrEqual(-1);
-    expect(box.x + box.width, `map control ${i} must not clip off the right edge`).toBeLessThanOrEqual(innerWidth + 1);
+  // MapLibre controls on the Ola map. Only when a key is configured:
+  // without one there is no map and no controls to clip.
+  if (OLA_KEY_PRESENT) {
+    const mapControls = phone.locator('.mapbox button, .mapbox .maplibregl-ctrl-attrib button');
+    const count = await mapControls.count();
+    expect(count, 'map must expose controls on a phone').toBeGreaterThan(0);
+    for (let i = 0; i < count; i++) {
+      const box = await mapControls.nth(i).boundingBox();
+      if (!box) continue;
+      expect(box.x, `map control ${i} must not clip off the left edge`).toBeGreaterThanOrEqual(-1);
+      expect(box.x + box.width, `map control ${i} must not clip off the right edge`).toBeLessThanOrEqual(innerWidth + 1);
+    }
   }
   await expectNoOverflow(phone, 'phone-width clipping @create');
   await context.close();
 });
 
-test('mode switch: Draw → Circle clears every corner marker; back to Draw starts clean', async ({ page, context }) => {
+test('draw (a): 3 taps enclose a triangle, 4th tap makes 4 points', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — tap-to-place needs a constructed map');
   test.setTimeout(120_000);
-  await context.grantPermissions(['geolocation']);
-  await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
-  await page.goto('/create');
-  await page.getByLabel(/codename/i).fill('Switch Host');
-  await page.getByRole('button', { name: /Use my location/ }).click();
-  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
-  // The centre pin is synced only after the map exists; wait for it
-  // (a slow map load would otherwise read 0 before the map is ready).
-  await expect(page.locator(YOU_MARKER).first()).toBeVisible({ timeout: 30_000 });
-  const corners = page.locator('[aria-label^="Corner "]');
-  // Circle is the default: no corner markers at all.
-  await expect(corners).toHaveCount(0);
+  await gotoDrawSetup(page, context, 'Draw Host');
+  // Draw starts with NO shape: no point markers, no middle marker,
+  // Undo / Redraw / Done disabled, "not drawn yet" status.
+  await expect(pointMarkers(page)).toHaveCount(0);
+  await expect(middleMarker(page)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Redraw', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeDisabled();
+  await expect(page.getByText(/not drawn yet — tap the map to place point 1/i)).toBeVisible();
+  // Tap 1: one numbered marker, "tap 2 more" status + announce.
+  await tapDrawPoint(page, 200, 100);
+  await expect(pointMarkers(page)).toHaveCount(1);
+  await expect(page.getByLabel(/Point 1 of 1 — drag to move\./)).toBeVisible();
+  await expect(page.getByText(/1 point placed — tap 2 more to enclose the zone/i)).toBeVisible();
+  await expect(page.getByText(/Point 1 placed — tap 2 more to enclose the zone\./)).toBeVisible();
+  // Tap 2: two markers, still unenclosed.
+  await tapDrawPoint(page, 420, 100);
+  await expect(pointMarkers(page)).toHaveCount(2);
+  await expect(page.getByText(/2 points placed — tap 1 more to enclose the zone/i)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeDisabled();
+  // Tap 3: the triangle encloses — 3 markers, the middle ✥ marker,
+  // "tap DONE" status, and the map region names the enclosed zone.
+  await tapDrawPoint(page, 310, 230);
+  await expect(pointMarkers(page)).toHaveCount(3);
+  await expect(page.getByLabel(/Point 3 of 3 — drag to move\./)).toBeVisible();
+  await expect(middleMarker(page)).toBeVisible();
+  await expect(page.getByText(/3 points · about .* across — tap DONE to apply the zone/i)).toBeVisible();
+  await expect(page.getByText(/Point 3 placed — 3 points enclose the zone\. Drag a point to fine-tune, or tap DONE to apply it\./)).toBeVisible();
+  await expect(page.getByRole('region', { name: /Drawn play zone — 3 points, about .* across\. Tap DONE to apply it\./ })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeEnabled();
+  // Tap 4: 4 points, still unenclosed-applied — the zone is a draft
+  // until DONE, so the status still says "tap DONE".
+  await tapDrawPoint(page, 520, 200);
+  await expect(pointMarkers(page)).toHaveCount(4);
+  await expect(page.getByLabel(/Point 4 of 4 — drag to move\./)).toBeVisible();
+  await expect(page.getByText(/4 points · about .* across — tap DONE to apply the zone/i)).toBeVisible();
+});
+
+test('draw (b): Undo removes the last point, Redraw clears all', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — tap-to-place needs a constructed map');
+  test.setTimeout(120_000);
+  await gotoDrawSetup(page, context, 'Draw Undo Host');
+  await tapDrawPoint(page, 200, 100);
+  await tapDrawPoint(page, 420, 100);
+  await tapDrawPoint(page, 310, 230);
+  await expect(pointMarkers(page)).toHaveCount(3);
+  await expect(middleMarker(page)).toBeVisible();
+  // Undo: 3 → 2, the zone un-encloses — the middle marker goes and
+  // the status drops back to "tap 1 more".
+  await page.getByRole('button', { name: 'Undo', exact: true }).click();
+  await expect(pointMarkers(page)).toHaveCount(2);
+  await expect(middleMarker(page)).toHaveCount(0);
+  await expect(page.getByText(/2 points placed — tap 1 more to enclose the zone/i)).toBeVisible();
+  await expect(page.getByText(/Point 3 removed — 2 points left\./)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeDisabled();
+  // Redraw: every point goes, back to the clean start.
+  await page.getByRole('button', { name: 'Redraw', exact: true }).click();
+  await expect(pointMarkers(page)).toHaveCount(0);
+  await expect(page.getByText(/not drawn yet — tap the map to place point 1/i)).toBeVisible();
+  await expect(page.getByText(/Cleared — tap the map to place point 1\./)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Redraw', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeDisabled();
+});
+
+test('draw (c): Done applies the zone — status, Size across, create passes', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — tap-to-place needs a constructed map');
+  test.setTimeout(120_000);
+  await gotoDrawSetup(page, context, 'Draw Done Host');
+  await tapDrawPoint(page, 200, 100);
+  await tapDrawPoint(page, 420, 100);
+  await tapDrawPoint(page, 310, 230);
+  await expect(pointMarkers(page)).toHaveCount(3);
+  // Until DONE the form validation sees no zone: the draft error
+  // is live on the page (create/page.tsx renders draftErrors[0]).
+  await expect(page.getByText(/Draw the zone first — switch to Draw, tap at least 3 points on the map, then tap DONE\./)).toBeVisible();
+  // DONE applies the draft: "zone applied" status + announce, and
+  // the form's Size across line updates from "not drawn yet".
+  await page.getByRole('button', { name: 'Done', exact: true }).click();
+  await expect(page.getByText(/3 points · about .* across — zone applied/i)).toBeVisible();
+  await expect(page.getByText(/Zone applied — 3 points, about .* across\./)).toBeVisible();
+  await expect(page.getByText(/Size across: about .* across/i)).toBeVisible();
+  await expect(page.getByText(/Draw the zone first/)).toHaveCount(0);
+  // Validation passes now: with the safety confirmations checked,
+  // CREATE LOBBY creates a room whose stored zone is the drawn
+  // 3-point boundary (draftToConfig keeps drawnBoundary as-is).
+  await page.getByLabel(/I have checked the venue/i).check();
+  await page.getByLabel(/I will be on site/i).check();
+  await expect(page.getByRole('button', { name: /CREATE LOBBY/ })).toHaveAttribute('aria-disabled', 'false');
+  await page.getByRole('button', { name: /CREATE LOBBY/ }).click();
+  await expect(page).toHaveURL(/\/room\/[0-9a-f-]+$/);
+  const created = await roomState(page);
+  expect(created!.room.config.zoneShape).toBe('draw');
+  expect(created!.room.config.zone?.boundary).toHaveLength(3);
+});
+
+test('draw (d): a point marker drags — the point moves on screen', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — point markers need a constructed map');
+  test.setTimeout(120_000);
+  await gotoDrawSetup(page, context, 'Draw Drag Host');
+  await tapDrawPoint(page, 200, 100);
+  await tapDrawPoint(page, 420, 100);
+  await tapDrawPoint(page, 310, 230);
+  await expect(pointMarkers(page)).toHaveCount(3);
+  // The point marker's box must be read from a SETTLED map — the
+  // same measurement race as the pin-drag test in
+  // map-accuracy.spec.ts (marker rebuilds + camera flight).
+  const selector = '.mapbox [aria-label^="Point 1 of 3"]';
+  const box = await settledMarkerBox(page, selector);
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  await page.mouse.move(cx, cy);
+  await page.mouse.down();
+  await page.mouse.move(cx + 80, cy, { steps: 10 });
+  // The point moved east: measure WHILE the drag is still held.
+  // Once the mouse goes up, dragend commits the new point and the
+  // markers rebuild, so a post-drag screen position proves nothing
+  // about the drag — the mid-drag box is the evidence.
+  const boxMidDrag = await settledMarkerBox(page, selector);
+  expect(boxMidDrag.x, 'point marker must have moved east on screen').toBeGreaterThan(box.x + 20);
+  await page.mouse.up();
+  // The drag landed: the dragend announce ("Point 1 moved.").
+  await expect(page.getByText(/Point 1 moved\./)).toBeVisible();
+});
+
+test('draw (e): mode switch Draw → Circle clears every point marker; back to Draw starts clean', async ({ page, context }) => {
+  test.skip(!OLA_KEY_PRESENT, 'no Ola key configured — point markers need a constructed map');
+  test.setTimeout(120_000);
+  await gotoDrawSetup(page, context, 'Switch Host');
+  // Circle is the default: no point markers at all.
+  await expect(pointMarkers(page)).toHaveCount(0);
   // Circle mode: the Radius stepper is the size readout (the old
   // "Zone size:" line was removed in the founder cleanup,
   // 2026-11-18).
   await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('500m');
-  // Switch to Draw: 6 corners appear, with the Drawn-zone summary.
-  await page.getByRole('radio', { name: /Draw/ }).check();
-  await expect(corners).toHaveCount(6);
+  // Draw + 3 taps: 3 point markers, the middle marker, the
+  // Drawn-zone summary.
+  await tapDrawPoint(page, 200, 100);
+  await tapDrawPoint(page, 420, 100);
+  await tapDrawPoint(page, 310, 230);
+  await expect(pointMarkers(page)).toHaveCount(3);
+  await expect(middleMarker(page)).toBeVisible();
   await expect(page.getByText(/Drawn zone:/)).toBeVisible();
-  // Back to Circle: every corner marker and the polygon are gone,
+  // Back to Circle: every point marker and the polygon are gone,
   // only the circle zone remains (centre + size lines back).
   await page.getByRole('radio', { name: /Circle/ }).check();
-  await expect(corners).toHaveCount(0);
+  await expect(pointMarkers(page)).toHaveCount(0);
+  await expect(middleMarker(page)).toHaveCount(0);
   await expect(page.getByText(/Drawn zone:/)).toHaveCount(0);
   await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
   await expect(page.getByRole('group', { name: 'Radius' }).locator('output')).toHaveText('500m');
-  // Back to Draw: starts clean with a fresh regular polygon — the
-  // circle is gone, 6 corners again, Drawn-zone summary back.
+  // Back to Draw: starts clean with NO points — the host taps again
+  // from scratch (no restored shape, no stale draft).
   await page.getByRole('radio', { name: /Draw/ }).check();
-  await expect(corners).toHaveCount(6);
+  await expect(pointMarkers(page)).toHaveCount(0);
+  await expect(page.getByText(/not drawn yet — tap the map to place point 1/i)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeDisabled();
   await expect(page.getByText(/Drawn zone:/)).toBeVisible();
   await expect(page.getByText(/Zone size:/)).toHaveCount(0);
 });
@@ -367,7 +569,10 @@ test('mode switch: Draw → Circle clears every corner marker; back to Draw star
 test('live play: outside-zone banner and HUD do not hide under the sticky header', async ({ page, context }) => {
   test.setTimeout(180_000);
   await startMatch(page, context, { pickHunters: 'host' });
-  await expect(page.locator(MAP_CANVAS).first()).toBeVisible({ timeout: 30_000 });
+  // With a key the map canvas must appear; without one the
+  // missing-key banner appears instead — either proves the play page
+  // hydrated, and the HUD/banner checks below run in both modes.
+  await waitForMapOrMissingKey(page);
   const headerBox = await page.locator('header').first().boundingBox();
   expect(headerBox, 'header must have a box').not.toBeNull();
   const headerBottom = headerBox!.y + headerBox!.height;
@@ -390,13 +595,13 @@ test('live play: outside-zone banner and HUD do not hide under the sticky header
     const bannerBox = await banner.first().boundingBox();
     expect(bannerBox, 'outside-zone banner must have a box').not.toBeNull();
     expect(bannerBox!.y, 'outside-zone banner must start below the sticky header').toBeGreaterThanOrEqual(headerBottom - 1);
-    // The moved fix (23.42, 85.33) is also OUTSIDE the downloaded map
-    // area (the bbox tops out at 23.38 N), so the play map must
-    // show the outside-area message (OUTSIDE_MAP_AREA_MESSAGE,
-    // MapLibreMapView.tsx). Plain words only: no lat/lng, no
-    // fallback, no switcher, no reload. It rides the same fix as
-    // the zone banner above, so it appears with it.
-    await expect(page.getByText(/Offline map: downloaded area only/)).toBeVisible();
+    // The moved fix (23.42, 85.33) is OUTSIDE the zone — but the map
+    // is Ola now, world-wide: there is NO downloaded area any more,
+    // so NO "downloaded area only" caption can ever appear. The old
+    // assertion had it VISIBLE here (it was the offline map's
+    // outside-area message); the new reality is its absence.
+    await expect(page.getByText(/Offline map: downloaded area only/)).toHaveCount(0);
+    await expect(page.getByText(/Map downloaded for Ranchi only/)).toHaveCount(0);
   } catch {
     console.log('OUTSIDE-ZONE banner did not appear after moving the fix outside — HUD check above still stands; watch delivery in headless Chromium is the suspect, not the header layout.');
   }

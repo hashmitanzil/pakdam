@@ -2,14 +2,37 @@
 // screenshots. Drives the REAL flows in a browser on phone width:
 // create → join → lobby → start → play → ping → catch (QR scan
 // attempt + manual-confirm fallback) → outside-zone countdown →
-// SOS → results. Plus: the map actually renders (canvas + real
-// tiles), the GPS-denied fallback is honest, no console errors, no
-// overflow / clipping / dead tap targets / overlapping text on any
-// screen, and the hamburger menu (built — TopBar renders it on
-// phones, desktop keeps the tab row).
+// SOS → results. Plus: the map renders (canvas + real Ola tiles
+// when a key is configured; the "Map key not set" banner when it is
+// not — the game still plays either way), the GPS-denied fallback
+// is honest, no console errors, no overflow / clipping / dead tap
+// targets / overlapping text on any screen, and the hamburger menu
+// (built — TopBar renders it on phones, desktop keeps the tab row).
 // Runs ONLY on the brutal-phone project (390x844, touch).
 import { test, expect, type BrowserContext, type Page } from '@playwright/test';
-import { addRealPlayers, expectNoOverflow, roomState, setPlayer } from './helpers';
+import {
+  addRealPlayers,
+  assertOlaTilesPaint,
+  collectOlaRequests,
+  detectOlaKey,
+  expectNoOverflow,
+  MISSING_KEY_TEXT,
+  roomState,
+  setPlayer,
+} from './helpers';
+
+/** True when the rendered app has an Ola Maps key (probed once per
+ *  file — see detectOlaKey in ./helpers). The map assertions below
+ *  branch on it: canvas + Ola tiles with a key, missing-key banner
+ *  without one. The rest of the flow runs in both modes. */
+let OLA_KEY_PRESENT = false;
+
+test.beforeAll(async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const probe = await ctx.newPage();
+  OLA_KEY_PRESENT = await detectOlaKey(probe);
+  await ctx.close();
+});
 
 const KEY_ROUTES = [
   '/', '/create', '/join', '/host',
@@ -197,12 +220,20 @@ test('brutal: GPS denied shows an honest fallback on host setup', async ({ page 
   await expect(createBtn).toHaveAttribute('aria-disabled', 'true');
   await createBtn.click({ force: true });
   await expect(page.getByText(/Set the zone centre first/)).toBeVisible();
-  const canvas = page.locator('.mapbox .maplibregl-canvas').first();
-  await expect(canvas).toBeVisible();
-  const box = await canvas.boundingBox();
-  expect(box, 'map canvas must render even without GPS').not.toBeNull();
-  expect(box!.width).toBeGreaterThan(0);
-  expect(box!.height).toBeGreaterThan(0);
+  // The map still renders even without GPS — canvas with a key,
+  // missing-key line without one (the map is never constructed
+  // without a key, so there is no canvas to expect then).
+  if (OLA_KEY_PRESENT) {
+    const canvas = page.locator('.mapbox .maplibregl-canvas').first();
+    await expect(canvas).toBeVisible();
+    const box = await canvas.boundingBox();
+    expect(box, 'map canvas must render even without GPS').not.toBeNull();
+    expect(box!.width).toBeGreaterThan(0);
+    expect(box!.height).toBeGreaterThan(0);
+  } else {
+    await expect(page.getByText(MISSING_KEY_TEXT).first()).toBeVisible();
+    await expect(page.locator('.mapbox .maplibregl-canvas')).toHaveCount(0);
+  }
 });
 
 test('brutal: full end-to-end on 390px touch — create to results', async ({ page, context }) => {
@@ -210,12 +241,10 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   const bucket: ErrorBucket = { consoleErrors: [], pageErrors: [] };
   attachToContext(context, bucket);
   attachErrorCollectors(page, bucket);
-  const tileResponses: { url: string; status: number }[] = [];
-  page.on('response', (res) => {
-    if (/\/offline-map\/tiles\//.test(res.url())) {
-      tileResponses.push({ url: res.url().slice(0, 80), status: res.status() });
-    }
-  });
+  // Ola requests on the host-setup page (style + tiles + sprites +
+  // glyphs). With a key they must all carry api_key and return 200;
+  // without a key there must be none at all.
+  const ola = collectOlaRequests(page);
 
   // --- Landing ---
   await page.goto('/');
@@ -224,7 +253,8 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   await assertNoOverlap(page, 'landing @390px');
   await assertTapTargets(page, 'landing @390px');
 
-  // --- Create: map REALLY renders (canvas + real tiles, not a container) ---
+  // --- Create: map REALLY renders (canvas + real Ola tiles, not a
+  // container) — or, without a key, the missing-key line instead. ---
   await context.grantPermissions(['geolocation']);
   await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
   await page.goto('/create');
@@ -240,14 +270,19 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   // simplification round (§5c) — the centre-set evidence now is
   // the "Location found — … (GPS accuracy ±N m)" status line.
   await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
-  const setupCanvas = page.locator('.mapbox .maplibregl-canvas').first();
-  await expect(setupCanvas).toBeVisible({ timeout: 30_000 });
-  const setupBox = await setupCanvas.boundingBox();
-  expect(setupBox, 'host-setup map canvas must render').not.toBeNull();
-  expect(setupBox!.width).toBeGreaterThan(100);
-  expect(setupBox!.height).toBeGreaterThan(100);
-  await expect(page.getByText(/The offline map tiles could not be loaded/)).toHaveCount(0);
-  await expect.poll(() => tileResponses.filter((t) => t.status === 200).length, { timeout: 30_000 }).toBeGreaterThan(0);
+  if (OLA_KEY_PRESENT) {
+    const setupCanvas = page.locator('.mapbox .maplibregl-canvas').first();
+    await expect(setupCanvas).toBeVisible({ timeout: 30_000 });
+    const setupBox = await setupCanvas.boundingBox();
+    expect(setupBox, 'host-setup map canvas must render').not.toBeNull();
+    expect(setupBox!.width).toBeGreaterThan(100);
+    expect(setupBox!.height).toBeGreaterThan(100);
+    await assertOlaTilesPaint(page, ola, 'brutal host setup');
+  } else {
+    await expect(page.getByText(MISSING_KEY_TEXT).first()).toBeVisible();
+    await expect(page.locator('.mapbox .maplibregl-canvas')).toHaveCount(0);
+    expect(ola.hits, 'no-key: the app must make zero api.olamaps.io requests').toEqual([]);
+  }
   // Default strip (roomSummaryStrip, draft.ts:210): 500 m radius,
   // Balance ON with no roster known -> 1 hunter, 3 min ping -> "3m",
   // 30 min -> "30m".
@@ -336,12 +371,21 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   await assertTapTargets(page, 'play @390px');
 
   // --- Ping (Hunter tool): two simulated pings; with Show ping
-  // history ON (toggled above) the areas stay rendered with ages. ---
+  // history ON (toggled above) the areas stay rendered with ages.
+  // The ping-area caption renders inside the map view, so it only
+  // exists with a key — without one the play map shows the
+  // missing-key banner instead and the pings still land (the Radar
+  // tab proves it below is map-independent). ---
   await page.getByRole('tab', { name: 'Radar' }).click();
   await page.getByRole('button', { name: /Simulate a scheduled ping/i }).click();
   await page.getByRole('button', { name: /Simulate a scheduled ping/i }).click();
   await page.getByRole('tab', { name: 'Map' }).click();
-  await expect(page.getByText(/Shaded blue areas: Nearest ping area \(/)).toBeVisible();
+  if (OLA_KEY_PRESENT) {
+    await expect(page.getByText(/Shaded blue areas: Nearest ping area \(/)).toBeVisible();
+  } else {
+    await expect(page.getByText(/Map key not set — add NEXT_PUBLIC_OLA_MAPS_API_KEY in Vercel \(Production \+ Preview\) and redeploy\. The game still works without the map picture\./)).toBeVisible();
+    await expect(page.getByText(/Shaded blue areas:/)).toHaveCount(0);
+  }
 
   // --- SOS asks for confirmation, then tells the host. ---
   page.once('dialog', (d) => d.accept());

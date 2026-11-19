@@ -1,4 +1,4 @@
-/** Shared props for the map view — one contract: the offline
+/** Shared props for the map view — one contract: the Ola
  *  MapLibre view draws the zone, next zone, ping areas, no-go areas,
  *  and own location as an uncertainty circle. Coordinates live here
  *  only as numbers in props; the view never renders them as text
@@ -31,8 +31,11 @@ export interface MapViewProps extends OverlayProps {
   /** Keyboard panning. Host setup passes false so arrow keys move the
    *  zone instead of panning the map. Defaults to true. */
   keyboardPan?: boolean;
-  /** Called when the view cannot initialise (no WebGL / library
-   *  failed to load) so the parent can show an honest error instead
-   *  of a blank map. There is no fallback view, by founder decision. */
-  onInitFailed?: () => void;
+  /** Called when the view cannot initialise so the parent can show
+   *  an honest error instead of a blank map. Reason is
+   *  'missing-key' when no Ola Maps API key is configured, or
+   *  'load-failed' for no WebGL / library / style load failure
+   *  (undefined keeps the old no-arg behaviour). There is no
+   *  fallback view, by founder decision. */
+  onInitFailed?: (reason?: 'missing-key' | 'load-failed') => void;
 }

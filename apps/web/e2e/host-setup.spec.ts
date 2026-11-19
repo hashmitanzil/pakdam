@@ -55,20 +55,51 @@ test('host setup: every stepper and toggle moves the live summary strip', async 
   // simplification §5c — assert the removed text stays gone.
   await expect(page.getByText(/Radius at least 100 m, no maximum/i)).toHaveCount(0);
 
-  // --- Draw mode: corners stepper appears, size-across line updates. ---
+  // --- Draw mode: tap-to-place, NO default shape, NO Corners
+  // stepper (founder spec, 2026-11-19). Switching to Draw creates
+  // no shape: no point markers, Undo / Redraw / Done present with
+  // Done disabled under 3 points, "not drawn yet" status + Size
+  // across lines, and the validation error (create blocked until
+  // the host taps 3 points and DONE). No map taps here — the
+  // interactive tap/drag flow lives in map-tiles.spec.ts (key-gated).
   await page.getByRole('button', { name: /Use my location/ }).click();
   // The old "Zone centre: set" status line was removed in the
   // simplification round (§5c) — the centre-set evidence now is
   // the "Location found — … (GPS accuracy ±N m)" status line.
   await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
-  await page.getByRole('radio', { name: /Draw/ }).check();
-  // "6 corners" also appears in the map's "Drawn zone: 6 corners"
-  // line, so assert the Corners stepper's own output exactly.
-  await expect(page.getByRole('group', { name: 'Corners' }).locator('output')).toHaveText('6 corners');
-  await page.getByRole('button', { name: /Increase Corners/ }).click();
-  await expect(page.getByRole('group', { name: 'Corners' }).locator('output')).toHaveText('8 corners');
+  await page.getByRole('radio', { name: /Draw — your own shape on the map/ }).check();
+  await expect(page.getByRole('radio', { name: /Draw — your own shape on the map/ })).toBeChecked();
+  // No Corners stepper anywhere (the old "6 corners" default
+  // hexagon is gone — Draw starts with no shape at all).
+  await expect(page.getByRole('group', { name: 'Corners' })).toHaveCount(0);
+  await expect(page.getByText(/corners/i)).toHaveCount(0);
+  // No point markers yet, no drag-the-middle marker, no removed
+  // buttons ("Start again" / "Remove corner" never existed in the
+  // tap-to-place flow).
+  await expect(page.locator('[aria-label^="Point "]')).toHaveCount(0);
+  await expect(page.getByLabel(/Drag to move the whole zone/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Start again|Remove corner/ })).toHaveCount(0);
+  // Draw buttons: Undo / Redraw / Done, all disabled at 0 points
+  // (Done needs 3 points to enclose a zone).
+  await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Redraw', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Redraw', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Done', exact: true })).toBeDisabled();
+  // "Not drawn yet" status + Size across lines.
+  await expect(page.getByText(/Drawn zone:/)).toBeVisible();
+  await expect(page.getByText(/not drawn yet — tap the map to place point 1/i)).toBeVisible();
   await expect(page.getByText(/Size across:/)).toBeVisible();
+  await expect(page.getByText(/not drawn yet — tap the map to place points, then DONE/i)).toBeVisible();
+  // Validation blocks create until the zone is drawn + DONE:
+  // the draft error renders live (create/page.tsx renders
+  // draftErrors[0] as the alert) and CREATE LOBBY is aria-disabled.
+  await expect(page.getByText(/Draw the zone first — switch to Draw, tap at least 3 points on the map, then tap DONE\./)).toBeVisible();
+  await expect(page.getByRole('button', { name: /CREATE LOBBY/ })).toHaveAttribute('aria-disabled', 'true');
   await page.getByRole('radio', { name: /Circle/ }).check();
+  // Back in Circle mode the Draw validation error is gone.
+  await expect(page.getByText(/Draw the zone first/)).toHaveCount(0);
 
   // --- Players: Balance OFF reveals the Hunters stepper. ---
   await page.getByRole('switch', { name: 'Balance hunters' }).click();

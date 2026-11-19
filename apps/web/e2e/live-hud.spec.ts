@@ -1,15 +1,35 @@
 // Live HUD e2e — TEXT/DOM assertions only, no screenshots.
 // Covers the brief's live game: head-start tutorial, HUD (time left,
 // next ping, zone, runners left), persistent pings with an age that
-// counts up ("0:27 ago" clock), the ONE bundled offline map (no map
-// styles — no Standard / Dark / Satellite switcher), bottom tabs
+// counts up ("0:27 ago" clock), the ONE Ola map (no map styles — no
+// Standard / Dark / Satellite switcher), bottom tabs
 // Map / Radar / Radio, the Hunters radio channel, safety pause +
 // SOS + Get help, and the app-wide Dark mode — removed in the
 // simplification round (2026-11-18): there is no colour-blind theme
 // and no Dark mode toggle anywhere (see the last test, which asserts
 // the controls are gone from the More sheet and /accessibility).
 import { test, expect } from '@playwright/test';
-import { roomState, setPlayer, startMatch } from './helpers';
+import {
+  assertOlaTilesPaint,
+  collectOlaRequests,
+  detectOlaKey,
+  roomState,
+  setPlayer,
+  startMatch,
+} from './helpers';
+
+/** True when the rendered app has an Ola Maps key (probed once per
+ *  file — see detectOlaKey in ./helpers). The map test below runs in
+ *  both modes: canvas + api_key with a key, missing-key banner
+ *  without one. */
+let OLA_KEY_PRESENT = false;
+
+test.beforeAll(async ({ browser }) => {
+  const ctx = await browser.newContext();
+  const probe = await ctx.newPage();
+  OLA_KEY_PRESENT = await detectOlaKey(probe);
+  await ctx.close();
+});
 
 test('start → head-start tutorial → live HUD with time, ping, zone, runners', async ({ page, context }) => {
   test.setTimeout(120_000);
@@ -126,28 +146,32 @@ test('ping history ON keeps earlier ping areas visible (dimmer, with ages)', asy
   await expect(caption).toContainText(/Earlier pings stay visible \(dimmer\) because Show ping history is on/);
 });
 
-test('offline map: one bundled map, no style switcher, tiles come from the app', async ({ page, context }) => {
+test('Ola map: one map, no style switcher, tiles come from Ola (or the missing-key banner without a key)', async ({ page, context }) => {
   test.setTimeout(120_000);
+  const ola = collectOlaRequests(page);
   await startMatch(page, context, { pickHunters: 'host' });
   // ONE map, no switcher (founder decision, 2026-11-17): there is no
   // "Map style" group and no Standard / Satellite / Dark buttons.
   await expect(page.getByRole('group', { name: 'Map style' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Satellite', exact: true })).toHaveCount(0);
-  // The offline map is showing: the canvas, and NO caption. The
-  // bundled-map caption ('Offline map: downloaded area only',
-  // OFFLINE_MAP_AREA_MESSAGE) renders ONLY when the fix/centre is
-  // OUTSIDE the downloaded area (MapLibreMapView.tsx) — this test's
-  // fix (23.36, 85.33) is INSIDE, so the caption must NOT be there.
-  // The old assertion had it backwards and failed twice in CI run 5
-  // ("element(s) not found"). The map-tiles live-play test asserts
-  // the same caption VISIBLE, correctly, because its fix is outside.
-  await expect(page.locator('.mapbox .maplibregl-canvas').first()).toBeVisible({ timeout: 30_000 });
+  // With a key the Ola map is showing: the canvas, and its tile
+  // requests carry api_key. Without a key the map is never
+  // constructed and the missing-key banner shows instead — the game
+  // still runs either way.
+  if (OLA_KEY_PRESENT) {
+    await expect(page.locator('.mapbox .maplibregl-canvas').first()).toBeVisible({ timeout: 30_000 });
+    await assertOlaTilesPaint(page, ola, 'live HUD play map');
+  } else {
+    await expect(page.getByText(/Map key not set — add NEXT_PUBLIC_OLA_MAPS_API_KEY in Vercel \(Production \+ Preview\) and redeploy\. The game still works without the map picture\./)).toBeVisible();
+    await expect(page.locator('.mapbox .maplibregl-canvas')).toHaveCount(0);
+    expect(ola.hits, 'no-key: the app must make zero api.olamaps.io requests').toEqual([]);
+  }
+  // There is NO downloaded area any more (Ola is world-wide), so the
+  // old offline captions can never appear — the fix (23.36, 85.33)
+  // used to be "inside" the downloaded area, which is why the old
+  // test asserted these as absent; now they are absent because the
+  // strings no longer exist anywhere in the app.
   await expect(page.getByText(/Offline map: downloaded area only/)).toHaveCount(0);
-  // The fix (23.36, 85.33) is INSIDE the downloaded area, so the
-  // outside-area message must NOT show — it is the one exception
-  // that names Ranchi ("Map downloaded for Ranchi only") and only
-  // renders when the fix leaves the downloaded area (see
-  // map-tiles.spec.ts, live-play test).
   await expect(page.getByText(/Map downloaded for Ranchi only/)).toHaveCount(0);
   // The match still runs: the HUD shows the match.
   await expect(page.getByRole('region', { name: 'Match status' })).toContainText('Active — hunt on');
@@ -245,8 +269,8 @@ test('appearance: one dark theme — no colour-blind theme, no Dark mode toggle 
   // / High contrast settings still apply via the layout provider,
   // but there is no page that edits them any more. There is NO map
   // Dark style and no "Map style" setting any more (one-map
-  // decision, 2026-11-17): the map is one bundled offline map with
-  // no style switcher.
+  // decision, 2026-11-17): the map is the one Ola map
+  // (`default-dark-standard`) with no style switcher.
   await expect(sheet.getByLabel(/Colour-blind theme/)).toHaveCount(0);
   await expect(sheet.getByLabel(/Dark mode/)).toHaveCount(0);
   expect(await page.evaluate(() => document.documentElement.classList.contains('cb-theme'))).toBe(false);

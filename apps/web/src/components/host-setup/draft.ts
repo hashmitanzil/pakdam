@@ -36,7 +36,8 @@ export interface HostSetupDraft extends HouseRules {
   radiusMeters: number;
   noGoAreas: GeoPolygon[];
   /** 'circle' = radius stepper around the centre. 'draw' = a custom
-   *  polygon on the map (draggable corners). Circle stays the default. */
+   *  polygon on the map (tap-to-place numbered points — no default
+   *  shape). Circle stays the default. */
   zoneShape: 'circle' | 'draw';
   /** The drawn polygon (Draw mode only). Null until the host draws one. */
   drawnBoundary: GeoPolygon | null;
@@ -49,9 +50,6 @@ export interface HostSetupDraft extends HouseRules {
    *  with their stored value intact. */
   finalSizePercent: number | null;
 }
-
-export const DRAW_DEFAULT_CORNERS = 6;
-export const CORNER_STEPS = [3, 4, 5, 6, 8, 10, 12] as const;
 
 export const DURATION_STEPS_MIN = [5, 10, 15, 30, 45, 60, 90, 120, 180] as const;
 export const HEAD_START_STEPS_S = [0, 30, 90, 180, 300, 600, 900, 1800] as const;
@@ -106,14 +104,6 @@ export function shrinkScaleFactors(d: Pick<HostSetupDraft, 'zoneShrinkEnabled' |
   if (times.length === 0) return [];
   const final = effectiveFinalSizePercent(d) / 100;
   return times.map((_, i) => final ** ((i + 1) / times.length));
-}
-
-/** The starting drawn polygon for Draw mode: a regular N-gon around
- *  the current centre at the current radius. Null when no centre is
- *  set yet — the host must place the centre first. */
-export function drawnBoundaryFor(d: Pick<HostSetupDraft, 'centreLat' | 'centreLng' | 'radiusMeters'>, corners: number): GeoPolygon | null {
-  if (d.centreLat == null || d.centreLng == null) return null;
-  return circlePolygon(d.centreLat, d.centreLng, d.radiusMeters, Math.max(3, corners));
 }
 
 /** Resize a drawn polygon so its widest distance across equals the
@@ -233,7 +223,7 @@ export function validateDraft(d: HostSetupDraft): string[] {
   if (!d.playZoneEnabled) return e;
   if (d.zoneShape === 'draw') {
     if (!d.drawnBoundary || d.drawnBoundary.length < 3) {
-      e.push('Draw the zone first — switch to Draw and place at least 3 corners on the map.');
+      e.push('Draw the zone first — switch to Draw, tap at least 3 points on the map, then tap DONE.');
     } else {
       const dia = zoneDiameterMeters(d.drawnBoundary);
       if (dia < 200) e.push('Drawn zone must be at least 200 m across (no maximum).');

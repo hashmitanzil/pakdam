@@ -24,6 +24,12 @@ export interface RoomState {
       showPingHistory?: boolean;
       zoneShrinkEnabled?: boolean;
       zoneShrinkIntervalSeconds: number;
+      /** Drawn zone shape + boundary (drawnBoundary as stored by
+       *  draftToConfig) — needed by the draw Done-applies test
+       *  (map-tiles.spec.ts); the projection is otherwise a subset
+       *  of RoomConfig, not the whole type. */
+      zoneShape?: string;
+      zone?: { boundary: { lat: number; lng: number }[] };
     };
   };
   players: {
@@ -282,4 +288,122 @@ export async function boxSize(
     const r = el.getBoundingClientRect();
     return { width: r.width, height: r.height };
   }, selector);
+}
+
+// ---------------------------------------------------------------------------
+// Ola Maps key detection + request collection (founder decision,
+// 2026-11-19: the bundled offline map is gone; the map is Ola Maps
+// vector tiles, `default-dark-standard`, keyed by
+// NEXT_PUBLIC_OLA_MAPS_API_KEY). CI has NO key, so the specs must
+// detect the key from the RENDERED page — never from process.env,
+// which cannot see a build-time NEXT_PUBLIC_ var — and split: the
+// map tests run only with a key, the no-key tests assert the graceful
+// "Map key not set" failure instead.
+// ---------------------------------------------------------------------------
+
+/** The missing-key line, as rendered (PlayAreaMap: short form, no
+ *  "(Production + Preview)"; MapView on the play map: long form).
+ *  Both share this prefix — match on it, never on the full line. */
+export const MISSING_KEY_TEXT = /Map key not set — add NEXT_PUBLIC_OLA_MAPS_API_KEY/;
+
+/** Probe whether an Ola Maps key is configured — from the rendered
+ *  page, not env. Goes to /create and waits for whichever lands
+ *  first: the missing-key line (no key) or the MapLibre canvas (key).
+ *  Throws when neither appears in 30 s, so a broken map cannot
+ *  silently skip the whole suite. */
+export async function detectOlaKey(page: Page): Promise<boolean> {
+  await page.goto('/create');
+  const missingKey = page.getByText(MISSING_KEY_TEXT).first();
+  const canvas = page.locator('.mapbox .maplibregl-canvas').first();
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    if (await missingKey.isVisible().catch(() => false)) return false;
+    if (await canvas.isVisible().catch(() => false)) return true;
+    await page.waitForTimeout(250);
+  }
+  throw new Error(
+    'detectOlaKey: neither the "Map key not set" line nor the map canvas appeared on /create within 30 s — cannot tell whether an Ola key is configured',
+  );
+}
+
+/** Hydration gate that works with AND without an Ola key: waits for
+ *  the map canvas (key configured) or the missing-key line (no key).
+ *  Returns true when the canvas appeared (key present). */
+export async function waitForMapOrMissingKey(page: Page): Promise<boolean> {
+  const canvas = page.locator('.mapbox .maplibregl-canvas').first();
+  const missingKey = page.getByText(MISSING_KEY_TEXT).first();
+  await expect(canvas.or(missingKey)).toBeVisible({ timeout: 30_000 });
+  return canvas.isVisible().catch(() => false);
+}
+
+export interface OlaHit { url: string; status: number }
+export interface OlaFail { url: string; error: string }
+export interface OlaLog {
+  hits: OlaHit[];
+  fails: OlaFail[];
+  /** Requests to a tile host that is NOT Ola — the map is Ola only. */
+  otherTileHosts: string[];
+}
+
+const OLA_HOST = /api\.olamaps\.io/;
+const OTHER_TILE_HOSTS =
+  /openfreemap|tile\.openstreetmap|basemaps\.arcgis|api\.mapbox|maps\.googleapis|carto\.com|basemaps\.cartocdn/i;
+
+/** Collect every api.olamaps.io request (style, tiles, sprites,
+ *  glyphs) plus failed ones and any request to another tile host. */
+export function collectOlaRequests(page: Page): OlaLog {
+  const log: OlaLog = { hits: [], fails: [], otherTileHosts: [] };
+  page.on('response', (res) => {
+    if (OLA_HOST.test(res.url())) {
+      log.hits.push({ url: res.url(), status: res.status() });
+    } else if (OTHER_TILE_HOSTS.test(res.url())) {
+      log.otherTileHosts.push(res.url().slice(0, 120));
+    }
+  });
+  page.on('requestfailed', (req) => {
+    if (OLA_HOST.test(req.url())) {
+      log.fails.push({ url: req.url(), error: req.failure()?.errorText ?? 'unknown' });
+    }
+  });
+  return log;
+}
+
+/** Wait 15 s (the founder's window), then demand painted Ola tiles:
+ *  HTTP 200 Ola responses, every one carrying api_key, no 401/403
+ *  (a wrong key fails the style/tile load), no network-failed Ola
+ *  requests, and no request to any other tile host. Non-200s other
+ *  than 401/403 are logged, not failed on: against a live service a
+ *  single transient 5xx on one tile is not a map failure, while 0
+ *  OK responses, a 401, or a missing api_key is. */
+export async function assertOlaTilesPaint(page: Page, log: OlaLog, where: string): Promise<void> {
+  await page.waitForTimeout(15_000);
+  const ok = log.hits.filter((h) => h.status === 200);
+  const noKey = log.hits.filter((h) => !/[?&]api_key=/.test(h.url));
+  const denied = log.hits.filter((h) => h.status === 401 || h.status === 403);
+  const bad = log.hits.filter((h) => h.status !== 200);
+  console.log(
+    `OLA ${where}: ${log.hits.length + log.fails.length} Ola requests, ${ok.length} HTTP 200, ${denied.length} 401/403, ${bad.length} HTTP non-200, ${log.fails.length} network-failed, ${noKey.length} without api_key` +
+      (log.fails.length ? ` — failures: ${[...new Set(log.fails.map((f) => f.error))].join(', ')}` : '') +
+      (bad.length ? ` — non-200: ${bad.map((b) => `${b.status} ${b.url.slice(0, 100)}`).join(' | ')}` : '') +
+      (log.hits.length ? ` — sample URL: ${log.hits[0]!.url.replace(/api_key=[^&]*/, 'api_key=…')}` : log.fails.length ? ' — NO OLA RESPONSES (all requests failed)' : ' — NO OLA REQUESTS AT ALL') +
+      (log.otherTileHosts.length ? ` — other tile hosts: ${log.otherTileHosts.slice(0, 3).join(' | ')}` : ''),
+  );
+  expect(ok.length, `${where}: expected Ola tile/style requests to return HTTP 200 (got ${log.hits.length} responses, ${ok.length} OK, ${log.fails.length} network-failed)`).toBeGreaterThan(0);
+  expect(denied, `${where}: Ola requests must not be 401/403 — a wrong key fails the style/tile load`).toEqual([]);
+  expect(noKey, `${where}: every api.olamaps.io request must carry api_key (olaTransformRequest appends it)`).toEqual([]);
+  expect(log.fails, `${where}: Ola requests must not fail at the network layer`).toEqual([]);
+  expect(log.otherTileHosts, `${where}: no other tile host may be requested — the map is Ola only`).toEqual([]);
+}
+
+/** Collect uncaught page exceptions (pageerror events). The no-key
+ *  tests assert this stays empty: a missing key must fail gracefully,
+ *  never throw. */
+export function collectPageErrors(page: Page): string[] {
+  const errors: string[] = [];
+  page.on('pageerror', (err) => errors.push(String(err).slice(0, 300)));
+  return errors;
+}
+
+export function assertNoPageErrors(errors: string[], where: string): void {
+  expect(errors, `${where}: uncaught exceptions — ${errors.join(' | ')}`).toEqual([]);
 }

@@ -10,8 +10,8 @@ import { usePathname } from 'next/navigation';
  *  stored still apply):
  *    large text      — localStorage pakdam.a11y.large-text ('1'/'0')
  *    high contrast   — localStorage pakdam.a11y.high-contrast ('1'/'0')
- *  (No map-style setting: one-map decision, 2026-11-17 — the map is
- *  one bundled offline map with no style switcher.)
+ *  (No map-style setting: one-map decision — the map is Ola Maps
+ *  (dark style) with no style switcher.)
  *  There is no theme setting any more (2026-11-18, simplification):
  *  Pakdam has ONE dark theme, applied by the base tokens in
  *  tokens.css — no light theme, no toggle, no class to apply.

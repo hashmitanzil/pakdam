@@ -1,134 +1,79 @@
-/** MapLibre GL JS loader + GeoJSON helpers — OFFLINE map (raster tiles).
+/** MapLibre GL JS loader + GeoJSON helpers — OLA MAPS (vector tiles).
  *
- *  Founder decision (2026-11-17 19:34 IST): ONE simple working map,
- *  downloaded offline and bundled in the app, covering Doranda +
- *  Hinoo, Ranchi, Jharkhand, for now. NO fallback / switcher /
- *  reload. GPS works on the downloaded map (device GPS is
- *  independent of tiles). The full live map service is a SEPARATE
- *  later task.
+ *  Founder decision (2026-11-19): replace the bundled offline map
+ *  with Ola Maps, fully. The map is now the Ola Maps vector style
+ *  `default-dark-standard` (dark style, fits the single dark
+ *  theme), rendered by the SAME vendored MapLibre GL JS engine —
+ *  no CDN, no Leaflet, no fallback / switcher / reload.
  *
- *  LANDED APPROACH (2026-11-17, reconciliation): bundled Esri World
- *  Street Map raster tiles — 1,038 JPEG tiles, zooms 12–17, bbox
- *  23.325–23.38 N / 85.285–85.355 E, ~15 MB, served from
- *  `public/offline-map/tiles/{z}/{x}/{y}.jpg` via the MapLibre
- *  raster style `public/offline-map/style.json`. A sample tile
- *  (16/48301/28392.jpg) was visually verified to paint REAL Ranchi
- *  streets (Konka Road, M. G. Marg, Sharad Babu Lane). This approach
- *  was chosen over the PMTiles vector file because the PMTiles
- *  wiring was half-done and unprovable on disk: it needed vendored
- *  glyphs under `public/offline-map/fonts/` that were never copied
- *  (the folder does not exist), so its labels could never render.
- *  The raster style needs no glyphs, no pmtiles.js, no basemaps.js
- *  — just MapLibre GL JS (vendored) + local JPEG tiles.
+ *  AUTH GOTCHA (critical): the style JSON's own tile / sprite /
+ *  glyph URLs carry NO api_key. Every request to api.olamaps.io
+ *  must carry `api_key` as a query parameter, so the map is
+ *  constructed with `transformRequest: olaTransformRequest` (see
+ *  below), which appends `api_key` to EVERY api.olamaps.io
+ *  request — style, tiles, sprites and glyphs alike. Without it
+ *  the style loads but every tile request fails with 401 and the
+ *  map paints blank. The key comes from
+ *  `NEXT_PUBLIC_OLA_MAPS_API_KEY` (Vercel: Production + Preview)
+ *  via `getOlaApiKey()` — NEVER put a key value in code.
  *
- *  EXPANSION DEFERRED (2026-11-18): the founder said this pack was
- *  too tight and asked for a wider bbox (23.30–23.405 / 85.26–85.38
- *  at z12–16, z17 capped to an extended core). The wider pack was
- *  fully planned (1,918 tiles — fetch script
- *  `apps/web/scripts/fetch-expanded-tiles.py`, per-zoom counts in
- *  the verifier) and the code was updated for it, but the VM's
- *  EPERM wave blocked ALL exec writes for 25+ minutes, so not one
- *  new tile could be downloaded before the 3:55 pm ship cutoff.
- *  The expansion was reverted to this 1,038-tile pack for the
- *  shipped zip; the wider pack follows as the immediate next
- *  delivery once the wave clears — re-run the fetch script, then
- *  restore the wide bbox / 1,918 counts (they were reverted here,
- *  in `download-offline-map.mjs`, `constants.ts`, `MapLibreMapView`
- *  and the e2e spec header — grep for "EXPANSION DEFERRED").
+ *  The map is world-wide now: there is NO maxBounds and NO
+ *  downloaded-area guard. The camera starts on Ranchi / Doranda
+ *  (MAP_INITIAL_CENTRE) when no fix / zone is set, because that is
+ *  the game's home area — not because tiles exist only there.
  *
- *  AREA LABELS (2026-11-18): the Esri tiles do NOT render "Doranda"
- *  or "Hinoo" as area labels at any zoom (verified by reading the
- *  tiles: Esri labels streets and colonies — Hindpiri, Harmu
- *  Housing Colony, Upkar Nagar — never the two locality names).
- *  So the map draws its own labels: `OFFLINE_AREA_LABELS` below,
- *  rendered as HTML markers by `MapLibreMapView` (the raster style
- *  has no glyphs, so a symbol layer cannot draw text — HTML
- *  markers are the only text path). Coordinates were fixed from
- *  the tiles themselves: Doranda sits on the Sersa Stadium /
- *  Station Road tile (z15 24151/14197, lng 85.3308–85.3418, lat
- *  23.3423–23.3523); Hinoo sits on the Upkar Nagar / Delatoli
- *  tile (z16 48298/28393, lng 85.3077–85.3132, lat 23.3513–
- *  23.3563). Doranda is south-east of Hinoo, as the founder
- *  described. Label positions are the tile centres.
- *
- *  HALO (2026-11-18, map fix): the pack carries a 1-tile halo
- *  around every zoom's rectangle (1,038 tiles total, up from 808),
- *  so the initial viewport never requests a tile just outside the
- *  pack (the old pack 404'd on z14 y=7096 at the viewport edge).
- *  The halo only fills viewport edges; it does not extend the
- *  playable area, which is the bbox below.
- *
- *  SPARE (NOT a live path): `public/offline-map/ranchi.pmtiles`
- *  (2,226,722 B) and `public/offline-map/vendor/pmtiles.js` /
- *  `basemaps.js` remain on disk as a documented spare only. Nothing
- *  in `src/` loads them, registers a pmtiles protocol, or references
- *  them — there is exactly one map, the raster tiles. Do NOT
- *  reintroduce live tile providers as a fallback. If the bundled
- *  tiles ever fail to load, the view shows the plain out-of-area /
- *  failed message and the pin flow carries the game.
- *
- *  Refreshing the map later: re-run
- *  `apps/web/scripts/fetch-expanded-tiles.py` (downloads the Esri
- *  tiles for the wide bbox at z12–16 + the z17 core, verifies every
- *  tile, and rewrites `manifest.json`) and replace `tiles/` +
- *  `manifest.json` together. `apps/web/scripts/download-offline-map.mjs`
- *  verifies the staged pack on disk (bbox, per-zoom counts,
- *  manifest agreement). */
+ *  The vendored library lives at `apps/web/public/vendor/maplibre/`
+ *  (moved there from `public/offline-map/vendor/` by a separate
+ *  worker). GPS is independent of tiles, as before. If the key is
+ *  missing, `isOlaConfigured()` is false and the view does not
+ *  construct the map at all — the parent shows the missing-key
+ *  banner instead. If the key is wrong, the style load fails
+ *  (401) and the view fails gracefully the same way. */
 
-export const OFFLINE_MAP_BBOX = {
-  minLat: 23.325, maxLat: 23.38, minLng: 85.285, maxLng: 85.355,
-} as const;
-/** App-drawn area labels (see header: the Esri tiles never render
- *  these names). Positions are the centres of the tiles that show
- *  each locality — Doranda: z15 24151/14197 (Sersa Stadium /
- *  Station Road); Hinoo: z16 48298/28393 (Upkar Nagar / Delatoli).
- *  [lng, lat]. Rendered by MapLibreMapView as HTML markers. */
-export const OFFLINE_AREA_LABELS: { name: string; lngLat: [number, number] }[] = [
-  { name: 'Doranda', lngLat: [85.336, 23.347] },
-  { name: 'Hinoo', lngLat: [85.311, 23.353] },
-] as const;
-/** Attribution for the bundled Esri World Street Map tiles (as in
- *  `public/offline-map/style.json`). */
-export const OFFLINE_MAP_ATTRIBUTION = '© Esri, HERE, Garmin, OpenStreetMap contributors, and the GIS user community';
-/** The ONE map style, served by Next.js from `public/`. It points
- *  at the bundled raster tiles only — no live URL anywhere. */
-export const OFFLINE_STYLE_URL = '/offline-map/style.json';
-/** Tile template inside the style (documented here for grep-ability). */
-export const OFFLINE_TILES_TEMPLATE = '/offline-map/tiles/{z}/{x}/{y}.jpg';
+/** Ola Maps vector style (dark standard). */
+export const OLA_STYLE_URL = 'https://api.olamaps.io/tiles/vector/v1/styles/default-dark-standard/style.json';
+/** Ranchi / Doranda — the map starts here when no fix / zone is
+ *  set. [lng, lat]. This is the game's home area; the map itself
+ *  is world-wide (no maxBounds), so this is a starting centre
+ *  only, not a boundary. */
+export const MAP_INITIAL_CENTRE: [number, number] = [85.33, 23.36];
+export const OLA_MAP_INITIAL_ZOOM = 14;
+export const OLA_MAP_MIN_ZOOM = 3;
+export const OLA_MAP_MAX_ZOOM = 19;
 /** Vendored MapLibre GL JS — local file only, never a CDN. */
-export const OFFLINE_VENDOR_BASE = '/offline-map/vendor';
-const MAPLIBRE_JS_URL = `${OFFLINE_VENDOR_BASE}/maplibre-gl.js`;
-const MAPLIBRE_CSS_URL = `${OFFLINE_VENDOR_BASE}/maplibre-gl.css`;
-/** Doranda, Ranchi — the map starts here. [lng, lat]. */
-export const OFFLINE_MAP_CENTRE: [number, number] = [85.33, 23.36];
-export const OFFLINE_MAP_INITIAL_ZOOM = 14;
-export const OFFLINE_MAP_MIN_ZOOM = 12;
-export const OFFLINE_MAP_MAX_ZOOM = 17;
-/** The camera never leaves the downloaded area. */
-export const OFFLINE_MAP_MAX_BOUNDS: [[number, number], [number, number]] = [
-  [OFFLINE_MAP_BBOX.minLng, OFFLINE_MAP_BBOX.minLat],
-  [OFFLINE_MAP_BBOX.maxLng, OFFLINE_MAP_BBOX.maxLat],
-];
-/** Plain-words area messages (no lat/lng numbers in the UI).
- *  Founder rule, reconciled 2026-11-17: no city/area names in the
- *  normal map UI — both messages say only "downloaded area".
- *  (D-M3 follow-up, 2026-11-18: the outside-area message used to
- *  be the ONE minimal exception, "Map downloaded for Ranchi only"
- *  — reworded to the same downloaded-area wording as the area
- *  message; no city name remains in any user-visible map string.) */
-export const OFFLINE_MAP_AREA_MESSAGE = 'Offline map: downloaded area only';
-export const OUTSIDE_MAP_AREA_MESSAGE = 'Offline map: downloaded area only';
+const MAPLIBRE_JS_URL = '/vendor/maplibre/maplibre-gl.js';
+const MAPLIBRE_CSS_URL = '/vendor/maplibre/maplibre-gl.css';
 
-/** True when a fix sits inside the downloaded map area. */
-export function isInsideOfflineMap(lat: number, lng: number): boolean {
-  return lat >= OFFLINE_MAP_BBOX.minLat && lat <= OFFLINE_MAP_BBOX.maxLat
-    && lng >= OFFLINE_MAP_BBOX.minLng && lng <= OFFLINE_MAP_BBOX.maxLng;
+/** The Ola Maps API key, from the public env var ('' when unset).
+ *  Never put a key value in code. */
+export function getOlaApiKey(): string {
+  return process.env.NEXT_PUBLIC_OLA_MAPS_API_KEY ?? '';
+}
+
+/** True when an Ola Maps API key is configured. */
+export function isOlaConfigured(): boolean {
+  return getOlaApiKey().trim().length > 0;
+}
+
+/** MapLibre transformRequest for Ola Maps: appends `api_key` to
+ *  EVERY request to api.olamaps.io — the style JSON's own
+ *  tile / sprite / glyph URLs carry no key, so without this the
+ *  style loads but tile requests fail with 401. Handles existing
+ *  query strings ('&' when '?' is already present, else '?').
+ *  Non-Ola requests (and requests with no key configured) pass
+ *  through unchanged. */
+export function olaTransformRequest(url: string, _resourceType: string): { url: string } {
+  if (!url.includes('api.olamaps.io')) return { url };
+  const key = getOlaApiKey();
+  if (!key) return { url };
+  const separator = url.includes('?') ? '&' : '?';
+  return { url: `${url}${separator}api_key=${encodeURIComponent(key)}` };
 }
 
 /** Minimal structural typing for the MapLibre surface this app uses,
  *  so the code typechecks with no `maplibre-gl` npm package
  *  installed (the library is vendored as plain scripts under
- *  `public/offline-map/vendor/` and loaded by `loadMapLibre`). */
+ *  `public/vendor/maplibre/` and loaded by `loadMapLibre`). */
 export interface MapLibreLngLat { lat: number; lng: number }
 /** Event payloads MapLibre hands to listeners (kept loose: only the
  *  fields this app reads). */
@@ -172,8 +117,7 @@ export interface MapLibreMap {
   removeLayer(id: string): void;
   getContainer(): HTMLElement;
   /** True when every visible tile has finished loading (MapLibre
-   *  v5). With the offline bundle, a tile that never loads means a
-   *  file is missing from the pack — the view reports it honestly. */
+   *  v5). */
   areTilesLoaded(): boolean;
 }
 export interface MapLibreMarker {
@@ -187,9 +131,7 @@ export interface MapLibreMarker {
   // guard the marker rebuild so a drag in progress is never snapped
   // back to the stored centre.
   on(event: 'dragstart' | 'drag' | 'dragend', handler: () => void): this;
-  /** The marker's wrapper element in the map container — used to
-   *  set pointer-events:none on the app-drawn area labels so taps
-   *  pass through to the map (zone placement). */
+  /** The marker's wrapper element in the map container. */
   getElement(): HTMLElement;
 }
 export interface MapLibrePopup {
@@ -205,6 +147,7 @@ export interface MapLibreLib {
     minZoom?: number;
     maxZoom?: number;
     maxBounds?: [[number, number], [number, number]];
+    transformRequest?: (url: string, resourceType: string) => { url: string };
     attributionControl?: boolean;
     trackResize?: boolean;
     dragRotate?: boolean;
@@ -231,7 +174,7 @@ function loadScript(src: string): Promise<void> {
     script.src = src;
     script.async = false;
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error(`Offline map script failed to load: ${src}`));
+    script.onerror = () => reject(new Error(`Map library script failed to load: ${src}`));
     document.head.appendChild(script);
   });
 }
@@ -266,10 +209,9 @@ export function isWebGLSupported(): boolean {
 /** Returns the MapLibre library (vendored script only). Throws when
  *  the vendored script is missing — the caller shows an honest
  *  error. There is no CDN and no alternate map provider, by founder
- *  decision. Only maplibre-gl.js is loaded: the raster style needs
- *  no pmtiles.js, basemaps.js or glyphs. A browser with no WebGL
- *  throws a distinct, honest error (the map genuinely cannot draw
- *  without WebGL) — it is NOT reported as a missing library. */
+ *  decision. A browser with no WebGL throws a distinct, honest
+ *  error (the map genuinely cannot draw without WebGL) — it is NOT
+ *  reported as a missing library. */
 export async function loadMapLibre(): Promise<MapLibreLib> {
   if (cachedLib) return cachedLib;
   if (loadPromise) return loadPromise;
@@ -278,10 +220,10 @@ export async function loadMapLibre(): Promise<MapLibreLib> {
     await loadScript(MAPLIBRE_JS_URL);
     const lib = window.maplibregl;
     if (!lib || !lib.Map) {
-      throw new Error('Offline MapLibre library failed to load (vendored script missing or corrupt)');
+      throw new Error('MapLibre library failed to load (vendored script missing or corrupt)');
     }
     if (!isWebGLSupported()) {
-      throw new Error('WebGL is not available in this browser — the offline map needs WebGL to draw tiles');
+      throw new Error('WebGL is not available in this browser — the Ola map needs WebGL to draw tiles');
     }
     cachedLib = lib;
     return lib;

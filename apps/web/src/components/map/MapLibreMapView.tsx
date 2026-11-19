@@ -4,32 +4,34 @@ import { ZONE_AUTO_CENTRE_MAX_ACCURACY_M } from '@pakdam/shared';
 import { formatAgeAgo, haversineMeters, polygonCentroid } from '@/components/match/freshness';
 import { locationPrecisionLabel } from '@/lib/geolocation';
 import {
-  loadMapLibre, isWebGLSupported, OFFLINE_STYLE_URL,
-  OFFLINE_MAP_CENTRE, OFFLINE_MAP_INITIAL_ZOOM, OFFLINE_MAP_MIN_ZOOM,
-  OFFLINE_MAP_MAX_ZOOM, OFFLINE_MAP_MAX_BOUNDS, OFFLINE_AREA_LABELS,
-  OUTSIDE_MAP_AREA_MESSAGE, isInsideOfflineMap,
+  loadMapLibre, isWebGLSupported, OLA_STYLE_URL,
+  MAP_INITIAL_CENTRE, OLA_MAP_INITIAL_ZOOM, OLA_MAP_MIN_ZOOM,
+  OLA_MAP_MAX_ZOOM, olaTransformRequest, isOlaConfigured,
   polygonToGeoJSON, circlePolygon, featureCollection,
   type MapLibreLib, type MapLibreMap, type MapLibreMarker,
 } from './maplibre';
 import type { MapViewProps, OverlayProps } from './types';
 
-/** MapLibre GL JS + the BUNDLED offline map — the ONLY map
- *  (founder decision, 2026-11-17 19:34 IST): ONE simple working map,
- *  downloaded offline and bundled in the app, covering Doranda +
- *  Hinoo, Ranchi, Jharkhand, for now. NO fallback / switcher /
- *  reload. The full live map service is a SEPARATE later task.
+/** MapLibre GL JS + OLA MAPS vector tiles — the ONLY map
+ *  (founder decision, 2026-11-19): replace the bundled offline map
+ *  with Ola Maps, fully. The Ola `default-dark-standard` vector
+ *  style is rendered by the same vendored MapLibre v5 engine
+ *  (`public/vendor/maplibre/`) — zero bundled tiles, no offline
+ *  pack, no downloaded-area guard, no maxBounds: the map is
+ *  world-wide. Ola tiles carry real area labels (Doranda, Hinoo,
+ *  …), so the app no longer draws its own area labels.
  *
- *  The bundle is `apps/web/public/offline-map/`: 1,038 bundled Esri
- *  World Street Map raster tiles (zooms 12–17, Doranda + Hinoo,
- *  bbox 23.325–23.38 N / 85.285–85.355 E) served by the raster style
- *  `public/offline-map/style.json`, rendered by vendored MapLibre v5
- *  (`public/offline-map/vendor/`) — zero network requests at runtime.
- *  (Wider pack deferred 2026-11-18 — see `maplibre.ts`, EXPANSION
- *  DEFERRED. The app-drawn Doranda/Hinoo labels below ARE landed.) If the bundled tiles cannot
- *  be loaded, the view says so honestly — there is no alternate map
- *  provider to fall back to, by founder decision. If WebGL is
- *  unavailable or a vendored library fails to load, `onInitFailed`
- *  fires and the parent shows an honest error.
+ *  Auth: the style JSON's tile / sprite / glyph URLs carry no key,
+ *  so the map is constructed with `transformRequest:
+ *  olaTransformRequest`, which appends `api_key` (from
+ *  NEXT_PUBLIC_OLA_MAPS_API_KEY) to every api.olamaps.io request.
+ *  If no key is configured the map is NOT constructed at all —
+ *  `onInitFailed('missing-key')` fires and the parent shows the
+ *  missing-key banner. If the style fails to load (e.g. a wrong
+ *  key → 401), the map 'error' event fires
+ *  `onInitFailed('load-failed')` instead. Either way there is no
+ *  blank silent map and no crash — the zone, markers and match
+ *  controls below still work.
  *
  *  Same overlays as before (zone, next zone, ping areas, no-go
  *  areas, own location as an uncertainty circle), same ±50 m camera
@@ -41,14 +43,7 @@ import type { MapViewProps, OverlayProps } from './types';
  *  accurate to ±50 m or better arrives, or a later fix at least
  *  halves the accuracy the camera last centred on.
  *
- *  Blank-map guard (live check 2026-11-17 22:11 — tiles counted,
- *  nothing painted, reload did not fix it): the camera NEVER flies
- *  to a fix OUTSIDE the downloaded tile area. A fix outside the
- *  pack has no tiles under it, so flying there paints white — and
- *  on reload the same out-of-area fix re-centred the map there
- *  again, which is why reload did not fix it. The camera stays on
- *  the zone / downloaded area and the outside-area message shows
- *  instead. Rapid movement also no longer thrashes the camera:
+ *  Rapid movement also no longer thrashes the camera:
  *  flyTo fires only when the fix moved >25 m or the accuracy at
  *  least halved. And the canvas is re-measured (resize) whenever
  *  its container changes size, so a hidden-then-shown map repaints
@@ -66,10 +61,10 @@ const SOURCE_IDS = {
   accuracy: 'pakdam-accuracy',
 } as const;
 
-/** Centre of the bundled area (Doranda) — the map starts here when
- *  no location is set yet. There are no tiles for anywhere else, so
- *  a world view would be an empty background. */
-const BBOX_CENTRE: [number, number] = OFFLINE_MAP_CENTRE;
+/** Fallback centre — Ranchi / Doranda, the game's home area — the
+ *  map starts here when no location is set yet. The map is
+ *  world-wide, so this is a starting centre only, not a boundary. */
+const FALLBACK_CENTRE: [number, number] = MAP_INITIAL_CENTRE;
 
 export function MapLibreMapView({
   lat, lng, accuracyM, label, zoneBoundary, nextZoneBoundary, pingArea, pingAreas, pingHistoryOn, noGoAreas, onMapClick, onInitFailed,
@@ -91,13 +86,13 @@ export function MapLibreMapView({
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const propsRef = useRef<OverlayProps & { onMapClick?: (lat: number, lng: number) => void }>({ lat, lng, accuracyM, label, zoneBoundary, nextZoneBoundary, pingArea, pingAreas, pingHistoryOn, noGoAreas, onMapClick });
   propsRef.current = { lat, lng, accuracyM, label, zoneBoundary, nextZoneBoundary, pingArea, pingAreas, pingHistoryOn, noGoAreas, onMapClick };
-  /** The bundled style file failed to load (missing/corrupt pack).
-   *  There is no other map to retry with, by founder decision — the
-   *  failure is reported up through onInitFailed instead, and the
-   *  parent shows the one short WebGL line. The zone, markers and
-   *  match controls below still work. */
+  /** The map failed to initialise (missing key, library / style
+   *  load failure, no WebGL). There is no other map to retry with,
+   *  by founder decision — the failure is reported up through
+   *  onInitFailed with a reason, and the parent shows the matching
+   *  banner. The zone, markers and match controls below still work. */
   const failedRef = useRef(false);
-  const fail = () => { if (!failedRef.current) { failedRef.current = true; onInitFailed?.(); } };
+  const fail = (reason?: 'missing-key' | 'load-failed') => { if (!failedRef.current) { failedRef.current = true; onInitFailed?.(reason); } };
 
   const ensureSourcesAndLayers = (map: MapLibreMap) => {
     const add = (id: string, sourceId: string, kind: string, paint: Record<string, unknown>, layout?: Record<string, unknown>) => {
@@ -129,32 +124,13 @@ export function MapLibreMapView({
     set(SOURCE_IDS.accuracy, p.lat != null && p.lng != null && p.accuracyM != null && p.accuracyM > 0
       ? circlePolygon(p.lat, p.lng, p.accuracyM) : featureCollection([]));
 
-    // Markers are rebuilt each sync (cheap: a pin + a few labels).
+    // Markers are rebuilt each sync (cheap: a pin + a few chips).
     // Marker chips use theme tokens (var(--surface)/var(--ink)/
     // var(--focus)/var(--line)/var(--muted)) so they follow dark mode
-    // — never hardcoded light fills. Light values equal the old
-    // hardcoded ones; the chips sit on the light raster tiles in
-    // both themes, so they stay readable either way.
+    // — never hardcoded light fills. (Ola tiles carry the real area
+    // labels now, so the app draws no area labels of its own.)
     for (const m of markersRef.current) m.remove();
     markersRef.current = [];
-    // App-drawn area labels FIRST, so they render beneath every pin
-    // and chip: the Esri tiles never render "Doranda" or "Hinoo"
-    // (verified by reading the tiles, 2026-11-18), so the map draws
-    // the names itself from OFFLINE_AREA_LABELS (maplibre.ts — tile-
-    // verified positions). A raster style has no glyphs, so a symbol
-    // layer cannot draw text; HTML markers are the only text path.
-    // pointer-events:none on the marker wrapper AND the label, so a
-    // tap on the name still reaches the map (zone placement) instead
-    // of being swallowed by the label. Dark text + white halo: the
-    // raster tiles are light in both themes, so this reads either way.
-    for (const a of OFFLINE_AREA_LABELS) {
-      const el = document.createElement('div');
-      el.setAttribute('aria-hidden', 'true');
-      el.innerHTML = `<span style="pointer-events:none;user-select:none;white-space:nowrap;font-size:13px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;color:#1F2937;text-shadow:0 0 3px #FFFFFF,0 0 6px #FFFFFF,0 1px 2px rgba(255,255,255,0.9);">${a.name}</span>`;
-      const labelMarker = new lib.Marker({ element: el }).setLngLat(a.lngLat).addTo(map);
-      labelMarker.getElement().style.pointerEvents = 'none';
-      markersRef.current.push(labelMarker);
-    }
     if (p.pingAreas) {
       for (const a of p.pingAreas) {
         const el = document.createElement('div');
@@ -172,11 +148,8 @@ export function MapLibreMapView({
     // better arrives, or a later fix at least halves the accuracy
     // the camera last centred on. A fix with no accuracy reported
     // keeps the old behaviour (fly) — it cannot be judged coarse.
-    // NEVER fly to a fix outside the downloaded tile area: there
-    // are no tiles there, so the map paints white — and on reload
-    // the same fix would re-centre it there again (live check
-    // 2026-11-17: tiles counted, nothing painted, reload no fix).
-    // The marker still draws; the camera stays on the zone area.
+    // The map is world-wide now, so there is no downloaded-area
+    // guard: the camera may fly to a fix anywhere.
     // Rapid movement: fly only when the fix moved >25 m from the
     // last flown-to centre, so movement-pad steps cannot thrash
     // the camera animation into a blank frame.
@@ -185,12 +158,11 @@ export function MapLibreMapView({
       el.title = p.label;
       el.innerHTML = `<span style="display:flex;align-items:center;justify-content:center;width:30px;height:30px;border-radius:50% 50% 50% 0;transform:rotate(-45deg);background:#B91C1C;border:2px solid var(--surface);box-shadow:0 1px 4px rgba(0,0,0,0.4);"><span style="width:10px;height:10px;border-radius:50%;background:var(--surface);"></span></span>`;
       markersRef.current.push(new lib.Marker({ element: el }).setLngLat([p.lng, p.lat]).setPopup(new lib.Popup({ offset: 25 }).setText(p.label)).addTo(map));
-      const fixInsideMap = isInsideOfflineMap(p.lat, p.lng);
       const accurateEnough = p.accuracyM == null || p.accuracyM <= ZONE_AUTO_CENTRE_MAX_ACCURACY_M;
       const lastFlown = lastFlownRef.current;
       const movedM = lastFlown ? haversineMeters(lastFlown.lat, lastFlown.lng, p.lat, p.lng) : Infinity;
       const accuracyHalved = p.accuracyM != null && centredAccuracyRef.current != null && p.accuracyM < centredAccuracyRef.current / 2;
-      if (fixInsideMap && accurateEnough && (!lastFlown || movedM > 25 || accuracyHalved)) {
+      if (accurateEnough && (!lastFlown || movedM > 25 || accuracyHalved)) {
         map.flyTo({ center: [p.lng, p.lat], zoom: 16 });
         centredAccuracyRef.current = p.accuracyM;
         lastFlownRef.current = { lat: p.lat, lng: p.lng };
@@ -216,12 +188,12 @@ export function MapLibreMapView({
       const c = map.getCenter();
       return [c.lng, c.lat];
     }
-    return BBOX_CENTRE;
+    return FALLBACK_CENTRE;
   };
   const zoomBy = (dir: 1 | -1) => {
     const map = mapRef.current;
     if (!map) return;
-    const z = Math.min(OFFLINE_MAP_MAX_ZOOM, Math.max(OFFLINE_MAP_MIN_ZOOM, map.getZoom() + dir));
+    const z = Math.min(OLA_MAP_MAX_ZOOM, Math.max(OLA_MAP_MIN_ZOOM, map.getZoom() + dir));
     map.easeTo({ center: zoomAnchor(), zoom: z, duration: 300 });
   };
   const centreOnPin = () => {
@@ -234,11 +206,15 @@ export function MapLibreMapView({
     let cancelled = false;
     failedRef.current = false;
     (async () => {
+      // No Ola key configured — do NOT construct the map. The
+      // parent shows the missing-key banner; the game still works
+      // without the map picture.
+      if (!isOlaConfigured()) { if (!cancelled) fail('missing-key'); return; }
       let lib: MapLibreLib;
       try {
         lib = await loadMapLibre();
       } catch {
-        if (!cancelled) fail();
+        if (!cancelled) fail('load-failed');
         return;
       }
       if (cancelled || !ref.current) return;
@@ -246,30 +222,28 @@ export function MapLibreMapView({
       // defence in depth before constructing the map). The old
       // `lib.supported()` call was the bug: MapLibre v5 has no such
       // export, so it threw on every device.
-      if (!isWebGLSupported()) { fail(); return; }
+      if (!isWebGLSupported()) { fail('load-failed'); return; }
       libRef.current = lib;
-      // Never start the camera outside the downloaded tile area:
-      // a fix outside the pack has no tiles under it, so the map
-      // opens white — and the same fix would re-centre it there on
-      // every reload. Start on the downloaded area instead; the
-      // outside-area message explains why the pin is off the map.
-      const fixInsideMap = lat != null && lng != null && isInsideOfflineMap(lat, lng);
-      const centre: [number, number] = fixInsideMap && lat != null && lng != null ? [lng, lat] : BBOX_CENTRE;
+      // Start on the fix when there is one, else on Ranchi /
+      // Doranda (the game's home area). The map is world-wide, so
+      // there is no area guard on the starting centre.
+      const hasFix = lat != null && lng != null;
+      const centre: [number, number] = hasFix && lat != null && lng != null ? [lng, lat] : MAP_INITIAL_CENTRE;
       let map: MapLibreMap;
       try {
         map = new lib.Map({
           container: ref.current,
-          style: OFFLINE_STYLE_URL,
+          style: OLA_STYLE_URL,
+          transformRequest: olaTransformRequest,
           center: centre,
-          zoom: fixInsideMap ? 15 : OFFLINE_MAP_INITIAL_ZOOM,
-          minZoom: OFFLINE_MAP_MIN_ZOOM,
-          maxZoom: OFFLINE_MAP_MAX_ZOOM,
-          maxBounds: OFFLINE_MAP_MAX_BOUNDS,
+          zoom: hasFix ? 15 : OLA_MAP_INITIAL_ZOOM,
+          minZoom: OLA_MAP_MIN_ZOOM,
+          maxZoom: OLA_MAP_MAX_ZOOM,
           dragRotate: false,
           touchPitch: false,
         });
       } catch {
-        if (!cancelled) fail();
+        if (!cancelled) fail('load-failed');
         return;
       }
       mapRef.current = map;
@@ -283,6 +257,16 @@ export function MapLibreMapView({
         loadedRef.current = true;
         ensureSourcesAndLayers(map);
         syncOverlays(map, lib, propsRef.current);
+      });
+      // Style-load failure (e.g. a wrong key → 401 on the style /
+      // sprite / glyph requests): fail gracefully with
+      // 'load-failed' instead of leaving a blank silent map. Only
+      // errors before the style has loaded count — a tile error
+      // (e.tile set) or an error after load must not kill the map.
+      map.on('error', (e) => {
+        if (loadedRef.current || styleLoadedRef.current) return;
+        if (e.tile) return;
+        if (!cancelled) fail('load-failed');
       });
       // A container that changes size (tab switch, layout shift)
       // leaves the WebGL canvas at its old size — blank or clipped
@@ -333,11 +317,6 @@ export function MapLibreMapView({
     }
   });
 
-  // The GPS fix (or centre) is outside the downloaded area: the
-  // pin still works, but no streets will show there. No fallback,
-  // no reload, no switcher — plain words only.
-  const outsideArea = lat != null && lng != null && !isInsideOfflineMap(lat, lng);
-
   return (
     <div>
       <div style={{ position: 'relative' }}>
@@ -348,9 +327,6 @@ export function MapLibreMapView({
           <button type="button" className="btn btn-secondary" style={{ minWidth: 48, minHeight: 48, padding: '8px 12px' }} onClick={centreOnPin} aria-label="Centre the map on your location">◎</button>
         </div>
       </div>
-      {outsideArea ? (
-        <p className="small" role="status">{OUTSIDE_MAP_AREA_MESSAGE}</p>
-      ) : null}
       <p className="small">
         {lat != null ? `Your location — ${locationPrecisionLabel(accuracyM)} (accuracy ±${accuracyM ?? '?'} m — shown as an uncertainty area, never an exact dot)` : 'No location on the map yet — use your location or tap the map to place the zone. The map starts on the game area, never a guessed place.'}
         {zoneBoundary ? ' Solid red ring with a white edge: current play zone.' : ''}{nextZoneBoundary ? ' Dashed red line: next zone preview — planned size only, not the final zone (the server draws the real zone when the shrink fires).' : ''}

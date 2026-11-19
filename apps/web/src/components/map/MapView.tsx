@@ -5,16 +5,27 @@ import type { MapViewProps } from './types';
 
 export type { MapViewProps } from './types';
 
-/** The ONE map (founder decision, 2026-11-17 19:34 IST): MapLibre
- *  GL JS + the BUNDLED offline map (Doranda + Hinoo, Ranchi).
- *  NO fallback / switcher / reload — no alternate provider, no
- *  Leaflet view. If the device has no WebGL or the library fails to
- *  load, this shows an honest error instead of a blank map or a
+/** The ONE map (founder decision, 2026-11-19): MapLibre GL JS +
+ *  Ola Maps vector tiles (default-dark-standard) — the bundled
+ *  offline map is gone. NO fallback / switcher / reload — no
+ *  alternate provider, no Leaflet view. If the Ola key is not set,
+ *  the map is not constructed and this shows the missing-key
+ *  banner. If the device has no WebGL or the library / style fails
+ *  to load, this shows an honest error instead of a blank map or a
  *  different map: the zone, markers and match controls still work,
  *  and the game stays playable. */
 export default function MapView(props: MapViewProps) {
-  const [failed, setFailed] = useState(false);
-  if (failed) {
+  const [failedReason, setFailedReason] = useState<'missing-key' | 'load-failed' | undefined>(undefined);
+  if (failedReason === 'missing-key') {
+    return (
+      <div>
+        <div className="banner" role="alert">
+          <strong>Map key not set — add NEXT_PUBLIC_OLA_MAPS_API_KEY in Vercel (Production + Preview) and redeploy. The game still works without the map picture.</strong>
+        </div>
+      </div>
+    );
+  }
+  if (failedReason) {
     return (
       <div>
         <div className="banner" role="alert">
@@ -23,5 +34,5 @@ export default function MapView(props: MapViewProps) {
       </div>
     );
   }
-  return <MapLibreMapView {...props} onInitFailed={() => setFailed(true)} />;
+  return <MapLibreMapView {...props} onInitFailed={(reason) => setFailedReason(reason ?? 'load-failed')} />;
 }

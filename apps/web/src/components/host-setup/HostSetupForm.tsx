@@ -7,9 +7,9 @@ import { describeMode, zoneDiameterMeters } from '@pakdam/engine';
 import { formatDistance } from '@/components/match/freshness';
 import { Section, StepperRow, ToggleRow } from './controls';
 import {
-  CORNER_STEPS, DRAW_DEFAULT_CORNERS, DURATION_STEPS_MIN,
+  DURATION_STEPS_MIN,
   HEAD_START_STEPS_S, PING_STEPS_S, RADIUS_BOUNDS,
-  SHRINK_STEPS_MIN, drawnBoundaryFor, formatMinutes,
+  SHRINK_STEPS_MIN, formatMinutes,
   formatRadiusCompact, formatSecondsShort, maxManualHunterCount,
   roomSummaryStrip, scaleDrawnToDiameter,
 } from './draft';
@@ -189,14 +189,15 @@ export default function HostSetupForm({ value, onChange, showPresets, shrinkAsOw
               <label style={cardStyle(value.zoneShape === 'draw')}>
                 <input
                   type="radio" name="zone-shape" checked={value.zoneShape === 'draw'}
-                  onChange={() => {
-                    const boundary = value.drawnBoundary ?? drawnBoundaryFor(value, DRAW_DEFAULT_CORNERS);
-                    if (boundary) update({ zoneShape: 'draw', drawnBoundary: boundary });
-                    else update({ zoneShape: 'draw' });
-                  }}
+                  // No default shape (founder spec, 2026-11-19): Draw
+                  // starts with no points — the host taps them on the
+                  // map. An existing applied shape (reopening
+                  // settings) is kept as-is; PlayAreaMap loads it
+                  // as the editable draft.
+                  onChange={() => update({ zoneShape: 'draw' })}
                   style={{ marginRight: 8, width: 20, height: 20, accentColor: '#B91C1C' }}
                 />
-                <strong>Draw</strong> — your own shape on the map. Drag the corners to shape it, drag the middle to move the whole zone.
+                <strong>Draw</strong> — your own shape on the map. Tap the map to place numbered points — 3 points enclose the zone. Drag points to fine-tune, then tap DONE.
               </label>
             </fieldset>
             <PlayAreaMap
@@ -205,14 +206,7 @@ export default function HostSetupForm({ value, onChange, showPresets, shrinkAsOw
               fitSignal={fitSignal}
             />
             {value.zoneShape === 'draw' ? (
-              <>
-                <StepperRow
-                  label="Corners" hint="Corners on the drawn shape. Changing this redraws it — drag the corners after to shape it again."
-                  steps={CORNER_STEPS} value={value.drawnBoundary?.length ?? DRAW_DEFAULT_CORNERS} display={`${value.drawnBoundary?.length ?? DRAW_DEFAULT_CORNERS} corners`}
-                  onChange={(v) => { const b = drawnBoundaryFor(value, v); if (b) update({ drawnBoundary: b }); }}
-                />
-                <p><strong>Size across:</strong> {value.drawnBoundary ? `about ${formatDistance(zoneDiameterMeters(value.drawnBoundary))} across` : 'not drawn yet'}</p>
-              </>
+              <p><strong>Size across:</strong> {value.drawnBoundary ? `about ${formatDistance(zoneDiameterMeters(value.drawnBoundary))} across` : 'not drawn yet — tap the map to place points, then DONE'}</p>
             ) : null}
             <StepperRow
               label="Radius" hint={value.zoneShape === 'draw' ? 'Scales the whole drawn shape.' : 'Centered on your current location.'}
