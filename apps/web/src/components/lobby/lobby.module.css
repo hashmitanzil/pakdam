@@ -242,77 +242,6 @@
   flex: 0 0 auto;
 }
 
-/* --- Readiness checklist --- */
-.progressBar {
-  height: 10px;
-  border-radius: 999px;
-  background: #FEE2E2;
-  overflow: hidden;
-  margin: 8px 0 4px;
-}
-
-.progressFill {
-  height: 100%;
-  background: var(--ember);
-  border-radius: 999px;
-}
-
-.checkList {
-  list-style: none;
-  padding: 0;
-  margin: 8px 0;
-}
-
-.checkRow {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  padding: 10px 0;
-  border-bottom: 1px solid var(--line);
-}
-
-.checkRow:last-child {
-  border-bottom: 0;
-}
-
-.checkIcon {
-  flex: 0 0 auto;
-  width: 28px;
-  height: 28px;
-  border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 800;
-  border: 2px solid var(--line);
-  background: var(--surface);
-}
-
-.checkIconPass {
-  background: #14532D;
-  border-color: var(--ok);
-  color: #BBF7D0;
-}
-
-.checkIconFail {
-  background: #FEF2F2;
-  border-color: var(--ember);
-  color: var(--ember-dark);
-}
-
-.checkBody {
-  flex: 1;
-}
-
-.checkLabel {
-  font-weight: 800;
-}
-
-.checkDetail {
-  color: var(--muted);
-  font-size: 14px;
-}
-
 .ackBox {
   display: flex;
   gap: 10px;
@@ -330,38 +259,6 @@
   flex: 0 0 auto;
   margin-top: 2px;
   accent-color: var(--ember);
-}
-
-/* --- Role preview --- */
-.roleGrid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 12px;
-  margin: 8px 0;
-}
-
-@media (max-width: 480px) {
-  .roleGrid {
-    grid-template-columns: 1fr;
-  }
-}
-
-.roleCard {
-  border: 2px solid var(--line);
-  border-radius: var(--radius);
-  padding: 12px;
-  background: var(--surface);
-}
-
-.roleCard h3 {
-  margin: 0 0 4px;
-  font-size: 16px;
-}
-
-.roleCard p {
-  margin: 4px 0;
-  font-size: 14px;
-  color: var(--muted);
 }
 
 /* --- Match facts --- */
@@ -462,30 +359,6 @@
 
 .sosAlert p {
   margin: 4px 0;
-}
-
-/* --- Events --- */
-.eventList {
-  list-style: none;
-  padding: 0;
-  margin: 8px 0;
-  max-height: 220px;
-  overflow-y: auto;
-}
-
-.eventList li {
-  padding: 6px 0;
-  border-bottom: 1px solid var(--line);
-  font-size: 14px;
-}
-
-.eventList li:last-child {
-  border-bottom: 0;
-}
-
-.eventTime {
-  color: var(--muted);
-  font-variant-numeric: tabular-nums;
 }
 
 /* --- Primary action / thumb zone ---

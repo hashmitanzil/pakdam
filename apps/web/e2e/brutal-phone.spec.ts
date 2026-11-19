@@ -321,15 +321,38 @@ test('brutal: full end-to-end on 390px touch — create to results', async ({ pa
   // player ready before "Ready to start" appears (no demo seats).
   await addRealPlayers(context, roomCode, ['Guest Two', 'Guest Three', 'Guest Four']);
   await expect(page.getByText(/Players \(5\/30\)/)).toBeVisible();
-  await expect(page.getByText(/Ready to start/i)).toBeVisible();
-  await expect(page.getByText(/5 of 5 ready/)).toBeVisible();
+  await expect(page.getByText(/✓ Ready to start/)).toBeVisible();
+  await expect(page.getByText(/5 of 5 ready\./)).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Players' }).getByText('✓ Ready', { exact: true })).toHaveCount(5);
+  // Minimal lobby (2026-11-19) on phone width: the readiness
+  // checklist, role preview, safety strip, lobby radio, host
+  // check-in and event log are all gone from the lobby. (Safety and
+  // radio still live on the play screen — SOS below, channels in
+  // live-hud.spec.ts.)
+  await expect(page.getByRole('heading', { name: 'Get ready to play' })).toHaveCount(0);
+  await expect(page.getByText(/Your checks/)).toHaveCount(0);
+  await expect(page.getByText(/Location permission/)).toHaveCount(0);
+  await expect(page.getByText(/GPS quality/)).toHaveCount(0);
+  await expect(page.getByText(/Screen-on \/ Wake Lock/)).toHaveCount(0);
+  await expect(page.getByText(/Network/)).toHaveCount(0);
+  await expect(page.getByText(/Briefing confirmed/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Run checks/ })).toHaveCount(0);
+  await expect(page.getByText(/Before you play — read this/)).toHaveCount(0);
+  await expect(page.getByText(/I understand the rules and the screen-on warning\./)).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Your role is decided when the game starts' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Safety — always here' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /SOS/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Safety pause/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Tell everyone/ })).toHaveCount(0);
+  await expect(page.getByRole('region', { name: 'Lobby radio' })).toHaveCount(0);
+  await expect(page.getByText(/Everyone in this lobby can read these messages/)).toHaveCount(0);
+  await expect(page.getByText(/Let.s go!/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Host check-in: lobby' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Host check-ins' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'What has happened' })).toHaveCount(0);
   await expectNoOverflow(page, 'lobby @390px');
   await assertNoOverlap(page, 'lobby @390px');
   await assertTapTargets(page, 'lobby @390px');
-  // Lobby radio works on phone width.
-  const lobbyRadio = page.getByRole('region', { name: 'Lobby radio' });
-  await lobbyRadio.getByRole('button', { name: /Let.s go!/ }).click();
-  await expect(lobbyRadio.locator('ul').getByText(/Let.s go!/)).toBeVisible();
 
   // Host-picked Hunters so the host is the Hunter (deterministic).
   await page.getByRole('button', { name: /Switch to host-picked Hunters/i }).click();

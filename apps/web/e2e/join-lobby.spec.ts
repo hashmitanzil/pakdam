@@ -1,8 +1,11 @@
 // Join + lobby e2e — TEXT/DOM assertions only, no screenshots.
 // Covers the brief's guest flow: join by 6-char code or invite link
 // with a display name and NO login, the Ready flow that gates Start,
-// the lobby settings sheet, report/block, Tell everyone, lobby Team
-// Radio, Get help, and profile friends / Played with / opt-in board.
+// the lobby settings sheet, report/block, and the minimal-lobby
+// absence checks (the safety strip, lobby radio, readiness
+// checklist, role preview, host check-in and event log are gone from
+// the lobby — safety and radio still live on the play screen, see
+// live-hud.spec.ts). Plus profile friends / Played with / opt-in board.
 import { test, expect } from '@playwright/test';
 import { createLobby, joinAsGuest, roomState, setPlayer } from './helpers';
 
@@ -34,14 +37,14 @@ test('guest join by invite link shows the code big and joins directly', async ({
   await guest.getByLabel(/18 or older/i).check();
   await guest.getByRole('button', { name: /Join lobby/i }).click();
   await expect(guest).toHaveURL(`/room/${roomId}`);
-  // The guest's name shows up in more than one place — roster row
-  // and "Your checks (Link Guest)" — so a bare getByText violates
-  // strict mode. Scope to the roster, the proof the guest is in the
-  // room: the roster name div lives in the Players region (Roster.tsx,
-  // room page.tsx: the roster <section aria-label="Players">). (Lobby
-  // trim 2026-11-19: the "You are playing as …" note and the "All
-  // players" duplicate list are deleted, and the event log hides when
-  // empty, so those matches are gone.)
+  // Scope to the roster, the proof the guest is in the room: the
+  // roster name div lives in the Players region (Roster.tsx,
+  // room page.tsx: the roster <section aria-label="Players">).
+  // (Minimal lobby 2026-11-19: the readiness checklist — whose
+  // "Your checks (Link Guest)" heading used to carry the name a
+  // second time — is deleted, as are the "You are playing as …"
+  // note, the "All players" duplicate list and the "What has
+  // happened" event log, so the roster is the name's home here.)
   await expect(guest.getByRole('region', { name: 'Players' }).getByText(/Link Guest/)).toBeVisible();
   await guest.close();
 
@@ -61,20 +64,37 @@ test('lobby Ready flow gates Start until everyone is ready', async ({ page, cont
   const { roomId, roomCode, hostId } = await createLobby(page, context);
   // Host alone: Start is disabled, the lobby says 3 players are needed
   // (MIN_PLAYERS = 3 — the old "NEED 2+ PLAYERS TO START" copy is gone).
+  // The host is ready by default (demo-store createRoom: isReady true),
+  // so the Players card reads "1 of 1 ready." and the host's button
+  // already shows the ready state.
   await expect(page.getByRole('button', { name: /Start game/i })).toBeDisabled();
+  await expect(page.getByText(/NEED 3\+ PLAYERS TO START/)).toBeVisible();
   await expect(page.getByText(/1 of at least 3 players in/i)).toBeVisible();
+  await expect(page.getByText(/Players \(1\/30\)/)).toBeVisible();
+  await expect(page.getByText(/1 of 1 ready\./)).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Players' }).getByText('✓ Ready', { exact: true })).toHaveCount(1);
+  await expect(page.getByRole('button', { name: /I.m ready — tap to change/ })).toBeVisible();
 
   const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
   await expect(guest).toHaveURL(`/room/${roomId}`);
   await setPlayer(page, hostId);
-  // Two players in: still short of the 3-player minimum.
+  // Two players in: still short of the 3-player minimum. The guest is
+  // not ready yet — the roster says so in words ("… Not ready yet"),
+  // and the old not-ready sub-line ("Tap when you have read the rules
+  // and run your checks.") is gone in the minimal lobby.
+  await expect(page.getByText(/NEED 3\+ PLAYERS TO START/)).toBeVisible();
   await expect(page.getByText(/2 of at least 3 players in/i)).toBeVisible();
-  await expect(page.getByRole('button', { name: /Start game/i })).toBeDisabled();
+  await expect(page.getByText(/1 of 2 ready\./)).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Players' }).getByText('… Not ready yet', { exact: true })).toHaveCount(1);
+  await expect(guest.getByText(/Tap when you have read the rules and run your checks\./)).toHaveCount(0);
 
-  // Guest taps "I'm ready" (their own page); the minimum is still unmet.
+  // Guest taps "I'm ready" (their own page) — the single tap IS the
+  // readiness mechanism now (no checks to run, no rules checkbox);
+  // the minimum is still unmet.
   await guest.getByRole('button', { name: /I.m ready/i }).click();
-  await expect(guest.getByText(/You are ready/)).toBeVisible();
+  await expect(guest.getByText(/You are ready\. The host starts the game when everyone is ready\./)).toBeVisible();
   await expect(page.getByText(/2 of at least 3 players in/i)).toBeVisible();
+  await expect(page.getByText(/2 of 2 ready\./)).toBeVisible();
 
   // A second guest joins: 3 players in, but the second guest is not ready yet.
   const guest2 = await joinAsGuest(context, roomCode, 'Guest Two');
@@ -82,16 +102,68 @@ test('lobby Ready flow gates Start until everyone is ready', async ({ page, cont
   await expect(page.getByText(/Waiting for everyone to be ready/i)).toBeVisible();
   await expect(page.getByRole('button', { name: /Start game/i })).toBeDisabled();
   await expect(page.getByText(/Waiting for: Guest Two/)).toBeVisible();
+  await expect(page.getByText(/Need at least 3 players, and everyone ready\./)).toBeVisible();
+  await expect(page.getByText(/2 of 3 ready\./)).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Players' }).getByText('✓ Ready', { exact: true })).toHaveCount(2);
+  await expect(page.getByRole('region', { name: 'Players' }).getByText('… Not ready yet', { exact: true })).toHaveCount(1);
 
   // Second guest readies: everyone is ready, Start enables.
   await guest2.getByRole('button', { name: /I.m ready/i }).click();
-  await expect(guest2.getByText(/You are ready/)).toBeVisible();
-  await expect(page.getByText(/Ready to start/i)).toBeVisible();
+  await expect(guest2.getByText(/You are ready\. The host starts the game when everyone is ready\./)).toBeVisible();
+  await expect(page.getByText(/✓ Ready to start/)).toBeVisible();
   await expect(page.getByRole('button', { name: /Start game/i })).toBeEnabled();
-  // The Ready list shows all three players ready.
-  await expect(page.getByText(/3 of 3 ready/)).toBeVisible();
+  // The Players card shows all three players ready.
+  await expect(page.getByText(/3 of 3 ready\./)).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Players' }).getByText('✓ Ready', { exact: true })).toHaveCount(3);
   await guest.close();
   await guest2.close();
+});
+
+test('lobby minimal: removed readiness, role-preview, check-in and event-log blocks are absent', async ({ page, context }) => {
+  test.setTimeout(120_000);
+  const { roomId, roomCode, hostId } = await createLobby(page, context);
+  const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
+  await expect(guest).toHaveURL(`/room/${roomId}`);
+  await setPlayer(page, hostId);
+
+  // Kept UI still here: the lobby heading, the Players card and the
+  // single-tap ready button (the host is ready by default, the guest
+  // is not — "1 of 2 ready.").
+  await expect(page.getByRole('heading', { name: 'Lobby', exact: true })).toBeVisible();
+  await expect(page.getByText(/Players \(2\/30\)/)).toBeVisible();
+  await expect(page.getByText(/1 of 2 ready\./)).toBeVisible();
+  await expect(guest.getByRole('button', { name: /I.m ready/i })).toBeVisible();
+
+  // Readiness checklist — all of it is gone: the "Get ready to play"
+  // heading, the "Your checks" line, every check row (Location
+  // permission / GPS quality / Screen-on / Wake Lock / Network /
+  // Briefing confirmed), the "Run checks / Retry" button, and the
+  // "Before you play" rules checkbox.
+  await expect(page.getByRole('heading', { name: 'Get ready to play' })).toHaveCount(0);
+  await expect(page.getByText(/Your checks/)).toHaveCount(0);
+  await expect(page.getByText(/Location permission/)).toHaveCount(0);
+  await expect(page.getByText(/GPS quality/)).toHaveCount(0);
+  await expect(page.getByText(/Screen-on \/ Wake Lock/)).toHaveCount(0);
+  await expect(page.getByText(/Network/)).toHaveCount(0);
+  await expect(page.getByText(/Briefing confirmed/)).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Run checks/ })).toHaveCount(0);
+  await expect(page.getByText(/Before you play — read this/)).toHaveCount(0);
+  await expect(page.getByText(/I understand the rules and the screen-on warning\./)).toHaveCount(0);
+
+  // Role preview, host check-in and the event log are gone too.
+  await expect(page.getByRole('heading', { name: 'Your role is decided when the game starts' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Host check-in: lobby' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'Host check-ins' })).toHaveCount(0);
+  await expect(page.getByRole('heading', { name: 'What has happened' })).toHaveCount(0);
+
+  // The not-ready sub-line under "I'm ready" is gone as well — the
+  // guest has not tapped ready yet, so it would have shown here
+  // before the strip. Tapping "I'm ready" is the whole readiness
+  // mechanism now: no checks, no checkbox, just the tap.
+  await expect(guest.getByText(/Tap when you have read the rules and run your checks\./)).toHaveCount(0);
+  await guest.getByRole('button', { name: /I.m ready/i }).click();
+  await expect(guest.getByText(/You are ready\. The host starts the game when everyone is ready\./)).toBeVisible();
+  await guest.close();
 });
 
 test('lobby settings sheet lets the host change rules before the start', async ({ page, context }) => {
@@ -147,44 +219,40 @@ test('lobby: report/block sheet files a report and blocks on this device', async
   await sheet.getByRole('button', { name: /Done/ }).click();
   // The roster now marks the player "Blocked by you".
   await expect(page.getByText(/Blocked by you/)).toBeVisible();
-  // The report landed in the room event log.
+  // The report landed in the room's stored events (roomState) — the
+  // lobby's "What has happened" event-log section is gone in the
+  // minimal lobby, so there is no DOM log to check; the store record
+  // is the proof. (A report was filed, so events are non-empty — the
+  // log section would have rendered here before the strip.)
+  await expect(page.getByText(/What has happened/i)).toHaveCount(0);
   const state = await roomState(page);
   expect(state!.events.some((e) => /Report filed about Guest Runner/i.test(e.text))).toBe(true);
   await guest.close();
 });
 
-test('lobby: Tell everyone (hold 2 s) shares position; lobby radio sends', async ({ page, context }) => {
+test('lobby: safety strip and lobby radio are gone — absence on the lobby', async ({ page, context }) => {
   test.setTimeout(120_000);
   const { roomId, roomCode, hostId } = await createLobby(page, context);
   const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
   await expect(guest).toHaveURL(`/room/${roomId}`);
   await setPlayer(page, hostId);
 
-  // Hold-to-reveal: press and hold the button for 2 seconds. (The
-  // accessible name is the aria-label, not the visible button text.)
-  const tellBtn = page.getByRole('button', { name: /Tell everyone in the game/ });
-  await expect(tellBtn).toBeVisible();
-  await tellBtn.hover();
-  await page.mouse.down();
-  await page.waitForTimeout(2300);
-  await page.mouse.up();
-  await expect(page.getByText(/Position shared with everyone/)).toBeVisible();
+  // Minimal lobby (2026-11-19): the "Safety — always here" block is
+  // gone from the lobby — no SOS, no safety pause, no hold-to-reveal
+  // "Tell everyone". Safety still lives on the PLAY screen (SOS +
+  // safety pause, live-hud.spec.ts; SOS in the brutal-phone flow).
+  await expect(page.getByRole('heading', { name: 'Safety — always here' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /SOS/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Safety pause/ })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: /Tell everyone/ })).toHaveCount(0);
+  await expect(page.getByText(/Position shared with everyone/)).toHaveCount(0);
 
-  // Lobby radio: a quick message lands in the channel. The scope note
-  // is one line now (lobby trim 2026-11-19): everyone in the lobby
-  // can read these messages.
-  const radio = page.getByRole('region', { name: 'Lobby radio' });
-  await expect(radio).toBeVisible();
-  await expect(radio).toContainText(/Everyone in this lobby can read these messages/);
-  await radio.getByRole('button', { name: /Let.s go!/ }).click();
-  // The sent message lands in the message list (<ul>); the quick chip
-  // with the same text sits outside it, in the "Quick messages" group
-  // (TeamRadio.tsx: messages render in <ul className={messageList}>,
-  // chips in <div role="group" aria-label="Quick messages">), so a
-  // bare getByText matches both and violates strict mode. Scope to
-  // the list — the only <ul> in the radio region.
-  await expect(radio.locator('ul').getByText(/Let.s go!/)).toBeVisible();
-  await expect(radio.getByText(/Test Host/)).toBeVisible();
+  // And the lobby radio is gone too — no region, no scope line, no
+  // quick chips. Radio still lives on the play screen (Hunters /
+  // Runners channels, live-hud.spec.ts).
+  await expect(page.getByRole('region', { name: 'Lobby radio' })).toHaveCount(0);
+  await expect(page.getByText(/Everyone in this lobby can read these messages/)).toHaveCount(0);
+  await expect(page.getByText(/Let.s go!/)).toHaveCount(0);
   await guest.close();
 });
 

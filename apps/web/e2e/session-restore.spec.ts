@@ -68,13 +68,18 @@ test('(b) reload restores the room, the host seat and the guest seat', async ({ 
   // Reload the guest tab: the room and the guest seat come back.
   await guest.reload();
   await expect(guest).toHaveURL(`/room/${roomId}`);
-  // The guest's name shows up in more than one place — roster row
-  // and "Your checks (Guest Runner)" — so a bare getByText violates
-  // strict mode. Scope to the roster in the Players region, the proof
-  // the guest seat came back. (Lobby trim 2026-11-19: the "All
-  // players" duplicate list and the "You are playing as …" note are
-  // deleted, and the event log hides when empty.)
+  // Scope to the roster in the Players region, the proof the guest
+  // seat came back. (Minimal lobby 2026-11-19: the readiness
+  // checklist — whose "Your checks (Guest Runner)" heading used to
+  // carry the name a second time — is deleted, as are the "All
+  // players" duplicate list, the "You are playing as …" note and
+  // the "What has happened" event log, so the roster is the name's
+  // home on this screen.)
   await expect(guest.getByRole('region', { name: 'Players' }).getByText(/Guest Runner/)).toBeVisible();
+  // The removed blocks stay gone after a reload, too.
+  await expect(guest.getByText(/Your checks/)).toHaveCount(0);
+  await expect(guest.getByText(/Get ready to play/)).toHaveCount(0);
+  await expect(guest.getByRole('heading', { name: 'What has happened' })).toHaveCount(0);
   const afterGuestReload = await roomState(guest);
   expect(afterGuestReload).not.toBeNull();
   expect(afterGuestReload!.players.some((p) => p.displayName === 'Guest Runner')).toBe(true);

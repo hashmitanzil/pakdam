@@ -1,29 +1,30 @@
 'use client';
 import { use, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { getRoom, setPhase, toggleReady, hostCheckin, currentPlayerId, clearCurrentPlayerId, leaveRoom, setTeamAssignment, setSelectedHunters, updateRoomConfig } from '@/lib/demo-store';
+import { getRoom, setPhase, toggleReady, currentPlayerId, clearCurrentPlayerId, leaveRoom, setTeamAssignment, setSelectedHunters, updateRoomConfig } from '@/lib/demo-store';
 import { draftFromConfig, roomSummaryStrip } from '@/components/host-setup/draft';
 import Roster from '@/components/lobby/Roster';
-import ReadinessChecklist from '@/components/lobby/ReadinessChecklist';
-import LobbySafety, { type LobbyPause } from '@/components/lobby/LobbySafety';
+import ReadinessProbe from '@/components/lobby/ReadinessProbe';
 import ReportBlockSheet from '@/components/lobby/ReportBlockSheet';
 import HostSettingsSheet from '@/components/host-setup/HostSettingsSheet';
 import { fileReport, type ReportReason } from '@/components/lobby/report-block';
-import TeamRadio from '@/components/radio/TeamRadio';
 import styles from '@/components/lobby/lobby.module.css';
 import type { DemoRoom } from '@/lib/demo-store';
 import { createLivePakdamSocket, getWorkerUrl, isLiveTransportEnabled } from '@/lib/websocket';
 import { clearSession, getSessionForRoom, saveLiveSession, type PakdamSession } from '@/lib/session-credentials';
 import { fetchHostToken, regenerateLiveRoomCode, removeLivePlayer, updateLiveRoomConfig } from '@/lib/live-room-client';
 import type { PakdamSocket, PakdamSocketState } from '@/lib/websocket';
-import type { LocationFix, Player, PlayerView, RadioMessage, Room, RoomConfig, WsServerMessage, WsSnapshotPayload } from '@pakdam/shared';
+import type { Player, PlayerView, Room, RoomConfig, WsServerMessage, WsSnapshotPayload } from '@pakdam/shared';
 import { generateRoomCode } from '@pakdam/shared';
 
-/** Lobby — redesigned 2026-11-17.
+/** Lobby — redesigned 2026-11-17, trimmed to ShadowHunt form 2026-11-19.
  *  No venue/area name anywhere on this screen: the game starts from the
- *  host's location, not from a name. One clear primary action (I'm ready /
- *  Start game), roster with ready states, readiness checklist, safety
- *  strip (SOS / pause / hold-to-reveal), lobby radio, host controls.
+ *  host's location, not from a name. Code + copy/share/settings, summary
+ *  strip, start gate, roster with ready states, "I'm ready", host
+ *  controls — nothing else. The readiness checks run silently on mount
+ *  (ReadinessProbe, renders nothing); there is no checklist, safety
+ *  panel, lobby radio, role preview, host check-in, or event log here.
+ *  Safety controls live on the play screen.
  *
  *  TWO MODES, never mixed (Worker 2, live wiring 2026-11-17):
  *  - DEMO (default): the local demo store, labelled on screen. Exactly
@@ -49,9 +50,7 @@ import { generateRoomCode } from '@pakdam/shared';
  *  WHAT IS LIVE, and what is NOT (the live server has no endpoint for
  *  it — the UI says so in plain language instead of faking it):
  *  - LIVE: player list + readiness (snapshot), ready toggle
- *    (ready.set + briefing.confirm), host check-in (announcement.send
- *    — host-only on the server, which is exactly the seat that checks
- *    in), leave (leave), safety pause/resume/SOS (safety.*), Start
+ *    (ready.set + briefing.confirm), leave (leave), Start
  *    (POST /v1/rooms/:id/start with {playerId, hostToken} — host
  *    authority is proved by the stored HOST token, never by display
  *    name or the reconnect token), and the transition to play on
@@ -63,17 +62,14 @@ import { generateRoomCode } from '@pakdam/shared';
  *    the Teams picker below), removing a player (POST
  *    /v1/rooms/:id/remove-player, host token — the server broadcasts
  *    player.removed and every lobby re-renders from a fresh
- *    snapshot), regenerating the room code (POST
+ *    snapshot), and regenerating the room code (POST
  *    /v1/rooms/:id/regenerate-code, host token — the old code stops
- *    working at once), and hold-to-reveal (WS `reveal.send` with
- *    this device's current fix — the DO validates it and broadcasts
- *    a coarse 150 m `reveal` area to every socket).
- *  - NOT LIVE YET: lobby radio is demo-only localStorage, so it is
- *    hidden in live mode. The warning acknowledgement tick-box is
- *    kept on this device in live mode: `announcement.send` is
- *    host-only, so a guest has no server channel for it, and the
- *    server's briefing record is briefing.confirm (sent when the
- *    player taps "I'm ready").
+ *    working at once).
+ *  - NOT LIVE HERE (no lobby UI for them): lobby radio is demo-only
+ *    localStorage, and the safety panel (SOS / pause / hold-to-reveal),
+ *    host check-in and event log were cut from this screen — safety
+ *    lives on the play screen. The server's briefing record is
+ *    briefing.confirm (sent when the player taps "I'm ready").
  *
  *  Demo-only local helpers below (removePlayer, appendRoomEvent) read and
  *  write the demo store's localStorage record directly, because the demo
@@ -83,6 +79,18 @@ import { generateRoomCode } from '@pakdam/shared';
 
 const DEMO_KEY = 'pakdam.demo.rooms.v1';
 const PAUSE_KEY = (roomId: string) => `pakdam.lobby-pause.${roomId}`;
+
+/** Demo safety-pause record (the shape LobbySafety used): who paused
+ *  and when. A live pause cannot be active in the lobby — the server
+ *  only allows safety.pause in ACTIVE/HEAD_START, and pausing moves
+ *  the phase out of LOBBY — but a demo pause stored in localStorage
+ *  before the lobby was trimmed can still be active, so the lobby
+ *  keeps a one-line Resume for it (see resumePause). */
+type LobbyPause = {
+  by: string;
+  byName: string;
+  at: string;
+} | null;
 
 function loadAll(): Record<string, DemoRoom> {
   try {
@@ -138,11 +146,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
   const [liveNotice, setLiveNotice] = useState('');
   const [socketState, setSocketState] = useState<PakdamSocketState>('idle');
   const [socketDetail, setSocketDetail] = useState('');
-  const [liveEvents, setLiveEvents] = useState<{ at: string; text: string }[]>([]);
-  // Team Radio TEXT (D-M7, live lobby): messages relayed by the DO
-  // to the whole lobby (no teams yet), oldest first, capped at 50.
-  const [liveRadio, setLiveRadio] = useState<RadioMessage[]>([]);
-  const [liveCheckins, setLiveCheckins] = useState<string[]>([]);
   const [liveRetry, setLiveRetry] = useState(0);
   const socketRef = useRef<PakdamSocket | null>(null);
   const wentToPlayRef = useRef(false);
@@ -181,10 +184,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
     if (wentToPlayRef.current) return;
     wentToPlayRef.current = true;
     router.push(`/room/${roomId}/play`);
-  };
-
-  const appendLiveEvent = (text: string) => {
-    setLiveEvents((prev) => [...prev, { at: new Date().toISOString(), text }]);
   };
 
   // --- demo load (demo mode only) ---
@@ -300,9 +299,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
       },
       onMessage: (msg: WsServerMessage) => {
         if (cancelled) return;
-        const nameOf = (id: string | null): string =>
-          snapRef.current?.players.find((p) => p.playerId === id)?.displayName
-          ?? (id === session.playerId ? 'you' : 'a player');
         switch (msg.type) {
           case 'match.started':
             goToPlay();
@@ -315,61 +311,18 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
             else socket.requestSnapshot();
             break;
           case 'player.joined':
-            appendLiveEvent(`${msg.payload.player.displayName} joined`);
-            socket.requestSnapshot();
-            break;
           case 'player.left':
-            appendLiveEvent(`${msg.payload.player.displayName} left`);
-            socket.requestSnapshot();
-            break;
           case 'player.removed':
-            appendLiveEvent(`${msg.payload.player.displayName} was removed from the lobby by the host`);
+          case 'host.transferred':
             socket.requestSnapshot();
             break;
-          case 'reveal': {
-            // D-M6: a player shared their position with the whole room
-            // over the live reveal channel — the event log is this
-            // lobby's receipt (the play map draws the coarse area).
-            const byId = msg.payload.reveal.byPlayerId;
-            appendLiveEvent(`${byId === session.playerId ? 'You' : nameOf(byId)} shared their position with everyone in the game — see the marked area`);
-            break;
-          }
           case 'player.suspended':
           case 'player.resumed':
             socket.requestSnapshot();
             break;
-          case 'host.transferred':
-            appendLiveEvent(`Host transferred to ${nameOf(msg.payload.newHostPlayerId)}`);
-            socket.requestSnapshot();
-            break;
-          case 'announcement': {
-            const a = msg.payload.announcement;
-            appendLiveEvent(a.text);
-            if (a.text.startsWith('Host check-in:')) {
-              setLiveCheckins((prev) => [...prev, `${a.sentAt} — ${a.text}`]);
-            }
-            break;
-          }
-          case 'radio': {
-            // Team Radio text (D-M7): a lobby message, relayed by the
-            // DO to the whole lobby. Append (deduped by messageId),
-            // keep the last 50. No snapshot refresh — radio is
-            // ephemeral and the snapshot carries no radio history.
-            const incoming = (msg as Extract<WsServerMessage, { type: 'radio' }>).payload.radio;
-            setLiveRadio((prev) => prev.some((m) => m.messageId === incoming.messageId)
-              ? prev : [...prev, incoming].slice(-50));
-            break;
-          }
           case 'safety.paused':
-            appendLiveEvent(`Safety pause — ${nameOf(msg.payload.byPlayerId)} paused the start`);
-            socket.requestSnapshot();
-            break;
           case 'safety.resumed':
-            appendLiveEvent('Safety pause lifted — the game can start again');
             socket.requestSnapshot();
-            break;
-          case 'sos.raised':
-            appendLiveEvent(`SOS raised by ${nameOf(msg.payload.byPlayerId)} — host notified`);
             break;
           case 'error':
             setLiveNotice(msg.payload.message || 'The server refused that action.');
@@ -418,8 +371,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
   const players: Player[] = mode === 'live'
     ? ((snap?.players ?? []) as Player[])
     : dr?.players ?? [];
-  const checkins: string[] = mode === 'live' ? liveCheckins : dr?.checkins ?? [];
-  const events: { at: string; text: string }[] = mode === 'live' ? liveEvents : dr?.events ?? [];
   const me = mode === 'live' ? liveSession?.playerId ?? null : currentPlayerId();
   const isHost = room !== null && room.hostPlayerId === me;
   const mePlayer = players.find((p) => p.playerId === me) ?? null;
@@ -446,6 +397,9 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
     }
     : null;
   const pauseActive = mode === 'live' ? livePause !== null : pause !== null;
+  // The pause (if any) currently holding the start, in either mode —
+  // the one-line Resume button below is gated on who set it.
+  const activePause = mode === 'live' ? livePause : pause;
   const inviteLink = room !== null && typeof window !== 'undefined'
     ? `${window.location.origin}/join/${room.roomCode}` : room !== null ? `/join/${room.roomCode}` : '';
 
@@ -525,18 +479,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
       detail: report.detail,
     });
     appendRoomEvent(roomId, `Report filed about ${report.subjectName} (${report.reason}) — host to review${report.blocked ? '; reporter also blocked them on their device' : ''}`);
-    setDr(getRoom(roomId));
-  };
-
-  const handlePauseChangeDemo = (next: LobbyPause) => {
-    setPause(next);
-    if (next) {
-      localStorage.setItem(PAUSE_KEY(roomId), JSON.stringify(next));
-      appendRoomEvent(roomId, `Safety pause — ${next.byName} paused the start`);
-    } else {
-      localStorage.removeItem(PAUSE_KEY(roomId));
-      appendRoomEvent(roomId, 'Safety pause lifted — the game can start again');
-    }
     setDr(getRoom(roomId));
   };
 
@@ -724,24 +666,20 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
     setLiveNotice('');
   };
 
-  const hostCheckinLive = () => {
-    const socket = socketRef.current;
-    if (!socket) return;
-    // No dedicated host-checkin endpoint exists: the check-in rides on
-    // announcement.send, which is host-only on the server and broadcast
-    // to the room — the lobby lists it under Host check-ins on echo.
-    if (!socket.sendCommand('announcement.send', { text: 'Host check-in: lobby — all players accounted for' })) {
-      setLiveNotice('Not connected — the check-in was not sent. Wait for the reconnect, then try again.');
+  /** One-line resume for a safety pause that is somehow active while
+   *  this screen is the lobby. Live: cannot happen — the server only
+   *  allows safety.pause in ACTIVE/HEAD_START, and pausing moves the
+   *  phase out of LOBBY — so the resume is sent anyway and the server
+   *  answers. Demo: a pause stored in localStorage before the lobby
+   *  was trimmed can still be active, and with the safety panel gone
+   *  this button is the only way to lift it. */
+  const resumePause = () => {
+    if (mode === 'live') {
+      socketRef.current?.sendCommand('safety.resume', {});
+      return;
     }
-  };
-
-  const acknowledgeLive = (note: string) => {
-    // The warning tick-box has no server channel for a guest
-    // (announcement.send is host-only). The host's acknowledgement is
-    // announced to the room; a guest's stays on their device, and the
-    // checklist says so. The server's briefing record is
-    // briefing.confirm, sent with "I'm ready".
-    if (isHost) socketRef.current?.sendCommand('announcement.send', { text: note });
+    localStorage.removeItem(PAUSE_KEY(roomId));
+    setPause(null);
   };
 
   const leaveLive = () => {
@@ -769,66 +707,9 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
     router.push('/');
   };
 
-  const handlePauseChangeLive = (next: LobbyPause) => {
-    const socket = socketRef.current;
-    if (!socket) return;
-    if (next) socket.sendCommand('safety.pause', { reason: null });
-    else socket.sendCommand('safety.resume', {});
-  };
-
-  const sosLive = () => {
-    socketRef.current?.sendCommand('safety.sos', { reason: null });
-  };
-
-  const revealLive = () => {
-    // D-M6: the live reveal channel. The 2 s hold already happened
-    // in LobbySafety; now get this device's current position and
-    // send it as `reveal.send` — the DO validates the fix and
-    // broadcasts a coarse 150 m `reveal` area to EVERY socket, so
-    // all players see it (this lobby logs it; the play map draws
-    // the area). No fix, no socket, no claim: any failure sets a
-    // plain notice and shares nothing. Any seat may reveal — this
-    // is a safety feature, not a host power — so there is no isHost
-    // gate here.
-    const socket = socketRef.current;
-    if (!socket || !mePlayer) {
-      setLiveNotice('Not connected — your position was not shared. Wait for the reconnect, then hold again.');
-      return;
-    }
-    if (!('geolocation' in navigator)) {
-      setLiveNotice('This device could not share a position — no location is available. No position was shared.');
-      return;
-    }
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        const fix: LocationFix = {
-          playerId: mePlayer.playerId, roomId,
-          lat: pos.coords.latitude, lng: pos.coords.longitude,
-          accuracyMeters: Math.max(1, Math.round(pos.coords.accuracy)),
-          capturedAt: new Date(pos.timestamp).toISOString(),
-          receivedAt: new Date().toISOString(),
-          // Client-side tier only — the server re-decides the quality
-          // from its own GPS validation before anything is broadcast.
-          quality: pos.coords.accuracy <= 50 ? 'good' : pos.coords.accuracy <= 150 ? 'fair' : 'poor',
-        };
-        if (!socket.sendCommand('reveal.send', { fix })) {
-          setLiveNotice('Not connected — your position was not shared. Wait for the reconnect, then hold again.');
-          return;
-        }
-        appendLiveEvent(`${mePlayer.displayName} shared their position with everyone in the game (hold-to-reveal)`);
-        setLiveNotice('');
-      },
-      () => {
-        setLiveNotice('Could not get your location — check location permission and hold again. No position was shared.');
-      },
-      { enableHighAccuracy: true, timeout: 10_000, maximumAge: 0 },
-    );
-  };
-
   const handleReportFiledLive = (report: { subjectName: string; reason: ReportReason; detail: string; blocked: boolean }) => {
     // Filing the report is device-local (fileReport) in both modes;
-    // live has no report endpoint, so the room-log line is a
-    // session-only note, not a server event.
+    // live has no report endpoint.
     fileReport({
       reporterName: mePlayer?.displayName ?? null,
       subjectName: report.subjectName,
@@ -836,7 +717,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
       reason: report.reason,
       detail: report.detail,
     });
-    appendLiveEvent(`Report filed about ${report.subjectName} (${report.reason}) — host to review${report.blocked ? '; reporter also blocked them on their device' : ''}`);
   };
 
   const startGameLive = async () => {
@@ -980,6 +860,16 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
         </div>
       )}
 
+      {/* A safety pause can only still be active here from a demo
+          pause stored before the lobby was trimmed (a live pause
+          cannot exist while the phase is LOBBY). One line, no panel:
+          the host or the player who paused can lift it. */}
+      {pauseActive && (isHost || activePause?.by === me) ? (
+        <p><button type="button" className="btn btn-secondary" onClick={resumePause}>Safety pause is on — Resume</button></p>
+      ) : null}
+
+      <ReadinessProbe />
+
       <section className="card" aria-label="Players">
         <h2 className={styles.sectionTitle}>Players ({players.length}/{room.config.maxPlayers})</h2>
         <p className={styles.sectionSub}>
@@ -991,20 +881,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
       </section>
 
       {offline ? <div className="banner" role="status"><strong>You are offline — reconnecting…</strong> The roster below is last-known, shown with last-seen times, never as live.</div> : null}
-
-      <section className="card" aria-label="Role preview">
-        <h2 className={styles.sectionTitle}>Your role is decided when the game starts</h2>
-        <p className={styles.sectionSub}>Hunter: follow rough pings, scan the Runner’s QR to catch.</p>
-        <p className={styles.sectionSub}>Runner: hide, outlast the clock — nothing exact is ever shared.</p>
-      </section>
-
-      <ReadinessChecklist
-        players={players}
-        meId={me}
-        roomId={roomId}
-        mode={mode === 'live' ? 'live' : 'demo'}
-        onAcknowledgeLive={mode === 'live' ? acknowledgeLive : undefined}
-      />
 
       {mePlayer ? (
         <div className={styles.primaryAction}>
@@ -1019,7 +895,7 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
           >
             {mePlayer.isReady ? '✓ I’m ready — tap to change' : 'I’m ready'}
           </button>
-          <p className={`small ${styles.center}`}>{mePlayer.isReady ? 'You are ready. The host starts the game when everyone is ready.' : 'Tap when you have read the rules and run your checks.'}</p>
+          {mePlayer.isReady ? <p className={`small ${styles.center}`}>You are ready. The host starts the game when everyone is ready.</p> : null}
           {/* Leave / switch player (founder bug, 2026-11-17): the lobby
               had no way to leave or change seats, and joining as a
               second player in the same browser stole the first
@@ -1039,41 +915,6 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
           <p role="alert">Your seat is not in this room’s roster — the server does not list this device as a player. Rejoin with the room code.</p>
         </div>
       ) : null}
-
-      <LobbySafety
-        meId={me}
-        meName={mePlayer?.displayName ?? null}
-        isHost={isHost}
-        pause={mode === 'live' ? livePause : pause}
-        onPauseChange={mode === 'live' ? handlePauseChangeLive : handlePauseChangeDemo}
-        onSos={() => {
-          if (mode === 'live') {
-            sosLive();
-            if (mePlayer) appendLiveEvent(`SOS raised by ${mePlayer.displayName} — host notified`);
-          } else {
-            if (mePlayer) appendRoomEvent(roomId, `SOS raised by ${mePlayer.displayName} — host notified`);
-            setDr(getRoom(roomId));
-          }
-        }}
-        onReveal={() => {
-          if (mode === 'live') revealLive();
-          else {
-            if (mePlayer) appendRoomEvent(roomId, `${mePlayer.displayName} shared their position with everyone in the game (hold-to-reveal)`);
-            setDr(getRoom(roomId));
-          }
-        }}
-      />
-
-      <TeamRadio
-        roomId={roomId}
-        scope="lobby"
-        meName={mePlayer?.displayName ?? null}
-        liveText={mode === 'live' ? {
-          messages: liveRadio,
-          connected: socketState === 'connected',
-          send: (text, kind) => socketRef.current?.sendRadioMessage(text, kind) ?? false,
-        } : undefined}
-      />
 
       {isHost ? (
         <div className="card">
@@ -1131,35 +972,14 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
           {mode === 'live' ? (
             <>
               {!canStart ? <p className="small">Need at least {MIN_PLAYERS} players, and everyone ready. {notReady.length > 0 ? `Waiting for: ${notReady.map((p) => p.displayName).join(', ')}.` : ''} {!teamsReady ? ' Hunter setup is incomplete — see Teams above.' : ''} The server also refuses to start until every player still in the room is ready.</p> : null}
-              {pauseActive ? <p className="small">Start is held by a safety pause. Resume it in the safety panel above to start.</p> : null}
             </>
           ) : (
             <>
               {!canStart ? <p className="small">Need at least {MIN_PLAYERS} players, and everyone ready. {notReady.length > 0 ? `Waiting for: ${notReady.map((p) => p.displayName).join(', ')}.` : ''} {!teamsReady ? `Pick ${room.config.hunterCount} Hunter(s) in Teams above first.` : ''} The host may start without a player who is not ready, once the minimum is met — use “I’m ready” above for yourself first.</p> : null}
-              {pause ? <p className="small">Start is held by a safety pause. Resume it in the safety panel above to start.</p> : null}
-            </>
-          )}
-          <p><button className="btn btn-secondary" onClick={() => { if (mode === 'live') hostCheckinLive(); else { hostCheckin(roomId, 'Lobby — all players accounted for'); setDr(getRoom(roomId)); } }}>Host check-in: lobby</button></p>
-          {checkins.length === 0 ? null : (
-            <>
-              <h3>Host check-ins</h3>
-              <ul>{checkins.map((c, i) => <li key={i}>{c}</li>)}</ul>
             </>
           )}
         </div>
       ) : null}
-
-      {events.length === 0 ? null : (
-        <section className="card" aria-label="Room events">
-          <h2 className={styles.sectionTitle}>What has happened</h2>
-          {mode === 'live' ? <p className="small">Only events received while this tab was connected are shown — the server keeps the full log.</p> : null}
-          <ul className={styles.eventList}>
-            {events.map((e, i) => (
-              <li key={i}><span className={styles.eventTime}>{new Date(e.at).toLocaleTimeString()}</span> — {e.text}</li>
-            ))}
-          </ul>
-        </section>
-      )}
 
       {reportTarget ? (
         <ReportBlockSheet
