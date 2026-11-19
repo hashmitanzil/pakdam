@@ -2,7 +2,14 @@ packages:
   - "apps/*"
   - "packages/*"
   - "workers"
+
+# pnpm 12: build approvals live here as the `allowBuilds` map.
+# `onlyBuiltDependencies` is the old pnpm 10/11 setting and does NOT
+# work in pnpm 12 (neither in package.json nor here — verified
+# 2026-11-19: install still failed with ERR_PNPM_IGNORED_BUILDS).
+# These three are first-party packages; all approved 2026-11-19.
+# Without this map, `pnpm install` fails with ERR_PNPM_IGNORED_BUILDS.
 allowBuilds:
-  '@sentry/cli': set this to true or false
-  esbuild: set this to true or false
-  workerd: set this to true or false
+  '@sentry/cli': true
+  esbuild: true
+  workerd: true
