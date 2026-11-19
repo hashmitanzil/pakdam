@@ -1,199 +1,125 @@
 'use client';
-import { useRef, useState } from 'react';
+
+/**
+ * Join by code — guest-only, no login (SCRAM-SPEC §3, PROTOCOL-MAP §1.2–1.3).
+ *
+ * Code + codename, JOIN → the lobby. Live: resolve the code, then join
+ * (a stored reconnect token is forwarded only to restore a seat under
+ * the same codename). Demo: join the local room by code.
+ */
+import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import Link from 'next/link';
-import { getRoomByCode, joinRoom, setCurrentPlayerId } from '@/lib/demo-store';
-import {
-  isLiveEnabled, joinLiveRoom, resolveRoomByCode, storeLiveSeat,
-} from '@/lib/live-client';
-import { saveDemoSession } from '@/lib/session-credentials';
-import styles from './join.module.css';
-
-/** Join a game — redesigned 2026-11-17.
- *  One clear primary action ("Join lobby"). The room code is entered in
- *  six boxes that auto-advance, handle backspace, and spread a pasted
- *  code across the boxes. The first box carries the "Room code" label so
- *  assistive tech and the e2e suite find it; the other five are labelled
- *  as code characters. Same join logic as before: code → room, name →
- *  guest seat, no account needed, 18+ only. */
-const CODE_LEN = 6;
-const CODE_CHARS = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-
-function cleanCode(raw: string): string {
-  return raw
-    .toUpperCase()
-    .replace(/[^A-Z0-9]/g, '')
-    .split('')
-    .filter((c) => CODE_CHARS.includes(c))
-    .join('')
-    .slice(0, CODE_LEN);
-}
+import { isValidDisplayName, isValidRoomCode } from '@pakdam/shared';
+import { isLiveTransportEnabled } from '../../lib/websocket';
+import { joinLiveRoom, resolveRoomByCode } from '../../lib/live-client';
+import { getRoomByCode, joinRoom as joinDemoRoom } from '../../lib/demo-store';
+import { getSessionForRoom, storeDemoSeat } from '../../lib/session-credentials';
 
 export default function JoinPage() {
   const router = useRouter();
-  const [boxes, setBoxes] = useState<string[]>(Array(CODE_LEN).fill(''));
-  const [name, setName] = useState('');
-  const [ageChecked, setAgeChecked] = useState(false);
-  const [error, setError] = useState('');
+  const [code, setCode] = useState('');
+  const [codename, setCodename] = useState('');
+  const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
-  const inputRefs = useRef<(HTMLInputElement | null)[]>([]);
-  // Live when a Worker URL is configured; otherwise the local demo
-  // loop (clearly labelled below). Never mixed in one room.
-  const live = isLiveEnabled();
 
-  const code = boxes.join('');
-
-  const setBoxAt = (index: number, value: string) => {
-    const next = [...boxes];
-    const cleaned = cleanCode(value);
-    if (cleaned.length > 1) {
-      // Paste / autofill: spread the characters across the boxes.
-      for (let i = 0; i < cleaned.length && index + i < CODE_LEN; i++) {
-        next[index + i] = cleaned[i] ?? '';
-      }
-      setBoxes(next);
-      const focusAt = Math.min(index + cleaned.length, CODE_LEN - 1);
-      inputRefs.current[focusAt]?.focus();
+  const join = async (): Promise<void> => {
+    const normalizedCode = code.trim().toUpperCase();
+    if (!isValidRoomCode(normalizedCode)) {
+      setError("That code didn't match a room — check it and try again.");
       return;
     }
-    next[index] = cleaned;
-    setBoxes(next);
-    if (cleaned && index < CODE_LEN - 1) inputRefs.current[index + 1]?.focus();
-  };
-
-  const onKeyDown = (index: number, e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Backspace' && !boxes[index] && index > 0) {
-      e.preventDefault();
-      const next = [...boxes];
-      next[index - 1] = '';
-      setBoxes(next);
-      inputRefs.current[index - 1]?.focus();
-    }
-  };
-
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (joining) return;
-    if (code.length !== CODE_LEN) {
-      setError('Enter the full 6-character room code.');
+    const name = codename.trim();
+    if (!isValidDisplayName(name)) {
+      setError('Enter a codename between 1 and 30 characters.');
       return;
     }
-    if (!name.trim()) {
-      setError('Enter your display name.');
-      return;
-    }
-    if (!ageChecked) {
-      setError('Confirm you are 18 or older and have read the safety briefing.');
-      return;
-    }
+    setError(null);
     setJoining(true);
-    setError('');
-    if (live) {
-      try {
-        // Code-only live join: resolve the 6-letter code to its roomId
-        // on the server (GET /v1/rooms/by-code/:code), then join that
-        // room with the code as invite proof. A bad code throws a
-        // plain-words LiveApiError (404 → "could not be found…",
-        // 429 → "Too many tries…"), caught below.
-        const { roomId } = await resolveRoomByCode(code);
-        const res = await joinLiveRoom({ roomId, roomCode: code, displayName: name.trim() });
-        storeLiveSeat(res, name.trim());
-        setCurrentPlayerId(res.playerId);
-        router.push(`/room/${res.roomId}`);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Could not join');
-        setJoining(false);
-      }
-      return;
-    }
-    const dr = getRoomByCode(code);
-    if (!dr) {
-      setError('Room not found or code expired — check with your host.');
-      setJoining(false);
-      return;
-    }
     try {
-      const p = joinRoom(dr.room.roomId, name.trim());
-      saveDemoSession({
-        roomId: dr.room.roomId, playerId: p.playerId,
-        displayName: name.trim(), isHost: p.isHost, roomCode: code,
-      });
-      setCurrentPlayerId(p.playerId);
-      router.push(`/room/${dr.room.roomId}`);
+      if (isLiveTransportEnabled()) {
+        const { roomId } = await resolveRoomByCode(normalizedCode);
+        const existing = getSessionForRoom(roomId);
+        const restoreToken =
+          existing?.displayName?.toLowerCase() === name.toLowerCase()
+            ? existing.reconnectToken
+            : undefined;
+        const session = await joinLiveRoom(roomId, name, normalizedCode, restoreToken);
+        router.push(`/room/${session.roomId}`);
+      } else {
+        const demo = getRoomByCode(normalizedCode);
+        if (!demo) throw new Error("That code didn't match a room — check it and try again.");
+        const { player } = joinDemoRoom(demo.room.roomId, name);
+        storeDemoSeat({
+          mode: 'demo',
+          roomId: demo.room.roomId,
+          playerId: player.playerId,
+          displayName: name,
+          isHost: player.isHost,
+          roomCode: demo.room.roomCode,
+        });
+        router.push(`/room/${demo.room.roomId}`);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not join');
+      setError(err instanceof Error ? err.message : 'Could not join — try again.');
       setJoining(false);
     }
   };
 
   return (
-    <div className={styles.wrap}>
-      <div className={styles.hero}>
-        <span className={styles.eyebrow}>Pakdam · Join</span>
-        <h1>Join a game</h1>
-        <p>Your host shared a 6-letter code. Type it in, pick the name everyone will see, and you are in — no account needed.</p>
-        {live
-          ? <p><strong>Live game</strong> — this joins the game on the server, with the other players.</p>
-          : <p><strong>Demo game</strong> — this joins a game on this device only, not a game on the server.</p>}
+    <main className="mx-auto min-h-dvh w-full max-w-[560px] px-4 pb-6 pt-6">
+      <header className="flex items-center">
+        <button
+          type="button"
+          onClick={() => router.push('/')}
+          aria-label="Back"
+          className="text-[22px] font-bold text-[#EF4444]"
+        >
+          ‹
+        </button>
+        <h1 className="flex-1 text-center text-[18px] font-bold text-white">Join a game</h1>
+        <span className="w-6" aria-hidden />
+      </header>
+
+      <label className="mt-6 block">
+        <span className="pakdam-label">Room code</span>
+        <input
+          value={code}
+          onChange={(event) => {
+            setCode(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6));
+            setError(null);
+          }}
+          placeholder="ABC123"
+          aria-label="Room code"
+          autoCapitalize="characters"
+          autoComplete="off"
+          className="mt-2 h-14 w-full rounded-[14px] border border-[#26262B] bg-[#1E1E22] px-4 text-center text-[20px] font-bold uppercase tracking-[0.2em] text-white placeholder:text-[#A1A1AA]"
+        />
+      </label>
+      <label className="mt-4 block">
+        <span className="pakdam-label">Your codename</span>
+        <input
+          value={codename}
+          onChange={(event) => {
+            setCodename(event.target.value.slice(0, 30));
+            setError(null);
+          }}
+          placeholder="e.g. Ana"
+          autoComplete="off"
+          className="mt-2 h-14 w-full rounded-[14px] border border-[#26262B] bg-[#1E1E22] px-4 text-[17px] font-bold text-white placeholder:text-[#A1A1AA]"
+        />
+      </label>
+      {error ? <p className="mt-2 text-[13px] text-[#EF4444]">{error}</p> : null}
+
+      <div className="mt-6">
+        <button
+          type="button"
+          disabled={joining}
+          onClick={() => void join()}
+          className="inline-flex h-14 w-full items-center justify-center rounded-[14px] bg-[#EF4444] text-[17px] font-bold text-white active:bg-[#DC2626] disabled:opacity-60"
+        >
+          {joining ? 'Joining…' : 'JOIN'}
+        </button>
       </div>
-      <form onSubmit={submit} noValidate>
-        <fieldset style={{ border: 0, padding: 0, margin: 0 }}>
-          <label className={styles.fieldLabel} htmlFor="code-0">Room code (6 characters)</label>
-          <div className={styles.codeBoxes}>
-            {boxes.map((value, i) => (
-              <input
-                key={i}
-                id={i === 0 ? 'code-0' : `code-${i}`}
-                ref={(el) => {
-                  inputRefs.current[i] = el;
-                }}
-                aria-label={i === 0 ? 'Room code, character 1 of 6' : `Code character ${i + 1} of 6`}
-                inputMode="text"
-                autoComplete={i === 0 ? 'one-time-code' : 'off'}
-                autoCapitalize="characters"
-                value={value}
-                maxLength={i === 0 ? CODE_LEN : 1}
-                onChange={(e) => setBoxAt(i, e.target.value)}
-                onKeyDown={(e) => onKeyDown(i, e)}
-                onPaste={(e) => {
-                  e.preventDefault();
-                  setBoxAt(0, e.clipboardData.getData('text'));
-                }}
-                className={value ? styles.filled : ''}
-              />
-            ))}
-          </div>
-          <p className={styles.codeHint}>Tip: paste the whole code — it fills all six boxes. Codes never use 0, 1, I or O.</p>
-        </fieldset>
-
-        <label className={styles.fieldLabel} htmlFor="name">Your display name — a codename is fine</label>
-        <input id="name" className="input" value={name} onChange={(e) => setName(e.target.value)} required maxLength={30} placeholder="What should everyone call you?" autoComplete="nickname" />
-        <p className={styles.codeHint}>Use a codename if you like — your real name is never needed. Everyone in the game sees this name only.</p>
-
-        <p className={styles.codeHint}>The host decides who is a Hunter and who is a Runner when the game starts — you do not pick your own side.</p>
-
-        <label className={styles.ageBox}>
-          <input type="checkbox" required checked={ageChecked} onChange={(e) => setAgeChecked(e.target.checked)} />
-          <span>
-            <strong>I am 18 or older</strong>, and I have read the safety briefing in the host setup. Pakdam is 18+ only.
-          </span>
-        </label>
-
-        <div className="banner"><strong>Foreground-only:</strong> keep this app open and your screen on while you play. Location, safety pause, SOS and Leave stop working if you lock your phone or switch apps.</div>
-        {error ? <p className={styles.error} role="alert">{error}</p> : null}
-        <div className={styles.primaryAction}>
-          <button className="btn" type="submit" disabled={joining || code.length !== CODE_LEN}>
-            {joining ? 'Joining…' : 'Join lobby'}
-          </button>
-        </div>
-      </form>
-      <p className={styles.center}>
-        <span className="small">No code yet? Ask your host for the 6-letter room code — games are private invite-only.</span>
-      </p>
-      <p className={styles.center}>
-        <span className="small">Hosting instead? </span>
-        <Link href="/create/mode">Create a game</Link>
-      </p>
-    </div>
+    </main>
   );
 }

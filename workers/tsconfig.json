@@ -1,16 +1,1 @@
-{
-  "extends": "../tsconfig.base.json",
-  "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": ".",
-    "moduleResolution": "node",
-    "types": [
-      "@cloudflare/workers-types",
-      "node"
-    ]
-  },
-  "include": [
-    "src",
-    "test"
-  ]
-}
+{"$schema":"https://json.schemastore.org/tsconfig","compilerOptions":{"noEmit":true,"outDir":"dist","rootDir":"src","types":["@cloudflare/workers-types"]},"extends":"../tsconfig.base.json","include":["src"]}

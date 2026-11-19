@@ -1,383 +1,438 @@
-import type { GeoPoint, GeoPolygon, Player, ZoneConfig } from '@pakdam/shared';
-import { OUTSIDE_ZONE_RETURN_SECONDS } from '@pakdam/shared';
-export function pointInPolygon(pt: GeoPoint, poly: GeoPolygon): boolean {
-  let inside = false;
-  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
-    const a = poly[i]!; const b = poly[j]!;
-    if (((a.lat > pt.lat) !== (b.lat > pt.lat)) && (pt.lng < ((b.lng - a.lng) * (pt.lat - a.lat)) / (b.lat - a.lat) + a.lng)) inside = !inside;
-  }
-  return inside;
-}
+/**
+ * Pakdam engine — zone geometry, shrink, and the outside-zone rule.
+ *
+ * Circle or host-drawn polygon zones (tap-to-place, 3 taps = triangle).
+ * Radius min 100 m, NO maximum (founder decision — "unlimited past 1 km").
+ * Never auto-centred on a fix worse than ±50 m — the host places it by hand
+ * instead (see `canAutoCentreZone` in @pakdam/shared).
+ *
+ * Each shrink scales the zone to 75% of its radius, then moves it to a
+ * RANDOM position fully inside the old boundary — NEVER concentric
+ * (near-concentric draws are discarded and re-drawn).
+ *
+ * Outside the zone: 30 s return countdown, then ejection. Poor GPS freezes
+ * the countdown (counted seconds stay); back inside clears it. Ejection is
+ * never undone by rejoining.
+ */
+import {
+  MIN_NEXT_ZONE_OFFSET_M,
+  SHRINK_MAX_ATTEMPTS,
+  SHRINK_RADIUS_FACTOR,
+  ZONE_RADIUS_MIN_M,
+  type GeoPoint,
+  type GeoPolygon,
+  haversineMeters,
+} from '@pakdam/shared';
 
-/** Great-circle distance between two points, in metres. */
-export function haversineMeters(a: GeoPoint, b: GeoPoint): number {
-  const R = 6371000;
-  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
-  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
-  const la1 = (a.lat * Math.PI) / 180;
-  const la2 = (b.lat * Math.PI) / 180;
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
-/** Widest distance across a zone boundary, in metres (the zone's size
- *  across). For the circle polygons the create screen builds this is the
- *  diameter. Used by the host dashboard; NOT a calibrated measurement. */
-export function zoneDiameterMeters(boundary: GeoPolygon): number {
-  let max = 0;
-  for (let i = 0; i < boundary.length; i++) {
-    for (let j = i + 1; j < boundary.length; j++) {
-      max = Math.max(max, haversineMeters(boundary[i]!, boundary[j]!));
-    }
-  }
-  return Math.round(max);
-}
+export { haversineMeters, ZONE_RADIUS_MIN_M };
+
+/** Outside-zone return countdown: 30 s, then ejection (fixed founder rule). */
+export const OUTSIDE_ZONE_RETURN_SECONDS = 30;
 
 /**
- * Outside-zone rule (founder FINAL, 2026-11-17 — replaces the old
- * SCRAM live/tag thresholds): a player outside the zone
- * gets a fixed 30-second return countdown (OUTSIDE_ZONE_RETURN_SECONDS)
- * on their own screen. At 0 they are EJECTED from the game. While
- * outside, Hunters may see the player's coarse area — never an exact
- * pin. The helpers below are the whole rule: how many seconds are left
- * on the countdown, and whether the countdown has run out.
+ * Metres per degree of latitude (equirectangular approximation). This MUST
+ * match the haversine Earth radius in @pakdam/shared (R = 6,371,000 m):
+ * a circle built with this constant measures its nominal radius back
+ * through `zoneDiameterMeters` (haversine). The old 111,320 value made a
+ * nominal 500 m zone measure 499 m in the lobby and the zone editor.
  */
-export function outsideZoneReturnRemainingSeconds(secondsOutside: number, returnSeconds: number = OUTSIDE_ZONE_RETURN_SECONDS): number {
-  return Math.max(0, returnSeconds - Math.max(0, secondsOutside));
-}
-/** True once the player has been outside for the full return window. */
-export function isOutsideZoneEjectionDue(secondsOutside: number, returnSeconds: number = OUTSIDE_ZONE_RETURN_SECONDS): boolean {
-  return secondsOutside >= returnSeconds;
+const METERS_PER_DEG_LAT = (6_371_000 * Math.PI) / 180;
+
+/** Convert a point to local metres relative to an origin point. */
+function toLocalMeters(point: GeoPoint, origin: GeoPoint): { x: number; y: number } {
+  const cosLat = Math.cos((origin.lat * Math.PI) / 180);
+  return {
+    x: (point.lng - origin.lng) * METERS_PER_DEG_LAT * cosLat,
+    y: (point.lat - origin.lat) * METERS_PER_DEG_LAT,
+  };
 }
 
-/** Apply the ejection at countdown zero: the player is out of play
- *  (ejectedAt set) but stays in the room record — leftAt stays null
- *  and the seat is never deleted. Idempotent: an already-ejected
- *  player is returned unchanged, and an ejection is NEVER undone by
- *  rejoining (the caller must not clear ejectedAt on restore).
- *  Call only when isOutsideZoneEjectionDue says the countdown is up. */
-export function applyOutsideZoneEjection(player: Player, nowIso: string): Player {
-  if (player.ejectedAt) return player;
-  return { ...player, ejectedAt: nowIso };
+/** Convert local metres back to a point, relative to an origin point. */
+function fromLocalMeters(local: { x: number; y: number }, origin: GeoPoint): GeoPoint {
+  const cosLat = Math.cos((origin.lat * Math.PI) / 180);
+  return {
+    lat: origin.lat + local.y / METERS_PER_DEG_LAT,
+    lng: origin.lng + local.x / (METERS_PER_DEG_LAT * cosLat),
+  };
 }
 
-/** Shrink schedule: the elapsed seconds at which the zone shrinks, from
- *  the host's shrink interval. Empty when shrinking is off. The geometry
- *  of each smaller boundary is a host/map concern, not computed here. */
-export function shrinkTimesSeconds(durationSeconds: number, shrinkIntervalSeconds: number, shrinkEnabled: boolean): number[] {
-  if (!shrinkEnabled || shrinkIntervalSeconds <= 0) return [];
-  const times: number[] = [];
-  for (let t = shrinkIntervalSeconds; t < durationSeconds; t += shrinkIntervalSeconds) times.push(t);
-  return times;
-}
-
-/** Each shrink loses a quarter of the radius: the zone keeps 75% of
- *  its radius per shrink (host screen: "loses a quarter of its radius
- *  each shrink"). `shrinkCount` is how many shrinks have happened. */
-export const SHRINK_RADIUS_FACTOR = 0.75;
-export function shrunkRadiusMeters(radiusMeters: number, shrinkCount: number): number {
-  if (shrinkCount <= 0) return radiusMeters;
-  return radiusMeters * SHRINK_RADIUS_FACTOR ** shrinkCount;
-}
-
-/** Centroid of a polygon (average of its vertices). Null when empty.
- *  For the regular polygons this app builds (circle approximations,
- *  regular drawn starts) the centroid is the shape's centre; for a
- *  concave drawn shape it can sit outside the shape — callers that
- *  need an interior point must check containment, not assume it. */
-export function polygonCentroid(poly: GeoPolygon): GeoPoint | null {
-  if (poly.length === 0) return null;
-  let lat = 0;
-  let lng = 0;
-  for (const p of poly) { lat += p.lat; lng += p.lng; }
-  return { lat: lat / poly.length, lng: lng / poly.length };
-}
-
-/** N-point circle approximation around a centre (the boundary a room
- *  is created with, and each drawn no-go area). Equirectangular
- *  approximation with the cos(lat) longitude correction — the same
- *  approximation scalePolygonTowardCentroid uses, so a circle polygon
- *  and its shrunk copies stay concentric in metres. Fine for play
- *  zones a few kilometres across. */
-export function circlePolygon(lat: number, lng: number, radiusMeters: number, points = 8): GeoPolygon {
-  const pts: GeoPolygon = [];
-  for (let i = 0; i < points; i++) {
-    const a = (i * 2 * Math.PI) / points;
-    pts.push({
-      lat: lat + (radiusMeters * Math.cos(a)) / 111320,
-      lng: lng + (radiusMeters * Math.sin(a)) / (111320 * Math.cos((lat * Math.PI) / 180)),
-    });
+/** Ray-casting point-in-polygon. A point exactly on the boundary counts as inside. */
+export function pointInPolygon(point: GeoPoint, polygon: GeoPolygon): boolean {
+  if (polygon.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i, i += 1) {
+    const a = polygon[i] as GeoPoint;
+    const b = polygon[j] as GeoPoint;
+    const crosses =
+      a.lng > point.lng !== b.lng > point.lng &&
+      point.lat < ((b.lat - a.lat) * (point.lng - a.lng)) / (b.lng - a.lng) + a.lat;
+    if (crosses) inside = !inside;
   }
-  return pts;
-}
-
-/** Scale a polygon toward its centroid by a factor (1 = unchanged,
- *  0.5 = half the size across). Same equirectangular approximation
- *  as circlePolygon. */
-export function scalePolygonTowardCentroid(poly: GeoPolygon, factor: number): GeoPolygon {
-  const c = polygonCentroid(poly);
-  if (!c || poly.length === 0) return poly;
-  return scalePolygonTowardPoint(poly, factor, c);
-}
-
-/** Scale a polygon toward an arbitrary anchor point (1 = unchanged).
- *  Scaling toward a vertex keeps that vertex fixed and pulls every
- *  other vertex toward it. */
-export function scalePolygonTowardPoint(poly: GeoPolygon, factor: number, anchor: GeoPoint): GeoPolygon {
-  return poly.map((p) => ({
-    lat: anchor.lat + (p.lat - anchor.lat) * factor,
-    lng: anchor.lng + (p.lng - anchor.lng) * factor,
-  }));
-}
-
-/** Signed area of a polygon (degrees² — sign only is used). */
-function signedArea(poly: GeoPolygon): number {
-  let s = 0;
-  for (let i = 0; i < poly.length; i++) {
-    const a = poly[i]!;
-    const b = poly[(i + 1) % poly.length]!;
-    s += a.lng * b.lat - b.lng * a.lat;
+  if (inside) return true;
+  // On-boundary check: within a hair of any edge counts as inside (ST_Covers semantics).
+  for (let i = 0; i < polygon.length; i += 1) {
+    const a = polygon[i] as GeoPoint;
+    const b = polygon[(i + 1) % polygon.length] as GeoPoint;
+    if (distancePointToSegmentMeters(point, a, b) < 0.5) return true;
   }
-  return s / 2;
-}
-
-/** True when vertex `i` is convex (interior angle < 180°). A tiny
- *  copy scaled toward a point just inside a convex vertex stays
- *  inside the interior wedge at that vertex, so shrinking toward one
- *  always finds an inside copy — unlike shrinking toward the
- *  centroid, which for a concave shape can sit outside the shape
- *  entirely, so no amount of concentric shrinking ever gets inside.
- *  The anchor is NOT the vertex itself: a copy scaled toward a
- *  boundary vertex shares that vertex and its incident edges, and
- *  polygonFullyInside counts touching the boundary as outside. */
-function isConvexVertex(poly: GeoPolygon, i: number): boolean {
-  const area = signedArea(poly);
-  if (area === 0) return false;
-  const prev = poly[(i - 1 + poly.length) % poly.length]!;
-  const cur = poly[i]!;
-  const next = poly[(i + 1) % poly.length]!;
-  const cross = (cur.lng - prev.lng) * (next.lat - cur.lat) - (cur.lat - prev.lat) * (next.lng - cur.lng);
-  return area > 0 ? cross > 0 : cross < 0;
-}
-
-/** Interior anchor near convex vertex `i`: 10% of the way from the
- *  vertex toward the midpoint of its two neighbours. For a convex
- *  vertex that segment lies inside the triangle prev–vertex–next,
- *  which lies inside the polygon — so the anchor is strictly inside
- *  the shape, never on its boundary. */
-function interiorAnchorNearVertex(poly: GeoPolygon, i: number): GeoPoint {
-  const prev = poly[(i - 1 + poly.length) % poly.length]!;
-  const cur = poly[i]!;
-  const next = poly[(i + 1) % poly.length]!;
-  const midLat = (prev.lat + next.lat) / 2;
-  const midLng = (prev.lng + next.lng) / 2;
-  return { lat: cur.lat + (midLat - cur.lat) * 0.1, lng: cur.lng + (midLng - cur.lng) * 0.1 };
-}
-
-/** Translate a polygon by degrees of latitude/longitude. */
-export function translatePolygon(poly: GeoPolygon, dLat: number, dLng: number): GeoPolygon {
-  return poly.map((p) => ({ lat: p.lat + dLat, lng: p.lng + dLng }));
-}
-
-function orientation(a: GeoPoint, b: GeoPoint, c: GeoPoint): number {
-  const v = (b.lng - a.lng) * (c.lat - a.lat) - (b.lat - a.lat) * (c.lng - a.lng);
-  if (Math.abs(v) < 1e-15) return 0;
-  return v > 0 ? 1 : -1;
-}
-function onSegment(a: GeoPoint, b: GeoPoint, c: GeoPoint): boolean {
-  return b.lng >= Math.min(a.lng, c.lng) && b.lng <= Math.max(a.lng, c.lng) &&
-    b.lat >= Math.min(a.lat, c.lat) && b.lat <= Math.max(a.lat, c.lat);
-}
-/** True when two segments touch or cross (touching counts: a boundary
- *  that merely grazes the outer edge is not fully inside). */
-export function segmentsIntersect(a1: GeoPoint, a2: GeoPoint, b1: GeoPoint, b2: GeoPoint): boolean {
-  const o1 = orientation(a1, a2, b1);
-  const o2 = orientation(a1, a2, b2);
-  const o3 = orientation(b1, b2, a1);
-  const o4 = orientation(b1, b2, a2);
-  if (o1 !== o2 && o3 !== o4) return true;
-  if (o1 === 0 && onSegment(a1, b1, a2)) return true;
-  if (o2 === 0 && onSegment(a1, b2, a2)) return true;
-  if (o3 === 0 && onSegment(b1, a1, b2)) return true;
-  if (o4 === 0 && onSegment(b1, a2, b2)) return true;
   return false;
 }
 
-/** True when `inner` lies fully inside `outer`: every vertex of
- *  `inner` is inside `outer` AND no edge of `inner` crosses an edge
- *  of `outer`. Both checks are needed: vertices-inside alone does not
- *  rule out an edge poking out through a concave bite of `outer`. */
+/** Distance from a point to a segment, in metres (equirectangular). */
+export function distancePointToSegmentMeters(
+  point: GeoPoint,
+  a: GeoPoint,
+  b: GeoPoint,
+): number {
+  const p = toLocalMeters(point, a);
+  const q = toLocalMeters(b, a);
+  const dx = q.x;
+  const dy = q.y;
+  const lenSq = dx * dx + dy * dy;
+  let t = lenSq === 0 ? 0 : (p.x * dx + p.y * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const cx = t * dx;
+  const cy = t * dy;
+  return Math.hypot(p.x - cx, p.y - cy);
+}
+
+/** Vertex average of a polygon. May sit outside a concave shape — callers needing an interior point must check containment. */
+export function polygonCentroid(polygon: GeoPolygon): GeoPoint {
+  let lat = 0;
+  let lng = 0;
+  for (const p of polygon) {
+    lat += p.lat;
+    lng += p.lng;
+  }
+  return { lat: lat / polygon.length, lng: lng / polygon.length };
+}
+
+/** Widest pair of vertices, in metres — the zone diameter. */
+export function zoneDiameterMeters(polygon: GeoPolygon): number {
+  let widest = 0;
+  for (let i = 0; i < polygon.length; i += 1) {
+    for (let j = i + 1; j < polygon.length; j += 1) {
+      const a = polygon[i] as GeoPoint;
+      const b = polygon[j] as GeoPoint;
+      widest = Math.max(widest, haversineMeters(a, b));
+    }
+  }
+  return widest;
+}
+
+/** N-point circle approximation (equirectangular + cos(lat) correction). */
+export function circlePolygon(
+  centre: GeoPoint,
+  radiusMeters: number,
+  points = 64,
+): GeoPolygon {
+  const boundary: GeoPolygon = [];
+  for (let i = 0; i < points; i += 1) {
+    const angle = (2 * Math.PI * i) / points;
+    boundary.push(
+      fromLocalMeters(
+        { x: radiusMeters * Math.cos(angle), y: radiusMeters * Math.sin(angle) },
+        centre,
+      ),
+    );
+  }
+  return boundary;
+}
+
+/** Scale a polygon toward a point by `factor` (0.75 = keep 75% of the radius). */
+export function scalePolygonTowardPoint(
+  polygon: GeoPolygon,
+  point: GeoPoint,
+  factor: number,
+): GeoPolygon {
+  return polygon.map((p) => ({
+    lat: point.lat + (p.lat - point.lat) * factor,
+    lng: point.lng + (p.lng - point.lng) * factor,
+  }));
+}
+
+/** Scale a polygon toward its centroid by `factor`. */
+export function scalePolygonTowardCentroid(
+  polygon: GeoPolygon,
+  factor: number,
+): GeoPolygon {
+  return scalePolygonTowardPoint(polygon, polygonCentroid(polygon), factor);
+}
+
+/** Offset every vertex of a polygon by (dx, dy) metres. */
+export function offsetPolygon(polygon: GeoPolygon, dxMeters: number, dyMeters: number): GeoPolygon {
+  const origin = polygon[0] as GeoPoint;
+  return polygon.map((p) => {
+    const local = toLocalMeters(p, origin);
+    return fromLocalMeters({ x: local.x + dxMeters, y: local.y + dyMeters }, origin);
+  });
+}
+
+type Segment = { x1: number; y1: number; x2: number; y2: number };
+
+function segmentsCross(a: Segment, b: Segment): boolean {
+  const d = (p: { x: number; y: number }, q: { x: number; y: number }, r: { x: number; y: number }) =>
+    (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  const p1 = { x: a.x1, y: a.y1 };
+  const p2 = { x: a.x2, y: a.y2 };
+  const p3 = { x: b.x1, y: b.y1 };
+  const p4 = { x: b.x2, y: b.y2 };
+  const d1 = d(p3, p4, p1);
+  const d2 = d(p3, p4, p2);
+  const d3 = d(p1, p2, p3);
+  const d4 = d(p1, p2, p4);
+  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+
+/**
+ * Is `inner` fully inside `outer`? All vertices inside AND no edge crossing.
+ * Touching the boundary counts as inside.
+ */
 export function polygonFullyInside(inner: GeoPolygon, outer: GeoPolygon): boolean {
   if (inner.length < 3 || outer.length < 3) return false;
   for (const p of inner) {
     if (!pointInPolygon(p, outer)) return false;
   }
-  for (let i = 0; i < inner.length; i++) {
-    const a1 = inner[i]!;
-    const a2 = inner[(i + 1) % inner.length]!;
-    for (let j = 0; j < outer.length; j++) {
-      const b1 = outer[j]!;
-      const b2 = outer[(j + 1) % outer.length]!;
-      if (segmentsIntersect(a1, a2, b1, b2)) return false;
+  const origin = outer[0] as GeoPoint;
+  const innerSegs: Segment[] = inner.map((p, i) => {
+    const a = toLocalMeters(p, origin);
+    const b = toLocalMeters(inner[(i + 1) % inner.length] as GeoPoint, origin);
+    return { x1: a.x, y1: a.y, x2: b.x, y2: b.y };
+  });
+  const outerSegs: Segment[] = outer.map((p, i) => {
+    const a = toLocalMeters(p, origin);
+    const b = toLocalMeters(outer[(i + 1) % outer.length] as GeoPoint, origin);
+    return { x1: a.x, y1: a.y, x2: b.x, y2: b.y };
+  });
+  for (const a of innerSegs) {
+    for (const b of outerSegs) {
+      if (segmentsCross(a, b)) return false;
     }
   }
   return true;
 }
 
-/**
- * Minimum centre shift (metres) for a next zone to count as a random
- * offset rather than concentric. A draw that lands within this of the
- * current centre is discarded and re-drawn — the founder rule is
- * "never concentric", and a zero/near-zero draw (hostile RNG, or a
- * real RNG landing on ~0) must never be accepted just because the
- * concentric copy verifies fully inside. 10 m is a geometry guard
- * (the test threshold), not a calibrated gameplay value.
- */
-export const MIN_NEXT_ZONE_OFFSET_M = 10;
-
-/**
- * PUBG/BGMI-style random-offset next zone (founder decision,
- * 2026-11-17): scale `boundary` toward its centroid by `factor`
- * (the host's shrink setting — size only), then move the smaller
- * shape to a RANDOMLY selected position fully inside the current
- * boundary — NOT concentric, not the same centre. One side of the
- * zone shrinks a lot, the other barely moves, so players must read
- * the preview and move.
- *
- * The offset is drawn uniformly over the disc the smaller shape can
- * occupy (radius (1 - factor) × the furthest vertex distance from
- * the centroid) and every candidate is verified with
- * polygonFullyInside before it is returned. `random` is injectable
- * so tests can use a seeded RNG; production passes Math.random.
- *
- * Fallback (no random draw verified in 50 attempts): the returned
- * boundary is STILL verified fully inside — never the concentric
- * copy unchecked. In order: (1) deterministic non-concentric offsets
- * of the host-size copy (the founder rule is "never concentric");
- * (2) copies scaled toward a point just inside a convex vertex of
- * the shape, progressively smaller — also non-concentric by
- * construction, and what saves a concave drawn shape whose vertex
- * centroid sits outside the shape: shrinking toward the centroid
- * collapses onto a point outside the shape, so no concentric copy
- * can ever be inside, while a small enough copy scaled toward a
- * convex vertex sits inside the interior wedge at that vertex;
- * (3) progressively smaller concentric copies; (4) the concentric
- * scaled copy itself, ONLY as a last resort when no non-concentric
- * copy verified at all. The fallback copies are smaller than the
- * host's shrink size — a smaller zone that is fully inside is
- * correct; a full-size zone poking outside the play area is not.
- * The last resort (a 2%-size copy toward the first convex
- * vertex) is returned only if no verified copy was found, which
- * cannot happen for a non-degenerate polygon.
- */
-export function randomOffsetShrinkBoundary(boundary: GeoPolygon, factor: number, random: () => number = Math.random): GeoPolygon {
-  if (boundary.length < 3 || factor >= 1 || factor <= 0) return boundary;
-  const scaled = scalePolygonTowardCentroid(boundary, factor);
-  const centroid = polygonCentroid(boundary);
-  if (!centroid) return scaled;
-  let maxVertexDistM = 0;
-  for (const p of boundary) maxVertexDistM = Math.max(maxVertexDistM, haversineMeters(centroid, p));
-  const maxShiftM = (1 - factor) * maxVertexDistM;
-  if (maxShiftM <= 0) return scaled;
-  const cosLat = Math.cos((centroid.lat * Math.PI) / 180);
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const angle = random() * 2 * Math.PI;
-    const distM = maxShiftM * Math.sqrt(random());
-    // Never accept a (near-)concentric draw: distM ~ 0 verifies fully
-    // inside, so without this check a hostile/stuck RNG (or a real
-    // one landing on ~0) returns the concentric copy — the one
-    // outcome the founder rule forbids. Discard and re-draw instead.
-    if (distM <= MIN_NEXT_ZONE_OFFSET_M) continue;
-    const dLat = (distM * Math.cos(angle)) / 111320;
-    const dLng = (distM * Math.sin(angle)) / (111320 * cosLat);
-    const candidate = translatePolygon(scaled, dLat, dLng);
-    if (polygonFullyInside(candidate, boundary)) return candidate;
-  }
-  // Fallback: shrink until a copy verifies fully inside. The founder
-  // rule is "never concentric", so NON-concentric copies are tried
-  // first: deterministic offsets (8 compass directions, full and half
-  // the max shift) of the host-size copy, then copies scaled toward
-  // a point just inside a convex vertex of the shape. Only when no
-  // non-concentric copy verifies does the fallback try progressively
-  // smaller concentric copies, and the concentric scaled copy itself
-  // only as a last resort before the unchecked 2% return below.
-  // The vertex-anchored step is what saves a concave drawn shape
-  // whose vertex centroid sits outside the shape: shrinking toward
-  // the centroid collapses onto a point outside the shape, so no
-  // concentric copy can ever be inside, while a small enough copy
-  // scaled toward a convex vertex sits inside the interior wedge at
-  // that vertex. The fallback copies are smaller than the host's
-  // shrink size — a smaller zone that is fully inside is correct; a
-  // full-size zone poking outside the play area is not.
-  for (const frac of [1, 0.5]) {
-    for (let k = 0; k < 8; k++) {
-      const a = (k * Math.PI) / 4;
-      const dLat = (frac * maxShiftM * Math.cos(a)) / 111320;
-      const dLng = (frac * maxShiftM * Math.sin(a)) / (111320 * cosLat);
-      const candidate = translatePolygon(scaled, dLat, dLng);
-      if (polygonFullyInside(candidate, boundary)) return candidate;
-    }
-  }
-  for (let i = 0; i < boundary.length; i++) {
-    if (!isConvexVertex(boundary, i)) continue;
-    const anchor = interiorAnchorNearVertex(boundary, i);
-    for (let f = factor; f >= 0.02; f *= 0.9) {
-      const candidate = scalePolygonTowardPoint(boundary, f, anchor);
-      if (polygonFullyInside(candidate, boundary)) return candidate;
-    }
-  }
-  for (let f = factor * 0.9; f >= 0.05; f *= 0.9) {
-    const candidate = scalePolygonTowardCentroid(boundary, f);
-    if (polygonFullyInside(candidate, boundary)) return candidate;
-  }
-  // Last-resort concentric copy: reached only when no non-concentric
-  // copy and no smaller concentric copy verified — a verified
-  // concentric zone is still a legal zone, just not a random offset.
-  if (polygonFullyInside(scaled, boundary)) return scaled;
-  // Last resort: the smallest vertex-anchored copy. For a
-  // non-degenerate polygon this is inside (see isConvexVertex); it is
-  // returned unchecked only because the loop above already covers
-  // every size down to 2%.
-  const firstConvex = boundary.findIndex((_, i) => isConvexVertex(boundary, i));
-  const anchor = firstConvex >= 0 ? interiorAnchorNearVertex(boundary, firstConvex) : boundary[0]!;
-  return scalePolygonTowardPoint(boundary, 0.02, anchor);
+/** Is this point inside the play zone? (Empty boundary = unplaced zone: not inside.) */
+export function isPointInZone(point: GeoPoint, boundary: GeoPolygon): boolean {
+  return pointInPolygon(point, boundary);
 }
 
-/** The zone boundary in force at `nowMs`: the latest shrink phase
- *  whose time has passed, else the base boundary. `startedAt` is the
- *  match start (ISO string); null before the match starts. This is
- *  the single definition of "current zone" — the map, the HUD size
- *  text, the way-back guide, the outside-zone check (client and
- *  worker) and the next-zone preview all derive from it, so they can
- *  never disagree about which zone is live. */
-export function effectiveZoneBoundary(zone: ZoneConfig, startedAt: string | null, nowMs: number): GeoPolygon {
-  const elapsed = startedAt ? Math.max(0, Math.floor((nowMs - new Date(startedAt).getTime()) / 1000)) : null;
-  if (elapsed === null) return zone.boundary;
-  let current = zone.boundary;
-  for (const p of zone.shrinkPhases) {
-    if (p.atSeconds <= elapsed) current = p.boundary;
+// ---------------------------------------------------------------------------
+// Shrink schedule
+// ---------------------------------------------------------------------------
+
+/**
+ * Shrink times (seconds from match start): every `intervalSeconds` while
+ * `< durationSeconds`. Empty when shrinking is off.
+ */
+export function shrinkTimesSeconds(
+  durationSeconds: number,
+  intervalSeconds: number,
+  shrinkEnabled: boolean,
+): number[] {
+  if (!shrinkEnabled || intervalSeconds <= 0) return [];
+  const times: number[] = [];
+  for (let t = intervalSeconds; t < durationSeconds; t += intervalSeconds) {
+    times.push(t);
   }
-  return current;
+  return times;
 }
 
-/** Next shrink phase for a zone, given the match start. Returns null
- *  when no shrink is scheduled or all phases have passed. The HUD
- *  bar, the next-zone panel and the map's dashed preview all read
- *  this one helper, so the preview, the countdown and the map can
- *  never disagree. */
-export function nextShrinkPhaseAt(
-  zone: ZoneConfig,
-  startedAt: string | null,
+/** How many shrinks have fired by `elapsedSeconds` into the match. */
+export function shrinkIndexAt(
+  elapsedSeconds: number,
+  intervalSeconds: number,
+  shrinkEnabled: boolean,
+): number {
+  if (!shrinkEnabled || intervalSeconds <= 0 || elapsedSeconds < 0) return 0;
+  return Math.floor(elapsedSeconds / intervalSeconds);
+}
+
+/** Epoch ms of the next shrink after `nowMs`, or null when none is scheduled. */
+export function nextShrinkAtMs(
+  startedAtMs: number,
+  durationSeconds: number,
+  intervalSeconds: number,
+  shrinkEnabled: boolean,
   nowMs: number,
-): { atSeconds: number; inSeconds: number | null; boundary: GeoPolygon; totalPhases: number; phaseIndex: number } | null {
-  const elapsed = startedAt ? Math.max(0, Math.floor((nowMs - new Date(startedAt).getTime()) / 1000)) : null;
-  const idx = zone.shrinkPhases.findIndex((p) => elapsed === null || p.atSeconds > elapsed);
-  if (idx === -1) return null;
-  const phase = zone.shrinkPhases[idx]!;
+): number | null {
+  const times = shrinkTimesSeconds(durationSeconds, intervalSeconds, shrinkEnabled);
+  for (const t of times) {
+    const at = startedAtMs + t * 1000;
+    if (at > nowMs) return at;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Random next zone per shrink — never concentric
+// ---------------------------------------------------------------------------
+
+export interface ShrinkDrawResult {
+  boundary: GeoPolygon;
+  /** How the boundary was produced: random draw, or which fallback saved it. */
+  method: 'random' | 'compass-fallback' | 'vertex-fallback' | 'smaller-concentric' | 'concentric-last-resort';
+  /** Centre offset of the new zone from the old centre, in metres. */
+  offsetMeters: number;
+}
+
+/**
+ * Draw the next zone: scale the boundary toward its centroid by the shrink
+ * factor (75% of the radius), then move the smaller shape to a RANDOM
+ * position fully inside the current boundary — NOT concentric. Offset drawn
+ * uniformly over the disc the smaller shape can occupy; every candidate is
+ * verified with `polygonFullyInside`; draws within 10 m of the current
+ * centre are discarded and re-drawn. Up to 50 attempts, then fallbacks in
+ * order: deterministic non-concentric offsets (8 compass directions) →
+ * copies scaled toward a point just inside a convex vertex (saves concave
+ * drawn shapes whose centroid sits outside) → progressively smaller
+ * concentric copies → the concentric scaled copy itself only as a last
+ * resort.
+ */
+export function randomOffsetShrinkBoundary(
+  boundary: GeoPolygon,
+  options: {
+    factor?: number;
+    random?: () => number;
+    maxAttempts?: number;
+  } = {},
+): ShrinkDrawResult {
+  const factor = options.factor ?? SHRINK_RADIUS_FACTOR;
+  const random = options.random ?? Math.random;
+  const maxAttempts = options.maxAttempts ?? SHRINK_MAX_ATTEMPTS;
+  const centroid = polygonCentroid(boundary);
+  const scaled = scalePolygonTowardCentroid(boundary, factor);
+  const scaledRadius = zoneDiameterMeters(scaled) / 2;
+  const currentRadius = zoneDiameterMeters(boundary) / 2;
+  // The smaller shape can move at most (current − scaled) radius from centre.
+  const maxOffset = Math.max(0, currentRadius - scaledRadius);
+
+  // Random draws, uniform over the disc the smaller shape can occupy.
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    const angle = random() * 2 * Math.PI;
+    const radius = Math.sqrt(random()) * maxOffset;
+    const dx = radius * Math.cos(angle);
+    const dy = radius * Math.sin(angle);
+    const offset = Math.hypot(dx, dy);
+    if (offset < MIN_NEXT_ZONE_OFFSET_M) continue;
+    const candidate = offsetPolygon(scaled, dx, dy);
+    if (polygonFullyInside(candidate, boundary)) {
+      return { boundary: candidate, method: 'random', offsetMeters: offset };
+    }
+  }
+
+  // Fallback 1: deterministic non-concentric offsets, 8 compass directions.
+  const directions = [0, 45, 90, 135, 180, 225, 270, 315];
+  for (const degrees of directions) {
+    const angle = (degrees * Math.PI) / 180;
+    for (const fraction of [0.75, 0.5, 0.25]) {
+      const dx = Math.cos(angle) * maxOffset * fraction;
+      const dy = Math.sin(angle) * maxOffset * fraction;
+      const offset = Math.hypot(dx, dy);
+      if (offset < MIN_NEXT_ZONE_OFFSET_M) continue;
+      const candidate = offsetPolygon(scaled, dx, dy);
+      if (polygonFullyInside(candidate, boundary)) {
+        return { boundary: candidate, method: 'compass-fallback', offsetMeters: offset };
+      }
+    }
+  }
+
+  // Fallback 2: scale toward a point just inside a convex vertex (saves
+  // concave drawn shapes whose centroid sits outside the shape).
+  for (const vertex of boundary) {
+    const toward = { lat: centroid.lat + (vertex.lat - centroid.lat) * 0.9, lng: centroid.lng + (vertex.lng - centroid.lng) * 0.9 };
+    if (!pointInPolygon(toward, boundary)) continue;
+    const candidate = scalePolygonTowardPoint(boundary, toward, factor);
+    const offset = haversineMeters(polygonCentroid(candidate), centroid);
+    if (offset >= MIN_NEXT_ZONE_OFFSET_M && polygonFullyInside(candidate, boundary)) {
+      return { boundary: candidate, method: 'vertex-fallback', offsetMeters: offset };
+    }
+  }
+
+  // Fallback 3: progressively smaller concentric copies.
+  for (const smaller of [0.6, 0.5, 0.4, 0.3]) {
+    const candidate = scalePolygonTowardCentroid(boundary, smaller);
+    if (polygonFullyInside(candidate, boundary)) {
+      return { boundary: candidate, method: 'smaller-concentric', offsetMeters: 0 };
+    }
+  }
+
+  // Last resort only: the concentric scaled copy itself.
+  return { boundary: scaled, method: 'concentric-last-resort', offsetMeters: 0 };
+}
+
+// ---------------------------------------------------------------------------
+// Outside-zone rule: 30 s, then ejection
+// ---------------------------------------------------------------------------
+
+/** Per-player outside-zone countdown state (DO memory only, never persisted). */
+export interface OutsideZoneState {
+  /** Epoch ms of the first-seen-outside of the current segment, or null. */
+  outsideSinceMs: number | null;
+  /** Seconds already counted in earlier segments (kept while GPS is poor). */
+  outsideAccumMs: number;
+}
+
+export function emptyOutsideZoneState(): OutsideZoneState {
+  return { outsideSinceMs: null, outsideAccumMs: 0 };
+}
+
+export interface OutsideZoneUpdate {
+  state: OutsideZoneState;
+  /** Seconds left on the return countdown (30 when fully inside). */
+  remainingSeconds: number;
+  /** True when the accumulated outside time has reached 30 s: eject. */
+  shouldEject: boolean;
+}
+
+/**
+ * Advance one player's outside-zone countdown from a fresh fix.
+ * - Inside: both counters clear.
+ * - Outside with a trustworthy fix: the current segment accrues; at
+ *   accumulated + current segment ≥ 30 s the player is ejected.
+ * - Outside with poor accuracy: the countdown FREEZES — seconds already
+ *   counted stay in `outsideAccumMs`, no new seconds accrue.
+ */
+export function updateOutsideZone(
+  state: OutsideZoneState,
+  input: { inside: boolean; poorAccuracy: boolean; nowMs: number },
+): OutsideZoneUpdate {
+  if (input.inside) {
+    return {
+      state: emptyOutsideZoneState(),
+      remainingSeconds: OUTSIDE_ZONE_RETURN_SECONDS,
+      shouldEject: false,
+    };
+  }
+  if (input.poorAccuracy) {
+    const frozen = state.outsideSinceMs === null
+      ? { ...state }
+      : { outsideSinceMs: null, outsideAccumMs: state.outsideAccumMs + (input.nowMs - state.outsideSinceMs) };
+    const remaining = Math.max(
+      0,
+      OUTSIDE_ZONE_RETURN_SECONDS - frozen.outsideAccumMs / 1000,
+    );
+    return { state: frozen, remainingSeconds: remaining, shouldEject: false };
+  }
+  const since = state.outsideSinceMs ?? input.nowMs;
+  const totalMs = state.outsideAccumMs + (input.nowMs - since);
+  const shouldEject = totalMs >= OUTSIDE_ZONE_RETURN_SECONDS * 1000;
   return {
-    atSeconds: phase.atSeconds,
-    inSeconds: elapsed === null ? null : phase.atSeconds - elapsed,
-    boundary: phase.boundary,
-    totalPhases: zone.shrinkPhases.length,
-    phaseIndex: idx,
+    state: { outsideSinceMs: since, outsideAccumMs: state.outsideAccumMs },
+    remainingSeconds: Math.max(0, OUTSIDE_ZONE_RETURN_SECONDS - totalMs / 1000),
+    shouldEject,
   };
+}
+
+/**
+ * Apply an outside-zone ejection to a seat. Idempotent and never undone by
+ * rejoining: a second call leaves the first `ejectedAt` in place.
+ * Returns the updated seat (a shallow copy; the input is not mutated).
+ */
+export function applyOutsideZoneEjection<T extends { ejectedAt: string | null }>(
+  player: T,
+  nowMs: number,
+): T {
+  if (player.ejectedAt !== null) return player;
+  return { ...player, ejectedAt: new Date(nowMs).toISOString() };
 }

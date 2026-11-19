@@ -1,225 +1,514 @@
 /**
- * GAME EVENTS — the validated event architecture (founder-approved
- * final stack, 2026-11-17). Every gameplay fact is one of these 10
- * events, validated by a Zod schema before it is accepted anywhere:
+ * Pakdam WS event catalogue — frozen contract v2.1.
  *
- *   PLAYER_JOINED, PLAYER_READY, MATCH_STARTED, LOCATION_UPDATED,
- *   LOCATION_PING_SENT, PLAYER_TAGGED, ZONE_UPDATED,
- *   PLAYER_DISCONNECTED, PLAYER_RECONNECTED, MATCH_COMPLETED
+ * 22 client→server message types, 34 server→client types.
  *
- * Envelope (every event): `id` (UUID, unique per event),
- * `timestamp` (ISO date-time, when the event happened),
- * `roomId` (the room it belongs to), `actorId` (the player who
- * caused it), `type`, `payload`. `seq` is assigned by the Durable
- * Object on receipt (monotonic per room) and is NOT client-set.
+ * NOTE — server count: the protocol map's header states 35 server→client
+ * types but its own §2.4 table enumerates 34 distinct type names (7
+ * connection + 7 roster + 9 play + 5 catch + 3 safety + 3 match = 34).
+ * This file implements the 34 enumerated types exactly; no 35th type
+ * exists in the table, so 34 is the complete count. The protocol map's
+ * header count (and BEHAVIOUR.md, which copied it) were wrong, not the
+ * enumeration. If a 35th type is ever identified, add it here and bump
+ * the protocol version. Do not invent one to make the count match.
  *
- * AUTHORISATION: the schema validates SHAPE only. Authority is the
- * Durable Object's job — it checks the actor's per-player secret
- * token and the room phase before applying an event (see
- * workers/src/room-do.ts). A well-formed event from the wrong player
- * or the wrong phase is rejected there, not here.
- *
- * DEDUPLICATION: event `id`s are unique; the DO keeps a set of seen
- * ids per room (in-memory + in the hibernation snapshot) and drops
- * repeats. `dedupeEvents` is the same rule for any consumer that
- * replays a log. Retried WebSocket messages and retried HTTP
- * commands must therefore reuse the same event `id` — a retry with
- * a fresh id is a NEW event, not a dedup hit.
- *
- * PRIVACY (HNT-068 vs HNT-120): raw coordinates appear ONLY in
- * LOCATION_UPDATED / LOCATION_PING_SENT payloads, which live in
- * active-room state and are purged at match end. Persistent logs and
- * recovery snapshots carry the event WITHOUT its coordinates (see
- * `redactForLog` / `redactForSnapshot`): the fact that a fix or a
- * ping happened, and its quality tier, survive — the position does
- * not.
- *
- * Zod note: this file imports real `zod` (packages/shared depends on
- * `zod@4.6.7`, installed in node_modules). The old `./zod-shim.js`
- * stopgap was deleted 2026-11-17 once real Zod was verified installed
- * and importable. All schemas are `.strict()` — unknown keys are
- * rejected, exactly as the shim behaved — so a misspelled field fails
- * loudly instead of being silently dropped.
+ * Broadcast scoping (server-side, must be preserved): direct messages
+ * (`welcome`, `snapshot`, `error`, `heartbeat.ack`, `auth.refreshed`,
+ * `ticket.renewal-required`) go only to the sender; `voice.signal` and
+ * `radio` are team-only (lobby = whole lobby); `ping` is Hunters-only;
+ * `reveal` goes to the whole room; everything else broadcasts to the room.
  */
-import { z, type ZodType } from 'zod';
+import type {
+  Announcement,
+  CatchView,
+  LocationFix,
+  MapPin,
+  MatchPhase,
+  MatchResult,
+  Ping,
+  PlayerView,
+  QuickSignal,
+  RadioMessage,
+  RevealArea,
+  Room,
+  SuspensionReason,
+  VoiceSignalKind,
+  WsErrorPayload,
+  WsSnapshotPayload,
+  ZoneConfig,
+} from './types.js';
 
-const uuid = () => z.string().uuid();
-const isoDateTime = () => z.string().datetime();
-const playerId = () => z.string().min(1);
-const roomId = () => z.string().min(1);
+// ---------------------------------------------------------------------------
+// Client → server (22 types)
+// ---------------------------------------------------------------------------
 
-const locationFixSchema = z.strictObject({
-  lat: z.number().min(-90).max(90),
-  lng: z.number().min(-180).max(180),
-  accuracyMeters: z.number().positive().finite(),
-  at: isoDateTime(),
-});
+/** `{}` — empty payload (heartbeat, safety.resume, briefing.confirm). */
+export type EmptyPayload = Record<string, never>;
 
-function envelope<LT extends string, P extends ZodType<unknown>>(type: LT, payload: P) {
-  return z.strictObject({
-    id: uuid(),
-    timestamp: isoDateTime(),
-    roomId: roomId(),
-    actorId: playerId(),
-    type: z.literal(type),
-    seq: z.number().int().min(0).optional(),
-    payload,
-  });
+/** First message on socket open. Carries NO credential — a hello containing one is rejected. */
+export interface HelloPayload {
+  protocolVersion: 1;
+  clientVersion: string;
+  lastServerSeq: number;
 }
 
-export const PlayerJoinedEvent = envelope('PLAYER_JOINED', z.strictObject({
-  displayName: z.string().min(1).max(30),
-  kind: z.enum(['host-account', 'guest']),
-}));
-export const PlayerReadyEvent = envelope('PLAYER_READY', z.strictObject({
-  playerId: playerId(),
-}));
-export const MatchStartedEvent = envelope('MATCH_STARTED', z.strictObject({
-  mode: z.enum(['classic', 'infection']),
-  hunterIds: z.array(playerId()),
-  headStartSeconds: z.number().int().min(0).max(1800),
-  durationSeconds: z.number().int().min(300).max(10800),
-}));
-export const LocationUpdatedEvent = envelope('LOCATION_UPDATED', z.strictObject({
-  fix: locationFixSchema,
-  quality: z.enum(['good', 'fair', 'poor', 'stale', 'suspicious', 'unknown']),
-}));
-export const LocationPingSentEvent = envelope('LOCATION_PING_SENT', z.strictObject({
-  pingId: uuid(),
-  runnerId: playerId(),
-  /** Coarse area label only ("~120 m north") — never coordinates. */
-  areaLabel: z.string().min(1),
-  distanceMeters: z.number().min(0),
-  bearingDegrees: z.number().min(0).max(360),
-}));
-export const PlayerTaggedEvent = envelope('PLAYER_TAGGED', z.strictObject({
-  runnerId: playerId(),
-  hunterId: playerId(),
-  catchId: uuid(),
-  // 'qr' = Hunter scan completed the claim; 'manual' = Runner confirmed
-  // themself (camera unavailable); 'no-confirmation' = the host turned
-  // Runner confirmation OFF, so the tag counted at once (QA BE-07,
-  // 2026-11-17: the DO auto-confirm path logged 'no-confirmation' here
-  // and the strict schema threw ZodError, so every catch in a
-  // no-confirmation room crashed the WS handler with no reply).
-  method: z.enum(['qr', 'manual', 'no-confirmation']),
-}));
-export const ZoneUpdatedEvent = envelope('ZONE_UPDATED', z.strictObject({
-  boundary: z.array(z.strictObject({ lat: z.number().min(-90).max(90), lng: z.number().min(-180).max(180) })),
-  reason: z.enum(['shrink', 'host-edit', 'next-zone']),
-  shrinkStep: z.number().int().min(0).optional(),
-}));
-export const PlayerDisconnectedEvent = envelope('PLAYER_DISCONNECTED', z.strictObject({
-  playerId: playerId(),
-  reason: z.enum(['tab-closed', 'network', 'timeout', 'ejected', 'left']),
-}));
-export const PlayerReconnectedEvent = envelope('PLAYER_RECONNECTED', z.strictObject({
-  playerId: playerId(),
-}));
-export const MatchCompletedEvent = envelope('MATCH_COMPLETED', z.strictObject({
-  result: z.enum(['hunters-win', 'runners-win', 'aborted']),
-  caughtCount: z.number().int().min(0),
-  durationSeconds: z.number().int().min(0),
-}));
-
-export const GameEventSchema = z.union([
-  PlayerJoinedEvent,
-  PlayerReadyEvent,
-  MatchStartedEvent,
-  LocationUpdatedEvent,
-  LocationPingSentEvent,
-  PlayerTaggedEvent,
-  ZoneUpdatedEvent,
-  PlayerDisconnectedEvent,
-  PlayerReconnectedEvent,
-  MatchCompletedEvent,
-]);
-
-export type GameEvent = z.infer<typeof GameEventSchema>;
-export type GameEventType = GameEvent['type'];
-
-export const GAME_EVENT_TYPES: GameEventType[] = [
-  'PLAYER_JOINED', 'PLAYER_READY', 'MATCH_STARTED', 'LOCATION_UPDATED',
-  'LOCATION_PING_SENT', 'PLAYER_TAGGED', 'ZONE_UPDATED',
-  'PLAYER_DISCONNECTED', 'PLAYER_RECONNECTED', 'MATCH_COMPLETED',
-];
-
-/** Parse any unknown value as a game event (throws ZodError). */
-export function parseGameEvent(input: unknown): GameEvent {
-  return GameEventSchema.parse(input);
+/** The ONLY message that ever carries a ticket (a fresh `renew` ticket). */
+export interface AuthRefreshPayload {
+  ticket: string;
 }
 
-/** Safe-parse variant (returns { success, data | error }). */
-export function safeParseGameEvent(input: unknown) {
-  return GameEventSchema.safeParse(input);
+export interface LocationUpdatePayload {
+  fix: LocationFix;
 }
 
-/** Build a new event envelope for a payload. `id` is a fresh UUID,
- *  `timestamp` is now; `seq` is left for the Durable Object. */
-export function createGameEvent<T extends GameEventType>(
-  type: T,
-  roomIdValue: string,
-  actorIdValue: string,
-  payload: Extract<GameEvent, { type: T }>['payload'],
-): Extract<GameEvent, { type: T }> {
-  return {
-    id: crypto.randomUUID(),
-    timestamp: new Date().toISOString(),
-    roomId: roomIdValue,
-    actorId: actorIdValue,
-    type,
-    payload,
-  } as Extract<GameEvent, { type: T }>;
+export interface RevealSendPayload {
+  fix: LocationFix;
 }
 
-/** Deduplicate an event log by `id`, keeping first-seen order. A
- *  retry that reuses its event id is dropped; a retry with a fresh
- *  id is (correctly) a new event. */
-export function dedupeEvents(events: GameEvent[]): GameEvent[] {
-  const seen = new Set<string>();
-  const out: GameEvent[] = [];
-  for (const e of events) {
-    if (seen.has(e.id)) continue;
-    seen.add(e.id);
-    out.push(e);
-  }
-  return out;
+export interface CatchRequestPayload {
+  runnerId: string;
 }
 
-/** Drop events whose ids are already seen (mutates the seen set). */
-export function filterNewEvents(events: GameEvent[], seen: Set<string>): GameEvent[] {
-  const out: GameEvent[] = [];
-  for (const e of events) {
-    if (seen.has(e.id)) continue;
-    seen.add(e.id);
-    out.push(e);
-  }
-  return out;
+/** Runner confirms with the fetched QR token, or manually with no token. */
+export interface CatchConfirmPayload {
+  catchId: string;
+  qrToken: string;
+  manualConfirm?: boolean;
+  resolution?: 'manual-confirm';
 }
 
-/** Strip raw coordinates for persistent logs (HNT-068): the event
- *  survives, the position does not. The quality tier and the fact
- *  survive — enough to audit "a fix arrived" without storing where. */
-export function redactForLog(event: GameEvent): Record<string, unknown> {
-  const { payload, ...rest } = event as unknown as { payload: Record<string, unknown> } & Record<string, unknown>;
-  if (event.type === 'LOCATION_UPDATED') {
-    const fix = payload.fix as { accuracyMeters: number; at: string } | undefined;
-    return { ...rest, payload: { quality: payload.quality, accuracyMeters: fix?.accuracyMeters ?? null, at: fix?.at ?? null } };
-  }
-  if (event.type === 'LOCATION_PING_SENT') {
-    return { ...rest, payload: { pingId: payload.pingId, runnerId: payload.runnerId, areaLabel: payload.areaLabel } };
-  }
-  if (event.type === 'ZONE_UPDATED') {
-    const boundary = payload.boundary as unknown[];
-    return { ...rest, payload: { reason: payload.reason, shrinkStep: payload.shrinkStep, pointCount: boundary.length } };
-  }
-  return { ...rest, payload };
+export interface CatchDisputePayload {
+  catchId: string;
+  reason: string;
 }
 
-/** Recovery snapshots carry the same redaction as logs, plus no
- *  `seq` (the DO reassigns it on recovery). */
-export function redactForSnapshot(event: GameEvent): Record<string, unknown> {
-  const redacted = redactForLog(event);
-  delete redacted.seq;
-  return redacted;
+export interface SafetyPausePayload {
+  reason: string | null;
+}
+
+export interface SafetySosPayload {
+  reason: string | null;
+}
+
+export interface LeavePayload {
+  reason: string | null;
+}
+
+export interface SignalSendPayload {
+  code: string;
+}
+
+export interface RadioSendPayload {
+  text: string;
+  kind?: 'quick' | 'text';
+}
+
+export interface VoiceSignalPayload {
+  toPlayerId: string;
+  kind: VoiceSignalKind;
+  sdp?: string;
+  candidate?: unknown;
+}
+
+export interface PinPlacePayload {
+  point: { lat: number; lng: number };
+  label: string;
+}
+
+export interface AnnouncementSendPayload {
+  text: string;
+}
+
+export interface ReadySetPayload {
+  isReady: boolean;
+}
+
+export interface SnapshotRequestPayload {
+  lastServerSeq: number;
+}
+
+export interface ResyncRequestPayload {
+  lastServerSeq: number;
+}
+
+export interface PlayerSuspendedPayload {
+  reason: SuspensionReason;
+}
+
+/** Payload for every client→server message type, keyed by type name. */
+export interface WsClientPayloads {
+  hello: HelloPayload;
+  'auth.refresh': AuthRefreshPayload;
+  heartbeat: EmptyPayload;
+  'snapshot.request': SnapshotRequestPayload;
+  'resync.request': ResyncRequestPayload;
+  'location.update': LocationUpdatePayload;
+  'reveal.send': RevealSendPayload;
+  'catch.request': CatchRequestPayload;
+  'catch.confirm': CatchConfirmPayload;
+  'catch.dispute': CatchDisputePayload;
+  'safety.pause': SafetyPausePayload;
+  'safety.resume': EmptyPayload;
+  'safety.sos': SafetySosPayload;
+  'ready.set': ReadySetPayload;
+  'briefing.confirm': EmptyPayload;
+  'radio.send': RadioSendPayload;
+  'signal.send': SignalSendPayload;
+  'voice.signal': VoiceSignalPayload;
+  'pin.place': PinPlacePayload;
+  'announcement.send': AnnouncementSendPayload;
+  leave: LeavePayload;
+  'player.suspended': PlayerSuspendedPayload;
+}
+
+export type WsClientMessageType = keyof WsClientPayloads;
+
+export const WS_CLIENT_TYPES: readonly WsClientMessageType[] = [
+  'hello',
+  'auth.refresh',
+  'heartbeat',
+  'snapshot.request',
+  'resync.request',
+  'location.update',
+  'reveal.send',
+  'catch.request',
+  'catch.confirm',
+  'catch.dispute',
+  'safety.pause',
+  'safety.resume',
+  'safety.sos',
+  'ready.set',
+  'briefing.confirm',
+  'radio.send',
+  'signal.send',
+  'voice.signal',
+  'pin.place',
+  'announcement.send',
+  'leave',
+  'player.suspended',
+] as const;
+
+/** Type guard: is this string a known client→server message type? */
+export function isWsClientMessageType(value: string): value is WsClientMessageType {
+  return (WS_CLIENT_TYPES as readonly string[]).includes(value);
+}
+
+// ---------------------------------------------------------------------------
+// Server → client (34 enumerated types; see note at the top of this file)
+// ---------------------------------------------------------------------------
+
+export interface WelcomePayload {
+  playerId: string;
+  serverSeq: number;
+  protocolVersion: 1;
+}
+
+export interface RoomStatePayload {
+  phase: MatchPhase;
+  version: number;
+  serverSeq: number;
+  reason: string;
+}
+
+export interface PlayerEventPayload {
+  player: PlayerView;
+  serverSeq: number;
+}
+
+export interface PlayerSuspendedEventPayload {
+  playerId: string;
+  reason?: string;
+  serverSeq: number;
+}
+
+export interface PlayerResumedEventPayload {
+  playerId: string;
+  reason?: string;
+  serverSeq: number;
+}
+
+export interface PlayerVisibilityPayload {
+  playerId: string;
+  locationQuality: 'good' | 'fair' | 'poor' | null;
+  lastFixAt: string | null;
+  serverSeq: number;
+}
+
+export interface PingEventPayload {
+  ping: Ping;
+  serverSeq: number;
+}
+
+export interface PingExpiredPayload {
+  pingId: string;
+  subjectPlayerId: string;
+  expiresAt: string;
+}
+
+export interface ZoneUpdatePayload {
+  zone: ZoneConfig;
+  phase: MatchPhase;
+  serverSeq: number;
+}
+
+export interface CatchEventPayload {
+  catch: CatchView;
+  serverSeq: number;
+}
+
+export interface SafetyPausedPayload {
+  byPlayerId: string;
+  reason: string | null;
+  serverSeq: number;
+}
+
+export interface SafetyResumedPayload {
+  byPlayerId: string;
+  reason: string | null;
+  serverSeq: number;
+}
+
+export interface SosRaisedPayload {
+  byPlayerId: string;
+  serverSeq: number;
+}
+
+export interface MatchStartedPayload {
+  result: MatchResult | null;
+  serverSeq: number;
+}
+
+export interface MatchCompletedPayload {
+  result: MatchResult | null;
+  serverSeq: number;
+}
+
+export interface MatchCancelledPayload {
+  result: MatchResult | null;
+  serverSeq: number;
+}
+
+export interface AnnouncementEventPayload {
+  announcement: Announcement;
+  serverSeq: number;
+}
+
+export interface RevealEventPayload {
+  reveal: RevealArea;
+  serverSeq: number;
+}
+
+export interface SignalEventPayload {
+  signal: QuickSignal;
+  serverSeq: number;
+}
+
+export interface RadioEventPayload {
+  radio: RadioMessage;
+  serverSeq: number;
+}
+
+export interface VoiceSignalEventPayload {
+  fromPlayerId: string;
+  toPlayerId: string;
+  kind: VoiceSignalKind;
+  sdp?: string;
+  candidate?: unknown;
+}
+
+export interface PinEventPayload {
+  pin: MapPin;
+  serverSeq: number;
+}
+
+export interface HostTransferredPayload {
+  previousHostPlayerId: string;
+  newHostPlayerId: string;
+  serverSeq: number;
+}
+
+export interface TicketRenewalRequiredPayload {
+  expiresAt: number;
+  serverSeq: number;
+}
+
+export interface AuthRefreshedPayload {
+  expiresAt: number;
+  /** ISO-8601 timestamp — the DO emits a string here, not epoch ms. */
+  serverTs: string;
+  serverSeq: number;
+}
+
+export interface HeartbeatAckPayload {
+  /** ISO-8601 timestamp — the DO emits a string here, not epoch ms. */
+  serverTs: string;
+  serverSeq: number;
+}
+
+/** Payload for every server→client message type, keyed by type name. */
+export interface WsServerPayloads {
+  welcome: WelcomePayload;
+  snapshot: WsSnapshotPayload;
+  'room.state': RoomStatePayload;
+  'ticket.renewal-required': TicketRenewalRequiredPayload;
+  'auth.refreshed': AuthRefreshedPayload;
+  'heartbeat.ack': HeartbeatAckPayload;
+  error: WsErrorPayload;
+  'player.joined': PlayerEventPayload;
+  'player.left': PlayerEventPayload;
+  'player.removed': PlayerEventPayload;
+  'player.suspended': PlayerSuspendedEventPayload;
+  'player.resumed': PlayerResumedEventPayload;
+  'player.visibility': PlayerVisibilityPayload;
+  'host.transferred': HostTransferredPayload;
+  ping: PingEventPayload;
+  'ping.expired': PingExpiredPayload;
+  'zone.update': ZoneUpdatePayload;
+  reveal: RevealEventPayload;
+  pin: PinEventPayload;
+  signal: SignalEventPayload;
+  radio: RadioEventPayload;
+  'voice.signal': VoiceSignalEventPayload;
+  announcement: AnnouncementEventPayload;
+  'catch.requested': CatchEventPayload;
+  'catch.confirmed': CatchEventPayload;
+  'catch.disputed': CatchEventPayload;
+  'catch.expired': CatchEventPayload;
+  'catch.rejected': CatchEventPayload;
+  'safety.paused': SafetyPausedPayload;
+  'safety.resumed': SafetyResumedPayload;
+  'sos.raised': SosRaisedPayload;
+  'match.started': MatchStartedPayload;
+  'match.completed': MatchCompletedPayload;
+  'match.cancelled': MatchCancelledPayload;
+}
+
+export type WsServerMessageType = keyof WsServerPayloads;
+
+export const WS_SERVER_TYPES: readonly WsServerMessageType[] = [
+  'welcome',
+  'snapshot',
+  'room.state',
+  'ticket.renewal-required',
+  'auth.refreshed',
+  'heartbeat.ack',
+  'error',
+  'player.joined',
+  'player.left',
+  'player.removed',
+  'player.suspended',
+  'player.resumed',
+  'player.visibility',
+  'host.transferred',
+  'ping',
+  'ping.expired',
+  'zone.update',
+  'reveal',
+  'pin',
+  'signal',
+  'radio',
+  'voice.signal',
+  'announcement',
+  'catch.requested',
+  'catch.confirmed',
+  'catch.disputed',
+  'catch.expired',
+  'catch.rejected',
+  'safety.paused',
+  'safety.resumed',
+  'sos.raised',
+  'match.started',
+  'match.completed',
+  'match.cancelled',
+] as const;
+
+/** Type guard: is this string a known server→client message type? */
+export function isWsServerMessageType(value: string): value is WsServerMessageType {
+  return (WS_SERVER_TYPES as readonly string[]).includes(value);
+}
+
+/** Server→client types sent ONLY to the sender (never broadcast). */
+export const WS_DIRECT_SERVER_TYPES: readonly WsServerMessageType[] = [
+  'welcome',
+  'snapshot',
+  'error',
+  'heartbeat.ack',
+  'auth.refreshed',
+  'ticket.renewal-required',
+] as const;
+
+/** Server→client types relayed team-only (lobby scope = whole lobby). */
+export const WS_TEAM_ONLY_SERVER_TYPES: readonly WsServerMessageType[] = [
+  'voice.signal',
+  'radio',
+] as const;
+
+/** Server→client types sent Hunters-only. */
+export const WS_HUNTERS_ONLY_SERVER_TYPES: readonly WsServerMessageType[] = ['ping'] as const;
+
+// ---------------------------------------------------------------------------
+// Game events (audit log) — 10 types
+// ---------------------------------------------------------------------------
+
+export type GameEventType =
+  | 'PLAYER_JOINED'
+  | 'PLAYER_READY'
+  | 'MATCH_STARTED'
+  | 'LOCATION_UPDATED'
+  | 'LOCATION_PING_SENT'
+  | 'PLAYER_TAGGED'
+  | 'ZONE_UPDATED'
+  | 'PLAYER_DISCONNECTED'
+  | 'PLAYER_RECONNECTED'
+  | 'MATCH_COMPLETED';
+
+export const GAME_EVENT_TYPES: readonly GameEventType[] = [
+  'PLAYER_JOINED',
+  'PLAYER_READY',
+  'MATCH_STARTED',
+  'LOCATION_UPDATED',
+  'LOCATION_PING_SENT',
+  'PLAYER_TAGGED',
+  'ZONE_UPDATED',
+  'PLAYER_DISCONNECTED',
+  'PLAYER_RECONNECTED',
+  'MATCH_COMPLETED',
+] as const;
+
+/**
+ * Payloads for the game events. Privacy: raw coordinates appear ONLY in
+ * `LOCATION_UPDATED` / `LOCATION_PING_SENT` payloads (active-room state,
+ * purged at match end); persistent logs and recovery snapshots carry the
+ * event WITHOUT coordinates.
+ */
+export interface GameEventPayloads {
+  PLAYER_JOINED: { playerId: string; displayName: string };
+  PLAYER_READY: { playerId: string; isReady: boolean };
+  MATCH_STARTED: { startedAt: string; endsAt: string };
+  LOCATION_UPDATED: { playerId: string };
+  LOCATION_PING_SENT: { pingId: string; subjectPlayerId: string };
+  PLAYER_TAGGED: { catchId: string; hunterPlayerId: string; runnerPlayerId: string };
+  ZONE_UPDATED: { zone: ZoneConfig };
+  PLAYER_DISCONNECTED: { playerId: string; reason?: string };
+  PLAYER_RECONNECTED: { playerId: string };
+  MATCH_COMPLETED: { result: MatchResult; room: Pick<Room, 'roomId' | 'phase'> };
+}
+
+/**
+ * Game-event envelope. `seq` is assigned by the DO. Deduplication by `id`
+ * (retries reuse the id). The DO keeps a redacted log capped at 500.
+ */
+export interface GameEvent<T extends GameEventType = GameEventType> {
+  id: string;
+  timestamp: string;
+  roomId: string;
+  actorId: string;
+  type: T;
+  payload: GameEventPayloads[T];
+  seq?: number;
+}
+
+/** Type guard: is this string a known game-event type? */
+export function isGameEventType(value: string): value is GameEventType {
+  return (GAME_EVENT_TYPES as readonly string[]).includes(value);
 }

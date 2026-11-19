@@ -1,393 +1,792 @@
-import { WsTicketStore } from './auth.js';
-import { RateLimiter, HTTP_RATE_LIMITS } from './rate-limit.js';
-import { z } from '@pakdam/shared';
 /**
- * Pure HTTP helpers for the Worker entry (skeleton — NOT deployed).
- * Kept in this module — not in index.ts — so the unit tests can import
- * them under plain Node: index.ts re-exports the Durable Object class,
- * and that class imports 'cloudflare:workers', which plain Node cannot
- * load (ERR_UNSUPPORTED_ESM_URL_SCHEME). Routes:
- *  POST /v1/rooms                 create room (host)
- *  POST /v1/rooms/:id/join        join via code (guest)
- *  GET  /v1/rooms/by-code/:code   code → roomId lookup (Worker F,
- *    2026-11-17 — 200 { ok, roomId, roomCode }, 404 unknown code)
- *  POST /v1/rooms/:id/ws-ticket   single-use WS ticket over HTTPS (17 §2.5)
- *  POST /v1/rooms/:id/ws-ticket/revoke  revoke WS tickets (17 §2.6)
- *  GET  /v1/rooms/:id             recipient-specific lobby state (HNT-038)
- *  WS   /v1/rooms/:id/ws?ticket=<ticket>  realtime (17 §3)
- *  POST /v1/rooms/:id/lifecycle  start/pause/resume/end (Worker 5 — REST,
- *    see below; pause is any player, the rest are host-only via host token)
- *  POST /v1/rooms/:id/host/token issue/rotate the host token (Worker 5)
- *  POST /v1/rooms/:id/host/transfer  explicit host transfer (Worker 5)
- *  POST /v1/rooms/:id/catches/:cid/resolve  host resolves a disputed catch (Worker 5)
- *  GET  /v1/rooms/:id/results    match result, participant-only (Worker 5)
- *  POST /v1/reports              report/block — audit record only (Worker 5)
- *  POST /v1/support/bugs         bug report, no location (Worker 5)
- *  POST /v1/support/grievances   Rule 20 grievance (Worker 5)
- * WS auth: the ticket travels ONLY in the handshake query string and is
- * consumed on upgrade. `hello` carries NO credential. The only WS message
- * that carries a ticket is `auth.refresh` (renewal).
- * Game authority stays in the Durable Object. This Worker never trusts
- * client-provided roles, timestamps or scores.
+ * @pakdam/workers — HTTP route handlers.
  *
- * REST-vs-WS (Worker 5, 2026-11-17 — the missing REST routes in
- * docs/API.md, one decision per route):
- *  - /lifecycle → REST (new). start/pause/resume/end had no REST
- *    surface; pause/resume also exist as WS messages and stay
- *    server-authoritative either way (the DO lifecycle op reuses the
- *    WS handler for pause/resume).
- *  - /catches, /catches/:cid/confirm, /catches/:cid/dispute → WS ONLY.
- *    catch.request / catch.confirm / catch.dispute already exist in
- *    the §3.3 catalogue, are server-authoritative, idempotent
- *    (commandId) and tested — a parallel REST surface would double
- *    the validation surface for no gain. No REST route is registered
- *    for them; they 404 over HTTP by design.
- *  - /safety/sos → WS ONLY (safety.sos message, same reason).
- *  - /leave → WS ONLY ('leave' message, same reason; it also drives
- *    the automatic host transfer, which no REST call can claim).
- *  - /reports, /support/bugs, /support/grievances → REST (new).
- *    They need no DO authority — they are Supabase intake only.
- *  - /results → REST (new). Reads room.result from the DO via the
- *    existing get-state op; 404 until the match has a result.
+ * The Worker is a thin front door: it validates HTTP bodies, verifies
+ * credentials by hash (raw tokens are hashed here, never logged, never
+ * stored), and forwards game authority to the room's DO. It NEVER validates
+ * a WS ticket against its own store — issuance mints the value and registers
+ * only the hash with the DO (see `handleWsTicket`).
  *
- * Ticket store limit (Worker 5): WsTicketStore is Worker-in-memory
- * PER ISOLATE — a module-level singleton (see auth.ts). Tickets do
- * not survive an isolate eviction and are not shared across
- * isolates: after a cold start or a scale-out, every seat must fetch
- * a fresh ticket (close 4401 → fresh ticket → reconnect once, 17
- * §3.4). That is the documented behaviour, not a bug to work around
- * by persisting ticket values anywhere (ticket VALUES are never
- * stored — only their hashes, in memory).
+ * Success is flat `{ ok: true, ... }`; errors are `{ error: '...' }`
+ * (or `{ error, issues }` for a bad body, 400).
+ *
+ * Deliberately NO REST routes (404 by design — WS only): catch
+ * request/confirm/dispute, safety SOS, leave. Do not add REST twins.
+ * No leaderboard route exists.
  */
-const limiter = new RateLimiter();
-export const ticketStore = new WsTicketStore();
-export function createTicketStore(): WsTicketStore {
-  return new WsTicketStore();
-}
-export function route(path: string): string {
-  if (path === '/v1/rooms') return 'create-room';
-  if (path.endsWith('/ws-ticket/revoke')) return 'ws-ticket-revoke';
-  if (path.endsWith('/ws-ticket')) return 'ws-ticket';
-  if (path.endsWith('/ticket')) return 'ws-ticket'; // legacy alias — canonical path is /ws-ticket
-  if (path.endsWith('/ws')) return 'websocket';
-  if (path.endsWith('/join')) return 'join';
-  if (path.endsWith('/start')) return 'start'; // QA BE-11: host starts the match (was unreachable)
-  if (path.endsWith('/config')) return 'config'; // WIRING 2026-11-17: host changes lobby settings (was demo-only)
-  if (path.endsWith('/remove-player')) return 'remove-player'; // WIRING 2026-11-17: host removes a lobby player (was demo-only)
-  if (path.endsWith('/regenerate-code')) return 'regenerate-code'; // D-M2: host regenerates the room code from the lobby
-  if (path.endsWith('/catch-token')) return 'catch-token'; // WIRING 2026-11-17: Runner fetches the raw QR token for an open catch (DO op existed, no Worker route)
-  if (path.endsWith('/lifecycle')) return 'lifecycle'; // Worker 5: start/pause/resume/end over REST
-  if (path.endsWith('/host/transfer')) return 'host-transfer'; // Worker 5: explicit host transfer
-  if (path.endsWith('/host/token')) return 'host-token'; // Worker 5: issue/rotate the host token
-  if (/\/catches\/[^/]+\/resolve$/.test(path)) return 'catch-resolve'; // Worker 5: host resolves a disputed catch
-  if (path.endsWith('/results')) return 'results'; // Worker 5: match result (participant-only)
-  if (path === '/v1/reports') return 'reports'; // Worker 5: report/block intake (audit only)
-  if (path === '/v1/support/bugs') return 'bugs'; // Worker 5: bug reports (HNT-117)
-  if (path === '/v1/support/grievances') return 'grievances'; // Worker 5: Rule 20 grievances
-  if (/^\/v1\/rooms\/by-code\/[^/]+$/.test(path)) return 'by-code'; // Worker F: code → roomId lookup (must precede get-state)
-  if (/^\/v1\/rooms\/[^/]+$/.test(path)) return 'get-state';
-  return 'not-found';
-}
-/** Issue a ticket for a seat. TTL is OPEN calibration (17 §7) — the
- *  60_000 ms here is a placeholder the API mission must replace with a
- *  measured value; it is not a fixed requirement. */
-export function newTicket(roomId: string, playerId: string): string {
-  return ticketStore.issue(roomId, playerId, 'connect', 60_000, Date.now()).ticket;
-}
-/** Per-IP join limit — default 5/min (OPEN HNT-071). `limit`
- *  overrides the default ONLY when the caller passes an explicit
- *  env-resolved value (see `parsePerMinuteLimit`); the default is
- *  never raised silently. */
-export function joinAllowed(key: string, nowMs: number, limit: number = HTTP_RATE_LIMITS['room.join'].limit): boolean {
-  return limiter.allow(`join:${key}`, limit, HTTP_RATE_LIMITS['room.join'].windowMs, nowMs); // placeholder limit — OPEN (HNT-071)
-}
-/** Per-IP room-create limit (SEC-12): stops room spam from one client. */
-export function createAllowed(key: string, nowMs: number, limit: number = HTTP_RATE_LIMITS['room.create'].limit): boolean {
-  return limiter.allow(`create:${key}`, limit, HTTP_RATE_LIMITS['room.create'].windowMs, nowMs);
-}
-/** Per-IP code-lookup limit (Worker F, SEC-12): the lookup is an
- *  unauthenticated oracle over the code space, so it gets the same
- *  5/min per-IP placeholder as joins (OPEN HNT-071). A 30-player
- *  roster behind one NAT IP can hit this together with the join
- *  cap — the same trade-off as joins, to be measured. */
-export function lookupAllowed(key: string, nowMs: number, limit = 5): boolean {
-  return limiter.allow(`lookup:${key}`, limit, 60_000, nowMs);
-}
-/** Per-seat WS-ticket limit (SEC-12): stops ticket farming for a seat. */
-export function ticketAllowed(roomId: string, playerId: string, nowMs: number): boolean {
-  return limiter.allow(`ticket:${roomId}:${playerId}`, HTTP_RATE_LIMITS['ws.ticket'].limit, HTTP_RATE_LIMITS['ws.ticket'].windowMs, nowMs);
-}
-/** Per-seat ticket-revoke limit (SEC-12). */
-export function ticketRevokeAllowed(roomId: string, playerId: string, nowMs: number): boolean {
-  return limiter.allow(`ticket-revoke:${roomId}:${playerId}`, HTTP_RATE_LIMITS['ws.ticket.revoke'].limit, HTTP_RATE_LIMITS['ws.ticket.revoke'].windowMs, nowMs);
-}
-/** Per-seat start limit (SEC-12): stops start-spam hammering the DO. */
-export function startAllowed(roomId: string, playerId: string, nowMs: number): boolean {
-  return limiter.allow(`start:${roomId}:${playerId}`, HTTP_RATE_LIMITS['room.start'].limit, HTTP_RATE_LIMITS['room.start'].windowMs, nowMs);
-}
-/** Support-intake rate limit (Worker 5): reports/bugs/grievances are
- *  unauthenticated-ish intake, so they are limited per CLIENT IP
- *  (5/min — same placeholder as joins, OPEN HNT-071). */
-export function reportAllowed(key: string, nowMs: number): boolean {
-  return limiter.allow(`report:${key}`, 5, 60_000, nowMs);
+import {
+  isValidDisplayName,
+  isValidRoomCode,
+  isValidCatchToken,
+  newId,
+  validateRoomConfig,
+  type RoomConfig,
+} from '@pakdam/shared';
+import {
+  generateRoomCode,
+  hashHostToken,
+  hashReconnectToken,
+  hashTicketValue,
+  hashWsTicket,
+  newHostToken,
+  newReconnectToken,
+  newWsTicket,
+} from './auth.js';
+import { persistBugReport, persistGrievance, persistReportAudit, type SupabaseEnv } from './supabase.js';
+import { recordTelemetry } from './telemetry.js';
+import type { Env } from './index.js';
+
+export interface HttpContext {
+  env: Env;
+  ctx: ExecutionContext;
 }
 
-/** Validate a WS upgrade (17 §3.1, §3.4). Consumes the ticket on success.
- *  On failure nothing is consumed and the caller must close the upgrade
- *  with the returned code. The ticket VALUE is never logged — callers log
- *  only `ticketId` (see WsTicketStore.logRef). */
-export function handleWsUpgrade(
-  store: WsTicketStore, presentedTicket: string | null,
-  roomId: string, playerId: string, nowMs: number,
-): { ok: true; ticketId: string } | { ok: false; code: 'TICKET_INVALID' | 'TICKET_REUSED' | 'TICKET_EXPIRED'; closeCode: 4401; message: string } {
-  if (!presentedTicket) {
-    return { ok: false, code: 'TICKET_INVALID', closeCode: 4401, message: 'WS ticket is required in the handshake query string' };
+export function json(data: unknown, status: number = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+export function err(message: string, status: number, issues?: string[]): Response {
+  return json(
+    issues ? { error: message, issues } : { error: message },
+    status,
+  );
+}
+
+export async function parseBody(req: Request): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
+  let raw: unknown;
+  try {
+    raw = await req.json();
+  } catch {
+    return { ok: false, response: err('Invalid JSON body.', 400) };
   }
-  const result = store.redeem(presentedTicket, roomId, playerId, nowMs);
-  if (!result.ok) {
-    const message = result.code === 'TICKET_REUSED'
-      ? 'WS ticket already redeemed — request a fresh ticket'
-      : result.code === 'TICKET_EXPIRED'
-        ? 'WS ticket expired — request a fresh ticket'
-        : 'WS ticket is not valid for this room and seat';
-    return { ok: false, code: result.code, closeCode: 4401, message };
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ok: false, response: err('Request body must be a JSON object.', 400) };
   }
-  // SEC-11: a 'renew' ticket is for `auth.refresh` on an EXISTING
-  // socket only — it must never open a new socket. The peek in the
-  // caller already rejects renew tickets before redeem, so reaching
-  // here with one is a defence-in-depth check (the ticket is already
-  // consumed by the redeem above, so it cannot be reused either way).
-  if (result.purpose !== 'connect') {
-    return { ok: false, code: 'TICKET_INVALID', closeCode: 4401, message: 'WS ticket is not valid for this room and seat' };
-  }
-  return { ok: true, ticketId: result.ticketId };
+  return { ok: true, body: raw as Record<string, unknown> };
 }
 
-// ---------------------------------------------------------------------------
-// HTTP request-body schemas (real Zod 4.6.7 — founder-approved final stack,
-// 2026-11-17). These validate SHAPE only (types, ranges, unknown-key
-// rejection — every schema is STRICT, via `.strict()`, preserving the
-// behaviour of the old zod-shim, which rejected unknown keys; plain
-// Zod `.object()` would silently strip them instead). Domain rules live
-// in `validateRoomConfig` / `isValidDisplayName` (shared) and in the DO,
-// which re-validates everything — the Worker never trusts the client.
-// `z` is real Zod, re-exported from '@pakdam/shared'.
-// ---------------------------------------------------------------------------
+export function bearerToken(req: Request): string | null {
+  const h = req.headers.get('Authorization');
+  if (!h || !h.startsWith('Bearer ')) return null;
+  return h.slice('Bearer '.length).trim() || null;
+}
 
-const geoPointSchema = z.object({
-  lat: z.number().min(-90).max(90),
-  lng: z.number().min(-180).max(180),
-}).strict();
-/** A polygon is an array of points. The shim's array has no `.min()`,
- *  so the ">= 3 points" rule is NOT enforced here — it is enforced by
- *  `validateRoomConfig` (zone boundary) and by the engine at use. */
-const geoPolygonSchema = z.array(geoPointSchema);
-const zoneConfigSchema = z.object({
-  boundary: geoPolygonSchema,
-  shrinkPhases: z.array(z.object({
-    atSeconds: z.number().int().min(0),
-    boundary: geoPolygonSchema,
-  }).strict()),
-}).strict();
+function asString(v: unknown): string | null {
+  return typeof v === 'string' ? v : null;
+}
 
-/** Full RoomConfig shape (shared types.ts). Ranges mirror
- *  HOST_RANGES / validation.ts; the DO's `validateRoomConfig` is
- *  still the authority on the domain rules (e.g. hostOnSiteConfirmed
- *  must be true, zone diameter limits, selectedHunterIds bounds). */
-export const roomConfigSchema = z.object({
-  mode: z.enum(['classic', 'infection']),
-  teamAssignment: z.enum(['random', 'selected']),
-  maxPlayers: z.number().int().min(3).max(30),
-  hunterCount: z.number().int().min(1),
-  durationSeconds: z.number().int().min(300).max(10800),
-  headStartSeconds: z.number().int().min(0).max(1800),
-  pingIntervalSeconds: z.number().int().min(0).max(1800),
-  zoneShrinkEnabled: z.boolean(),
-  zoneShrinkIntervalSeconds: z.number().int().min(0),
-  catchConfirmationRequired: z.boolean(),
-  balanceHunters: z.boolean().optional(),
-  randomDraw: z.boolean().optional(),
-  playZoneEnabled: z.boolean().optional(),
-  huntersCanTalk: z.boolean().optional(),
-  finalSizePercent: z.number().nullable().optional(),
-  showPingHistory: z.boolean().optional(),
-  zone: zoneConfigSchema,
-  zoneShape: z.enum(['circle', 'draw']).optional(), // FIX 2026-11-18: the web app always sends zoneShape (draftToConfig); strict() rejected every lobby create without it ("Unrecognized key: zoneShape"). Optional so older clients still pass.
-  safeAreas: z.array(geoPolygonSchema),
-  noGoAreas: z.array(geoPolygonSchema),
-  selectedHunterIds: z.array(z.string()),
-  hostOnSiteConfirmed: z.boolean(),
-}).strict();
+// -- DO plumbing ---------------------------------------------------------------
 
-/** GET /v1/rooms/by-code/:code — the :code path segment (Worker F).
- *  The regex is the same as shared `isValidRoomCode` (6 chars
- *  A-Z0-9): the server's canonical code shape, used by the DO
- *  `create` op too. It is deliberately WIDER than the 32-char
- *  generation alphabet (no 0/O/1/I) — a code the server accepted at
- *  creation must always stay lookable-up, and generation never
- *  emits the excluded four. Lowercase is malformed (400), not
- *  unknown (404): the web client uppercases before calling. */
-export const roomCodeSchema = z.string().regex(/^[A-Z0-9]{6}$/, 'room code must be 6 characters A-Z0-9');
+function doStub(env: Env, roomId: string): DurableObjectStub {
+  return env.ROOM_DO.get(env.ROOM_DO.idFromName(roomId));
+}
 
-/** POST /v1/rooms — the host creates a room. `kind` is the host's
- *  account kind ('guest' for the guest-only pilot, 'host-account'
- *  when accounts exist); the server always makes this seat the host
- *  — a caller cannot claim host powers for another seat. */
-export const createRoomBody = z.object({
-  displayName: z.string().min(1).max(30),
-  kind: z.enum(['guest', 'host-account'] as const),
-  config: roomConfigSchema,
-  ageGatePassed: z.boolean(),
-}).strict();
+function registryStub(env: Env): DurableObjectStub {
+  return env.CODE_REGISTRY_DO.get(env.CODE_REGISTRY_DO.idFromName('pakdam-code-registry'));
+}
 
-/** POST /v1/rooms/:id/join — a guest joins with the room CODE (the
- *  invite proof; the Worker verifies it against the DO before
- *  forwarding the join). The roomId in the path is the UUID from the
- *  host's invite link. `reconnectToken` is OPTIONAL for a brand-new
- *  join and REQUIRED to restore an existing seat by display name
- *  (SEC-06 fix, Worker 5): a restore with a missing or wrong token
- *  is 403 and restores nothing. */
-export const joinBody = z.object({
-  displayName: z.string().min(1).max(30),
-  kind: z.enum(['guest', 'host-account'] as const),
-  roomCode: z.string().min(6).max(6),
-  reconnectToken: z.string().min(1).optional(),
-}).strict();
+interface DoResponse {
+  ok: boolean;
+  error?: string;
+  code?: string;
+  status?: number;
+  [key: string]: unknown;
+}
 
-/** POST /v1/rooms/:id/ws-ticket and .../ws-ticket/revoke — prove the
- *  seat with the raw reconnect token received at join/create (the DO
- *  verifies it against the stored hash; the token is never logged).
- *  The ticket itself is issued by the Worker, never by the client.
- *  SEC-11: `purpose` is 'connect' (default — opens a new socket) or
- *  'renew' (a fresh ticket for `auth.refresh` on an EXISTING socket;
- *  a renew ticket can never open a socket). */
-export const ticketBody = z.object({
-  playerId: z.string().min(1),
-  reconnectToken: z.string().min(1),
-  purpose: z.enum(['connect', 'renew'] as const).optional(),
-}).strict();
+/** Call one DO op; maps DO failures onto HTTP errors. */
+async function callDo(
+  env: Env,
+  roomId: string,
+  op: string,
+  payload: Record<string, unknown>,
+): Promise<DoResponse> {
+  const stub = doStub(env, roomId);
+  let res: Response;
+  try {
+    res = await stub.fetch('http://room-do/op', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ op, ...payload }),
+    });
+  } catch {
+    return { ok: false, error: 'Room service unavailable.', code: 'SERVICE_UNAVAILABLE', status: 503 };
+  }
+  let data: DoResponse;
+  try {
+    data = (await res.json()) as DoResponse;
+  } catch {
+    return { ok: false, error: 'Room service returned an unreadable response.', code: 'SERVER_ERROR', status: 502 };
+  }
+  return data;
+}
 
-/** POST /v1/rooms/:id/config — host-only lobby settings change
- *  (WIRING 2026-11-17). `config` is the full new RoomConfig; the DO
- *  re-validates it with validateRoomConfig and enforces host-only +
- *  LOBBY-only. Host authority is proven with the HOST token (Worker
- *  5, SEC-06) — the per-seat host token issued at room creation —
- *  not with the reconnect token: the reconnect token proves a seat,
- *  the host token proves host authority. */
-export const updateConfigBody = z.object({
-  playerId: z.string().min(1),
-  hostToken: z.string().min(1),
-  config: roomConfigSchema,
-}).strict();
+async function callRegistry(
+  env: Env,
+  op: string,
+  payload: Record<string, unknown>,
+): Promise<DoResponse> {
+  const stub = registryStub(env);
+  try {
+    const res = await stub.fetch('http://code-registry/op', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ op, ...payload }),
+    });
+    return (await res.json()) as DoResponse;
+  } catch {
+    return { ok: false, error: 'Code registry unavailable.', code: 'SERVICE_UNAVAILABLE', status: 503 };
+  }
+}
 
-/** POST /v1/rooms/:id/remove-player — host-only lobby removal
- *  (WIRING 2026-11-17). The DO enforces host-only, LOBBY-only, and
- *  never removes the host seat. Auth is the HOST token (Worker 5,
- *  SEC-06), same as config/start. */
-export const removePlayerBody = z.object({
-  playerId: z.string().min(1),
-  hostToken: z.string().min(1),
-  targetPlayerId: z.string().min(1),
-}).strict();
+/** Turn a DO failure into an HTTP error response. */
+function doError(r: DoResponse): Response {
+  const status =
+    typeof r.status === 'number'
+      ? r.status
+      : r.code === 'FORBIDDEN'
+        ? 403
+        : r.code === 'NOT_FOUND' || r.code === 'ROOM_NOT_FOUND'
+          ? 404
+          : r.code === 'CONFLICT' || r.code === 'INVALID_STATE'
+            ? 409
+            : r.code === 'VALIDATION_FAILED'
+              ? 400
+              : 400;
+  return err(r.error ?? 'Room operation failed.', status);
+}
 
-/** POST /v1/rooms/:id/regenerate-code — host-only room-code change
- *  (D-M2). No code in the body: the Worker generates the fresh code
- *  (same alphabet as create), checks it is free in the index, and
- *  registers it before the DO swaps it in. Auth is the HOST token
- *  (Worker 5, SEC-06), same as config/remove-player/start. */
-export const regenerateCodeBody = z.object({
-  playerId: z.string().min(1),
-  hostToken: z.string().min(1),
-}).strict();
+function stripDoEnvelope(r: DoResponse): Record<string, unknown> {
+  const { ok: _ok, ...rest } = r;
+  void _ok;
+  return rest;
+}
 
-/** Host-only actions (Worker 5, SEC-06) prove host authority with
- *  the host token: `{ playerId, hostToken }`. The Worker verifies it
- *  against the DO (`verify-host-token` op) before forwarding; the DO
- *  re-checks actorId === room.hostPlayerId. A missing field is 400
- *  (strict schema); a wrong token, or a non-host seat, is 403. */
-export const hostTokenBody = z.object({
-  playerId: z.string().min(1),
-  hostToken: z.string().min(1),
-}).strict();
+// -- rooms ---------------------------------------------------------------------
 
-/** POST /v1/rooms/:id/lifecycle — start / pause / resume / end
- *  (Worker 5). start, resume and end are host-only and require
- *  `hostToken`; pause is any player (safety is not host-gated) and
- *  requires `reconnectToken`. Exactly the credential the action
- *  needs must be present; the other may be omitted. */
-export const lifecycleBody = z.object({
-  action: z.enum(['start', 'pause', 'resume', 'end']),
-  playerId: z.string().min(1),
-  hostToken: z.string().min(1).optional(),
-  reconnectToken: z.string().min(1).optional(),
-}).strict();
+/** POST /v1/rooms — create room (host). 201 + roomId, code, host seat, both tokens. */
+export async function handleCreateRoom(req: Request, ctx: HttpContext): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const displayName = asString(body['displayName']);
+  if (!displayName || !isValidDisplayName(displayName)) {
+    return err('Display name must be 1–30 characters.', 400);
+  }
+  if (body['kind'] !== 'guest') {
+    return err("kind must be 'guest'.", 400);
+  }
+  if (body['ageGatePassed'] !== true) {
+    return err('Age gate must be passed to create a room.', 400);
+  }
+  const config = body['config'];
+  if (typeof config !== 'object' || config === null) {
+    return err('config is required.', 400);
+  }
+  const issues = validateRoomConfig(config);
+  if (issues.length > 0) {
+    return err('Room config is not valid.', 400, issues);
+  }
 
-/** POST /v1/rooms/:id/host/transfer — explicit host transfer
- *  (Worker 5). The current host names the successor seat; the old
- *  host's token entry is deleted and the successor holds NO host
- *  token until they call POST .../host/token with their reconnect
- *  token. Auth is the CURRENT host's host token. */
-export const transferBody = z.object({
-  playerId: z.string().min(1),
-  hostToken: z.string().min(1),
-  newHostPlayerId: z.string().min(1),
-}).strict();
+  const roomId = newId();
+  const hostPlayerId = newId();
+  const reconnectToken = newReconnectToken();
+  const hostToken = newHostToken();
 
-/** POST /v1/rooms/:id/catches/:cid/resolve — host resolves a
- *  DISPUTED catch (Worker 5, "host resolves disputes"). `decision`
- *  'confirmed' counts the tag (mode + win rules apply);
- *  'rejected' voids the claim. `reason` is recorded nowhere on the
- *  wire beyond the DO audit log; it is accepted for the client's
- *  own record (max 500 chars). Auth is the host token. */
-export const resolveBody = z.object({
-  playerId: z.string().min(1),
-  hostToken: z.string().min(1),
-  decision: z.enum(['confirmed', 'rejected']),
-  reason: z.string().max(500).optional(),
-}).strict();
+  // Register the code synchronously before the 201 returns (retry on collision).
+  let roomCode = '';
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    roomCode = generateRoomCode();
+    const reg = await callRegistry(ctx.env, 'register', { code: roomCode, roomId });
+    if (reg.ok) break;
+    if (reg.code === 'CONFLICT') continue;
+    return err('Code registry unavailable — try again.', 503);
+  }
+  if (!roomCode) return err('Could not allocate a room code — try again.', 503);
 
-/** POST /v1/support/bugs (HNT-117, Worker 5). No location is ever
- *  attached to a bug report. roomId/playerId are optional context;
- *  deviceInfo + appVersion + description are required. */
-export const bugReportBody = z.object({
-  roomId: z.string().min(1).nullable().optional(),
-  playerId: z.string().min(1).nullable().optional(),
-  deviceInfo: z.string().min(1).max(500),
-  appVersion: z.string().min(1).max(100),
-  description: z.string().min(1).max(2000),
-}).strict();
+  const created = await callDo(ctx.env, roomId, 'create', {
+    roomId,
+    roomCode,
+    hostPlayerId,
+    displayName: displayName.trim(),
+    config: config as RoomConfig,
+    reconnectTokenHash: await hashReconnectToken(reconnectToken),
+    hostTokenHash: await hashHostToken(hostToken),
+  });
+  if (!created.ok) {
+    // Roll the code registration back so the code can be reused.
+    await callRegistry(ctx.env, 'unregister', { code: roomCode, roomId });
+    return doError(created);
+  }
+  recordTelemetry('player_games', 1);
+  return json(
+    { ok: true, roomId, roomCode, hostPlayerId, reconnectToken, hostToken },
+    201,
+  );
+}
 
-/** POST /v1/support/grievances (Rule 20, Worker 5 — distinct from
- *  bugs). No auth: anyone may file; the complainant reference is a
- *  free-text handle the filer supplies (never an email/password). */
-export const grievanceBody = z.object({
-  complainantRef: z.string().min(1).max(200),
-  channel: z.enum(['in-app', 'email']),
-  summary: z.string().min(1).max(2000),
-}).strict();
+/** GET /v1/rooms/by-code/:code — resolve a 6-letter invite code to a roomId. */
+export async function handleLookupByCode(
+  _req: Request,
+  ctx: HttpContext,
+  code: string,
+): Promise<Response> {
+  if (!isValidRoomCode(code)) {
+    return err('Room code must be 6 characters A–Z0–9.', 400);
+  }
+  const found = await callRegistry(ctx.env, 'lookup', { code });
+  if (!found.ok) {
+    return err('No live room for that code.', 404);
+  }
+  return json({ ok: true, roomId: found['roomId'], roomCode: code });
+}
 
-/** POST /v1/reports (HNT-064, Worker 5). The reporter must be a
- *  participant: playerId + reconnectToken are verified against the
- *  DO before the audit record is written. A 'block' is recorded
- *  only — it does NOT itself remove or silence anyone (no block
- *  list exists in the DO yet; enforcement is a follow-up). */
-export const reportBody = z.object({
-  roomId: z.string().min(1),
-  playerId: z.string().min(1),
-  reconnectToken: z.string().min(1),
-  targetPlayerId: z.string().min(1).nullable().optional(),
-  kind: z.enum(['report', 'block']),
-  reason: z.string().min(1).max(500),
-}).strict();
+/** POST /v1/rooms/:id/join — join by code; restores a seat on name + token. */
+export async function handleJoin(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const displayName = asString(body['displayName']);
+  if (!displayName || !isValidDisplayName(displayName)) {
+    return err('Display name must be 1–30 characters.', 400);
+  }
+  if (body['kind'] !== 'guest') {
+    return err("kind must be 'guest'.", 400);
+  }
+  const roomCode = asString(body['roomCode']);
+  if (!roomCode || !isValidRoomCode(roomCode)) {
+    return err('roomCode must be 6 characters A–Z0–9.', 400);
+  }
+  const rawReconnect = asString(body['reconnectToken']);
+  const joined = await callDo(ctx.env, roomId, 'add-player', {
+    displayName: displayName.trim(),
+    roomCode,
+    reconnectTokenHash: rawReconnect ? await hashReconnectToken(rawReconnect) : null,
+  });
+  if (!joined.ok) return doError(joined);
+  // A restore returns an EMPTY reconnect token — the client must never
+  // overwrite a good stored token with it (enforced client-side).
+  // Defense in depth: the DO already returns a PlayerView, but the HTTP
+  // boundary strips any reconnectTokenHash all the same, so no join
+  // response can ever carry one (BEHAVIOUR §4).
+  const joinedPlayer = joined['player'];
+  const player =
+    joinedPlayer !== null && typeof joinedPlayer === 'object'
+      ? (({ reconnectTokenHash: _hash, ...rest }) => rest)(
+          joinedPlayer as Record<string, unknown>,
+        )
+      : joinedPlayer;
+  recordTelemetry('player_games', 1);
+  return json({
+    ok: true,
+    player,
+    reconnectToken: joined['reconnectToken'],
+    restored: joined['restored'],
+  });
+}
 
-/** POST /v1/rooms/:id/catch-token — the RUNNER's seat fetches the raw
- *  one-time catch token for an open catch, to show as a QR (WIRING
- *  2026-11-17 — the DO `get-catch-token` op existed but no Worker
- *  route exposed it, so a Runner on the live backend could never show
- *  a QR). The DO enforces runner-only + open-catch-only; the token is
- *  returned once over HTTPS and never logged. */
-export const catchTokenBody = z.object({
-  playerId: z.string().min(1),
-  reconnectToken: z.string().min(1),
-  catchId: z.string().min(1),
-}).strict();
+/**
+ * POST /v1/rooms/:id/ws-ticket — single-use WS ticket (60 s TTL).
+ * ISSUANCE-SIDE ONLY: the Worker mints the value and registers its HASH
+ * with the DO. The Worker never validates a ticket against its own store.
+ */
+export async function handleWsTicket(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawReconnect = asString(body['reconnectToken']);
+  const purpose = body['purpose'] === 'renew' ? 'renew' : 'connect';
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawReconnect) return err('reconnectToken is required.', 400);
+  const ticket = newWsTicket();
+  const registered = await callDo(ctx.env, roomId, 'register-ticket', {
+    playerId,
+    reconnectTokenHash: await hashReconnectToken(rawReconnect),
+    ticketId: ticket.ticketId,
+    ticketHash: await hashTicketValue(ticket.ticket),
+    purpose,
+    expiresAtMs: ticket.expiresAtMs,
+  });
+  if (!registered.ok) return doError(registered);
+  return json({
+    ok: true,
+    ticket: ticket.ticket,
+    ticketId: ticket.ticketId,
+    expiresAtMs: ticket.expiresAtMs,
+  });
+}
+
+/** POST /v1/rooms/:id/ws-ticket/revoke — revoke WS tickets for a seat (DO count authoritative). */
+export async function handleRevokeTicket(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawReconnect = asString(body['reconnectToken']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawReconnect) return err('reconnectToken is required.', 400);
+  const revoked = await callDo(ctx.env, roomId, 'revoke-tickets', {
+    playerId,
+    reconnectTokenHash: await hashReconnectToken(rawReconnect),
+  });
+  if (!revoked.ok) return doError(revoked);
+  return json({ ok: true, revoked: revoked['revoked'] });
+}
+
+/**
+ * GET /v1/rooms/:id?playerId=… — recipient-filtered room state.
+ * Authorization: Bearer <reconnectToken>. PlayerId alone 400s; a non-seat
+ * playerId 404s (IDOR guard); a wrong token 403s.
+ */
+export async function handleGetState(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const playerId = url.searchParams.get('playerId');
+  const token = bearerToken(req) ?? url.searchParams.get('reconnectToken');
+  if (!playerId) return err('playerId is required.', 400);
+  if (!token) return err('reconnectToken is required.', 400);
+  const state = await callDo(ctx.env, roomId, 'get-state', {
+    playerId,
+    reconnectTokenHash: await hashReconnectToken(token),
+  });
+  if (!state.ok) return doError(state);
+  return json({ ok: true, ...stripDoEnvelope(state) });
+}
+
+/** POST /v1/rooms/:id/start — host starts the match (host token; 409 if gate unmet). */
+export async function handleStart(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawHost = asString(body['hostToken']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawHost) return err('hostToken is required.', 400);
+  const started = await callDo(ctx.env, roomId, 'start', {
+    playerId,
+    hostTokenHash: await hashHostToken(rawHost),
+  });
+  if (!started.ok) return doError(started);
+  return json({ ok: true, ...stripDoEnvelope(started) });
+}
+
+/** POST /v1/rooms/:id/config — host replaces the full lobby config (lobby only). */
+export async function handleUpdateConfig(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawHost = asString(body['hostToken']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawHost) return err('hostToken is required.', 400);
+  if (typeof body['config'] !== 'object' || body['config'] === null) {
+    return err('config is required.', 400);
+  }
+  const issues = validateRoomConfig(body['config']);
+  if (issues.length > 0) {
+    return err('Room config is not valid.', 400, issues);
+  }
+  const updated = await callDo(ctx.env, roomId, 'update-config', {
+    playerId,
+    hostTokenHash: await hashHostToken(rawHost),
+    config: body['config'],
+  });
+  if (!updated.ok) return doError(updated);
+  return json({ ok: true, room: updated['room'] });
+}
+
+/** POST /v1/rooms/:id/remove-player — host removes a lobby player (never the host). */
+export async function handleRemovePlayer(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawHost = asString(body['hostToken']);
+  const targetPlayerId = asString(body['targetPlayerId']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawHost) return err('hostToken is required.', 400);
+  if (!targetPlayerId) return err('targetPlayerId is required.', 400);
+  const removed = await callDo(ctx.env, roomId, 'remove-player', {
+    playerId,
+    hostTokenHash: await hashHostToken(rawHost),
+    targetPlayerId,
+  });
+  if (!removed.ok) return doError(removed);
+  return json({ ok: true, ...stripDoEnvelope(removed) });
+}
+
+/** POST /v1/rooms/:id/regenerate-code — host swaps the room code; old code dies at once. */
+export async function handleRegenerateCode(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawHost = asString(body['hostToken']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawHost) return err('hostToken is required.', 400);
+  const newCode = generateRoomCode();
+  const reg = await callRegistry(ctx.env, 'register', { code: newCode, roomId });
+  if (!reg.ok) {
+    return reg.code === 'CONFLICT'
+      ? err('Could not allocate a fresh code — try again.', 503)
+      : err('Code registry unavailable — try again.', 503);
+  }
+  const swapped = await callDo(ctx.env, roomId, 'regenerate-code', {
+    playerId,
+    hostTokenHash: await hashHostToken(rawHost),
+    newCode,
+  });
+  if (!swapped.ok) {
+    await callRegistry(ctx.env, 'unregister', { code: newCode, roomId });
+    return doError(swapped);
+  }
+  const oldRoomCode = asString(swapped['oldRoomCode']);
+  if (oldRoomCode) {
+    await callRegistry(ctx.env, 'unregister', { code: oldRoomCode, roomId });
+  }
+  return json({ ok: true, roomCode: newCode, oldRoomCode });
+}
+
+/**
+ * POST /v1/rooms/:id/host/token — mint / rotate the host token for the host seat.
+ * The caller proves the SEAT with the reconnect token; the previous host
+ * token for that seat dies on rotation. Raw token returned ONCE, never logged.
+ */
+export async function handleHostToken(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawReconnect = asString(body['reconnectToken']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawReconnect) return err('reconnectToken is required.', 400);
+  const minted = await callDo(ctx.env, roomId, 'issue-host-token', {
+    playerId,
+    reconnectTokenHash: await hashReconnectToken(rawReconnect),
+  });
+  if (!minted.ok) return doError(minted);
+  return json({ ok: true, hostToken: minted['hostToken'] });
+}
+
+/** POST /v1/rooms/:id/host/transfer — explicit host transfer (current host's token required). */
+export async function handleHostTransfer(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawHost = asString(body['hostToken']);
+  const newHostPlayerId = asString(body['newHostPlayerId']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawHost) return err('hostToken is required.', 400);
+  if (!newHostPlayerId) return err('newHostPlayerId is required.', 400);
+  const transferred = await callDo(ctx.env, roomId, 'transfer-host', {
+    playerId,
+    hostTokenHash: await hashHostToken(rawHost),
+    newHostPlayerId,
+  });
+  if (!transferred.ok) return doError(transferred);
+  return json({ ok: true, ...stripDoEnvelope(transferred) });
+}
+
+/**
+ * POST /v1/rooms/:id/catch-token — Runner fetches the raw one-time catch
+ * token for their QR. The token is >= 128 bits, single-use, TTL 120 s
+ * (OPEN), QR-only carriage — never typed, never shown as text.
+ */
+export async function handleCatchToken(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawReconnect = asString(body['reconnectToken']);
+  const catchId = asString(body['catchId']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawReconnect) return err('reconnectToken is required.', 400);
+  if (!catchId) return err('catchId is required.', 400);
+  const got = await callDo(ctx.env, roomId, 'get-catch-token', {
+    playerId,
+    reconnectTokenHash: await hashReconnectToken(rawReconnect),
+    catchId,
+  });
+  if (!got.ok) return doError(got);
+  const token = asString(got['token']);
+  if (token && !isValidCatchToken(token)) {
+    return err('Catch token failed validation.', 500);
+  }
+  return json({ ok: true, ...stripDoEnvelope(got) });
+}
+
+/**
+ * POST /v1/rooms/:id/catches/:cid/resolve — host resolves a disputed catch.
+ * IMPLEMENTED (decided, not half-wired): 'confirmed' applies the mode rule
+ * (Classic: Runner out; Infection: Runner flips to Hunter) and runs the win
+ * check; 'rejected' voids the claim. The host's decision is final; a
+ * disputed catch can never be re-confirmed by the Runner.
+ */
+export async function handleResolveCatch(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+  catchId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawHost = asString(body['hostToken']);
+  const decision = body['decision'];
+  const reason = asString(body['reason']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!rawHost) return err('hostToken is required.', 400);
+  if (decision !== 'confirmed' && decision !== 'rejected') {
+    return err("decision must be 'confirmed' or 'rejected'.", 400);
+  }
+  if (reason !== null && reason.length > 500) {
+    return err('reason must be at most 500 characters.', 400);
+  }
+  const resolved = await callDo(ctx.env, roomId, 'resolve-catch', {
+    playerId,
+    hostTokenHash: await hashHostToken(rawHost),
+    catchId,
+    decision,
+    ...(reason !== null ? { reason } : {}),
+  });
+  if (!resolved.ok) return doError(resolved);
+  return json({ ok: true, ...stripDoEnvelope(resolved) });
+}
+
+/**
+ * POST /v1/rooms/:id/lifecycle — server-only REST lifecycle.
+ * start / resume / end are host-only (hostToken); pause is ANY player
+ * (reconnectToken) — safety is not host-gated. The web app never calls this
+ * (pause/resume go over WS); it exists for server-side control.
+ */
+export async function handleLifecycle(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const action = body['action'];
+  const playerId = asString(body['playerId']);
+  const rawHost = asString(body['hostToken']);
+  const rawReconnect = asString(body['reconnectToken']);
+  if (action !== 'start' && action !== 'pause' && action !== 'resume' && action !== 'end') {
+    return err("action must be 'start', 'pause', 'resume' or 'end'.", 400);
+  }
+  if (!playerId) return err('playerId is required.', 400);
+  const done = await callDo(ctx.env, roomId, 'lifecycle', {
+    action,
+    playerId,
+    ...(rawHost ? { hostTokenHash: await hashHostToken(rawHost) } : {}),
+    ...(rawReconnect ? { reconnectTokenHash: await hashReconnectToken(rawReconnect) } : {}),
+  });
+  if (!done.ok) return doError(done);
+  return json({ ok: true, ...stripDoEnvelope(done) });
+}
+
+/** GET /v1/rooms/:id/results — match result, participant-only; 404 until a result exists. */
+export async function handleResults(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const playerId = url.searchParams.get('playerId');
+  const token = bearerToken(req) ?? url.searchParams.get('reconnectToken');
+  if (!playerId) return err('playerId is required.', 400);
+  if (!token) return err('reconnectToken is required.', 400);
+  const results = await callDo(ctx.env, roomId, 'get-results', {
+    playerId,
+    reconnectTokenHash: await hashReconnectToken(token),
+  });
+  if (!results.ok) return doError(results);
+  return json({ ok: true, ...stripDoEnvelope(results) });
+}
+
+// -- intake (server-only, Supabase best-effort) --------------------------------
+
+/** POST /v1/reports — report/block intake, audit record ONLY (202). A 'block' does NOT remove or silence anyone. */
+export async function handleReports(req: Request, ctx: HttpContext): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const roomId = asString(body['roomId']);
+  const playerId = asString(body['playerId']);
+  const targetPlayerId = asString(body['targetPlayerId']);
+  const kind = body['kind'];
+  if (!roomId) return err('roomId is required.', 400);
+  if (!playerId) return err('playerId is required.', 400);
+  if (kind !== 'report' && kind !== 'block') {
+    return err("kind must be 'report' or 'block'.", 400);
+  }
+  ctx.ctx.waitUntil(
+    persistReportAudit(ctx.env as SupabaseEnv, {
+      roomId,
+      playerId,
+      targetPlayerId,
+      kind,
+    }),
+  );
+  return json({ ok: true }, 202);
+}
+
+/** POST /v1/support/bugs — bug intake, no location ever attached (202). */
+export async function handleBugReport(req: Request, ctx: HttpContext): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const description = asString(body['description']);
+  if (!description || description.trim().length === 0 || description.length > 5000) {
+    return err('description must be 1–5000 characters.', 400);
+  }
+  ctx.ctx.waitUntil(
+    persistBugReport(ctx.env as SupabaseEnv, {
+      roomId: asString(body['roomId']),
+      playerId: asString(body['playerId']),
+      deviceInfo: asString(body['deviceInfo']),
+      appVersion: asString(body['appVersion']),
+      description: description.trim(),
+    }),
+  );
+  return json({ ok: true }, 202);
+}
+
+/** POST /v1/support/grievances — grievance intake, distinct from bugs (202). */
+export async function handleGrievance(req: Request, ctx: HttpContext): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const summary = asString(body['summary']);
+  const channel = asString(body['channel']) ?? 'in-app';
+  if (!summary || summary.trim().length === 0 || summary.length > 5000) {
+    return err('summary must be 1–5000 characters.', 400);
+  }
+  if (channel !== 'in-app' && channel !== 'email') {
+    return err("channel must be 'in-app' or 'email'.", 400);
+  }
+  ctx.ctx.waitUntil(
+    persistGrievance(ctx.env as SupabaseEnv, {
+      complainantRef: asString(body['complainantRef']),
+      channel,
+      summary: summary.trim(),
+    }),
+  );
+  return json({ ok: true }, 202);
+}
+
+// -- WS upgrade (Worker side) ---------------------------------------------------
+
+/**
+ * GET /v1/rooms/:id/ws?ticket=… — the WS upgrade path.
+ *
+ * The ticket VALUE arrives in the query string (the one sanctioned
+ * exception to "never put a token in a URL"). The Worker hashes it and
+ * forwards ONLY the hash to the DO, which validates + redeems atomically.
+ * A missing/invalid ticket gets a real WS 4401 close frame, not an HTTP
+ * 401 (an HTTP 401 surfaces to browsers as close 1006 and the client
+ * mis-handles it).
+ */
+export async function handleWsUpgrade(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const url = new URL(req.url);
+  const ticket = url.searchParams.get('ticket');
+  if (!ticket) {
+    return wsCloseResponse(4401, 'Missing ticket — fetch a fresh ticket and reconnect once.');
+  }
+  const ticketHash = await hashWsTicket(ticket);
+  let doRes: Response;
+  try {
+    doRes = await doStub(ctx.env, roomId).fetch(
+      new Request('http://room-do/ws', {
+        headers: {
+          Upgrade: 'websocket',
+          'x-pakdam-ticket-hash': ticketHash,
+        },
+      }),
+    );
+  } catch {
+    return wsCloseResponse(4401, 'Room service unavailable — fetch a fresh ticket and reconnect once.');
+  }
+  if (doRes.status !== 101) {
+    let code = 4401;
+    let reason = 'Ticket invalid — fetch a fresh ticket and reconnect once.';
+    try {
+      const data = (await doRes.json()) as { error?: string; code?: string };
+      if (data.code === 'FORBIDDEN') {
+        code = 4403;
+        reason = 'Forbidden — this seat is no longer in the room.';
+      } else if (typeof data.error === 'string' && data.error.length > 0) {
+        reason = data.error;
+      }
+    } catch {
+      // Keep the default 4401 wording.
+    }
+    return wsCloseResponse(code, reason);
+  }
+  return doRes;
+}
+
+/** Answer a WS handshake with a real close frame (101 + closing socket). */
+export function wsCloseResponse(code: number, reason: string): Response {
+  const pair = new WebSocketPair();
+  const server = pair[1] as WebSocket;
+  try {
+    server.accept();
+    server.close(code, reason);
+  } catch {
+    // If accept/close fails, the client still sees the 101 + close.
+  }
+  return new Response(null, { status: 101, webSocket: pair[0] });
+}

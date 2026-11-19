@@ -1,91 +1,158 @@
-import type { MatchResult, Player } from '@pakdam/shared';
-export function resolveOutcome(players: Player[], caughtRunnerIds: string[], timeExpired: boolean): MatchResult {
-  // QA 2026-11-17 (GL-10): ejected players were counted as survivors
-  // here (only leftAt was excluded). Kept for backwards compatibility
-  // with scripts/simulate-match.ts; new code must use
-  // resolveModeOutcome (modes.ts), which is mode-aware and excludes
-  // ejected players. This helper is mode-blind by design of its
-  // signature — do not use it for Infection outcomes.
-  const runners = players.filter((p) => p.matchRole === 'runner' && !p.leftAt && !p.ejectedAt);
-  const survivors = runners.filter((r) => !caughtRunnerIds.includes(r.playerId)).map((r) => r.playerId);
-  // timeExpired does not change the outcome: all Runners caught means
-  // Hunters win, otherwise a surviving Runner means Runners win.
-  void timeExpired;
-  const outcome = survivors.length === 0 ? 'hunters-win' : 'runners-win';
-  return { outcome, durationSeconds: 0, caughtRunnerIds, survivingRunnerIds: survivors };
-}
+/**
+ * Pakdam engine — scoring (completed matches only).
+ *
+ * Fixed founder rules, NOT calibration:
+ * - Runner +1 per whole 3 min free (free time stops at the tag).
+ * - Runner +10 never caught (still free at end — not caught AND not
+ *   ejected; a turned Infection Runner was caught).
+ * - Hunter +3 per confirmed tag (to the Hunter who made it).
+ * - Hunter +10 clean sweep to every Hunter on the winning side, when every
+ *   Runner was caught (ejected Runners break the sweep).
+ * Only completed matches earn points. The leaderboard itself is
+ * device-local; this module computes the points, nothing more.
+ */
+import {
+  SCORING_CLEAN_SWEEP,
+  SCORING_HUNTER_PER_TAG,
+  SCORING_RUNNER_NEVER_CAUGHT,
+  SCORING_RUNNER_PER_3_MIN_FREE,
+  type MatchResult,
+} from '@pakdam/shared';
 
-// --- Leaderboard points (founder checklist, 2026-11-17) -----------------
-// Monthly leaderboards, opt-in only. Points per completed match:
-//   +1 per 3 minutes free (Runner time uncaught — for a caught Runner,
-//     free time stops at the tag; for a never-caught Runner it is the
-//     full match)
-//   +10 never caught (a Runner still free at match end — not caught
-//     AND not ejected; an ejected Runner did not stay free)
-//   +3 per tag (each confirmed tag, to the Hunter who made it)
-//   +10 clean sweep (every Hunter on the winning side, when every
-//     Runner was caught)
-// These are fixed founder rules, NOT calibration placeholders. The
-// engine only computes points from match records the caller supplies
-// (free seconds, confirmed tags); it never invents them.
-export const POINTS_PER_FREE_3_MIN = 1;
-export const POINTS_NEVER_CAUGHT = 10;
-export const POINTS_PER_TAG = 3;
-export const POINTS_CLEAN_SWEEP = 10;
-/** Whole 3-minute blocks of free time. Partial blocks earn nothing. */
-export const FREE_POINTS_INTERVAL_SECONDS = 180;
+export {
+  SCORING_CLEAN_SWEEP,
+  SCORING_HUNTER_PER_TAG,
+  SCORING_RUNNER_NEVER_CAUGHT,
+  SCORING_RUNNER_PER_3_MIN_FREE,
+};
 
-/** A clean sweep needs every Runner CAUGHT: ejected Runners are out,
- *  not caught, so they break the sweep. Same definition as the results
- *  screen. In Infection a turned Runner counts as caught (the tag
- *  confirmed), so the caller passes the turned ids as caught ids. */
-export function isCleanSweep(players: Player[], caughtRunnerIds: string[]): boolean {
-  const runners = players.filter((p) => p.matchRole === 'runner' || caughtRunnerIds.includes(p.playerId));
-  if (runners.length === 0) return false;
-  if (players.some((p) => p.matchRole === 'runner' && p.ejectedAt)) return false;
-  return runners.every((r) => caughtRunnerIds.includes(r.playerId));
-}
+/** Seconds of free time that earn one Runner point. */
+export const RUNNER_FREE_SECONDS_PER_POINT = 180;
 
-export interface PlayerPointsInput {
+/** Minimal per-player scoring input (no coordinates, no tokens). */
+export interface ScoringPlayer {
   playerId: string;
-  /** Role at match end (a turned Infection Runner ends as 'hunter'). */
-  matchRole: 'hunter' | 'runner';
-  /** Seconds the player spent free as a Runner (0 for a Hunter who
-   *  started as one; stops at the tag for a caught Runner). */
+  /** Role at match end (an Infection flip changes this to 'hunter'). */
+  matchRole: 'hunter' | 'runner' | null;
+  /** Seconds this Runner was free (stops at the tag; whole match if never caught). */
   freeSeconds: number;
-  /** Confirmed tags this player made (0 for Runners). */
-  tags: number;
-  /** True when the player was caught/turned by a confirmed tag. */
+  /** Was this Runner caught (confirmed tag)? */
   caught: boolean;
-  /** True when the player was ejected (outside-zone countdown). */
+  /** Was this Runner ejected (out, but recorded as "ejected", not "caught")? */
   ejected: boolean;
+  /** Confirmed tags this Hunter made. */
+  tagsMade: number;
 }
-export interface PlayerPoints {
+
+/**
+ * Is this a clean sweep? Every Runner was caught (none ejected, none
+ * surviving) and the Hunters won. Ejected Runners break the sweep.
+ */
+export function isCleanSweep(input: {
+  result: MatchResult;
+  ejectedRunnerIds: readonly string[];
+}): boolean {
+  if (input.result.outcome !== 'hunters-win') return false;
+  if (input.ejectedRunnerIds.length > 0) return false;
+  if (input.result.survivingRunnerIds.length > 0) return false;
+  if (input.result.caughtRunnerIds.length === 0) return false;
+  return true;
+}
+
+/** Points for one Runner: +1 per whole 3 min free, +10 if never caught. */
+export function runnerScore(player: ScoringPlayer): number {
+  if (player.matchRole !== 'runner') return 0;
+  let points = Math.floor(Math.max(0, player.freeSeconds) / RUNNER_FREE_SECONDS_PER_POINT) * SCORING_RUNNER_PER_3_MIN_FREE;
+  if (!player.caught && !player.ejected) {
+    points += SCORING_RUNNER_NEVER_CAUGHT;
+  }
+  return points;
+}
+
+/** Points for one Hunter: +3 per confirmed tag, +10 clean sweep when it applies. */
+export function hunterScore(
+  player: ScoringPlayer,
+  cleanSweep: boolean,
+  huntersWon: boolean,
+): number {
+  if (player.matchRole !== 'hunter') return 0;
+  let points = Math.max(0, player.tagsMade) * SCORING_HUNTER_PER_TAG;
+  if (cleanSweep && huntersWon) points += SCORING_CLEAN_SWEEP;
+  return points;
+}
+
+/** Points for one player in a completed match (0 when the match never completed). */
+export function scorePlayer(
+  player: ScoringPlayer,
+  context: { result: MatchResult | null; cleanSweep: boolean },
+): number {
+  if (context.result === null) return 0;
+  const huntersWon = context.result.outcome === 'hunters-win';
+  if (player.matchRole === 'runner') return runnerScore(player);
+  if (player.matchRole === 'hunter') return hunterScore(player, context.cleanSweep, huntersWon);
+  return 0;
+}
+
+export interface ScoreBreakdown {
   playerId: string;
   points: number;
-  freeMinutesPoints: number;
-  neverCaughtBonus: number;
-  tagPoints: number;
-  cleanSweepBonus: number;
+  /** Whole 3-min blocks free (Runner). */
+  freeBlocks: number;
+  /** Never-caught bonus applied (Runner). */
+  neverCaughtBonus: boolean;
+  /** Confirmed tags made (Hunter). */
+  tagsMade: number;
+  /** Clean-sweep bonus applied (Hunter). */
+  cleanSweepBonus: boolean;
 }
-/** Points for one completed match. `cleanSweep` is the isCleanSweep
- *  result for the match — pass it in so the caller, not this helper,
- *  decides what counts as a sweep. Call only for completed matches
- *  (cancelled/abandoned matches earn no points). */
-export function computeMatchPoints(inputs: PlayerPointsInput[], cleanSweep: boolean): PlayerPoints[] {
-  return inputs.map((p) => {
-    const freeSeconds = Math.max(0, p.freeSeconds);
-    const tags = Math.max(0, p.tags);
-    const freeMinutesPoints = Math.floor(freeSeconds / FREE_POINTS_INTERVAL_SECONDS) * POINTS_PER_FREE_3_MIN;
-    // Never caught: a Runner still free at the end — not caught and
-    // not ejected. A turned Infection Runner was caught, so no bonus.
-    const neverCaughtBonus = p.matchRole === 'runner' && !p.caught && !p.ejected ? POINTS_NEVER_CAUGHT : 0;
-    const tagPoints = p.matchRole === 'hunter' ? tags * POINTS_PER_TAG : 0;
-    const cleanSweepBonus = cleanSweep && p.matchRole === 'hunter' ? POINTS_CLEAN_SWEEP : 0;
-    return {
-      playerId: p.playerId,
-      points: freeMinutesPoints + neverCaughtBonus + tagPoints + cleanSweepBonus,
-      freeMinutesPoints, neverCaughtBonus, tagPoints, cleanSweepBonus,
-    };
+
+/**
+ * Score a completed match. Returns 0 for every player (with empty
+ * breakdowns) when the match has no result — only completed matches earn
+ * points.
+ */
+export function scoreMatch(input: {
+  players: readonly ScoringPlayer[];
+  result: MatchResult | null;
+  ejectedRunnerIds: readonly string[];
+}): { scores: Record<string, number>; breakdown: ScoreBreakdown[] } {
+  const scores: Record<string, number> = {};
+  const breakdown: ScoreBreakdown[] = [];
+  if (input.result === null) {
+    for (const p of input.players) {
+      scores[p.playerId] = 0;
+      breakdown.push({
+        playerId: p.playerId,
+        points: 0,
+        freeBlocks: 0,
+        neverCaughtBonus: false,
+        tagsMade: 0,
+        cleanSweepBonus: false,
+      });
+    }
+    return { scores, breakdown };
+  }
+  const cleanSweep = isCleanSweep({
+    result: input.result,
+    ejectedRunnerIds: input.ejectedRunnerIds,
   });
+  const huntersWon = input.result.outcome === 'hunters-win';
+  for (const p of input.players) {
+    const points = scorePlayer(p, { result: input.result, cleanSweep });
+    const freeBlocks =
+      p.matchRole === 'runner'
+        ? Math.floor(Math.max(0, p.freeSeconds) / RUNNER_FREE_SECONDS_PER_POINT)
+        : 0;
+    scores[p.playerId] = points;
+    breakdown.push({
+      playerId: p.playerId,
+      points,
+      freeBlocks,
+      neverCaughtBonus:
+        p.matchRole === 'runner' && !p.caught && !p.ejected,
+      tagsMade: p.matchRole === 'hunter' ? Math.max(0, p.tagsMade) : 0,
+      cleanSweepBonus: p.matchRole === 'hunter' && cleanSweep && huntersWon,
+    });
+  }
+  return { scores, breakdown };
 }

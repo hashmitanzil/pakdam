@@ -1,31 +1,42 @@
-# Cloudflare Workers + Durable Object per room (leading candidate — ADR-001, NOT approved).
-# Deploy ONLY after founder approves the M00 report + architecture. No secrets here.
+# Pakdam Worker — live game server (fresh build)
+#
+# Worker name: pakdam. One Durable Object per room (ROOM_DO) plus a single
+# code-registry Durable Object (CODE_REGISTRY_DO) that owns invite-code ->
+# roomId mappings. The registry exists because a code lookup must work from
+# ANY isolate: a per-isolate Worker map (or a map held inside one room's DO)
+# cannot answer "which room owns this code". The registry DO is the single
+# owner of that mapping, the same single-owner lesson as the WS ticket
+# registry (see src/room-do.ts).
+#
+# SUPABASE_URL lives HERE, in [vars], on purpose. The old deployment kept
+# losing it when it lived only as a secret / --var value: a plain
+# `wrangler deploy` overwrote it and match results silently stopped
+# persisting. The project URL is public (it is also the web app's
+# NEXT_PUBLIC_SUPABASE_URL). Only the service-role KEY stays a secret:
+#   wrangler secret put SUPABASE_SERVICE_ROLE_KEY
+# Never put the key in this file.
+
 name = "pakdam"
 main = "src/index.ts"
 compatibility_date = "2026-11-01"
 compatibility_flags = ["nodejs_compat"]
+usage_model = "standard"
 
-[durable_objects]
-bindings = [{ name = "ROOM_DO", class_name = "RoomDurableObject" }]
+[[durable_objects.bindings]]
+name = "ROOM_DO"
+class_name = "RoomDO"
+
+[[durable_objects.bindings]]
+name = "CODE_REGISTRY_DO"
+class_name = "CodeRegistryDO"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["RoomDurableObject"]
+new_sqlite_classes = ["RoomDO", "CodeRegistryDO"]
 
 [vars]
-ENVIRONMENT = "dev"
-# Per-IP placeholder rate limits (OPEN HNT-071): the deployed default
-# is 5/min/IP and is NEVER set here — PAKDAM_JOIN_PER_MINUTE /
-# PAKDAM_CREATE_PER_MINUTE / PAKDAM_LOOKUP_PER_MINUTE are set ONLY
-# for a local load run (e.g. `npx wrangler dev --var
-# PAKDAM_JOIN_PER_MINUTE:100` for the 16-player k6 run, where all VUs
-# share 127.0.0.1). See workers/src/rate-limit.ts parsePerMinuteLimit.
-# Supabase (Worker 5, 2026-11-17): SUPABASE_URL is a plain var — the
-# project URL is public (same value as the web app's
-# NEXT_PUBLIC_SUPABASE_URL). Set the real URL here at deploy time;
-# empty means "run without Supabase persistence" (the DO stays the
-# authority, nothing fails). SUPABASE_SERVICE_ROLE_KEY is a SECRET
-# and must NEVER appear in this file — set it with
-# `npx wrangler secret put SUPABASE_SERVICE_ROLE_KEY` (see
-# docs/CLOUDFLARE-SETUP.md §9).
-SUPABASE_URL = "https://gcgakeslhfmilicokdtp.supabase.co" # FIX 2026-11-18: was "" — every plain `wrangler deploy` wiped the --var value set on 2026-11-18 14:54, silently turning Supabase persistence off (DO stays the authority, nothing fails, but match results are not saved). The URL is public (same as the web app's NEXT_PUBLIC_SUPABASE_URL), so it belongs here permanently; only the service role KEY stays a secret.
+SUPABASE_URL = "https://gcgakeslhfmilicokdtp.supabase.co"
+# ALLOWED_ORIGINS is optional (comma-separated). When unset, the Worker
+# allows the production Vercel origin plus localhost dev (see src/index.ts).
+# SUPABASE_SERVICE_ROLE_KEY is a SECRET, set via:
+#   wrangler secret put SUPABASE_SERVICE_ROLE_KEY

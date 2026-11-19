@@ -1,78 +1,131 @@
-import type { MatchMode, MatchResult, Player } from '@pakdam/shared';
+/**
+ * Pakdam engine — modes (Classic + Infection) and win conditions.
+ *
+ * Only two modes exist. Breach/Zombie are not in `MatchMode` — do not re-add
+ * them. A tagged Runner is OUT in Classic; in Infection a tagged Runner
+ * FLIPS to the Hunters. Ejected players are out of play and never survivors,
+ * in either mode — ejection removes a Runner exactly like a catch for win
+ * purposes, but the record keeps them "ejected", not "caught".
+ */
+import type { MatchMode, MatchResult, MatchRole } from '@pakdam/shared';
+
+/** Minimal seat shape the mode rules need (no coordinates, no tokens). */
+export interface ModePlayer {
+  playerId: string;
+  /** Current role; null until roles are drawn at head start. */
+  matchRole: MatchRole | null;
+  /** Set = ejected (out of play, recorded as "ejected", not "caught"). */
+  ejectedAt: string | null;
+  /** Set = left the room (out of play). */
+  leftAt: string | null;
+}
+
+/** A Runner is free (still in play) when they are a Runner, not caught, not ejected, not left. */
+export function isRunnerFree(
+  player: ModePlayer,
+  caughtRunnerIds: ReadonlySet<string> | readonly string[],
+): boolean {
+  const caughtSet =
+    caughtRunnerIds instanceof Set ? caughtRunnerIds : new Set(caughtRunnerIds);
+  const caught = caughtSet.has(player.playerId);
+  return (
+    player.matchRole === 'runner' &&
+    !caught &&
+    player.ejectedAt === null &&
+    player.leftAt === null
+  );
+}
+
+/** Every Runner id on the roster (regardless of caught/ejected/left). */
+export function runnerIds(players: readonly ModePlayer[]): string[] {
+  return players.filter((p) => p.matchRole === 'runner').map((p) => p.playerId);
+}
+
+/** Free (still in play) Runner ids. */
+export function freeRunnerIds(
+  players: readonly ModePlayer[],
+  caughtRunnerIds: ReadonlySet<string> | readonly string[],
+): string[] {
+  return players
+    .filter((p) => isRunnerFree(p, caughtRunnerIds))
+    .map((p) => p.playerId);
+}
 
 /**
- * Game modes — engine rules, not UI labels. All copy below is Pakdam's
- * own wording; no competitor text, code, or brand is used. Only two
- * modes exist in the pilot (founder decision, 2026-11-17): Classic
- * Manhunt and Infection. Breach and Zombie are later, not now — they
- * are not in MatchMode, not in MODE_INFO, and no mode helper knows
- * them. Do not re-add them without a founder decision.
- *
- * - Classic: a tagged Runner is OUT (watches live). Hunters win when
- *   every Runner is caught; Runners win if any survive the clock.
- * - Infection: a tagged Runner JOINS the Hunters (role flips). Hunters
- *   win when no Runner is left; Runners win if any survive the clock.
+ * Resolve the mode outcome. `timeExpired` does not change the outcome:
+ * all Runners caught/ejected → Hunters win, else a surviving Runner →
+ * Runners win. Duration is filled in by the caller (0 in this pure helper).
+ * Ejected Runners count as out for win purposes but appear in neither the
+ * caught list nor the surviving list of the result — they are recorded as
+ * "ejected", not "caught".
  */
-export interface ModeInfo {
-  label: string; short: string; catchRule: string; winRule: string;
-}
-export const MODE_INFO: Record<MatchMode, ModeInfo> = {
-  classic: {
-    label: 'Classic Manhunt',
-    short: 'Tagged Runners are out.',
-    catchRule: 'A tagged Runner is out of the game and watches live. A catch counts only when the Runner confirms it on their own phone (unless the host turned confirmation off).',
-    winRule: 'Hunters win when every Runner is caught. Runners win if even one survives the clock.',
-  },
-  infection: {
-    label: 'Infection',
-    short: 'Tagged Runners join the Hunters.',
-    catchRule: 'A tagged Runner becomes a Hunter and hunts their old team. A catch counts only when the Runner confirms it on their own phone (unless the host turned confirmation off).',
-    winRule: 'Hunters win when no Runner is left. Runners win if even one survives the clock.',
-  },
-};
-export function describeMode(mode: MatchMode): ModeInfo { return MODE_INFO[mode]; }
-/** True when a confirmed tag flips the Runner to the Hunters' side. */
-export function modeTurnsRunner(mode: MatchMode): boolean { return mode === 'infection'; }
-
-export interface TagOutcome {
-  players: Player[];
-  /** Runner id when the tag puts the Runner out (Classic). */
-  caughtRunnerId: string | null;
-  /** Runner id when the tag turns the Runner into a Hunter (Infection). */
-  turnedHunterId: string | null;
-}
-/** Apply one CONFIRMED tag under the room's mode. Classic leaves
- *  roles alone (the caller records the Runner as caught); Infection
- *  flips the Runner to Hunter. The caller still records the catch
- *  event either way. Throws when the Runner is not a Runner. */
-export function applyConfirmedTag(players: Player[], runnerId: string, mode: MatchMode): TagOutcome {
-  const runner = players.find((p) => p.playerId === runnerId);
-  if (!runner) throw new Error('INVALID_STATE: tagged player is not in this room');
-  if (runner.matchRole !== 'runner') throw new Error('INVALID_STATE: only a Runner can be tagged');
-  if (!modeTurnsRunner(mode)) return { players, caughtRunnerId: runnerId, turnedHunterId: null };
-  const next = players.map((p) => (p.playerId === runnerId ? { ...p, matchRole: 'hunter' as const, team: 'hunters' as const } : p));
-  return { players: next, caughtRunnerId: null, turnedHunterId: runnerId };
+export function resolveModeOutcome(input: {
+  mode: MatchMode;
+  players: readonly ModePlayer[];
+  caughtRunnerIds: readonly string[];
+  /** Duration in seconds; 0 when the caller has not measured it yet. */
+  durationSeconds?: number;
+}): MatchResult {
+  const caught = new Set(input.caughtRunnerIds);
+  const free = freeRunnerIds(input.players, caught);
+  const allRunners = runnerIds(input.players);
+  const surviving = free;
+  const caughtList = allRunners.filter((id) => caught.has(id));
+  return {
+    outcome: free.length === 0 ? 'hunters-win' : 'runners-win',
+    durationSeconds: input.durationSeconds ?? 0,
+    caughtRunnerIds: caughtList,
+    survivingRunnerIds: surviving,
+  };
 }
 
-/** Mode-aware outcome. `caughtRunnerIds` are the confirmed Classic
- *  catches; for Infection the flipped roles already carry the
- *  truth, so the list is ignored. `timeExpired` ends the round in the
- *  Runners' favour unless no Runner is left at all. An EJECTED player
- *  (ejectedAt set — outside the play zone past the 30-second return
- *  countdown) is out of play and never a survivor, in either mode:
- *  ejection removes a Runner from the game exactly like a catch does
- *  for win purposes, but the record keeps them as "ejected", not
- *  "caught" — the results screen tells the two apart. */
-export function resolveModeOutcome(players: Player[], caughtRunnerIds: string[], timeExpired: boolean, mode: MatchMode): MatchResult {
-  const active = players.filter((p) => !p.leftAt && !p.ejectedAt);
-  if (modeTurnsRunner(mode)) {
-    const runnersLeft = active.filter((p) => p.matchRole === 'runner').map((p) => p.playerId);
-    const outcome = runnersLeft.length === 0 ? 'hunters-win' : 'runners-win';
-    return { outcome, durationSeconds: 0, caughtRunnerIds, survivingRunnerIds: runnersLeft };
+/** What applying a confirmed tag does to the tagged Runner, per mode. */
+export type TagApplication =
+  | {
+      kind: 'out';
+      /** Classic: the Runner is out; their role stays 'runner', now caught. */
+      newRole: 'runner';
+    }
+  | {
+      kind: 'flip';
+      /** Infection: the Runner flips to the Hunters. */
+      newRole: 'hunter';
+    };
+
+/**
+ * Apply a confirmed tag to a Runner. Classic → out; Infection → flips to
+ * Hunter. Returns the tag application (the caller applies it to the seat);
+ * the win check is separate — see `maybeCompleteOnWin`.
+ */
+export function applyConfirmedTag(mode: MatchMode): TagApplication {
+  return mode === 'infection' ? { kind: 'flip', newRole: 'hunter' } : { kind: 'out', newRole: 'runner' };
+}
+
+/**
+ * Win check after a tag (or an ejection): if no Runner is left free, the
+ * Hunters win and the match completes; otherwise play continues.
+ * Returns the outcome when the match is over, else null.
+ */
+export function maybeCompleteOnWin(input: {
+  mode: MatchMode;
+  players: readonly ModePlayer[];
+  caughtRunnerIds: readonly string[];
+  durationSeconds?: number;
+}): MatchResult | null {
+  const outcome = resolveModeOutcome(input);
+  return outcome.outcome === 'hunters-win' ? outcome : null;
+}
+
+/** Human-readable outcome label for the results screen. */
+export function outcomeLabel(outcome: MatchResult['outcome']): string {
+  switch (outcome) {
+    case 'hunters-win':
+      return 'Hunters win';
+    case 'runners-win':
+      return 'Runners win';
+    case 'cancelled':
+      return 'Match cancelled';
+    case 'abandoned':
+      return 'Match abandoned';
   }
-  const runners = active.filter((p) => p.matchRole === 'runner');
-  const survivors = runners.filter((r) => !caughtRunnerIds.includes(r.playerId)).map((r) => r.playerId);
-  const outcome = survivors.length === 0 ? 'hunters-win' : 'runners-win';
-  void timeExpired; // same result either way: all caught wins, else surviving Runners win
-  return { outcome, durationSeconds: 0, caughtRunnerIds, survivingRunnerIds: survivors };
 }

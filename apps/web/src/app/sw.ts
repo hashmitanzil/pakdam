@@ -2,15 +2,23 @@
 import { defaultCache } from '@serwist/next/worker';
 import type { PrecacheEntry, SerwistGlobalConfig } from 'serwist';
 import { Serwist } from 'serwist';
-// Service worker caches the app SHELL ONLY (Serwist precache).
-// It NEVER caches private game/location/staff data, and NEVER queues
-// competitive actions for offline replay.
-declare const self: ServiceWorkerGlobalScope & SerwistGlobalConfig;
+
+// PWA service worker (Serwist). Offline shell only — map tiles are Ola live
+// tiles and are out of scope for offline caching in this rebuild.
+declare global {
+  interface WorkerGlobalScope extends SerwistGlobalConfig {
+    __SW_MANIFEST: (PrecacheEntry | string)[] | undefined;
+  }
+}
+
+declare const self: ServiceWorkerGlobalScope;
+
 const serwist = new Serwist({
-  precacheEntries: (self as unknown as { __SW_MANIFEST: PrecacheEntry[] }).__SW_MANIFEST,
+  precacheEntries: self.__SW_MANIFEST,
   skipWaiting: true,
   clientsClaim: true,
   navigationPreload: true,
   runtimeCaching: defaultCache,
 });
+
 serwist.addEventListeners();

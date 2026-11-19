@@ -1,117 +1,86 @@
-import { sha256Hex, randomHex } from '@pakdam/shared';
-import type { WsTicketPurpose } from '@pakdam/shared';
 /**
- * Short-lived, single-use WebSocket ticket issued over HTTPS (17 §2.5, §3.1).
- * The ticket travels ONLY in the handshake query string
- *   wss://<api-host>/v1/rooms/{roomId}/ws?ticket=<ticket>
- * and is consumed the moment the handshake succeeds. The `hello` message
- * carries NO credential. The ONLY WS message that carries a ticket is
- * `auth.refresh` (renewal, 17 §3.2).
+ * @pakdam/workers — auth helpers.
  *
- * Ticket VALUES are never logged and never stored — only their SHA-256
- * hash and a `ticketId` (uuid). Logs may carry the `ticketId` only.
- * `wsTicketTtlSeconds` is OPEN calibration (17 §7); the TTL is a parameter
- * supplied by the issuer, never a fixed number in this file.
+ * Rules enforced here (frozen contract v2.1 + built-in checklist):
+ * - Ticket / token VALUES are never stored and never logged — only SHA-256
+ *   hashes cross the Worker -> DO boundary and only hashes are stored.
+ * - WS tickets are >= 128 bits of entropy, single-use, 60 s TTL.
+ * - Catch tokens are >= 128 bits (32 uppercase hex chars, `newCatchToken`
+ *   from @pakdam/shared). The old 12-char (48-bit) form is rejected by
+ *   `isValidCatchToken` and must never be minted.
+ * - Reconnect tokens and host tokens are SEPARATE credentials. Sending one
+ *   as the other 403s. Only hashes live in the DO.
  */
-export interface WsTicket { ticket: string; hash: string; roomId: string; playerId: string; expiresAtMs: number }
-export interface WsTicketRecord {
-  ticketId: string; hash: string; roomId: string; playerId: string;
-  purpose: WsTicketPurpose; issuedAtMs: number; expiresAtMs: number;
-  status: 'valid' | 'redeemed' | 'revoked' | 'expired';
-}
-export interface TicketIssue { ticket: string; ticketId: string; expiresAtMs: number }
-export type TicketRedeemResult =
-  | { ok: true; ticketId: string; purpose: WsTicketPurpose }
-  | { ok: false; code: 'TICKET_INVALID' | 'TICKET_REUSED' | 'TICKET_EXPIRED' };
+import {
+  WS_TICKET_TTL_MS,
+  hashHostToken,
+  hashReconnectToken,
+  hashWsTicket,
+  newId,
+  randomHex,
+} from '@pakdam/shared';
 
-export function issueWsTicket(roomId: string, playerId: string, ttlMs: number, nowMs: number): WsTicket {
-  const ticket = randomHex(16);
-  return { ticket, hash: sha256Hex(ticket), roomId, playerId, expiresAtMs: nowMs + ttlMs };
-}
-/** Pure hash/expiry check. This alone does NOT enforce single-use — the
- *  WsTicketStore below is the single-use mechanism; use it on upgrade. */
-export function verifyWsTicket(t: WsTicket, presented: string, nowMs: number): boolean {
-  if (nowMs > t.expiresAtMs) return false;
-  return sha256Hex(presented) === t.hash;
+export { hashHostToken, hashReconnectToken, hashWsTicket };
+
+/** A fresh 128-bit reconnect token (raw value — returned to the client once). */
+export function newReconnectToken(): string {
+  return randomHex(16);
 }
 
-/** Single-use ticket store (in-memory; the DO owns one per room in
- *  production — persistence of ticket records is a deployment concern,
- *  not part of this contract). */
-export class WsTicketStore {
-  private tickets = new Map<string, WsTicketRecord>(); // keyed by hash only
+/** A fresh 128-bit host token (raw value — returned to the client once). */
+export function newHostToken(): string {
+  return randomHex(16);
+}
 
-  issue(roomId: string, playerId: string, purpose: WsTicketPurpose, ttlMs: number, nowMs: number): TicketIssue {
-    // Issuing a new ticket invalidates any other UNREDEEMED ticket for the
-    // same seat (17 §2.5). It does NOT invalidate an already-connected socket.
-    for (const rec of this.tickets.values()) {
-      if (rec.roomId === roomId && rec.playerId === playerId && rec.status === 'valid') {
-        rec.status = 'revoked';
-      }
-    }
-    const ticket = randomHex(16);
-    const rec: WsTicketRecord = {
-      ticketId: randomHex(8), hash: sha256Hex(ticket), roomId, playerId,
-      purpose, issuedAtMs: nowMs, expiresAtMs: nowMs + ttlMs, status: 'valid',
-    };
-    this.tickets.set(rec.hash, rec);
-    return { ticket, ticketId: rec.ticketId, expiresAtMs: rec.expiresAtMs };
-  }
+/** A fresh 6-letter invite code (A-Z0-9). Retried by the caller on collision. */
+export function generateRoomCode(): string {
+  const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  const bytes = new Uint8Array(6);
+  crypto.getRandomValues(bytes);
+  let code = '';
+  for (const b of bytes) code += alphabet[b % alphabet.length] as string;
+  return code;
+}
 
-  /** Consume a ticket on handshake. A second use of the same ticket is
-   *  TICKET_REUSED; a ticket for another room/seat (or malformed) is
-   *  TICKET_INVALID; a past-TTL ticket is TICKET_EXPIRED. */
-  redeem(presented: string, roomId: string, playerId: string, nowMs: number): TicketRedeemResult {
-    const rec = this.tickets.get(sha256Hex(presented));
-    if (!rec || rec.roomId !== roomId || rec.playerId !== playerId) {
-      return { ok: false, code: 'TICKET_INVALID' };
-    }
-    if (rec.status === 'redeemed') return { ok: false, code: 'TICKET_REUSED' };
-    if (rec.status === 'revoked') return { ok: false, code: 'TICKET_INVALID' };
-    if (nowMs > rec.expiresAtMs || rec.status === 'expired') {
-      rec.status = 'expired';
-      return { ok: false, code: 'TICKET_EXPIRED' };
-    }
-    rec.status = 'redeemed';
-    return { ok: true, ticketId: rec.ticketId, purpose: rec.purpose };
-  }
+export interface WsTicket {
+  /** Raw ticket value — handed to the client ONCE, never stored, never logged. */
+  ticket: string;
+  ticketId: string;
+  expiresAtMs: number;
+}
 
-  /** Revoke all unredeemed tickets for a seat (17 §2.6). Returns the count
-   *  revoked — counts only, no ticket values. */
-  revokeSeat(roomId: string, playerId: string): number {
-    let n = 0;
-    for (const rec of this.tickets.values()) {
-      if (rec.roomId === roomId && rec.playerId === playerId && rec.status === 'valid') {
-        rec.status = 'revoked'; n++;
-      }
-    }
-    return n;
-  }
+/**
+ * Mint a WS ticket. The Worker mints the VALUE; only its SHA-256 hash is
+ * ever sent to the DO (see `register-ticket`). A ticket issued for one seat
+ * revokes any other unredeemed ticket for that seat (enforced in the DO).
+ */
+export function newWsTicket(nowMs: number = Date.now()): WsTicket {
+  return {
+    ticket: randomHex(32),
+    ticketId: newId(),
+    expiresAtMs: nowMs + WS_TICKET_TTL_MS,
+  };
+}
 
-  /** Read-only lookup for the WS upgrade: resolve a presented ticket
-   *  to its room + seat WITHOUT consuming it (the upgrade handler
-   *  then redeems it via `redeem` with the resolved seat). Returns
-   *  null for an unknown ticket. Never logs the ticket value. */
-  peek(presented: string): { roomId: string; playerId: string; purpose: WsTicketPurpose; expiresAtMs: number } | null {
-    const rec = this.tickets.get(sha256Hex(presented));
-    if (!rec) return null;
-    return { roomId: rec.roomId, playerId: rec.playerId, purpose: rec.purpose, expiresAtMs: rec.expiresAtMs };
-  }
+/** SHA-256 hex of a WS ticket value — the only form that crosses Worker -> DO. */
+export async function hashTicketValue(ticket: string): Promise<string> {
+  return hashWsTicket(ticket);
+}
 
-  /** Server-side lookup by ticketId (Worker → DO registration):
-   *  returns the stored record (hash included — server-side only,
-   *  never sent to a client) or null. Lets the Worker register the
-   *  ticket's hash with the Durable Object so the DO can validate
-   *  `auth.refresh` renewals itself (SEC-11). */
-  recordFor(ticketId: string): WsTicketRecord | null {
-    for (const rec of this.tickets.values()) {
-      if (rec.ticketId === ticketId) return rec;
-    }
-    return null;
-  }
+/** Does this raw reconnect token match the stored hash for the seat? */
+export async function verifyReconnectToken(
+  rawToken: string | undefined | null,
+  storedHash: string,
+): Promise<boolean> {
+  if (!rawToken) return false;
+  return (await hashReconnectToken(rawToken)) === storedHash;
+}
 
-  /** The only ticket reference that may appear in a log. */
-  static logRef(ticketId: string): string {
-    return `ticketId=${ticketId}`;
-  }
+/** Does this raw host token match the stored hash for the seat? */
+export async function verifyHostToken(
+  rawToken: string | undefined | null,
+  storedHash: string,
+): Promise<boolean> {
+  if (!rawToken) return false;
+  return (await hashHostToken(rawToken)) === storedHash;
 }

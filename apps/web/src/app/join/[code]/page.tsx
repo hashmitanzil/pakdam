@@ -1,135 +1,117 @@
 'use client';
-import { use, useState } from 'react';
-import { useRouter } from 'next/navigation';
-import Link from 'next/link';
-import { getRoomByCode, joinRoom, setCurrentPlayerId } from '@/lib/demo-store';
-import {
-  isLiveEnabled, joinLiveRoom, resolveRoomByCode, storeLiveSeat,
-} from '@/lib/live-client';
-import { saveDemoSession } from '@/lib/session-credentials';
-import styles from '../join.module.css';
 
-/** Invite landing — redesigned 2026-11-17.
- *  A shared link (/join/ABC123) now joins directly: the code is shown
- *  big, the guest only enters a display name and confirms 18+, then
- *  lands in the lobby. No account needed. Invalid or closed invites get
- *  a plain-language error and a way to type a different code. */
-export default function JoinCodePage({ params }: { params: Promise<{ code: string }> }) {
-  const { code } = use(params);
-  const inviteCode = code.toUpperCase();
+/**
+ * Deep-link join — the code comes from the URL (`/join/<CODE>`), the
+ * player only enters a codename, JOIN → the lobby. Guest-only, no login.
+ * Same join path as /join (PROTOCOL-MAP §1.2–1.3).
+ */
+import { useState } from 'react';
+import { useParams, useRouter } from 'next/navigation';
+import { isValidDisplayName, isValidRoomCode } from '@pakdam/shared';
+import { isLiveTransportEnabled } from '../../../lib/websocket';
+import { joinLiveRoom, resolveRoomByCode } from '../../../lib/live-client';
+import { getRoomByCode, joinRoom as joinDemoRoom } from '../../../lib/demo-store';
+import { getSessionForRoom, storeDemoSeat } from '../../../lib/session-credentials';
+
+export default function JoinByCodePage() {
   const router = useRouter();
-  const [name, setName] = useState('');
-  const [ageChecked, setAgeChecked] = useState(false);
-  const [error, setError] = useState('');
+  const params = useParams();
+  const rawCode = typeof params.code === 'string' ? params.code : '';
+  const code = rawCode.trim().toUpperCase();
+  const [codename, setCodename] = useState('');
+  const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
-  const [copied, setCopied] = useState('');
-  // Live when a Worker URL is configured; otherwise the local demo
-  // loop (clearly labelled below). Never mixed in one room.
-  const live = isLiveEnabled();
 
-  const submit = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (joining) return;
-    if (!name.trim()) {
-      setError('Enter your display name.');
+  const join = async (): Promise<void> => {
+    if (!isValidRoomCode(code)) {
+      setError("That code didn't match a room — check it and try again.");
       return;
     }
-    if (!ageChecked) {
-      setError('Confirm you are 18 or older and have read the safety briefing.');
+    const name = codename.trim();
+    if (!isValidDisplayName(name)) {
+      setError('Enter a codename between 1 and 30 characters.');
       return;
     }
+    setError(null);
     setJoining(true);
-    setError('');
-    if (live) {
-      try {
-        // Code-only live join: resolve the 6-letter code to its roomId
-        // on the server (GET /v1/rooms/by-code/:code), then join that
-        // room with the code as invite proof. A bad code throws a
-        // plain-words LiveApiError (404 → "could not be found…",
-        // 429 → "Too many tries…"), caught below.
-        const { roomId } = await resolveRoomByCode(inviteCode);
-        const res = await joinLiveRoom({ roomId, roomCode: inviteCode, displayName: name.trim() });
-        storeLiveSeat(res, name.trim());
-        setCurrentPlayerId(res.playerId);
-        router.push(`/room/${res.roomId}`);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : 'Could not join');
-        setJoining(false);
-      }
-      return;
-    }
-    const dr = getRoomByCode(inviteCode);
-    if (!dr) {
-      setError('This invite doesn’t match an open game — the code may be wrong, or the game may have already started or ended. Check with your host, or type a different code.');
-      setJoining(false);
-      return;
-    }
     try {
-      const p = joinRoom(dr.room.roomId, name.trim());
-      saveDemoSession({
-        roomId: dr.room.roomId, playerId: p.playerId,
-        displayName: name.trim(), isHost: p.isHost, roomCode: inviteCode,
-      });
-      setCurrentPlayerId(p.playerId);
-      router.push(`/room/${dr.room.roomId}`);
+      if (isLiveTransportEnabled()) {
+        const { roomId } = await resolveRoomByCode(code);
+        const existing = getSessionForRoom(roomId);
+        const restoreToken =
+          existing?.displayName?.toLowerCase() === name.toLowerCase()
+            ? existing.reconnectToken
+            : undefined;
+        const session = await joinLiveRoom(roomId, name, code, restoreToken);
+        router.push(`/room/${session.roomId}`);
+      } else {
+        const demo = getRoomByCode(code);
+        if (!demo) throw new Error("That code didn't match a room — check it and try again.");
+        const { player } = joinDemoRoom(demo.room.roomId, name);
+        storeDemoSeat({
+          mode: 'demo',
+          roomId: demo.room.roomId,
+          playerId: player.playerId,
+          displayName: name,
+          isHost: player.isHost,
+          roomCode: demo.room.roomCode,
+        });
+        router.push(`/room/${demo.room.roomId}`);
+      }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not join');
+      setError(err instanceof Error ? err.message : 'Could not join — try again.');
       setJoining(false);
     }
   };
 
   return (
-    <div className={styles.wrap}>
-      <div className={styles.hero}>
-        <span className={styles.eyebrow}>Pakdam · You’re invited</span>
-        <h1>You’re invited to a game</h1>
-        <p>Someone sent you this invite. Enter the name everyone will see, and you’ll join the lobby — no account needed.</p>
-        {live
-          ? <p><strong>Live game</strong> — this joins the game on the server, with the other players.</p>
-          : <p><strong>Demo game</strong> — this joins a game on this device only, not a game on the server.</p>}
-      </div>
-      <div className={`card ${styles.center}`} aria-label="Invite code">
-        <p className="small" style={{ margin: '4px 0' }}>Your invite code</p>
-        <p className={styles.inviteCode}>{inviteCode}</p>
-        <p>
-          <button
-            type="button"
-            className="btn btn-secondary"
-            onClick={() => {
-              void navigator.clipboard?.writeText(inviteCode).then(
-                () => setCopied('Code copied ✓'),
-                () => setCopied('Copy didn’t work in this browser — long-press the code to copy it.'),
-              );
-            }}
-          >
-            Copy code
-          </button>
-        </p>
-        {copied ? <p className="small" role="status">{copied}</p> : null}
-      </div>
-      <form onSubmit={submit} noValidate>
-        <label className={styles.fieldLabel} htmlFor="invite-name">Your display name — a codename is fine</label>
-        <input id="invite-name" className="input" value={name} onChange={(e) => setName(e.target.value)} required maxLength={30} placeholder="What should everyone call you?" autoComplete="nickname" />
-        <p className={styles.codeHint}>Use a codename if you like — your real name is never needed. Everyone in the game sees this name only.</p>
-        <p className={styles.codeHint}>The host decides who is a Hunter and who is a Runner when the game starts — you do not pick your own side.</p>
-        <label className={styles.ageBox}>
-          <input type="checkbox" required checked={ageChecked} onChange={(e) => setAgeChecked(e.target.checked)} />
-          <span>
-            <strong>I am 18 or older</strong>, and I have read the safety briefing in the host setup. Pakdam is 18+ only.
-          </span>
-        </label>
-        <div className="banner"><strong>Foreground-only:</strong> keep this app open and your screen on while you play. Location, safety pause, SOS and Leave stop working if you lock your phone or switch apps.</div>
-        {error ? <p className={styles.error} role="alert">{error}</p> : null}
-        <div className={styles.primaryAction}>
-          <button className="btn" type="submit" disabled={joining}>{joining ? 'Joining…' : 'Join lobby'}</button>
-        </div>
-      </form>
-      <p className={styles.center}>
-        <span className="small">Wrong code? </span>
-        <span className={styles.footerLinks}>
-          <Link href="/join">Type a different code</Link>
-        </span>
+    <main className="mx-auto min-h-dvh w-full max-w-[560px] px-4 pb-6 pt-6">
+      <header className="flex items-center">
+        <button
+          type="button"
+          onClick={() => router.push('/')}
+          aria-label="Back"
+          className="text-[22px] font-bold text-[#EF4444]"
+        >
+          ‹
+        </button>
+        <h1 className="flex-1 text-center text-[18px] font-bold text-white">Join a game</h1>
+        <span className="w-6" aria-hidden />
+      </header>
+
+      <p className="mt-6 text-center">
+        <span className="pakdam-label block">Room code</span>
+        <span className="pakdam-code mt-2 block text-white">{code || '——————'}</span>
       </p>
-    </div>
+      <label className="mt-4 block">
+        <span className="pakdam-label">Your codename</span>
+        <input
+          value={codename}
+          onChange={(event) => {
+            setCodename(event.target.value.slice(0, 30));
+            setError(null);
+          }}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') void join();
+          }}
+          placeholder="e.g. Ana"
+          autoComplete="off"
+          autoFocus
+          className="mt-2 h-14 w-full rounded-[14px] border border-[#26262B] bg-[#1E1E22] px-4 text-[17px] font-bold text-white placeholder:text-[#A1A1AA]"
+        />
+      </label>
+      {error ? <p className="mt-2 text-[13px] text-[#EF4444]">{error}</p> : null}
+
+      <div className="mt-6">
+        <button
+          type="button"
+          disabled={joining}
+          onClick={() => void join()}
+          className="inline-flex h-14 w-full items-center justify-center rounded-[14px] bg-[#EF4444] text-[17px] font-bold text-white active:bg-[#DC2626] disabled:opacity-60"
+        >
+          {joining ? 'Joining…' : 'JOIN'}
+        </button>
+      </div>
+    </main>
   );
 }

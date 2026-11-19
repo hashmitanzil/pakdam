@@ -1,409 +1,286 @@
-// Shared helpers for the Pakdam e2e suite — TEXT/DOM assertions only,
-// no screenshots (gateway rule). Demo mode: rooms persist to
-// localStorage, so host + guest use two pages in ONE browser context
-// (shared localStorage for the origin). Imported by the *.spec.ts files;
-// this file itself holds no tests.
+/**
+ * Shared helpers for the Pakdam Playwright suite (fresh rebuild, pakdam-fresh).
+ *
+ * Text-only assertions throughout: every check below is DOM text, roles or
+ * element state — no screenshots, no visual assertions.
+ *
+ * Modes: the app is demo or live depending on NEXT_PUBLIC_WORKER_URL at the
+ * time the dev server started. Demo specs skip when that variable is set;
+ * live specs skip when it is not (see LIVE below). Demo rooms live in
+ * localStorage (`pakdam.demo.rooms.v1`), so multi-player demo tests use
+ * several pages in ONE browser context (localStorage is shared across pages
+ * in a context; each page keeps its own seat in sessionStorage).
+ */
 import { expect, type BrowserContext, type Page } from '@playwright/test';
 
-export const ROOM_KEY = 'pakdam.demo.rooms.v1';
-export const PLAYER_KEY = 'pakdam.playerId';
+export const DEMO_ROOMS_KEY = 'pakdam.demo.rooms.v1';
+export const SESSION_STORAGE_KEY = 'pakdam.session.v1';
 
-export interface RoomState {
+/** True when the suite is running against a live Worker (env at test time). */
+export const LIVE = Boolean(process.env.NEXT_PUBLIC_WORKER_URL);
+/** True when an Ola Maps key is configured (env at test time). */
+export const OLA_KEY_SET = Boolean(process.env.NEXT_PUBLIC_OLA_MAPS_API_KEY);
+
+export const HOST_NAME = 'Teo';
+export const GUEST_NAMES = ['Ana', 'Ben'] as const;
+
+/** Minimal shape of a demo room as stored in localStorage. */
+export interface DemoPlayer {
+  playerId: string;
+  displayName: string;
+  matchRole: string | null;
+  team: string | null;
+  isReady: boolean;
+  leftAt: string | null;
+  ejectedAt: string | null;
+}
+
+export interface DemoRoomData {
   room: {
     roomId: string;
     roomCode: string;
     phase: string;
-    config: {
-      mode: string;
-      pingIntervalSeconds: number;
-      playZoneEnabled?: boolean;
-      maxPlayers: number;
-      hunterCount: number;
-      durationSeconds: number;
-      headStartSeconds: number;
-      showPingHistory?: boolean;
-      zoneShrinkEnabled?: boolean;
-      zoneShrinkIntervalSeconds: number;
-      /** Drawn zone shape + boundary (drawnBoundary as stored by
-       *  draftToConfig) — needed by the draw Done-applies test
-       *  (map-tiles.spec.ts); the projection is otherwise a subset
-       *  of RoomConfig, not the whole type. */
-      zoneShape?: string;
-      zone?: { boundary: { lat: number; lng: number }[] };
-    };
+    endsAt: string | null;
+    startedAt: string | null;
   };
-  players: {
-    playerId: string;
-    displayName: string;
-    matchRole: string | null;
-    isReady: boolean;
-    isHost: boolean;
-    ejectedAt: string | null;
-  }[];
-  catches: { state: string; runnerPlayerId: string; hunterPlayerId: string }[];
-  events: { at: string; text: string }[];
+  players: DemoPlayer[];
+  catches: unknown[];
 }
 
-export async function roomState(page: Page): Promise<RoomState | null> {
-  return page.evaluate((key) => {
-    const all = JSON.parse(localStorage.getItem(key) ?? '{}') as Record<string, RoomState>;
-    return Object.values(all)[0] ?? null;
-  }, ROOM_KEY);
-}
-
-export async function setPlayer(page: Page, playerId: string): Promise<void> {
-  // Per-tab identity (sessionStorage, not localStorage): the host tab
-  // and the guest tab each hold their own player id, so joining as a
-  // second player cannot steal the first tab's identity.
-  await page.evaluate((value) => sessionStorage.setItem('pakdam.playerId', value), playerId);
-}
-
-/** Create a lobby through the real host-setup UI. Defaults: codename
- *  "Test Host", GPS centre 23.36, 85.33 (mocked). The create screen
- *  starts from defaultDraft() — there are no presets any more
- *  (removed in the video rebuild, 2026-11-18).
- *  Returns the room ids + the host page (already on the lobby). */
-export async function createLobby(
-  page: Page,
-  context: BrowserContext,
-  opts: {
-    codename?: string;
-    /** Extra host-setup changes (toggles/steppers) before creating. */
-    configureDraft?: (page: Page) => Promise<void>;
-  } = {},
-): Promise<{ roomId: string; roomCode: string; hostId: string }> {
-  await context.grantPermissions(['geolocation']);
-  await context.setGeolocation({ latitude: 23.36, longitude: 85.33 });
-  await page.goto('/create');
-  // Head start is the CONFIGURED value (3 min by default) — the
-  // play page honours it exactly, so the suite uses a short 30 s head
-  // start here (180 -> 90 -> 30) instead of waiting out 3 minutes per
-  // match. The head-start tutorial still shows for the full 30 s.
-  await page.getByRole('button', { name: /Decrease Head start/ }).click();
-  await page.getByRole('button', { name: /Decrease Head start/ }).click();
-  await expect(page.getByRole('group', { name: 'Head start' }).locator('output')).toHaveText('30s');
-  await page.getByLabel(/codename/i).fill(opts.codename ?? 'Test Host');
-  if (opts.configureDraft) await opts.configureDraft(page);
-  await page.getByRole('button', { name: /Use my location/ }).click();
-  // The old "Zone centre: set" status line was removed in the
-  // simplification round (§5c) — the centre-set evidence now is
-  // the "Location found — … (GPS accuracy ±N m)" status line.
-  await expect(page.getByText(/Location found — .*\(GPS accuracy ±\d+ m\)/i).first()).toBeVisible();
-  await page.getByLabel(/I have checked the venue/i).check();
-  await page.getByLabel(/I will be on site/i).check();
-  await page.getByRole('button', { name: /CREATE LOBBY/ }).click();
-  await expect(page).toHaveURL(/\/room\/[0-9a-f-]+$/);
-  await expect(page.getByText(/Room code/i)).toBeVisible();
-  const created = await roomState(page);
-  expect(created).not.toBeNull();
-  expect(created!.room.roomCode).toMatch(/^[A-Z0-9]{6}$/);
-  return { roomId: created!.room.roomId, roomCode: created!.room.roomCode, hostId: created!.players[0]!.playerId };
-}
-
-/** Guest join through /join: 6-char code boxes + display name, 18+,
- *  no account. Returns the guest page (already on the lobby). */
-export async function joinAsGuest(
-  context: BrowserContext,
-  roomCode: string,
-  displayName: string,
-): Promise<Page> {
-  const guest = await context.newPage();
-  await guest.goto('/join');
-  await guest.getByLabel(/Room code/i).fill(roomCode);
-  await guest.getByLabel(/Your display name/i).fill(displayName);
-  await guest.getByLabel(/18 or older/i).check();
-  await guest.getByRole('button', { name: /Join lobby/i }).click();
-  return guest;
-}
-
-export interface StartedMatch {
-  roomId: string;
-  roomCode: string;
-  hostId: string;
-  hunterId: string;
-  runners: RoomState['players'];
-}
-
-/** Join extra REAL guests through the real /join flow (each taps
- *  "I'm ready"). This replaces the removed "Add 3 demo players"
- *  button — no demo seats exist any more, so a match that needs more
- *  than the host + first guest must join real players. Returns their
- *  pages; the caller closes them when done (closing a tab does not
- *  remove the player from the room). */
-export async function addRealPlayers(
-  context: BrowserContext,
-  roomCode: string,
-  names: string[],
-): Promise<Page[]> {
-  const pages: Page[] = [];
-  for (const name of names) {
-    const g = await joinAsGuest(context, roomCode, name);
-    await expect(g).toHaveURL(/\/room\/[0-9a-f-]+$/);
-    await g.getByRole('button', { name: /I.m ready/i }).click();
-    pages.push(g);
-  }
-  return pages;
-}
-
-/** Full pre-match flow: create -> 4 real guests join + ready ->
- *  (optionally) host-picked Hunters -> Start game.
- *  `pickHunters: 'host'` makes the host a Hunter (deterministic);
- *  `pickHunters: 'others'` makes the host a Runner (the first two
- *  extra guests are the Hunters). Default (no pick) leaves the
- *  Random draw. The guest pages are closed once the match starts.
- *  Returns the store state read just after ACTIVE begins. */
-export async function startMatch(
-  page: Page,
-  context: BrowserContext,
-  opts: {
-    pickHunters?: 'host' | 'others';
-    configureDraft?: (page: Page) => Promise<void>;
-    /** False = return as soon as the play page loads (HEAD_START),
-     *  so the caller can assert the head-start tutorial itself. */
-    waitActive?: boolean;
-  } = {},
-): Promise<StartedMatch> {
-  const { roomId, roomCode, hostId } = await createLobby(page, context, {
-    configureDraft: opts.configureDraft,
-  });
-  const guest = await joinAsGuest(context, roomCode, 'Guest Runner');
-  await expect(guest).toHaveURL(`/room/${roomId}`);
-  await expect(guest.getByRole('heading', { name: 'Lobby', exact: true })).toBeVisible();
-  await guest.getByRole('button', { name: /I.m ready/i }).click();
-
-  await setPlayer(page, hostId);
-  await expect(page.getByRole('heading', { name: /Host controls/ })).toBeVisible();
-  // Three more real guests (host + Guest Runner + 3 = 5 of 30).
-  // The "Add 3 demo players" button is gone — no demo seats exist.
-  const extras = await addRealPlayers(context, roomCode, ['Guest Two', 'Guest Three', 'Guest Four']);
-  await expect(page.getByText(/Players \(5\/30\)/)).toBeVisible();
-
-  if (opts.pickHunters) {
-    // Switch Random -> host-picked, pick exactly hunterCount Hunters
-    // (default = 2), save, then start. Deterministic roles: no
-    // Random-draw flakiness in the specs that depend on who is who.
-    await page.getByRole('button', { name: /Switch to host-picked Hunters/i }).click();
-    const before = await roomState(page);
-    const others = before!.players.filter((p) => p.playerId !== hostId);
-    const picked =
-      opts.pickHunters === 'host'
-        ? [hostId, others[0]!.playerId]
-        : [others[0]!.playerId, others[1]!.playerId];
-    for (const id of picked) {
-      const name = before!.players.find((p) => p.playerId === id)!.displayName;
-      // Scope to the checkbox: the roster row also has Report/block
-      // and Remove buttons whose aria-labels contain the same name.
-      await page.getByRole('checkbox', { name: new RegExp(escapeRegExp(name)) }).check();
-    }
-    await page.getByRole('button', { name: /Save Hunters/i }).click();
-    await expect(page.getByText(/Saved Hunters:/)).toBeVisible();
-  }
-
-  await expect(page.getByRole('button', { name: /Start game/i })).toBeEnabled();
-  await page.getByRole('button', { name: /Start game/i }).click();
-  await expect(page).toHaveURL(`/room/${roomId}/play`);
-  await guest.close();
-  for (const g of extras) await g.close();
-
-  if (opts.waitActive === false) {
-    const early = await roomState(page);
-    expect(early).not.toBeNull();
-    const earlyHunter = early!.players.find((p) => p.matchRole === 'hunter');
-    expect(earlyHunter).toBeDefined();
-    return {
-      roomId,
-      roomCode,
-      hostId,
-      hunterId: earlyHunter!.playerId,
-      runners: early!.players.filter((p) => p.matchRole === 'runner'),
-    };
-  }
-
-  const hud = page.getByRole('region', { name: 'Match status' });
-  await expect(hud).toContainText('Active — hunt on', { timeout: 60_000 });
-  const state = await roomState(page);
-  expect(state).not.toBeNull();
-  const hunter = state!.players.find((p) => p.matchRole === 'hunter');
-  expect(hunter).toBeDefined();
-  return {
-    roomId,
-    roomCode,
-    hostId,
-    hunterId: hunter!.playerId,
-    runners: state!.players.filter((p) => p.matchRole === 'runner'),
-  };
-}
-
-function escapeRegExp(s: string): string {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-/** Horizontal-overflow probe: returns the document width vs the
- *  viewport width plus the worst offending elements (tag, class,
- *  text snippet) so a failure names the culprit. */
-export async function overflowProbe(page: Page): Promise<{
-  scrollWidth: number;
-  innerWidth: number;
-  overflowing: boolean;
-  offenders: string[];
-}> {
-  return page.evaluate(() => {
-    const innerWidth = window.innerWidth;
-    const offenders: string[] = [];
-    for (const el of document.querySelectorAll('body *')) {
-      const r = (el as HTMLElement).getBoundingClientRect();
-      if (r.width > 0 && r.right > innerWidth + 1) {
-        const t = (el as HTMLElement).innerText?.trim().slice(0, 40) ?? '';
-        offenders.push(`${el.tagName.toLowerCase()}.${String((el as HTMLElement).className).split(' ')[0] ?? ''} right=${Math.round(r.right)} "${t}"`);
-      }
-    }
-    return {
-      scrollWidth: document.documentElement.scrollWidth,
-      innerWidth,
-      overflowing: document.documentElement.scrollWidth > innerWidth + 1,
-      offenders: offenders.slice(0, 8),
-    };
-  });
-}
-
-/** Assert no horizontal overflow on the current page, naming the
- *  offending elements when it fails. */
-export async function expectNoOverflow(page: Page, where: string): Promise<void> {
-  const probe = await overflowProbe(page);
-  expect(
-    probe.overflowing,
-    `${where}: horizontal overflow — doc ${probe.scrollWidth}px vs viewport ${probe.innerWidth}px; offenders: ${probe.offenders.join(' | ') || 'none identified'}`,
-  ).toBe(false);
-}
-
-/** Bounding-box height/width of the first matching locator (0 when
- *  the element is not visible). */
-export async function boxSize(
-  page: Page,
-  selector: string,
-): Promise<{ width: number; height: number } | null> {
-  return page.evaluate((sel) => {
-    const el = document.querySelector(sel);
-    if (!el) return null;
-    const r = el.getBoundingClientRect();
-    return { width: r.width, height: r.height };
-  }, selector);
-}
-
-// ---------------------------------------------------------------------------
-// Ola Maps key detection + request collection (founder decision,
-// 2026-11-19: the bundled offline map is gone; the map is Ola Maps
-// vector tiles, `default-dark-standard`, keyed by
-// NEXT_PUBLIC_OLA_MAPS_API_KEY). CI has NO key, so the specs must
-// detect the key from the RENDERED page — never from process.env,
-// which cannot see a build-time NEXT_PUBLIC_ var — and split: the
-// map tests run only with a key, the no-key tests assert the graceful
-// "Map key not set" failure instead.
-// ---------------------------------------------------------------------------
-
-/** The missing-key line, as rendered (PlayAreaMap: short form, no
- *  "(Production + Preview)"; MapView on the play map: long form).
- *  Both share this prefix — match on it, never on the full line. */
-export const MISSING_KEY_TEXT = /Map key not set — add NEXT_PUBLIC_OLA_MAPS_API_KEY/;
-
-/** Probe whether an Ola Maps key is configured — from the rendered
- *  page, not env. Goes to /create and waits for whichever lands
- *  first: the missing-key line (no key) or the MapLibre canvas (key).
- *  Throws when neither appears in 30 s, so a broken map cannot
- *  silently skip the whole suite. */
-export async function detectOlaKey(page: Page): Promise<boolean> {
-  await page.goto('/create');
-  const missingKey = page.getByText(MISSING_KEY_TEXT).first();
-  const canvas = page.locator('.mapbox .maplibregl-canvas').first();
-  const deadline = Date.now() + 30_000;
-  while (Date.now() < deadline) {
-    if (await missingKey.isVisible().catch(() => false)) return false;
-    if (await canvas.isVisible().catch(() => false)) return true;
-    await page.waitForTimeout(250);
-  }
-  throw new Error(
-    'detectOlaKey: neither the "Map key not set" line nor the map canvas appeared on /create within 30 s — cannot tell whether an Ola key is configured',
-  );
-}
-
-/** Hydration gate that works with AND without an Ola key: waits for
- *  the map canvas (key configured) or the missing-key line (no key).
- *  Returns true when the canvas appeared (key present). */
-export async function waitForMapOrMissingKey(page: Page): Promise<boolean> {
-  const canvas = page.locator('.mapbox .maplibregl-canvas').first();
-  const missingKey = page.getByText(MISSING_KEY_TEXT).first();
-  await expect(canvas.or(missingKey)).toBeVisible({ timeout: 30_000 });
-  return canvas.isVisible().catch(() => false);
-}
-
-export interface OlaHit { url: string; status: number }
-export interface OlaFail { url: string; error: string }
-export interface OlaLog {
-  hits: OlaHit[];
-  fails: OlaFail[];
-  /** Requests to a tile host that is NOT Ola — the map is Ola only. */
-  otherTileHosts: string[];
-}
-
-const OLA_HOST = /api\.olamaps\.io/;
-const OTHER_TILE_HOSTS =
-  /openfreemap|tile\.openstreetmap|basemaps\.arcgis|api\.mapbox|maps\.googleapis|carto\.com|basemaps\.cartocdn/i;
-
-/** Collect every api.olamaps.io request (style, tiles, sprites,
- *  glyphs) plus failed ones and any request to another tile host. */
-export function collectOlaRequests(page: Page): OlaLog {
-  const log: OlaLog = { hits: [], fails: [], otherTileHosts: [] };
-  page.on('response', (res) => {
-    if (OLA_HOST.test(res.url())) {
-      log.hits.push({ url: res.url(), status: res.status() });
-    } else if (OTHER_TILE_HOSTS.test(res.url())) {
-      log.otherTileHosts.push(res.url().slice(0, 120));
-    }
-  });
-  page.on('requestfailed', (req) => {
-    if (OLA_HOST.test(req.url())) {
-      log.fails.push({ url: req.url(), error: req.failure()?.errorText ?? 'unknown' });
-    }
-  });
-  return log;
-}
-
-/** Wait 15 s (the founder's window), then demand painted Ola tiles:
- *  HTTP 200 Ola responses, every one carrying api_key, no 401/403
- *  (a wrong key fails the style/tile load), no network-failed Ola
- *  requests, and no request to any other tile host. Non-200s other
- *  than 401/403 are logged, not failed on: against a live service a
- *  single transient 5xx on one tile is not a map failure, while 0
- *  OK responses, a 401, or a missing api_key is. */
-export async function assertOlaTilesPaint(page: Page, log: OlaLog, where: string): Promise<void> {
-  await page.waitForTimeout(15_000);
-  const ok = log.hits.filter((h) => h.status === 200);
-  const noKey = log.hits.filter((h) => !/[?&]api_key=/.test(h.url));
-  const denied = log.hits.filter((h) => h.status === 401 || h.status === 403);
-  const bad = log.hits.filter((h) => h.status !== 200);
-  console.log(
-    `OLA ${where}: ${log.hits.length + log.fails.length} Ola requests, ${ok.length} HTTP 200, ${denied.length} 401/403, ${bad.length} HTTP non-200, ${log.fails.length} network-failed, ${noKey.length} without api_key` +
-      (log.fails.length ? ` — failures: ${[...new Set(log.fails.map((f) => f.error))].join(', ')}` : '') +
-      (bad.length ? ` — non-200: ${bad.map((b) => `${b.status} ${b.url.slice(0, 100)}`).join(' | ')}` : '') +
-      (log.hits.length ? ` — sample URL: ${log.hits[0]!.url.replace(/api_key=[^&]*/, 'api_key=…')}` : log.fails.length ? ' — NO OLA RESPONSES (all requests failed)' : ' — NO OLA REQUESTS AT ALL') +
-      (log.otherTileHosts.length ? ` — other tile hosts: ${log.otherTileHosts.slice(0, 3).join(' | ')}` : ''),
-  );
-  expect(ok.length, `${where}: expected Ola tile/style requests to return HTTP 200 (got ${log.hits.length} responses, ${ok.length} OK, ${log.fails.length} network-failed)`).toBeGreaterThan(0);
-  expect(denied, `${where}: Ola requests must not be 401/403 — a wrong key fails the style/tile load`).toEqual([]);
-  expect(noKey, `${where}: every api.olamaps.io request must carry api_key (olaTransformRequest appends it)`).toEqual([]);
-  expect(log.fails, `${where}: Ola requests must not fail at the network layer`).toEqual([]);
-  expect(log.otherTileHosts, `${where}: no other tile host may be requested — the map is Ola only`).toEqual([]);
-}
-
-/** Collect uncaught page exceptions (pageerror events). The no-key
- *  tests assert this stays empty: a missing key must fail gracefully,
- *  never throw. */
+/** Collect page errors + console errors; assert on them at the end of a test. */
 export function collectPageErrors(page: Page): string[] {
   const errors: string[] = [];
-  page.on('pageerror', (err) => errors.push(String(err).slice(0, 300)));
+  page.on('pageerror', (err) => errors.push(`pageerror: ${err.message}`));
+  page.on('console', (msg) => {
+    if (msg.type() === 'error') errors.push(`console: ${msg.text()}`);
+  });
   return errors;
 }
 
-export function assertNoPageErrors(errors: string[], where: string): void {
-  expect(errors, `${where}: uncaught exceptions — ${errors.join(' | ')}`).toEqual([]);
+export function expectNoPageErrors(errors: string[]): void {
+  expect(errors, 'expected no page/console errors').toEqual([]);
+}
+
+/** Fail fast with a plain message if the app is not in demo mode. */
+export async function expectDemoMode(page: Page): Promise<void> {
+  const isDemo = await page.evaluate((key) => {
+    return window.localStorage.getItem(key) !== null;
+  }, DEMO_ROOMS_KEY);
+  expect(
+    isDemo,
+    'expected demo mode (a demo room in localStorage) — is NEXT_PUBLIC_WORKER_URL set on the dev server?',
+  ).toBe(true);
+}
+
+/**
+ * Host flow: Home → HOST A GAME → codename → mode card → lobby-is-setup.
+ * Returns the room id (from the URL) and the 6-letter code (from the card).
+ */
+export async function createHostRoom(
+  page: Page,
+  hostName: string = HOST_NAME,
+  mode: 'Classic' | 'Infection' = 'Classic',
+): Promise<{ roomId: string; code: string }> {
+  await page.goto('/');
+  await page.getByRole('button', { name: /HOST A GAME/ }).click();
+  await expect(page.getByRole('heading', { name: 'Pick a mode' })).toBeVisible();
+  await page.getByLabel('Your codename').fill(hostName);
+  await page.getByRole('button', { name: mode }).click();
+  await page.waitForURL(/\/room\/[^/]+$/);
+  await expect(page.getByRole('heading', { name: 'Lobby' })).toBeVisible();
+  const code = (await page.locator('section[aria-label="Game code"] .pakdam-code').innerText()).trim();
+  expect(code).toMatch(/^[A-Z0-9]{6}$/);
+  const roomId = page.url().split('/room/')[1]?.split(/[?#]/)[0] ?? '';
+  expect(roomId).not.toBe('');
+  return { roomId, code };
+}
+
+/** Guest flow: Home → code + JOIN → codename + JOIN → lobby. New page, same context. */
+export async function joinRoomAsGuest(
+  context: BrowserContext,
+  code: string,
+  name: string,
+): Promise<Page> {
+  const page = await context.newPage();
+  await page.goto('/');
+  await page.getByLabel('Room code').fill(code);
+  await page.getByRole('button', { name: 'JOIN', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Join a game' })).toBeVisible();
+  await page.getByLabel('Your codename').fill(name);
+  await page.getByRole('button', { name: 'JOIN', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Lobby' })).toBeVisible();
+  return page;
+}
+
+export interface LobbySetup {
+  hostPage: Page;
+  guestPages: Page[];
+  code: string;
+  roomId: string;
+}
+
+/**
+ * A 3-player lobby: host + 2 guests. Optionally shortens the round
+ * (10 min) and the head start (None) on the host's sliders so the match
+ * reaches ACTIVE quickly after start.
+ */
+export async function setupThreePlayerLobby(
+  context: BrowserContext,
+  opts: { mode?: 'Classic' | 'Infection'; headStartNone?: boolean; roundShort?: boolean } = {},
+): Promise<LobbySetup> {
+  const hostPage = await context.newPage();
+  const { roomId, code } = await createHostRoom(hostPage, HOST_NAME, opts.mode ?? 'Classic');
+  if (opts.roundShort !== false) {
+    await setSlider(hostPage, 'Round length', 0); // index 0 = 10 min
+  }
+  if (opts.headStartNone !== false) {
+    await setSlider(hostPage, 'Head start', 0); // index 0 = None
+  }
+  const guestPages = [
+    await joinRoomAsGuest(context, code, GUEST_NAMES[0]),
+    await joinRoomAsGuest(context, code, GUEST_NAMES[1]),
+  ];
+  return { hostPage, guestPages, code, roomId };
+}
+
+/** Set a discrete slider (range input) by step index, then check its value label. */
+export async function setSlider(page: Page, label: string, index: number): Promise<void> {
+  const slider = page.getByLabel(label, { exact: true });
+  await slider.fill(String(index));
+}
+
+/**
+ * Tap "I'm ready" on each page that is not ready yet, and wait for the
+ * flipped ready state. The HOST is created ready (live DO create + demo
+ * createRoom both set isReady + briefingConfirmed at creation — the host
+ * obviously wants to play their own game), so the host's page already
+ * shows "I'm ready — tap to change" and is skipped, not clicked.
+ */
+export async function readyAll(pages: Page[]): Promise<void> {
+  for (const page of pages) {
+    const readyBtn = page.getByRole('button', { name: "I'm ready", exact: true });
+    const readyState = page.getByRole('button', { name: /I'm ready — tap to change/ });
+    await expect(readyBtn.or(readyState)).toBeVisible();
+    if ((await readyState.count()) > 0) continue; // already ready (host)
+    await readyBtn.click();
+    await expect(readyState).toBeVisible();
+  }
+}
+
+/** Host taps START GAME and lands on /play; guests follow via the F2 auto-navigate. */
+export async function startMatchAsHost(hostPage: Page): Promise<void> {
+  await expect(hostPage.getByRole('button', { name: 'START GAME', exact: true })).toBeVisible();
+  await hostPage.getByRole('button', { name: 'START GAME', exact: true }).click();
+  await hostPage.waitForURL(/\/room\/[^/]+\/play/);
+}
+
+export async function waitForPlay(page: Page): Promise<void> {
+  await page.waitForURL(/\/room\/[^/]+\/play/, { timeout: 20000 });
+}
+
+/** Dismiss the role-reveal overlay ("Let's go") if it is showing. */
+export async function dismissRoleReveal(page: Page): Promise<void> {
+  const letsGo = page.getByRole('button', { name: "Let's go", exact: true });
+  // The reveal renders once roles load; wait briefly for it, then dismiss.
+  await letsGo.waitFor({ state: 'attached', timeout: 8000 }).catch(() => undefined);
+  if ((await letsGo.count()) > 0) {
+    await letsGo.click({ timeout: 5000 }).catch(() => undefined);
+  }
+}
+
+/**
+ * Full demo setup: 3-player lobby, everyone ready, host starts, everyone
+ * lands on /play with the reveal dismissed. Returns the pages plus each
+ * player's role as recorded in the demo store (demo has no role secrecy).
+ */
+export async function startDemoMatch(
+  context: BrowserContext,
+  opts: { mode?: 'Classic' | 'Infection'; roundShort?: boolean } = {},
+): Promise<LobbySetup & { roles: Map<string, string | null> }> {
+  const setup = await setupThreePlayerLobby(context, opts);
+  const allPages = [setup.hostPage, ...setup.guestPages];
+  await readyAll(allPages);
+  await startMatchAsHost(setup.hostPage);
+  for (const guest of setup.guestPages) await waitForPlay(guest);
+  for (const page of allPages) await dismissRoleReveal(page);
+  const roles = new Map<string, string | null>();
+  for (const page of allPages) {
+    const room = await getDemoRoom(page, setup.roomId);
+    for (const p of room?.players ?? []) roles.set(p.displayName, p.matchRole);
+  }
+  return { ...setup, roles };
+}
+
+/** Read the demo room (localStorage) from a page in the same context. */
+export async function getDemoRoom(page: Page, roomId: string): Promise<DemoRoomData | null> {
+  return page.evaluate(
+    ({ key, roomId: id }) => {
+      const rooms = JSON.parse(window.localStorage.getItem(key) ?? '[]') as DemoRoomData[];
+      return rooms.find((r) => r.room.roomId === id) ?? null;
+    },
+    { key: DEMO_ROOMS_KEY, roomId },
+  );
+}
+
+export async function roleOf(
+  page: Page,
+  roomId: string,
+  displayName: string,
+): Promise<string | null> {
+  const room = await getDemoRoom(page, roomId);
+  return room?.players.find((p) => p.displayName === displayName)?.matchRole ?? null;
+}
+
+export async function playerIdOf(
+  page: Page,
+  roomId: string,
+  displayName: string,
+): Promise<string | null> {
+  const room = await getDemoRoom(page, roomId);
+  return room?.players.find((p) => p.displayName === displayName)?.playerId ?? null;
+}
+
+/**
+ * White-box demo helper: move the match end into the past so the demo
+ * tick completes the match on the next 1 s poll (the play page then
+ * redirects to /results). Demo-only; localStorage is the demo store.
+ */
+export async function forceDemoMatchEnd(page: Page, roomId: string): Promise<void> {
+  await page.evaluate(
+    ({ key, roomId: id }) => {
+      const rooms = JSON.parse(window.localStorage.getItem(key) ?? '[]') as DemoRoomData[];
+      const found = rooms.find((r) => r.room.roomId === id);
+      if (!found) throw new Error(`demo room ${id} not found in localStorage`);
+      found.room.endsAt = new Date(Date.now() - 1000).toISOString();
+      window.localStorage.setItem(key, JSON.stringify(rooms));
+    },
+    { key: DEMO_ROOMS_KEY, roomId },
+  );
+}
+
+/** No horizontal overflow at the current viewport. */
+export async function expectNoHorizontalOverflow(page: Page): Promise<void> {
+  const overflowing = await page.evaluate(
+    () => document.documentElement.scrollWidth - window.innerWidth,
+  );
+  expect(overflowing, 'page must not scroll horizontally').toBeLessThanOrEqual(1);
+}
+
+/** A named button must be a real thumb target (≥ 48 px tall). */
+export async function expectButtonHeight(
+  page: Page,
+  name: string | RegExp,
+  minHeight = 48,
+): Promise<void> {
+  const box = await page.getByRole('button', { name }).first().boundingBox();
+  expect(box, `button ${String(name)} should be visible`).not.toBeNull();
+  expect(box!.height, `button ${String(name)} height`).toBeGreaterThanOrEqual(minHeight);
+}
+
+/** The PWA must contain no Forge-office references anywhere in its visible text. */
+export async function expectNoForgeOfficeText(page: Page): Promise<void> {
+  const text = (await page.evaluate(() => document.body.innerText)).toLowerCase();
+  for (const word of ['forge', 'hermes', 'digital office', 'openclaw', 'mission control']) {
+    expect(text, `visible text must not mention "${word}"`).not.toContain(word);
+  }
 }

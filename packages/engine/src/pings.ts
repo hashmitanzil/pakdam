@@ -1,41 +1,145 @@
-import type { LocationFix, Ping } from '@pakdam/shared';
-/** Pending pings (v2.1 Issue 9): expire, are never delivered stale, are excluded from snapshots, purged at match end.
- *  Delivery expiry is NOT display removal (founder decision, 2026-11-17):
- *  once a ping IS delivered and shown, it stays on the hunter's map
- *  until the next ping replaces it — the web client never removes a
- *  shown ping on a timer. These helpers only govern PENDING
- *  (undelivered) pings. */
-export function isPingDeliverable(p: Ping, nowMs: number): boolean {
-  return new Date(p.expiresAt).getTime() > nowMs;
+/**
+ * Pakdam engine — pings.
+ *
+ * A ping is a coarse area, never an exact pin: centre = the Runner's latest
+ * server-held fix, radius 150 m, Hunters only. No fix = no ping, never an
+ * invented position.
+ *
+ * Schedule: ACTIVE phase only, play zone ON, `pingIntervalSeconds > 0`;
+ * one ping per free Runner per interval; the first ping lands one interval
+ * after match start (`lastPingAtMs` defaults to `startedAt`).
+ *
+ * Display rule (founder decision): once a ping IS delivered and shown, it
+ * stays on the Hunter's map until the next ping replaces it — the client
+ * never removes a shown ping on a timer. The pending-ping TTL governs
+ * UNDELIVERED pings only.
+ */
+import {
+  PENDING_PING_TTL_SECONDS,
+  PING_AREA_RADIUS_M,
+  type GeoPoint,
+  type LocationFix,
+  type LocationQuality,
+  type Ping,
+} from '@pakdam/shared';
+
+export { PING_AREA_RADIUS_M, PENDING_PING_TTL_SECONDS };
+
+/** Is this ping due yet? First ping lands one interval after match start. */
+export function isPingDue(
+  lastPingAtMs: number | null,
+  startedAtMs: number,
+  intervalSeconds: number,
+  nowMs: number,
+): boolean {
+  if (intervalSeconds <= 0) return false;
+  const last = lastPingAtMs ?? startedAtMs;
+  return nowMs - last >= intervalSeconds * 1000;
 }
-export function purgeExpiredPings(pings: Ping[], nowMs: number): Ping[] {
-  return pings.filter((p) => isPingDeliverable(p, nowMs));
-}
-export function snapshotPings(pings: Ping[], nowMs: number): Ping[] {
-  // Snapshots exclude pending pings entirely — a recovered room re-computes them.
-  void nowMs; return [];
+
+/** Epoch ms of the next scheduled ping after `nowMs`. */
+export function nextPingAtMs(
+  lastPingAtMs: number | null,
+  startedAtMs: number,
+  intervalSeconds: number,
+): number | null {
+  if (intervalSeconds <= 0) return null;
+  const last = lastPingAtMs ?? startedAtMs;
+  return last + intervalSeconds * 1000;
 }
 
 /**
- * QA 2026-11-17 (GL-16): build one scheduled ping for a Runner from
- * their latest server-held fix. A ping is a COARSE area, never an
- * exact pin (HNT-024/025): the centre is the fix, but the radius is
- * the fixed coarse area below — a Hunter sees "roughly here", never
- * the Runner's precise dot. The radius is a PLACEHOLDER (it matches
- * the demo's 150 m coarse area); field evidence must replace it —
- * calibration OPEN, do not treat 150 m as a measured requirement.
- * Returns null when there is no fix to ping from (no fix, no ping —
- * never invent a position).
+ * Build one ping for a free Runner from their latest server-held fix.
+ * Returns null when there is no fix — never an invented position.
+ * `pingId` is supplied by the caller (a fresh id per ping).
  */
-export const PING_AREA_RADIUS_M = 150;
-export function buildPing(
-  pingId: string, roomId: string, fix: LocationFix, nowMs: number, pendingPingTtlSeconds: number,
-): Ping {
+export function buildPing(input: {
+  pingId: string;
+  roomId: string;
+  subjectPlayerId: string;
+  fix: LocationFix | null;
+  qualityAtPing: LocationQuality | null;
+  nowMs: number;
+}): Ping | null {
+  if (input.fix === null) return null;
+  const centre: GeoPoint = { lat: input.fix.lat, lng: input.fix.lng };
+  const createdAt = new Date(input.nowMs).toISOString();
   return {
-    pingId, roomId, subjectPlayerId: fix.playerId, recipientRole: 'hunters',
-    uncertainty: { centre: { lat: fix.lat, lng: fix.lng }, radiusMeters: PING_AREA_RADIUS_M },
-    ageSeconds: 0, qualityAtPing: fix.quality,
-    createdAt: new Date(nowMs).toISOString(),
-    expiresAt: new Date(nowMs + pendingPingTtlSeconds * 1000).toISOString(),
+    pingId: input.pingId,
+    roomId: input.roomId,
+    subjectPlayerId: input.subjectPlayerId,
+    recipientRole: 'hunters',
+    uncertainty: { centre, radiusMeters: PING_AREA_RADIUS_M },
+    ageSeconds: 0,
+    qualityAtPing: input.qualityAtPing,
+    createdAt,
+    expiresAt: new Date(input.nowMs + PENDING_PING_TTL_SECONDS * 1000).toISOString(),
   };
+}
+
+/**
+ * Is an undelivered ping still deliverable? The pending-ping TTL (300 s)
+ * governs UNDELIVERED pings only — a delivered ping is never removed on a
+ * timer.
+ */
+export function isPingDeliverable(
+  ping: Ping,
+  nowMs: number,
+  ttlSeconds: number = PENDING_PING_TTL_SECONDS,
+): boolean {
+  return nowMs - Date.parse(ping.createdAt) < ttlSeconds * 1000;
+}
+
+/** Drop undelivered pings past their TTL. Delivered pings are not in this list. */
+export function purgeExpiredPings(
+  pendingPings: readonly Ping[],
+  nowMs: number,
+  ttlSeconds: number = PENDING_PING_TTL_SECONDS,
+): Ping[] {
+  return pendingPings.filter((p) => isPingDeliverable(p, nowMs, ttlSeconds));
+}
+
+/**
+ * Replace a delivered ping for one Runner with the fresh one. A delivered
+ * ping stays until the next ping replaces it — it is never removed on a
+ * timer, and a snapshot cycle never carries pending pings (a recovered room
+ * re-computes them).
+ */
+export function replaceDeliveredPing(
+  delivered: readonly Ping[],
+  next: Ping,
+): Ping[] {
+  return [
+    ...delivered.filter((p) => p.subjectPlayerId !== next.subjectPlayerId),
+    next,
+  ];
+}
+
+/** Age of a delivered ping in whole seconds, for the `m:ss ago` label. */
+export function pingAgeSeconds(ping: Ping, nowMs: number): number {
+  return Math.max(0, Math.floor((nowMs - Date.parse(ping.createdAt)) / 1000));
+}
+
+/** A delivered ping with its age filled in at render time. */
+export function withAge(ping: Ping, nowMs: number): Ping {
+  return { ...ping, ageSeconds: pingAgeSeconds(ping, nowMs) };
+}
+
+/**
+ * Which free Runners are due a ping right now? One ping per free Runner per
+ * interval; Runners with no fix are skipped (no ping, never invented).
+ */
+export function dueRunnerIds(input: {
+  freeRunnerIds: readonly string[];
+  fixes: Readonly<Record<string, LocationFix | null>>;
+  lastPingAtMs: Readonly<Record<string, number | null>>;
+  startedAtMs: number;
+  intervalSeconds: number;
+  nowMs: number;
+}): string[] {
+  return input.freeRunnerIds.filter((id) => {
+    if (input.fixes[id] === undefined || input.fixes[id] === null) return false;
+    const last = input.lastPingAtMs[id] ?? null;
+    return isPingDue(last, input.startedAtMs, input.intervalSeconds, input.nowMs);
+  });
 }

@@ -1,113 +1,346 @@
-import type { HouseRulePreset, HouseRules, LocationFix, MatchMode, RoomConfig, TeamAssignment } from './types.js';
-export function isValidDisplayName(n: string): boolean {
-  return typeof n === 'string' && n.trim().length >= 1 && n.trim().length <= 30 && !/https?:\/\//i.test(n);
-}
-export function isValidRoomCode(c: string): boolean { return /^[A-Z0-9]{6}$/.test(c); }
-export function isValidFix(f: LocationFix): boolean {
-  return f.lat >= -90 && f.lat <= 90 && f.lng >= -180 && f.lng <= 180 &&
-    f.accuracyMeters > 0 && Number.isFinite(f.accuracyMeters);
+/**
+ * Pakdam pure validation helpers — inputs only (room code, codename, zone,
+ * config values, ticket format, hello credential scan, accuracy tiers).
+ * No I/O, no secrets. Every function returns data; nothing throws for bad
+ * input except where noted.
+ */
+import {
+  ACCURACY_FAIR_M,
+  ACCURACY_GOOD_M,
+  BALANCED_HUNTER_TABLE,
+  CATCH_TOKEN_HEX_LENGTH,
+  MAX_PLAYERS,
+  MIN_PLAYERS,
+  SUGGESTED_ZONE_RADIUS_BASE_M,
+  SUGGESTED_ZONE_RADIUS_CAP_M,
+  SUGGESTED_ZONE_RADIUS_PER_PLAYER_M,
+  ZONE_RADIUS_MIN_M,
+} from './calibration.js';
+import type {
+  GeoPoint,
+  GeoPolygon,
+  LocationQuality,
+  RoomConfig,
+} from './types.js';
+
+// ---------------------------------------------------------------------------
+// Room code + codename
+// ---------------------------------------------------------------------------
+
+/** Room invite code: exactly 6 chars, A–Z0–9. */
+export const ROOM_CODE_PATTERN = /^[A-Z0-9]{6}$/;
+
+/** A 6-letter invite code is valid only in this exact form. */
+export function isValidRoomCode(code: unknown): code is string {
+  return typeof code === 'string' && ROOM_CODE_PATTERN.test(code);
 }
 
-export const MATCH_MODES: MatchMode[] = ['classic', 'infection'];
-export const TEAM_ASSIGNMENTS: TeamAssignment[] = ['random', 'selected'];
-/** Host ranges (Brief v2 + founder update + location-first redesign).
- *  All bounds are the brief's published ranges; the values inside them
- *  are calibration OPEN. Ping may be as frequent as every 30 s; shrink
- *  as frequent as every 1 min; zone diameter has a 200 m minimum and
- *  NO maximum (founder decision, 2026-11-17 — unlimited past 1 km;
- *  the old 3 km diameter cap is deleted with the 1.5 km radius cap). */
-export const HOST_RANGES = {
-  maxPlayers: { min: 3, max: 30 }, // founder 2026-11-17: personal game, limit raised 16 -> 30
-  durationSeconds: { min: 300, max: 10800 }, // 5 min–3 h
-  headStartSeconds: { min: 0, max: 1800 }, // 0–30 min
-  pingIntervalSeconds: { min: 30, max: 1800 }, // 30 s–30 min, or 0 = no pings
-  zoneShrinkIntervalSeconds: { min: 60, max: 3600 }, // every 1–60 min
-  // No outside-zone ranges: the 30-second return countdown, then
-  // ejection, is a fixed founder rule (OUTSIDE_ZONE_RETURN_SECONDS).
-  // Zone across (diameter): minimum 200 m, NO maximum (founder
-  // decision, 2026-11-17 — unlimited past 1 km).
-  zoneDiameterMeters: { min: 200 },
-} as const;
-
-/** Great-circle distance, metres (local copy so shared stays free of
- *  the engine dependency). Used only to bound the zone diameter —
- *  and by gps-validation for movement/proximity checks. */
-export function haversineMeters(aLat: number, aLng: number, bLat: number, bLng: number): number {
-  const R = 6371000;
-  const toRad = (d: number) => (d * Math.PI) / 180;
-  const dLat = toRad(bLat - aLat);
-  const dLng = toRad(bLng - aLng);
-  const h = Math.sin(dLat / 2) ** 2 + Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
+/** Display name / codename: 1–30 characters after trimming. */
+export function isValidDisplayName(name: unknown): name is string {
+  return typeof name === 'string' && name.trim().length >= 1 && name.trim().length <= 30;
 }
-/** Widest distance across a zone boundary, metres. */
-export function zoneDiameterMeters(boundary: { lat: number; lng: number }[]): number {
-  let max = 0;
-  for (let i = 0; i < boundary.length; i++) {
-    for (let j = i + 1; j < boundary.length; j++) {
-      max = Math.max(max, haversineMeters(boundary[i]!.lat, boundary[i]!.lng, boundary[j]!.lat, boundary[j]!.lng));
+
+/** UUID (v4-shaped) check for ids generated with crypto.randomUUID(). */
+export const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export function isUuid(value: unknown): value is string {
+  return typeof value === 'string' && UUID_PATTERN.test(value);
+}
+
+// ---------------------------------------------------------------------------
+// Geography
+// ---------------------------------------------------------------------------
+
+/** Latitude ±90, longitude ±180, both finite numbers. */
+export function isValidGeoPoint(point: unknown): point is GeoPoint {
+  if (typeof point !== 'object' || point === null) return false;
+  const p = point as { lat?: unknown; lng?: unknown };
+  return (
+    typeof p.lat === 'number' &&
+    Number.isFinite(p.lat) &&
+    p.lat >= -90 &&
+    p.lat <= 90 &&
+    typeof p.lng === 'number' &&
+    Number.isFinite(p.lng) &&
+    p.lng >= -180 &&
+    p.lng <= 180
+  );
+}
+
+/** A zone boundary needs ≥ 3 valid points to enclose a shape. */
+export function isValidGeoPolygon(points: unknown, minPoints = 3): points is GeoPolygon {
+  if (!Array.isArray(points) || points.length < minPoints) return false;
+  for (const point of points) {
+    if (!isValidGeoPoint(point)) return false;
+  }
+  return true;
+}
+
+/**
+ * Validate a zone boundary. Returns issue strings (empty = valid).
+ * An empty boundary is allowed — it means the zone has not been placed yet
+ * (a zone is never given a default place; the host places it by hand).
+ */
+export function validateZoneBoundary(boundary: unknown): string[] {
+  const issues: string[] = [];
+  if (!Array.isArray(boundary)) {
+    issues.push('zone boundary must be an array of points');
+    return issues;
+  }
+  if (boundary.length === 0) return issues;
+  if (boundary.length < 3) {
+    issues.push('zone boundary needs at least 3 points to enclose a shape');
+    return issues;
+  }
+  for (const point of boundary) {
+    if (!isValidGeoPoint(point)) {
+      issues.push('zone boundary contains a point outside lat ±90 / lng ±180');
+      break;
     }
   }
-  return Math.round(max);
+  return issues;
 }
 
-/** Range + mode-rule checks shared by validateRoomConfig and
- *  validateHousePreset, so a saved preset can never hold rules a room
- *  would reject. No venue/area name is checked — the field does not exist. */
-export function validateRules(r: HouseRules): string[] {
-  const e: string[] = [];
-  if (!MATCH_MODES.includes(r.mode)) e.push(`mode must be one of ${MATCH_MODES.join(', ')}`);
-  if (!TEAM_ASSIGNMENTS.includes(r.teamAssignment)) e.push(`teamAssignment must be one of ${TEAM_ASSIGNMENTS.join(', ')}`);
-  if (r.maxPlayers < HOST_RANGES.maxPlayers.min || r.maxPlayers > HOST_RANGES.maxPlayers.max) e.push('maxPlayers must be 3–30');
-  if (r.hunterCount < 1 || r.hunterCount >= r.maxPlayers) e.push('hunterCount must be >=1 and < maxPlayers');
-  if (r.durationSeconds < HOST_RANGES.durationSeconds.min || r.durationSeconds > HOST_RANGES.durationSeconds.max) e.push('durationSeconds must be 5 min–3 h (300–10800)');
-  if (r.headStartSeconds < HOST_RANGES.headStartSeconds.min || r.headStartSeconds > HOST_RANGES.headStartSeconds.max) e.push('headStartSeconds must be 0–30 min (0–1800)');
-  if (r.pingIntervalSeconds !== 0 && (r.pingIntervalSeconds < HOST_RANGES.pingIntervalSeconds.min || r.pingIntervalSeconds > HOST_RANGES.pingIntervalSeconds.max)) e.push('pingIntervalSeconds must be 0 (no pings) or 30 s–30 min (30–1800)');
-  if (r.zoneShrinkEnabled && (r.zoneShrinkIntervalSeconds < HOST_RANGES.zoneShrinkIntervalSeconds.min || r.zoneShrinkIntervalSeconds > HOST_RANGES.zoneShrinkIntervalSeconds.max)) e.push('zoneShrinkIntervalSeconds must be 1–60 min (60–3600) when shrinking is on');
-  for (const f of ['balanceHunters', 'randomDraw', 'showPingHistory'] as const) {
-    if (r[f] !== undefined && typeof r[f] !== 'boolean') e.push(`${f} must be true or false when set`);
+// ---------------------------------------------------------------------------
+// Room config
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate a full RoomConfig. Returns issue strings (empty = valid).
+ * Enforces the ranges from the protocol map: duration 300–10800 s,
+ * head start 0–1800 s, ping 0 (off) or 30–1800 s, maxPlayers 3–30,
+ * hunterCount 1..maxPlayers−1, zone radius ≥ 100 m with no maximum,
+ * finalSizePercent null (Auto) or 0–100, hostOnSiteConfirmed required,
+ * catchConfirmationRequired forced true, and the pick invariant
+ * (teamAssignment 'selected' ⇒ exactly hunterCount picked ids;
+ * 'random' ⇒ no picked ids — switching to Random clears the pick).
+ */
+export function validateRoomConfig(config: unknown): string[] {
+  const issues: string[] = [];
+  if (typeof config !== 'object' || config === null) {
+    return ['room config must be an object'];
   }
-  for (const f of ['playZoneEnabled', 'huntersCanTalk'] as const) {
-    if (r[f] !== undefined && typeof r[f] !== 'boolean') e.push(`${f} must be true or false when set`);
+  const c = config as Partial<RoomConfig>;
+
+  if (c.mode !== 'classic' && c.mode !== 'infection') {
+    issues.push("mode must be 'classic' or 'infection'");
   }
-  if (r.finalSizePercent !== undefined && r.finalSizePercent !== null &&
-    (typeof r.finalSizePercent !== 'number' || r.finalSizePercent < 5 || r.finalSizePercent > 100)) {
-    e.push('finalSizePercent must be 5–100, or null for Auto');
+  if (c.teamAssignment !== 'random' && c.teamAssignment !== 'selected') {
+    issues.push("teamAssignment must be 'random' or 'selected'");
   }
-  if (r.playZoneEnabled === false && r.pingIntervalSeconds !== 0) {
-    e.push('pingIntervalSeconds must be 0 (no pings) when the play zone is off');
+  if (
+    typeof c.maxPlayers !== 'number' ||
+    !Number.isInteger(c.maxPlayers) ||
+    c.maxPlayers < MIN_PLAYERS ||
+    c.maxPlayers > MAX_PLAYERS
+  ) {
+    issues.push(`maxPlayers must be an integer between ${MIN_PLAYERS} and ${MAX_PLAYERS}`);
   }
-  return e;
-}
-export function validateRoomConfig(c: RoomConfig): string[] {
-  const e = validateRules(c);
-  if (!c.hostOnSiteConfirmed) e.push('host must confirm they will be on site');
-  if (c.zoneShape !== undefined && c.zoneShape !== 'circle' && c.zoneShape !== 'draw') e.push('zoneShape must be circle or draw when set');
-  // Play zone OFF = no boundary at all (classic hide and seek): the
-  // boundary and diameter checks below do not apply.
-  if (c.playZoneEnabled === false) {
-    if (c.zone?.boundary && c.zone.boundary.length > 0) e.push('zone boundary must be empty when the play zone is off');
-  } else if (!c.zone?.boundary || c.zone.boundary.length < 3) e.push('zone boundary needs >=3 points');
-  else {
-    const d = zoneDiameterMeters(c.zone.boundary);
-    if (d < HOST_RANGES.zoneDiameterMeters.min) {
-      e.push(`zone diameter must be at least ${HOST_RANGES.zoneDiameterMeters.min} m across (no maximum)`);
+  if (
+    typeof c.hunterCount !== 'number' ||
+    !Number.isInteger(c.hunterCount) ||
+    c.hunterCount < 1 ||
+    (typeof c.maxPlayers === 'number' && c.hunterCount > c.maxPlayers - 1)
+  ) {
+    issues.push('hunterCount must be at least 1 and less than maxPlayers');
+  }
+  if (
+    typeof c.durationSeconds !== 'number' ||
+    !Number.isInteger(c.durationSeconds) ||
+    c.durationSeconds < 300 ||
+    c.durationSeconds > 10800
+  ) {
+    issues.push('durationSeconds must be an integer between 300 and 10800');
+  }
+  if (
+    typeof c.headStartSeconds !== 'number' ||
+    !Number.isInteger(c.headStartSeconds) ||
+    c.headStartSeconds < 0 ||
+    c.headStartSeconds > 1800
+  ) {
+    issues.push('headStartSeconds must be an integer between 0 and 1800');
+  }
+  if (
+    typeof c.pingIntervalSeconds !== 'number' ||
+    !Number.isInteger(c.pingIntervalSeconds) ||
+    (c.pingIntervalSeconds !== 0 && (c.pingIntervalSeconds < 30 || c.pingIntervalSeconds > 1800))
+  ) {
+    issues.push('pingIntervalSeconds must be 0 (no pings) or an integer between 30 and 1800');
+  }
+  if (typeof c.zoneShrinkEnabled !== 'boolean') {
+    issues.push('zoneShrinkEnabled must be a boolean');
+  }
+  if (
+    typeof c.zoneShrinkIntervalSeconds !== 'number' ||
+    !Number.isInteger(c.zoneShrinkIntervalSeconds) ||
+    c.zoneShrinkIntervalSeconds < 60 ||
+    c.zoneShrinkIntervalSeconds > 3600
+  ) {
+    issues.push('zoneShrinkIntervalSeconds must be an integer between 60 and 3600');
+  }
+  if (c.catchConfirmationRequired !== true) {
+    issues.push('catchConfirmationRequired must be true — a tag never counts at once');
+  }
+  if (
+    c.finalSizePercent !== undefined &&
+    c.finalSizePercent !== null &&
+    (typeof c.finalSizePercent !== 'number' ||
+      c.finalSizePercent < 0 ||
+      c.finalSizePercent > 100)
+  ) {
+    issues.push('finalSizePercent must be null (Auto) or a number between 0 and 100');
+  }
+  if (c.zoneShape !== undefined && c.zoneShape !== 'circle' && c.zoneShape !== 'draw') {
+    issues.push("zoneShape must be 'circle' or 'draw'");
+  }
+  if (!Array.isArray(c.safeAreas)) {
+    issues.push('safeAreas must be an array');
+  }
+  if (!Array.isArray(c.noGoAreas)) {
+    issues.push('noGoAreas must be an array');
+  } else {
+    for (const area of c.noGoAreas) {
+      if (!isValidGeoPolygon(area)) {
+        issues.push('every no-go area must be a polygon of at least 3 valid points');
+        break;
+      }
     }
   }
-  if (c.selectedHunterIds.length > c.hunterCount) e.push('selectedHunterIds must hold at most hunterCount players');
-  if (new Set(c.selectedHunterIds).size !== c.selectedHunterIds.length) e.push('selectedHunterIds must not repeat a player');
-  return e;
+  if (c.zone === undefined || typeof c.zone !== 'object' || c.zone === null) {
+    issues.push('zone must be an object with a boundary');
+  } else {
+    for (const issue of validateZoneBoundary(c.zone.boundary)) {
+      issues.push(`zone: ${issue}`);
+    }
+    if (Array.isArray(c.zone.shrinkPhases)) {
+      for (const phase of c.zone.shrinkPhases) {
+        if (typeof phase.atSeconds !== 'number' || phase.atSeconds < 0) {
+          issues.push('every shrink phase needs a non-negative atSeconds');
+          break;
+        }
+        for (const issue of validateZoneBoundary(phase.boundary)) {
+          issues.push(`shrink phase: ${issue}`);
+          break;
+        }
+      }
+    } else {
+      issues.push('zone.shrinkPhases must be an array');
+    }
+  }
+  if (!Array.isArray(c.selectedHunterIds)) {
+    issues.push('selectedHunterIds must be an array');
+  } else {
+    const seen = new Set<string>();
+    for (const id of c.selectedHunterIds) {
+      if (typeof id !== 'string' || id.length === 0) {
+        issues.push('selectedHunterIds must contain non-empty string ids');
+        break;
+      }
+      if (seen.has(id)) {
+        issues.push('selectedHunterIds must not contain repeats');
+        break;
+      }
+      seen.add(id);
+    }
+    if (c.teamAssignment === 'selected' && c.selectedHunterIds.length !== c.hunterCount) {
+      issues.push('with teamAssignment selected, exactly hunterCount Hunters must be picked');
+    }
+    if (c.teamAssignment === 'random' && c.selectedHunterIds.length !== 0) {
+      issues.push('with teamAssignment random, no Hunters may be picked (Random clears the pick)');
+    }
+  }
+  if (c.hostOnSiteConfirmed !== true) {
+    issues.push('hostOnSiteConfirmed is required — the host confirms they are on site');
+  }
+  return issues;
 }
-export function validateHousePreset(p: HouseRulePreset): string[] {
-  const e: string[] = [];
-  if (!p.name.trim()) e.push('preset name is required');
-  if (p.name.trim().length > 40) e.push('preset name must be 40 characters or fewer');
-  e.push(...validateRules(p.rules));
-  return e;
+
+// ---------------------------------------------------------------------------
+// Catch token format (≥ 128 bits)
+// ---------------------------------------------------------------------------
+
+/** Fresh catch token: 32 uppercase hex chars = 128 bits. The old 12-char (48-bit) token is rejected. */
+export const CATCH_TOKEN_PATTERN = new RegExp(`^[0-9A-F]{${CATCH_TOKEN_HEX_LENGTH}}$`);
+
+/** A raw catch token is valid only in the fresh ≥128-bit form. */
+export function isValidCatchToken(token: unknown): token is string {
+  return typeof token === 'string' && CATCH_TOKEN_PATTERN.test(token);
 }
-export function classifyAccuracy(accuracyM: number, cal: { accuracyGoodMaxM: number; accuracyFairMaxM: number; accuracyPoorMaxM: number }): 'good' | 'fair' | 'poor' {
-  if (accuracyM <= cal.accuracyGoodMaxM) return 'good';
-  if (accuracyM <= cal.accuracyFairMaxM) return 'fair';
-  if (accuracyM <= cal.accuracyPoorMaxM) return 'poor';
-  return 'poor'; // poor accuracy is NEVER cheating evidence — it is only a quality tier (HNT-034)
+
+// ---------------------------------------------------------------------------
+// Accuracy tiers + balance + suggested radius
+// ---------------------------------------------------------------------------
+
+/**
+ * GPS accuracy tier. Thresholds are OPEN calibration (good ≤ 10 m, fair ≤ 25 m,
+ * poor ≤ 60 m). The SERVER decides the tier; poor accuracy warns, never rejects.
+ */
+export function classifyAccuracy(accuracyMeters: number): LocationQuality {
+  if (accuracyMeters <= ACCURACY_GOOD_M) return 'good';
+  if (accuracyMeters <= ACCURACY_FAIR_M) return 'fair';
+  return 'poor';
+}
+
+/**
+ * Hunter balance table: 3–4 → 1, 5–8 → 2, 9–16 → 3, 17–24 → 4, 25–30 → 5.
+ * OPEN calibration. Returns 1 for rosters below 3 (never called with < 3 at start).
+ */
+export function balancedHunterCount(playerCount: number): number {
+  for (const row of BALANCED_HUNTER_TABLE) {
+    if (playerCount >= row.minPlayers && playerCount <= row.maxPlayers) {
+      return row.hunters;
+    }
+  }
+  return 1;
+}
+
+/**
+ * Suggested zone radius: 200 m + 25 m per player beyond 3, capped at 1000 m
+ * as a starting point only. OPEN — never a requirement.
+ */
+export function suggestZoneRadiusMeters(playerCount: number): number {
+  const extra = Math.max(0, playerCount - 3) * SUGGESTED_ZONE_RADIUS_PER_PLAYER_M;
+  return Math.min(
+    SUGGESTED_ZONE_RADIUS_CAP_M,
+    Math.max(ZONE_RADIUS_MIN_M, SUGGESTED_ZONE_RADIUS_BASE_M + extra),
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Hello credential scan
+// ---------------------------------------------------------------------------
+
+const HELLO_CREDENTIAL_KEYS = new Set([
+  'token',
+  'ticket',
+  'password',
+  'authtoken',
+  'reconnecttoken',
+  'hosttoken',
+]);
+
+/**
+ * `hello` carries NO credential. Returns true if the payload contains a
+ * credential key anywhere (any depth, any casing) — such a hello is rejected
+ * with VALIDATION_FAILED and audited.
+ */
+export function helloHasCredential(payload: unknown): boolean {
+  const seen = new Set<object>();
+  const walk = (value: unknown): boolean => {
+    if (typeof value !== 'object' || value === null) return false;
+    if (seen.has(value)) return false;
+    seen.add(value);
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        if (walk(item)) return true;
+      }
+      return false;
+    }
+    for (const key of Object.keys(value)) {
+      if (HELLO_CREDENTIAL_KEYS.has(key.toLowerCase())) return true;
+      if (walk((value as Record<string, unknown>)[key])) return true;
+    }
+    return false;
+  };
+  return walk(payload);
 }

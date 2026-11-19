@@ -1,111 +1,148 @@
 'use client';
-import type { Player } from '@pakdam/shared';
-import { freshnessState } from '../match/freshness';
-import { isBlocked } from './report-block';
-import styles from './lobby.module.css';
 
-/** Lobby roster — redesigned 2026-11-17.
- *  Every row shows, in words as well as marks: who the player is, whether
- *  they are the host, whether they are ready, and how fresh their last
- *  location report is. Ready state is icon + word, never colour alone.
- *  Match roles are NOT assigned here and players do NOT pick a side:
- *  the host decides Hunter/Runner (Balance / Random / host-picked), so
- *  each row shows only readiness — no side preference badge.
- *  Tapping a player's name opens report / block for that player (not
- *  yourself, not the host seat's own row for the host). The host can
- *  remove a player from the lobby (not themselves, not the host seat)
- *  via `onRemove`; without it, no remove button is rendered. */
-export default function Roster({
+/**
+ * Roster — the Players card rows (SCRAM-SPEC §7.2).
+ *
+ * Join order, host first. Rounded-square initials avatar with a gold star
+ * on the host; HOST pill (host row only), READY pill (ready players only).
+ * Suspended rows show `✕ Suspended` + a freshness label. Roles are NOT
+ * shown in the lobby — roles are decided at start. Below the rows the
+ * card is empty dark space (ShadowHunt form — the emptiness is the
+ * design, so this component renders no empty-state copy).
+ */
+import { useState } from 'react';
+import type { PlayerView } from '@pakdam/shared';
+import { Pill } from '../ui/Pill';
+import { initialsForName } from '../../lib/utils';
+import { locationFreshnessLabel } from '../../lib/geolocation';
+
+export interface RosterProps {
+  players: PlayerView[];
+  hostPlayerId: string;
+  myPlayerId: string | null;
+  isHost: boolean;
+  /** When the host picks Hunters by hand (Random OFF). */
+  pickingHunters: boolean;
+  selectedHunterIds: string[];
+  hunterCount: number;
+  onToggleHunter?: (playerId: string) => void;
+  onRemove?: (playerId: string) => void;
+}
+
+function freshnessLabel(player: PlayerView): string {
+  if (!player.lastFixAt) return locationFreshnessLabel(null);
+  return locationFreshnessLabel(new Date(player.lastFixAt).getTime());
+}
+
+export function Roster({
   players,
-  meId,
+  hostPlayerId,
+  myPlayerId,
   isHost,
+  pickingHunters,
+  selectedHunterIds,
+  hunterCount,
+  onToggleHunter,
   onRemove,
-  onReport,
-}: {
-  players: Player[];
-  meId?: string | null;
-  isHost?: boolean;
-  onRemove?: (playerId: string, displayName: string) => void;
-  onReport?: (playerId: string, displayName: string) => void;
-}) {
+}: RosterProps) {
+  const [menuFor, setMenuFor] = useState<string | null>(null);
+  const active = players.filter((p) => p.leftAt === null);
+  const sorted = [...active].sort((a, b) => {
+    if (a.playerId === hostPlayerId) return -1;
+    if (b.playerId === hostPlayerId) return 1;
+    return a.joinedAt.localeCompare(b.joinedAt);
+  });
   return (
-    <ul className={styles.roster}>
-      {players.map((p) => {
-        const fresh = freshnessState(p.connectionState, p.lastFixAt);
-        const isMe = p.playerId === meId;
-        const blocked = !isMe && isBlocked(p.displayName);
-        const initials = p.displayName
-          .trim()
-          .split(/\s+/)
-          .map((w) => w[0])
-          .filter(Boolean)
-          .slice(0, 2)
-          .join('')
-          .toUpperCase() || '?';
-        const stateClass =
-          p.ejectedAt
-            ? styles.rosterStateSuspended
-            : p.connectionState === 'suspended'
-              ? styles.rosterStateSuspended
-              : p.isReady
-                ? styles.rosterStateReady
-                : styles.rosterStateWaiting;
-        const stateWord =
-          p.ejectedAt
-            ? '✕ Ejected'
-            : p.connectionState === 'suspended'
-              ? '✕ Suspended'
-              : p.isReady
-                ? '✓ Ready'
-                : '… Not ready yet';
+    <ul className="divide-y divide-[#26262B]">
+      {sorted.map((player) => {
+        const isPlayerHost = player.playerId === hostPlayerId;
+        const suspended = player.connectionState === 'suspended';
+        const ejected = player.ejectedAt !== null;
+        const selected = selectedHunterIds.includes(player.playerId);
+        const pickable = pickingHunters && isHost && !ejected;
         return (
-          <li key={p.playerId} className={styles.rosterRow}>
-            <span className={`${styles.avatar} ${isMe ? styles.avatarMe : ''}`} aria-hidden="true">
-              {initials}
-            </span>
-            <div className={styles.rosterMain}>
-              <div className={styles.rosterName}>
-                {onReport && !isMe ? (
-                  <button
-                    type="button"
-                    className={styles.rosterNameBtn}
-                    onClick={() => onReport(p.playerId, p.displayName)}
-                    aria-label={`Report or block ${p.displayName}`}
-                    title="Tap to report or block this player"
-                  >
-                    {p.displayName}
-                  </button>
-                ) : (
-                  p.displayName
-                )}
-                {p.isHost ? <span className="tag">Host</span> : null}
-                {isMe ? <span className="tag">You</span> : null}
-                {blocked ? <span className={styles.blockedBadge}>Blocked by you</span> : null}
-              </div>
-              <div className={styles.rosterMeta}>
-                {fresh.label}
-                {p.suspensionCount > 0 ? ` · suspended ${p.suspensionCount}× before` : ''}
-                {p.ejectedAt ? ' · ejected — outside the play zone for 30 seconds' : ''}
-              </div>
-            </div>
-            <span className={`${styles.rosterState} ${stateClass}`}>{stateWord}</span>
-            {isHost && onRemove && !p.isHost && p.playerId !== meId ? (
+          <li key={player.playerId} className="flex items-center gap-3 py-3 first:pt-0 last:pb-0">
+            {pickable ? (
               <button
                 type="button"
-                className={styles.removeBtn}
-                onClick={() => {
-                  if (window.confirm(`Remove ${p.displayName} from this lobby? They will have to join again with the room code.`)) {
-                    onRemove(p.playerId, p.displayName);
-                  }
-                }}
-                aria-label={`Remove ${p.displayName} from the lobby`}
+                aria-label={`Pick ${player.displayName} as Hunter`}
+                aria-pressed={selected}
+                onClick={() => onToggleHunter?.(player.playerId)}
+                className={`flex h-6 w-6 shrink-0 items-center justify-center rounded-[6px] border text-[13px] font-bold ${
+                  selected
+                    ? 'border-[#EF4444] bg-[#EF4444] text-white'
+                    : 'border-[#26262B] bg-[#1E1E22] text-transparent'
+                }`}
               >
-                Remove
+                ✓
               </button>
+            ) : null}
+            <span className="relative flex h-11 w-11 shrink-0 items-center justify-center rounded-[10px] bg-[#1E1E22] text-[15px] font-bold text-white">
+              {initialsForName(player.displayName)}
+              {isPlayerHost ? (
+                <span
+                  aria-label="Host"
+                  className="absolute -left-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-[#F59E0B] text-[10px] text-black"
+                >
+                  ★
+                </span>
+              ) : null}
+            </span>
+            <span className="min-w-0 flex-1">
+              <span className="block truncate text-[15px] font-bold text-white">
+                {player.displayName}
+                {player.playerId === myPlayerId ? ' (you)' : ''}
+              </span>
+              {suspended ? (
+                <span className="block text-[13px] text-[#A1A1AA]">
+                  ✕ Suspended · {freshnessLabel(player)}
+                </span>
+              ) : ejected ? (
+                <span className="block text-[13px] text-[#A1A1AA]">Ejected</span>
+              ) : player.lastFixAt ? (
+                <span className="block text-[13px] text-[#A1A1AA]">
+                  {freshnessLabel(player)}
+                </span>
+              ) : null}
+            </span>
+            {isPlayerHost ? <Pill tone="host">HOST</Pill> : null}
+            {player.isReady ? <Pill tone="ready">READY</Pill> : null}
+            {pickingHunters && selected ? <Pill tone="hunter">Hunter</Pill> : null}
+            {isHost && !isPlayerHost ? (
+              <span className="relative shrink-0">
+                <button
+                  type="button"
+                  aria-label={`Options for ${player.displayName}`}
+                  aria-expanded={menuFor === player.playerId}
+                  onClick={() => setMenuFor((m) => (m === player.playerId ? null : player.playerId))}
+                  className="px-2 text-[18px] font-bold text-[#A1A1AA]"
+                >
+                  ···
+                </button>
+                {menuFor === player.playerId ? (
+                  <span className="absolute right-0 top-9 z-10 flex flex-col rounded-[10px] border border-[#26262B] bg-[#1E1E22] py-1 shadow-lg">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setMenuFor(null);
+                        onRemove?.(player.playerId);
+                      }}
+                      className="px-4 py-2 text-left text-[15px] font-semibold text-[#EF4444]"
+                    >
+                      Remove
+                    </button>
+                  </span>
+                ) : null}
+              </span>
             ) : null}
           </li>
         );
       })}
+      {pickingHunters && isHost ? (
+        <li className="pt-3 text-[13px] text-[#A1A1AA]">
+          {selectedHunterIds.length} of {hunterCount} Hunters picked — tap a player to pick them.
+        </li>
+      ) : null}
     </ul>
   );
 }

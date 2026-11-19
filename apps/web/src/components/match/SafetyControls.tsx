@@ -1,25 +1,134 @@
+/**
+ * SafetyControls — safety during play (SCRAM-SPEC §8c–d, BEHAVIOUR §2).
+ *
+ * No safety theatre: every label says what the control actually does.
+ *
+ * - SOS alerts the host in this game. Pakdam is NOT an emergency service
+ *   and does not call police or ambulance. (Exact `SOS_COPY`.) In demo
+ *   mode SOS notifies nobody — the demo copy says so plainly.
+ * - Safety pause freezes the match clock for everyone; resume returns to
+ *   the phase paused from, never hard-codes ACTIVE. Any player may pause.
+ * - "I'm safe" travels as an announcement to everyone in the room.
+ *
+ * SOS is one tap away on the play screen at all times. When an SOS is
+ * active, the host sees who raised it; the player who raised it sees that
+ * the host has been alerted.
+ */
 'use client';
-import { SOS_COPY } from '@pakdam/engine';
-/** Safety bar — always visible, never obscured (24 S05). SOS is alert red
- *  with white text (4.83:1). The bar is sticky at the bottom of the play
- *  screen. "I'm safe" is a Runner check-in, separate from SOS: it tells
- *  the host you are OK without raising an alarm. SOS asks once to confirm
- *  (it shares your position with the host and pauses the match), so a
- *  pocket tap cannot fire it by accident. */
-export default function SafetyControls({
-  onPause, onSos, onLeave, paused, onSafe,
-}: {
-  onPause: () => void; onSos: () => void; onLeave: () => void; paused: boolean; onSafe?: () => void;
-}) {
+
+import type { MatchPhase } from '@pakdam/shared';
+import { SOS_COPY } from '@pakdam/shared';
+import { SOS_DEMO_COPY } from '@/lib/demo-store';
+import { Button } from '@/components/ui/Button';
+
+export interface SafetyControlsProps {
+  phase: MatchPhase;
+  paused: boolean;
+  pausedByName: string | null;
+  /** The phase to return to on resume (demo knows it; live keeps it server-side). */
+  pausedFrom: MatchPhase | null;
+  sosActive: boolean;
+  sosByName: string | null;
+  /** True when the viewer is the host (sees who raised an SOS). */
+  isHost: boolean;
+  /** True when I raised the SOS currently active. */
+  sosIsMine: boolean;
+  /** Demo mode: SOS notifies nobody. */
+  isDemo: boolean;
+  canPause: boolean;
+  onSos: () => void;
+  onPause: () => void;
+  onResume: () => void;
+  onAnnounceSafe: () => void;
+}
+
+export function SafetyControls({
+  phase,
+  paused,
+  pausedByName,
+  pausedFrom,
+  sosActive,
+  sosByName,
+  isHost,
+  sosIsMine,
+  isDemo,
+  canPause,
+  onSos,
+  onPause,
+  onResume,
+  onAnnounceSafe,
+}: SafetyControlsProps) {
+  const pausable = canPause && (phase === 'HEAD_START' || phase === 'ACTIVE');
+
   return (
-    <div>
-      <div className="safety" role="group" aria-label="Safety controls — always visible">
-        <button type="button" onClick={onPause} aria-label="Safety pause — pauses the match for everyone" style={{ minHeight: 52 }}>{paused ? '▶ Resume game' : '❚❚ Safety pause'}</button>
-        <button type="button" className="danger" aria-label="SOS — shares your position with the host" style={{ minHeight: 52 }} onClick={() => { if (window.confirm(SOS_COPY)) onSos(); }}>SOS</button>
-        {onSafe ? <button type="button" onClick={onSafe} aria-label="I'm safe — check in with the host" style={{ minHeight: 52 }}>✓ I’m safe</button> : null}
-        <button type="button" onClick={onLeave} aria-label="Leave game — stops sharing your location" style={{ minHeight: 52 }}>Leave / Stop sharing</button>
+    <div className="flex flex-col gap-4">
+      {/* SOS — always one tap away during play. */}
+      <div>
+        <Button variant="primary" onClick={onSos} disabled={sosActive && sosIsMine}>
+          {sosActive && sosIsMine ? 'SOS sent' : 'SOS'}
+        </Button>
+        <p className="mt-2 text-[13px] text-[#A1A1AA]">{isDemo ? SOS_DEMO_COPY : SOS_COPY}</p>
+        {sosActive && isHost && sosByName ? (
+          <p className="mt-2 text-[14px] font-semibold text-[#EF4444]">
+            SOS raised by {sosByName} — check on them.
+          </p>
+        ) : null}
+        {sosActive && sosIsMine && !isHost ? (
+          <p className="mt-2 text-[14px] font-semibold text-[#EF4444]">
+            SOS sent — the host has been alerted.
+          </p>
+        ) : null}
       </div>
-      <p className="small">Safety pause, SOS, “I’m safe” and Leave work only while this app is open and your screen is on. {SOS_COPY}</p>
+
+      {/* Safety pause — freezes the clock; resume returns to the phase paused from. */}
+      <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
+        {paused ? (
+          <>
+            <p className="text-[15px] font-bold text-white">
+              Match paused{pausedByName ? ` by ${pausedByName}` : ''} — clock frozen.
+            </p>
+            {pausedFrom ? (
+              <p className="mt-1 text-[13px] text-[#A1A1AA]">
+                Resume returns to {pausedFrom === 'HEAD_START' ? 'the head start' : 'live play'}.
+              </p>
+            ) : null}
+            <Button variant="outline" onClick={onResume} className="mt-3">
+              Resume the match
+            </Button>
+          </>
+        ) : (
+          <>
+            <p className="text-[15px] font-bold text-white">Safety pause</p>
+            <p className="mt-1 text-[13px] text-[#A1A1AA]">
+              Pauses the match for everyone and freezes the clock.
+            </p>
+            <Button
+              variant="outline"
+              onClick={onPause}
+              disabled={!pausable}
+              className="mt-3"
+            >
+              Pause the match
+            </Button>
+            {!pausable ? (
+              <p className="mt-2 text-[13px] text-[#A1A1AA]">
+                The match can&apos;t be paused right now.
+              </p>
+            ) : null}
+          </>
+        )}
+      </div>
+
+      {/* Tell everyone — an announcement, not a command. */}
+      <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
+        <p className="text-[15px] font-bold text-white">Tell everyone</p>
+        <p className="mt-1 text-[13px] text-[#A1A1AA]">
+          Sends &ldquo;I&rsquo;m safe&rdquo; to everyone in the room.
+        </p>
+        <Button variant="ghost" onClick={onAnnounceSafe} className="mt-3">
+          I&rsquo;m safe
+        </Button>
+      </div>
     </div>
   );
 }

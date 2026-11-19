@@ -1,173 +1,205 @@
 /**
- * GPS VALIDATION — server-side fix checks (founder-approved final
- * stack, 2026-11-17). Every location fix the Durable Object accepts
- * passes through `validateFix` before it can move a player, count
- * outside-zone seconds, or confirm a catch.
+ * Pakdam GPS rules — fix validation, the ±50 m auto-centre / send rule,
+ * fix-quality handling, freshness labels, catch-proximity plausibility.
  *
- * Checks, in order:
- *   1. Shape/range — lat/lng in range, accuracy finite and > 0,
- *      timestamp a real ISO date. Malformed fixes are REJECTED
- *      (they are never a player's fault to punish — they are dropped).
- *   2. Timestamp — a fix from the future (beyond clock skew) or
- *      older than the staleness limit is REJECTED as stale/future
- *      (a replayed or mis-clocked fix must not move a player).
- *   3. Duplicate — byte-identical to the previous accepted fix
- *      (same lat/lng/accuracy/at) is REJECTED as a duplicate update
- *      (retransmits and double-sends must not double-count).
- *   4. Accuracy tier — good/fair/poor via `classifyAccuracy`
- *      (CALIBRATION_OPEN tiers). Poor accuracy is NEVER a rejection
- *      and NEVER cheating evidence (HNT-034): it only warns, and the
- *      outside-zone countdown PAUSES while the fix is poor (founder
- *      decision, docs/DECISIONS.md).
- *   5. Impossible movement — the speed from the previous accepted
- *      fix exceeds the plausible maximum. This WARNS, never rejects:
- *      indoor GPS drift and urban multipath routinely produce
- *      jumps, and an honest player must never be ejected for them.
- *      The warning is a flag for the host, not a punishment.
- *   6. Server-side proximity — `verifyCatchProximity` checks the
- *      hunter/runner distance against the plausibility radius. It
- *      is PLAUSIBILITY ONLY, never proof (HNT-053): a catch is
- *      confirmed by the QR/manual flow, never by GPS alone.
- *
- * THRESHOLDS ARE CALIBRATION OPEN — generous placeholders, not
- * measured facts. `MAX_PLAUSIBLE_SPEED_MPS`, `CLOCK_SKEW_MS` and
- * `STALE_FIX_MS` below must be replaced by field-test measurements
- * before the external pilot (see docs/DECISIONS.md, calibration
- * section). The code is written so a threshold change is one
- * constant, and so a warn never becomes a punishment by accident:
- * only `reject` verdicts drop a fix, and only malformed / future /
- * stale / duplicate fixes are rejected.
+ * Foundational rules:
+ *  - Only fixes accurate to ±50 m or better are ever sent.
+ *  - Poor accuracy is warned, never treated as cheating, never a rejection.
+ *  - GPS is supporting evidence for a catch only — never proof, never a
+ *    rejection on its own.
+ *  - Foreground-only: location stops when the tab hides.
  */
-import { CALIBRATION_OPEN } from './calibration.js';
-import { ZONE_AUTO_CENTRE_MAX_ACCURACY_M } from './types.js';
+import {
+  CLOCK_SKEW_MS,
+  LOCATION_FRESHNESS_SECONDS,
+  MAX_PLAUSIBLE_SPEED_MPS,
+  STALE_FIX_MS,
+  ZONE_AUTO_CENTRE_MAX_ACCURACY_M,
+  CATCH_PROXIMITY_PLAUSIBILITY_M,
+} from './calibration.js';
+import type { GeoPoint, LocationFix, LocationQuality } from './types.js';
 import { classifyAccuracy } from './validation.js';
-import type { LocationQuality } from './types.js';
-import { haversineMeters } from './validation.js';
 
-/** Generous placeholder: 30 m/s ≈ 108 km/h. A player on foot cannot
- *  sustain it; a car can. CALIBRATION OPEN — measure in the field
- *  (urban multipath routinely reports 10–20 m/s jumps for a
- *  stationary phone). Warn only, never reject. */
-export const MAX_PLAUSIBLE_SPEED_MPS = 30;
-/** Clock skew tolerated between a player's phone clock and the
- *  server clock. CALIBRATION OPEN — 5 min is generous on purpose. */
-export const CLOCK_SKEW_MS = 5 * 60 * 1000;
-/** A fix older than this on arrival is stale. CALIBRATION OPEN —
- *  60 s matches the disconnect-grace placeholder. */
-export const STALE_FIX_MS = 60 * 1000;
+// ---------------------------------------------------------------------------
+// Fix validation
+// ---------------------------------------------------------------------------
 
-export type FixVerdict = 'accept' | 'warn' | 'reject';
-
-export interface FixValidation {
-  verdict: FixVerdict;
-  quality: LocationQuality;
-  /** Human-readable reasons, in order found. Empty when accepted. */
-  issues: string[];
-  /** Speed from the previous fix, when computable (m/s). */
-  speedMps: number | null;
-}
-
-export interface PreviousFix {
-  lat: number;
-  lng: number;
-  accuracyMeters: number;
-  at: string;
-}
-
-/** Validate one fix. `now` is the server time (defaults to now);
- *  `previous` is the player's last ACCEPTED fix, when one exists.
- *  The fix shape is minimal on purpose (lat/lng/accuracy/at) so
- *  both the wire shape (capturedAt) and the stored LocationFix can
- *  be validated through the same function. */
-export function validateFix(
-  fix: { lat: number; lng: number; accuracyMeters: number; at: string },
-  opts: { now?: Date; previous?: PreviousFix | null } = {},
-): FixValidation {
-  const now = opts.now ?? new Date();
-  const issues: string[] = [];
-  const quality: LocationQuality = classifyAccuracy(fix.accuracyMeters, CALIBRATION_OPEN);
-
-  // 1. Shape/range — reject malformed fixes outright.
-  if (!Number.isFinite(fix.lat) || fix.lat < -90 || fix.lat > 90) {
-    return { verdict: 'reject', quality: 'unknown', issues: ['latitude out of range (-90–90)'], speedMps: null };
-  }
-  if (!Number.isFinite(fix.lng) || fix.lng < -180 || fix.lng > 180) {
-    return { verdict: 'reject', quality: 'unknown', issues: ['longitude out of range (-180–180)'], speedMps: null };
-  }
-  if (!Number.isFinite(fix.accuracyMeters) || fix.accuracyMeters <= 0) {
-    return { verdict: 'reject', quality: 'unknown', issues: ['accuracy must be a positive finite number of metres'], speedMps: null };
-  }
-  const atMs = Date.parse(fix.at);
-  if (Number.isNaN(atMs)) {
-    return { verdict: 'reject', quality: 'unknown', issues: ['timestamp is not a valid date-time'], speedMps: null };
-  }
-
-  // 2. Timestamp — future beyond skew, or stale on arrival.
-  if (atMs > now.getTime() + CLOCK_SKEW_MS) {
-    return { verdict: 'reject', quality, issues: [`fix timestamp is ${(Math.round((atMs - now.getTime()) / 1000))} s in the future — clock skew or replay`], speedMps: null };
-  }
-  if (now.getTime() - atMs > STALE_FIX_MS) {
-    return { verdict: 'reject', quality, issues: [`fix is ${Math.round((now.getTime() - atMs) / 1000)} s old — stale location`], speedMps: null };
-  }
-
-  const prev = opts.previous ?? null;
-  // 3. Duplicate — identical to the previous accepted fix.
-  if (prev && prev.lat === fix.lat && prev.lng === fix.lng && prev.accuracyMeters === fix.accuracyMeters && prev.at === fix.at) {
-    return { verdict: 'reject', quality, issues: ['duplicate of the previous fix — retransmit ignored'], speedMps: 0 };
-  }
-
-  // 4. Accuracy tier — poor accuracy warns; it never rejects.
-  if (quality === 'poor') {
-    issues.push(`GPS accuracy is poor (±${Math.round(fix.accuracyMeters)} m) — treat the position as approximate`);
-  }
-
-  // 5. Impossible movement — warn only, never reject.
-  let speedMps: number | null = null;
-  if (prev) {
-    const prevMs = Date.parse(prev.at);
-    const dtSeconds = (atMs - prevMs) / 1000;
-    if (dtSeconds > 0) {
-      const dist = haversineMeters(prev.lat, prev.lng, fix.lat, fix.lng);
-      speedMps = dist / dtSeconds;
-      if (speedMps > MAX_PLAUSIBLE_SPEED_MPS) {
-        issues.push(`impossible movement: ${Math.round(speedMps)} m/s from the previous fix (limit ${MAX_PLAUSIBLE_SPEED_MPS} m/s) — likely GPS jump, not a real move`);
-      }
-    }
-  }
-
-  return { verdict: issues.length ? 'warn' : 'accept', quality, issues, speedMps };
-}
-
-/** Server-side proximity verification for a catch: is the hunter
- *  plausibly near the runner? Returns the distance and whether it
- *  is within the plausibility radius. PLAUSIBILITY ONLY — a catch
- *  is confirmed by the QR/manual flow, never by this check, and a
- *  failed check never rejects a catch on its own (it flags it for
- *  the host). Threshold: CALIBRATION_OPEN `catchProximityPlausibilityM`. */
-export function verifyCatchProximity(
-  hunter: { lat: number; lng: number },
-  runner: { lat: number; lng: number },
-): { distanceMeters: number; plausible: boolean; plausibilityRadiusM: number } {
-  const distanceMeters = haversineMeters(hunter.lat, hunter.lng, runner.lat, runner.lng);
-  const plausibilityRadiusM = CALIBRATION_OPEN.catchProximityPlausibilityM;
-  return { distanceMeters, plausible: distanceMeters <= plausibilityRadiusM, plausibilityRadiusM };
+export interface FixValidationResult {
+  /** False when an `errors` entry exists; warnings never fail a fix. */
+  ok: boolean;
+  /** Hard rejections: shape/range, bad timestamp, clock skew, stale, exact duplicate. */
+  errors: string[];
+  /** Soft warnings: poor accuracy, impossible movement. Never a rejection. */
+  warnings: string[];
+  /** Quality tier of the fix (null when the fix is rejected). */
+  quality: LocationQuality | null;
 }
 
 /**
- * Zone auto-centre rule (founder, 2026-11-17 — FIXED, not
- * calibration): only a GPS fix within ±50 m
- * (ZONE_AUTO_CENTRE_MAX_ACCURACY_M) may auto-centre the play zone.
- * A coarser fix NEVER places or moves the zone — the host places it
- * by hand instead (tap the map / drag the centre pin). A missing,
- * non-finite or non-positive accuracy is never good enough.
+ * Validate one fix (`validateFix`).
+ * Rejects: bad shape/range (lat ±90, lng ±180, accuracy > 0 finite, valid
+ * timestamp), timestamp > 5 min in the future (clock skew / replay), a fix
+ * > 60 s old on arrival, an exact duplicate of the previous accepted fix.
+ * Warns only: poor accuracy, impossible movement (> 30 m/s from the previous
+ * fix). `nowMs` defaults to Date.now(); pass it explicitly in tests.
  */
-export function canAutoCentreZone(accuracyMeters: number | null | undefined): boolean {
-  return typeof accuracyMeters === 'number' &&
-    Number.isFinite(accuracyMeters) &&
-    accuracyMeters > 0 &&
-    accuracyMeters <= ZONE_AUTO_CENTRE_MAX_ACCURACY_M;
+export function validateFix(
+  fix: unknown,
+  previousFix?: LocationFix | null,
+  nowMs: number = Date.now(),
+): FixValidationResult {
+  const errors: string[] = [];
+  const warnings: string[] = [];
+
+  if (typeof fix !== 'object' || fix === null) {
+    return { ok: false, errors: ['fix must be an object'], warnings, quality: null };
+  }
+  const f = fix as Partial<LocationFix>;
+  if (
+    typeof f.lat !== 'number' ||
+    !Number.isFinite(f.lat) ||
+    f.lat < -90 ||
+    f.lat > 90 ||
+    typeof f.lng !== 'number' ||
+    !Number.isFinite(f.lng) ||
+    f.lng < -180 ||
+    f.lng > 180
+  ) {
+    errors.push('fix latitude must be ±90 and longitude ±180');
+  }
+  if (typeof f.accuracyMeters !== 'number' || !Number.isFinite(f.accuracyMeters) || f.accuracyMeters <= 0) {
+    errors.push('fix accuracyMeters must be a finite number greater than 0');
+  }
+  if (typeof f.timestampMs !== 'number' || !Number.isFinite(f.timestampMs)) {
+    errors.push('fix timestampMs must be a finite epoch-milliseconds number');
+  }
+  if (errors.length > 0) {
+    return { ok: false, errors, warnings, quality: null };
+  }
+
+  const timestampMs = f.timestampMs as number;
+  if (timestampMs - nowMs > CLOCK_SKEW_MS) {
+    errors.push('fix timestamp is too far in the future (clock skew or replay)');
+  }
+  if (nowMs - timestampMs > STALE_FIX_MS) {
+    errors.push('fix is too old on arrival');
+  }
+  if (errors.length > 0) {
+    return { ok: false, errors, warnings, quality: null };
+  }
+
+  if (
+    previousFix !== null &&
+    previousFix !== undefined &&
+    f.lat === previousFix.lat &&
+    f.lng === previousFix.lng &&
+    f.accuracyMeters === previousFix.accuracyMeters &&
+    timestampMs === previousFix.timestampMs
+  ) {
+    errors.push('fix is an exact duplicate of the previous accepted fix');
+    return { ok: false, errors, warnings, quality: null };
+  }
+
+  const accuracyMeters = f.accuracyMeters as number;
+  const quality = classifyAccuracy(accuracyMeters);
+  if (quality === 'poor') {
+    warnings.push('poor GPS accuracy — warned, never treated as cheating');
+  }
+  if (previousFix !== null && previousFix !== undefined) {
+    const dtSeconds = Math.max(0, (timestampMs - previousFix.timestampMs) / 1000);
+    if (dtSeconds > 0) {
+      const speed = haversineMeters(previousFix, { lat: f.lat as number, lng: f.lng as number }) / dtSeconds;
+      if (speed > MAX_PLAUSIBLE_SPEED_MPS) {
+        warnings.push('impossible movement from the previous fix — warned, never rejected');
+      }
+    }
+  }
+  return { ok: true, errors, warnings, quality };
 }
 
-/** Re-exported for consumers that need the distance helper without
- *  importing the whole validation module. */
-export { haversineMeters };
+// ---------------------------------------------------------------------------
+// The ±50 m rule
+// ---------------------------------------------------------------------------
+
+/**
+ * Can the zone be auto-centred on this fix? Never on a fix worse than ±50 m —
+ * the host places the zone by hand instead.
+ */
+export function canAutoCentreZone(fix: LocationFix): boolean {
+  return fix.accuracyMeters <= ZONE_AUTO_CENTRE_MAX_ACCURACY_M;
+}
+
+/**
+ * May this fix be sent at all? Same ±50 m rule: a fix worse than that is
+ * never sent and the UI says so plainly.
+ */
+export function isFixSendable(fix: LocationFix): boolean {
+  return canAutoCentreZone(fix);
+}
+
+// ---------------------------------------------------------------------------
+// Freshness — "Location never reported"
+// ---------------------------------------------------------------------------
+
+/** Per-player location status for the snapshot: 'known' only while a fresh foreground fix is held. */
+export type LocationStatus = 'known' | 'unknown';
+
+/**
+ * Location status from the last fix timestamp. `lastFixAtMs` null means the
+ * player has never reported a fix. Freshness window is OPEN calibration (30 s).
+ */
+export function locationStatusForPlayer(lastFixAtMs: number | null, nowMs: number = Date.now()): LocationStatus {
+  if (lastFixAtMs === null) return 'unknown';
+  return nowMs - lastFixAtMs <= LOCATION_FRESHNESS_SECONDS * 1000 ? 'known' : 'unknown';
+}
+
+/**
+ * Plain-words freshness label for a roster row.
+ * - null → "Location never reported"
+ * - stale → "Location unknown"
+ * - fresh → "Last fix 0:20 ago"
+ */
+export function locationFreshnessLabel(lastFixAtMs: number | null, nowMs: number = Date.now()): string {
+  if (lastFixAtMs === null) return 'Location never reported';
+  const ageSeconds = Math.max(0, Math.floor((nowMs - lastFixAtMs) / 1000));
+  if (ageSeconds > LOCATION_FRESHNESS_SECONDS) return 'Location unknown';
+  return `Last fix ${formatAgeLabel(ageSeconds)} ago`;
+}
+
+/** Format an age in seconds as `m:ss` (e.g. 20 → "0:20", 125 → "2:05"). */
+export function formatAgeLabel(totalSeconds: number): string {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  return `${minutes}:${String(remainder).padStart(2, '0')}`;
+}
+
+// ---------------------------------------------------------------------------
+// Catch proximity + haversine
+// ---------------------------------------------------------------------------
+
+/**
+ * Catch-proximity plausibility: hunter↔runner distance vs 15 m (OPEN).
+ * Plausibility only — never proof, and a failed check never rejects a catch
+ * on its own. Absent/stale GPS is "no GPS evidence", never negative evidence.
+ */
+export function verifyCatchProximity(
+  hunterFix: LocationFix,
+  runnerFix: LocationFix,
+): { distanceMeters: number; plausible: boolean } {
+  const distanceMeters = haversineMeters(hunterFix, runnerFix);
+  return { distanceMeters, plausible: distanceMeters <= CATCH_PROXIMITY_PLAUSIBILITY_M };
+}
+
+/** Great-circle distance in metres between two points. */
+export function haversineMeters(a: GeoPoint, b: GeoPoint): number {
+  const earthRadiusM = 6_371_000;
+  const toRadians = (degrees: number): number => (degrees * Math.PI) / 180;
+  const dLat = toRadians(b.lat - a.lat);
+  const dLng = toRadians(b.lng - a.lng);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLng = Math.sin(dLng / 2);
+  const h =
+    sinLat * sinLat + Math.cos(toRadians(a.lat)) * Math.cos(toRadians(b.lat)) * sinLng * sinLng;
+  return 2 * earthRadiusM * Math.asin(Math.min(1, Math.sqrt(h)));
+}

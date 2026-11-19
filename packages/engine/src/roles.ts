@@ -1,66 +1,196 @@
-import type { MatchRole, Player, Team, TeamAssignment } from '@pakdam/shared';
-/** Balanced-Hunter table (location-first redesign, Nov 2026).
- *  3–4 players -> 1 Hunter; 5–8 -> 2; 9–16 -> 3; 17–24 -> 4;
- *  25–30 -> 5. That is the table the host screen shows ("2 for 6
- *  players, 3 for 16"). The ladder keeps the Hunter share roughly
- *  flat as the roster grows to the 30-player cap (founder, 2026-11-17),
- *  instead of leaving 30 players with the same 3 Hunters as 9.
- *  It is a starting point, NOT a measured value — calibration OPEN:
- *  field evidence (fairness, catch rates, match length) must replace
- *  it before any public pilot. */
-export function balancedHunterCount(totalPlayers: number): number {
-  if (totalPlayers <= 4) return 1;
-  if (totalPlayers <= 8) return 2;
-  if (totalPlayers <= 16) return 3;
-  if (totalPlayers <= 24) return 4;
-  return 5;
+/**
+ * Pakdam engine — host-controlled teams.
+ *
+ * Teams are host-controlled, never self-picked. Balance ON (default) sets
+ * the Hunter count from the roster at start (3–4 → 1, 5–8 → 2, 9–16 → 3,
+ * 17–24 → 4, 25–30 → 5); Balance OFF lets the host pick a count with a
+ * stepper. Random ON (default) draws Hunters at random (Fisher–Yates);
+ * Random OFF lets the host tap roster names to pick them. Roles are drawn
+ * once, at head start, and never re-drawn.
+ *
+ * The balance table itself lives in @pakdam/shared (`BALANCED_HUNTER_TABLE`
+ * / `balancedHunterCount`); this module applies the host toggles around it.
+ */
+import {
+  BALANCED_HUNTER_TABLE,
+  MAX_PLAYERS,
+  MIN_PLAYERS,
+  balancedHunterCount,
+  type MatchRole,
+  type Team,
+  type TeamAssignment,
+} from '@pakdam/shared';
+
+export { BALANCED_HUNTER_TABLE, balancedHunterCount };
+
+/** Minimal seat shape role assignment needs. */
+export interface RolePlayer {
+  playerId: string;
 }
-export interface RoleAssignmentOptions {
-  /** 'random' (default): first `hunterCount` players by join order are
-   *  Hunters. Deterministic in the demo so tests can assert it; the
-   *  production server must shuffle instead of using join order.
-   *  'selected': `selectedHunterIds` (exactly hunterCount, all joined
-   *  players) are Hunters; everyone else is a Runner. */
-  teamAssignment?: TeamAssignment;
-  selectedHunterIds?: string[];
-  /** True = draw the Hunters at random (Fisher–Yates shuffle with
-   *  Math.random) instead of taking the first `hunterCount` in join
-   *  order. The host screen sets this when "Random hunters" is ON.
-   *  Default false: legacy join-order draw, which existing rooms
-   *  rely on (the host is first, so the host is the Hunter). */
-  shuffle?: boolean;
+
+/** Host toggles that decide how roles are drawn. */
+export interface RoleDrawOptions {
+  /** Balance ON: Hunter count comes from the roster size. OFF: host stepper. */
+  balanceHunters: boolean;
+  /** Random ON: Hunters are drawn at random. OFF: host taps roster names. */
+  randomDraw: boolean;
+  /** 'random' | 'selected' team assignment from the room config. */
+  teamAssignment: TeamAssignment;
+  /** Host-picked Hunter count (stepper value); used when Balance is OFF. */
+  hostHunterCount: number;
+  /** Host-picked Hunter ids; used when Random is OFF / assignment 'selected'. */
+  selectedHunterIds: readonly string[];
+  /**
+   * The Hunter count the host pick was made against. When Balance later
+   * changes the effective count, a pick that matched this count is stale —
+   * the start draws at random instead of blocking. A pick that never
+   * matched this count is genuinely short and is rejected. Defaults to the
+   * effective Hunter count (i.e. the pick was made against the current count).
+   */
+  pickHunterCount?: number;
+  /**
+   * Random source (defaults to `Math.random`). Pass a seeded function in
+   * tests / the demo so a draw is reproducible.
+   */
+  random?: () => number;
 }
-/** Assign match roles server-side. Host designation is separate (Player.isHost). */
-export function assignRoles(players: Player[], hunterCount: number, opts: RoleAssignmentOptions = {}): Player[] {
-  if (players.length < 3) throw new Error('INVALID_STATE: need at least 3 players');
-  if (hunterCount < 1 || hunterCount >= players.length) throw new Error('VALIDATION_FAILED: hunterCount');
-  const assignment = opts.teamAssignment ?? 'random';
-  let hunterIds: Set<string>;
-  if (assignment === 'selected') {
-    const ids = opts.selectedHunterIds ?? [];
-    if (ids.length !== hunterCount) throw new Error('VALIDATION_FAILED: selectedHunterIds must hold exactly hunterCount players');
-    if (new Set(ids).size !== ids.length) throw new Error('VALIDATION_FAILED: selectedHunterIds must not repeat a player');
-    const joined = new Set(players.map((p) => p.playerId));
-    if (ids.some((id) => !joined.has(id))) throw new Error('VALIDATION_FAILED: selectedHunterIds must be joined players');
-    hunterIds = new Set(ids);
-  } else {
-    // Random draw: shuffle the roster first so the Hunters are a real
-    // random draw, not the first joiners. With shuffle off (default),
-    // the legacy join-order draw is kept for the demo board.
-    const order = [...players];
-    if (opts.shuffle) {
-      for (let i = order.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        const tmp = order[i]!;
-        order[i] = order[j]!;
-        order[j] = tmp;
-      }
+
+export type AssignRolesResult =
+  | {
+      ok: true;
+      /** Hunter count actually drawn (balance-derived or host-picked). */
+      hunterCount: number;
+      hunterIds: string[];
+      runnerIds: string[];
+      /** Role + team per seat. */
+      assignments: Record<string, { matchRole: MatchRole; team: Team }>;
     }
-    hunterIds = new Set(order.slice(0, hunterCount).map((p) => p.playerId));
+  | { ok: false; reason: string };
+
+/**
+ * Effective Hunter count for a roster: Balance ON reads the table from the
+ * roster size; Balance OFF uses the host's stepper value (clamped to
+ * 1..rosterSize−1).
+ */
+export function resolveHunterCount(input: {
+  balanceHunters: boolean;
+  rosterSize: number;
+  hostHunterCount: number;
+}): number {
+  if (input.balanceHunters) return balancedHunterCount(input.rosterSize);
+  const max = Math.max(1, input.rosterSize - 1);
+  return Math.min(Math.max(1, Math.floor(input.hostHunterCount)), max);
+}
+
+/**
+ * Validate a host-picked Hunter list: exactly `hunterCount` ids, all joined,
+ * no repeats. Returns the problem in plain words, or null when the pick is
+ * valid. A pick that matched the stored `hunterCount` when made never blocks
+ * the start even if Balance later changed the effective count — the caller
+ * then draws at random instead (see `assignRoles`).
+ */
+export function validateSelectedHunters(input: {
+  selectedHunterIds: readonly string[];
+  hunterCount: number;
+  joinedPlayerIds: readonly string[];
+}): string | null {
+  const joined = new Set(input.joinedPlayerIds);
+  const unique = new Set(input.selectedHunterIds);
+  if (unique.size !== input.selectedHunterIds.length) {
+    return 'The same player was picked twice.';
   }
-  return players.map((p): Player => {
-    const role: MatchRole = hunterIds.has(p.playerId) ? 'hunter' : 'runner';
-    const team: Team = role === 'hunter' ? 'hunters' : 'runners';
-    return { ...p, matchRole: role, team };
+  if (input.selectedHunterIds.length !== input.hunterCount) {
+    return `Pick exactly ${input.hunterCount} Hunter${input.hunterCount === 1 ? '' : 's'}.`;
+  }
+  for (const id of input.selectedHunterIds) {
+    if (!joined.has(id)) return 'A picked Hunter is no longer in the room.';
+  }
+  return null;
+}
+
+/** Fisher–Yates shuffle of a copy, using the injected random source. */
+export function shuffled<T>(items: readonly T[], random: () => number = Math.random): T[] {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(random() * (i + 1));
+    const tmp = copy[i];
+    copy[i] = copy[j] as T;
+    copy[j] = tmp as T;
+  }
+  return copy;
+}
+
+/**
+ * Draw roles once, at head start. Needs ≥ 3 players; `hunterCount` 1..n−1.
+ * - `teamAssignment 'selected'` (Random OFF): exactly `hunterCount` picked
+ *   ids, all joined, no repeats. A genuinely short/stale pick is rejected;
+ *   a pick whose count no longer matches the balance-derived count falls
+ *   back to a random draw instead of blocking the start.
+ * - `teamAssignment 'random'` (Random ON): Fisher–Yates shuffle, first
+ *   `hunterCount` seats are Hunters.
+ * Never re-drawn: call this once per match.
+ */
+export function assignRoles(
+  players: readonly RolePlayer[],
+  options: RoleDrawOptions,
+): AssignRolesResult {
+  const ids = players.map((p) => p.playerId);
+  if (ids.length < MIN_PLAYERS) {
+    return { ok: false, reason: `Need at least ${MIN_PLAYERS} players to start.` };
+  }
+  if (ids.length > MAX_PLAYERS) {
+    return { ok: false, reason: `A room holds at most ${MAX_PLAYERS} players.` };
+  }
+  const hunterCount = resolveHunterCount({
+    balanceHunters: options.balanceHunters,
+    rosterSize: ids.length,
+    hostHunterCount: options.hostHunterCount,
   });
+  if (hunterCount < 1 || hunterCount > ids.length - 1) {
+    return { ok: false, reason: 'Hunter count must leave at least one Runner.' };
+  }
+
+  let hunterIds: string[];
+  if (options.teamAssignment === 'selected') {
+    const problem = validateSelectedHunters({
+      selectedHunterIds: options.selectedHunterIds,
+      hunterCount,
+      joinedPlayerIds: ids,
+    });
+    if (problem === null) {
+      hunterIds = [...options.selectedHunterIds];
+    } else if (
+      options.selectedHunterIds.length > 0 &&
+      options.selectedHunterIds.length === (options.pickHunterCount ?? hunterCount) &&
+      (options.pickHunterCount ?? hunterCount) !== hunterCount &&
+      options.selectedHunterIds.every((id) => ids.includes(id)) &&
+      new Set(options.selectedHunterIds).size === options.selectedHunterIds.length
+    ) {
+      // Stale pick: it matched the stored hunterCount when made, but Balance
+      // changed the effective count since. Draw at random instead of blocking.
+      hunterIds = shuffled(ids, options.random).slice(0, hunterCount);
+    } else {
+      return { ok: false, reason: problem };
+    }
+  } else {
+    hunterIds = shuffled(ids, options.random).slice(0, hunterCount);
+  }
+
+  const hunterSet = new Set(hunterIds);
+  const runnerIds = ids.filter((id) => !hunterSet.has(id));
+  const assignments: Record<string, { matchRole: MatchRole; team: Team }> = {};
+  for (const id of ids) {
+    assignments[id] = hunterSet.has(id)
+      ? { matchRole: 'hunter', team: 'hunters' }
+      : { matchRole: 'runner', team: 'runners' };
+  }
+  return { ok: true, hunterCount, hunterIds, runnerIds, assignments };
+}
+
+/**
+ * Switching to Random clears the host pick; changing hunter count or team
+ * assignment clears it too. Returns the cleared pick (always `[]`).
+ */
+export function clearSelectedHunters(): string[] {
+  return [];
 }

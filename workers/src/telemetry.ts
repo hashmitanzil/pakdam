@@ -1,31 +1,50 @@
-/** HNT-115: counts only. NO raw location, NO coordinates, NO player trails,
- *  NO ticket/token values — ticket events are counted by outcome only. */
-export interface TelemetryCounts {
-  matchesCompleted: number; locationUpdates: number; wsMessages: number; errors: number;
-  wsTicketsIssued: number; wsTicketsReused: number; wsTicketsInvalid: number;
-  wsHelloRejected: number; wsSnapshotsSent: number; wsReconnects: number;
-  wsHeartbeatsMissed: number;
+/**
+ * @pakdam/workers — telemetry_daily aggregation.
+ *
+ * Daily counts ONLY — no payloads, no identifiers. Best-effort: a failed
+ * flush never blocks game flow, and counters are in-memory per isolate, so
+ * a flush simply upserts whatever this isolate saw. The DO is the authority;
+ * telemetry is a counter, not a record.
+ */
+import { upsertTelemetryDaily, type SupabaseEnv } from './supabase.js';
+
+export type TelemetryKind =
+  | 'matches_completed'
+  | 'player_games'
+  | 'messages'
+  | 'location_updates_count'
+  | 'tile_requests'
+  | 'storage_bytes'
+  | 'errors';
+
+const counters = new Map<string, number>();
+let countersDate = '';
+
+function todayUtc(): string {
+  return new Date().toISOString().slice(0, 10);
 }
-export function emptyTelemetry(): TelemetryCounts {
-  return {
-    matchesCompleted: 0, locationUpdates: 0, wsMessages: 0, errors: 0,
-    wsTicketsIssued: 0, wsTicketsReused: 0, wsTicketsInvalid: 0,
-    wsHelloRejected: 0, wsSnapshotsSent: 0, wsReconnects: 0,
-    wsHeartbeatsMissed: 0,
-  };
-}
-export type TelemetryWsEvent =
-  | 'ticket-issued' | 'ticket-reused' | 'ticket-invalid'
-  | 'hello-rejected' | 'snapshot-sent' | 'reconnect' | 'heartbeat-missed';
-/** Count one WS protocol event. Counts only — no payload, no identifier. */
-export function countWsEvent(counts: TelemetryCounts, event: TelemetryWsEvent): TelemetryCounts {
-  switch (event) {
-    case 'ticket-issued': return { ...counts, wsTicketsIssued: counts.wsTicketsIssued + 1 };
-    case 'ticket-reused': return { ...counts, wsTicketsReused: counts.wsTicketsReused + 1 };
-    case 'ticket-invalid': return { ...counts, wsTicketsInvalid: counts.wsTicketsInvalid + 1 };
-    case 'hello-rejected': return { ...counts, wsHelloRejected: counts.wsHelloRejected + 1 };
-    case 'snapshot-sent': return { ...counts, wsSnapshotsSent: counts.wsSnapshotsSent + 1 };
-    case 'reconnect': return { ...counts, wsReconnects: counts.wsReconnects + 1 };
-    case 'heartbeat-missed': return { ...counts, wsHeartbeatsMissed: counts.wsHeartbeatsMissed + 1 };
+
+/** Increment a daily counter (in-memory, per isolate). */
+export function recordTelemetry(kind: TelemetryKind, n: number = 1): void {
+  const today = todayUtc();
+  if (countersDate !== today) {
+    counters.clear();
+    countersDate = today;
   }
+  counters.set(kind, (counters.get(kind) ?? 0) + n);
+}
+
+/**
+ * Flush this isolate's counters to telemetry_daily (upsert by date) and
+ * reset them. Best-effort: returns false when Supabase is unconfigured or
+ * the upsert fails; counters are kept on failure so a later flush retries.
+ */
+export async function flushTelemetry(env: SupabaseEnv): Promise<boolean> {
+  if (counters.size === 0) return true;
+  const date = countersDate || todayUtc();
+  const counts: Record<string, number> = {};
+  for (const [k, v] of counters) counts[k] = v;
+  const ok = await upsertTelemetryDaily(env, date, counts);
+  if (ok) counters.clear();
+  return ok;
 }

@@ -1,52 +1,343 @@
 /**
- * CALIBRATION — ALL VALUES OPEN. DO NOT TREAT AS MEASURED FACTS.
- * Pack v2 / v2.1 rule: GPS accuracy tiers, catch distance, ping schedule,
- * grace, catch-token TTL, rate limits are fixed ONLY by field/measurement
- * evidence. The numbers below are PLACEHOLDERS so the code can run and be
- * tested; every one must be replaced by a measured value before the
- * external pilot, and the replacement must be recorded with its evidence.
+ * Pakdam calibration — every named constant in one place.
+ *
+ * Three sections, in authority order:
+ *  1. PROTOCOL — frozen wire contract v2.1. Do not change without a protocol bump.
+ *  2. FIXED — founder-decided rules. NOT calibration. Do not re-open without the founder.
+ *  3. OPEN — placeholders carried over from the old build. Every value here is a
+ *     starting guess that MUST be replaced by measured field evidence before any
+ *     public pilot. Never present an OPEN value as a measured requirement.
+ *
+ * Pure constants only — no I/O, no secrets.
  */
-export interface Calibration {
-  /** Placeholder only. Browser accuracy distribution must be recalibrated (HNT-034, OD-041). */
-  accuracyGoodMaxM: number; accuracyFairMaxM: number; accuracyPoorMaxM: number;
-  /** Placeholder only. Catch proximity is plausibility, NEVER proof (HNT-053). */
-  catchProximityPlausibilityM: number;
-  /** Placeholder only. */
-  catchTokenTtlSeconds: number;
-  pingIntervalSeconds: number; pingAccelerationSeconds: number;
-  disconnectGraceSeconds: number; suspensionFreshnessSeconds: number;
-  /** Placeholder only. Repeated suspension -> host check-in (v2.1 Issue 3). */
-  suspensionCountBeforeHostCheckin: number;
-  /** Placeholder only. Pending ping lifetime (v2.1 Issue 9). */
-  pendingPingTtlSeconds: number;
-  quickPresetDurationSeconds: number; // Quick preset numeric duration — OPEN in v3
-  headStartSeconds: number; standardDurationSeconds: number;
-  /** Placeholder only. Zone shrink timing (Brief v2 reference: every 10 min). */
-  zoneShrinkIntervalSeconds: number;
-  // No outside-zone timing fields: the rule is a single fixed 30-second
-  // return countdown, then ejection (OUTSIDE_ZONE_RETURN_SECONDS in
-  // types.ts) — a founder rule, not a calibration placeholder.
-}
-export const CALIBRATION_OPEN: Calibration = {
-  accuracyGoodMaxM: 10, accuracyFairMaxM: 25, accuracyPoorMaxM: 60,
-  catchProximityPlausibilityM: 15,
-  catchTokenTtlSeconds: 120, pingIntervalSeconds: 180, pingAccelerationSeconds: 60,
-  disconnectGraceSeconds: 60, suspensionFreshnessSeconds: 30,
-  suspensionCountBeforeHostCheckin: 3, pendingPingTtlSeconds: 300,
-  quickPresetDurationSeconds: 1800, headStartSeconds: 180, standardDurationSeconds: 3600,
-  zoneShrinkIntervalSeconds: 600,
-};
-/** Starting size suggestion from player count — a starting point only,
- *  NOT a measured value. Formula: 200 m base + 25 m per player beyond
- *  3, capped at 1000 m (so 3 players -> 200 m, 6 -> 275 m, 16 -> 525 m,
- *  30 -> 875 m). The host checks the circle against the real ground
- *  and adjusts the stepper/slider. Calibration OPEN — field evidence
- *  may change the formula; the cap is a UI starting point, not a zone
- *  limit (there is no zone-size maximum — founder decision,
- *  2026-11-17, unlimited past 1 km). */
-export function suggestZoneRadiusMeters(totalPlayers: number): number {
-  return Math.min(1000, Math.max(200, 200 + 25 * (totalPlayers - 3)));
-}
-export function calibrationStatus(): string {
-  return 'OPEN — every value in CALIBRATION_OPEN is a placeholder to be measured; none is a fixed requirement.';
-}
+
+// ---------------------------------------------------------------------------
+// 1. PROTOCOL — frozen contract v2.1
+// ---------------------------------------------------------------------------
+
+/** Wire protocol version. `hello` must carry exactly this; anything else → 4409. */
+export const PROTOCOL_VERSION = 1 as const;
+
+/** Client version string sent in `hello`. */
+export const CLIENT_VERSION = 'pakdam-web/0.1.0' as const;
+
+/** How long a (seat, commandId) idempotency record lives: 10 min. */
+export const IDEMPOTENCY_TTL_MS = 600_000;
+
+/** The DO warns once when the socket's ticket expires within this window. */
+export const RENEWAL_WARNING_MS = 30_000;
+
+/** WS ticket TTL: 60 s. OPEN — placeholder, not a measured value. */
+export const WS_TICKET_TTL_MS = 60_000;
+
+/** Reconnect attempts before the client enters `reconnect-failed`. OPEN. */
+export const RECONNECT_MAX_ATTEMPTS = 5;
+
+/** Reconnect backoff: base 1 s, doubled per attempt, ceiling 30 s, jitter ×0.5–1.0. OPEN. */
+export const RECONNECT_BACKOFF_BASE_MS = 1_000;
+export const RECONNECT_BACKOFF_CEILING_MS = 30_000;
+
+/**
+ * Heartbeat interval (client → server `heartbeat`, server → `heartbeat.ack`).
+ * OPEN — the old build never ran a heartbeat at all, so no measured value exists.
+ * 30 s is chosen deliberately: the WS ticket lives 60 s and the renewal warning
+ * fires 30 s before expiry, so a 30 s heartbeat guarantees inbound traffic inside
+ * the warning window. Measure in the field and replace.
+ */
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+
+/**
+ * Missed-heartbeat limit: after this many unanswered heartbeats the client stops
+ * heartbeating and closes the socket (1006, 'heartbeat timeout') so the reconnect
+ * path re-syncs via snapshot. Carried over from the old client's defaults.
+ * OPEN — measure in the field.
+ */
+export const HEARTBEAT_MISSED_LIMIT = 3;
+
+/** Latest fixes older than this are purged every DO tick; fixes purge at match end. */
+export const FIX_TTL_MS = 120_000;
+
+/** Redacted game-event log cap in the DO. */
+export const GAME_EVENT_LOG_CAP = 500;
+
+/** Text radio: keep the last 50 messages per client, ephemeral, no backfill. */
+export const RADIO_KEEP_LAST = 50;
+
+/** Text radio: max 140 characters per message (enforced by the DO). */
+export const RADIO_MAX_CHARS = 140;
+
+/** Voice radio: max 10 s per push-to-talk burst. */
+export const VOICE_MAX_BURST_MS = 10_000;
+
+/** Voice radio: free public STUN only. No TURN, no recording, no storage. */
+export const VOICE_STUN_SERVERS: readonly string[] = [
+  'stun:stun.l.google.com:19302',
+  'stun:stun1.l.google.com:19302',
+] as const;
+
+/** Voice SDP payload cap: 8 KB. */
+export const VOICE_SDP_MAX_BYTES = 8_192;
+
+// ---------------------------------------------------------------------------
+// 2. FIXED — founder rules, NOT calibration
+// ---------------------------------------------------------------------------
+
+/** Minimum players to start a match. Server gate AND client gate must agree. */
+export const MIN_PLAYERS = 3;
+
+/** Maximum players in a room. */
+export const MAX_PLAYERS = 30;
+
+/** Zone radius: minimum 100 m. */
+export const ZONE_RADIUS_MIN_M = 100;
+
+/** Zone radius: default 500 m. */
+export const ZONE_RADIUS_DEFAULT_M = 500;
+
+/** Zone radius stepper step: 50 m. */
+export const ZONE_RADIUS_STEP_M = 50;
+
+/**
+ * Zone radius UI slider convenience range only (10 km). NEVER a cap —
+ * the zone has no maximum by founder decision ("unlimited past 1 km").
+ */
+export const ZONE_RADIUS_UI_MAX_M = 10_000;
+
+/** Minimum zone diameter: 200 m. */
+export const ZONE_DIAMETER_MIN_M = 200;
+
+/**
+ * A zone is NEVER auto-centred on a GPS fix worse than ±50 m.
+ * The host places it by hand instead.
+ */
+export const ZONE_AUTO_CENTRE_MAX_ACCURACY_M = 50;
+
+/** Outside-zone return countdown: 30 s, then ejection. */
+export const OUTSIDE_ZONE_RETURN_SECONDS = 30;
+
+/** Each shrink keeps 75% of the radius (−25% per shrink). */
+export const SHRINK_RADIUS_FACTOR = 0.75;
+
+/** Next-zone draws within 10 m of the current centre are discarded and re-drawn. */
+export const MIN_NEXT_ZONE_OFFSET_M = 10;
+
+/** Random next-zone draw attempts before the deterministic fallbacks. */
+export const SHRINK_MAX_ATTEMPTS = 50;
+
+/** Runner confirmation is ALWAYS required — a tag never counts at once. */
+export const CATCH_CONFIRMATION_REQUIRED = true;
+
+/**
+ * Catch token: minimum 128 bits of entropy. The old token was 12 hex chars
+ * (48 bits) — too short. Fresh tokens are 32 hex chars = 128 bits.
+ * Same hash construction (sha256(catchId + ':' + raw)), same single-use + TTL
+ * semantics, same QR-only carriage (never typed, never shown as text).
+ */
+export const CATCH_TOKEN_HEX_LENGTH = 32;
+export const CATCH_TOKEN_BITS = 128;
+
+/** Scoring (completed matches only) — fixed founder rules, NOT calibration. */
+export const SCORING_RUNNER_PER_3_MIN_FREE = 1;
+export const SCORING_RUNNER_NEVER_CAUGHT = 10;
+export const SCORING_HUNTER_PER_TAG = 3;
+export const SCORING_CLEAN_SWEEP = 10;
+
+/** One sessionStorage key holds the whole live session (two separate tokens inside). */
+export const SESSION_STORAGE_KEY = 'pakdam.session.v1';
+
+/** SOS copy — exact string. SOS alerts the host; it is NOT emergency dispatch. */
+export const SOS_COPY =
+  'SOS alerts your host in this game. Pakdam is NOT an emergency service and does not call police or ambulance. If you are in danger, call your local emergency number.';
+
+/** Fixed string sent as the reason on `catch.dispute`. */
+export const CATCH_DISPUTE_REASON =
+  'Runner disputes this catch — the host reviews it in person.';
+
+// ---------------------------------------------------------------------------
+// 3. OPEN — measure in the field before any public pilot
+// ---------------------------------------------------------------------------
+
+/**
+ * GPS accuracy quality tiers (metres). The SERVER — never the client — decides
+ * the tier. Poor accuracy is warned, never treated as cheating.
+ * OPEN — all three numbers are placeholders.
+ */
+export const ACCURACY_GOOD_M = 10;
+export const ACCURACY_FAIR_M = 25;
+export const ACCURACY_POOR_M = 60;
+
+/** Catch proximity plausibility: hunter↔runner distance. Plausibility only, never proof. OPEN. */
+export const CATCH_PROXIMITY_PLAUSIBILITY_M = 15;
+
+/** Catch-token TTL: 120 s. OPEN. */
+export const CATCH_TOKEN_TTL_SECONDS = 120;
+
+/** Default ping interval: 180 s (3 min). OPEN. */
+export const PING_INTERVAL_SECONDS_DEFAULT = 180;
+
+/** Ping acceleration: 60 s. OPEN. */
+export const PING_ACCELERATION_SECONDS = 60;
+
+/** Disconnect grace: 60 s. OPEN. */
+export const DISCONNECT_GRACE_SECONDS = 60;
+
+/** Suspension freshness: 30 s. OPEN. */
+export const SUSPENSION_FRESHNESS_SECONDS = 30;
+
+/** Location freshness window: a fix older than this is 'unknown'. OPEN. */
+export const LOCATION_FRESHNESS_SECONDS = 30;
+
+/** Repeated suspensions before a host check-in is raised: 3. OPEN. */
+export const SUSPENSIONS_BEFORE_HOST_CHECKIN = 3;
+
+/** Pending (undelivered) ping TTL: 300 s. Governs undelivered pings only. OPEN. */
+export const PENDING_PING_TTL_SECONDS = 300;
+
+/** Quick-preset duration: 1800 s. OPEN. (Presets are cut from the UI; kept for reference.) */
+export const QUICK_PRESET_DURATION_SECONDS = 1800;
+
+/** Head-start default: 180 s (3 min). OPEN. */
+export const HEAD_START_SECONDS_DEFAULT = 180;
+
+/** Standard round duration: 1800 s (30 min) — the founder-decided default (BEHAVIOUR.md §2, SCRAM-SPEC §13). OPEN. */
+export const STANDARD_DURATION_SECONDS = 1800;
+
+/** Zone shrink interval default: 600 s (10 min). OPEN. */
+export const ZONE_SHRINK_INTERVAL_SECONDS_DEFAULT = 600;
+
+/** Ping area radius: 150 m coarse area, never an exact pin. OPEN. */
+export const PING_AREA_RADIUS_M = 150;
+
+/** Clock-skew / replay guard: a fix > 5 min in the future is rejected. OPEN. */
+export const CLOCK_SKEW_MS = 300_000;
+
+/** A fix > 60 s old on arrival is rejected. OPEN. */
+export const STALE_FIX_MS = 60_000;
+
+/** Impossible movement: > 30 m/s from the previous fix warns only, never rejects. OPEN. */
+export const MAX_PLAUSIBLE_SPEED_MPS = 30;
+
+/** Demo-only wrong-scan cooldown: 3 wrong scans → 30 s lock. OPEN. */
+export const WRONG_SCAN_MAX = 3;
+export const WRONG_SCAN_LOCK_SECONDS = 30;
+
+/**
+ * Hunter balance table (Balance ON sets the Hunter count from the roster at start).
+ * OPEN — calibration, not a founder rule.
+ */
+export const BALANCED_HUNTER_TABLE: readonly { readonly minPlayers: number; readonly maxPlayers: number; readonly hunters: number }[] =
+  [
+    { minPlayers: 3, maxPlayers: 4, hunters: 1 },
+    { minPlayers: 5, maxPlayers: 8, hunters: 2 },
+    { minPlayers: 9, maxPlayers: 16, hunters: 3 },
+    { minPlayers: 17, maxPlayers: 24, hunters: 4 },
+    { minPlayers: 25, maxPlayers: 30, hunters: 5 },
+  ] as const;
+
+/** Suggested zone radius: 200 m + 25 m per player beyond 3, capped at 1000 m — starting point only. OPEN. */
+export const SUGGESTED_ZONE_RADIUS_BASE_M = 200;
+export const SUGGESTED_ZONE_RADIUS_PER_PLAYER_M = 25;
+export const SUGGESTED_ZONE_RADIUS_CAP_M = 1000;
+
+/**
+ * WS per-seat per-message rate limits. All numbers are OPEN placeholders.
+ * `player.suspended` is exempt.
+ */
+export const WS_MESSAGE_RATE_LIMITS: Readonly<Record<string, { readonly limit: number; readonly windowSeconds: number } | 'exempt'>> =
+  {
+    'location.update': { limit: 60, windowSeconds: 10 },
+    'catch.request': { limit: 5, windowSeconds: 60 },
+    'catch.confirm': { limit: 5, windowSeconds: 60 },
+    'catch.dispute': { limit: 5, windowSeconds: 60 },
+    'signal.send': { limit: 10, windowSeconds: 60 },
+    'radio.send': { limit: 10, windowSeconds: 60 },
+    'pin.place': { limit: 10, windowSeconds: 60 },
+    'voice.signal': { limit: 600, windowSeconds: 60 },
+    'announcement.send': { limit: 5, windowSeconds: 60 },
+    'reveal.send': { limit: 5, windowSeconds: 60 },
+    'briefing.confirm': { limit: 5, windowSeconds: 60 },
+    'ready.set': { limit: 10, windowSeconds: 60 },
+    'safety.pause': { limit: 10, windowSeconds: 60 },
+    'safety.resume': { limit: 10, windowSeconds: 60 },
+    'safety.sos': { limit: 10, windowSeconds: 60 },
+    leave: { limit: 3, windowSeconds: 60 },
+    'player.suspended': 'exempt',
+  } as const;
+
+/** Fallback WS per-message rate limit when a type has no entry above. OPEN. */
+export const WS_MESSAGE_RATE_LIMIT_DEFAULT = { limit: 20, windowSeconds: 60 } as const;
+
+/**
+ * HTTP per-route rate limits. The limits the old build HAD are carried over;
+ * the routes the old build left un-limited get starting values here — all OPEN
+ * placeholders to validate in the field. WARNING: a 30-player roster joining
+ * inside a minute from one NAT IP is legitimate and must not be throttled by a
+ * per-IP join cap; per-seat keys are used for seat-scoped actions.
+ */
+export const HTTP_RATE_LIMITS: Readonly<Record<string, { readonly limit: number; readonly windowSeconds: number; readonly key: 'ip' | 'seat' | 'room' }>> =
+  {
+    'POST /v1/rooms': { limit: 5, windowSeconds: 60, key: 'ip' },
+    // NAT-JOIN: 30 players on one venue WiFi share one IP. Keyed by the
+    // room code (not the IP) at 35/min — a full roster + retries/mistypes
+    // inside a minute — so a crowded join never 429s the 6th player.
+    'GET /v1/rooms/by-code/:code': { limit: 35, windowSeconds: 60, key: 'room' },
+    'POST /v1/rooms/:id/join': { limit: 35, windowSeconds: 60, key: 'room' },
+    'POST /v1/rooms/:id/ws-ticket': { limit: 10, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/ws-ticket/revoke': { limit: 10, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/start': { limit: 5, windowSeconds: 60, key: 'seat' },
+    'POST /v1/reports': { limit: 5, windowSeconds: 60, key: 'ip' },
+    'POST /v1/support/bugs': { limit: 5, windowSeconds: 60, key: 'ip' },
+    'POST /v1/support/grievances': { limit: 5, windowSeconds: 60, key: 'ip' },
+    // Routes the old build left un-limited — fresh build MUST limit them:
+    'GET /v1/rooms/:id': { limit: 60, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/config': { limit: 10, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/remove-player': { limit: 10, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/regenerate-code': { limit: 5, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/catch-token': { limit: 10, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/lifecycle': { limit: 10, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/host/token': { limit: 5, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/host/transfer': { limit: 5, windowSeconds: 60, key: 'seat' },
+    'POST /v1/rooms/:id/catches/:cid/resolve': { limit: 10, windowSeconds: 60, key: 'seat' },
+    'GET /v1/rooms/:id/results': { limit: 30, windowSeconds: 60, key: 'seat' },
+    // The WS upgrade keys on client IP at the HTTP layer because the seat
+    // is unknown before ticket validation (the table says 'ip' for it).
+    'WS /v1/rooms/:id/ws': { limit: 10, windowSeconds: 60, key: 'ip' },
+  } as const;
+
+/**
+ * The OPEN calibration values, grouped, so a field-measurement pass can find
+ * them all in one place. These are placeholders, not requirements.
+ */
+export const CALIBRATION_OPEN = {
+  accuracyGoodM: ACCURACY_GOOD_M,
+  accuracyFairM: ACCURACY_FAIR_M,
+  accuracyPoorM: ACCURACY_POOR_M,
+  catchProximityPlausibilityM: CATCH_PROXIMITY_PLAUSIBILITY_M,
+  catchTokenTtlSeconds: CATCH_TOKEN_TTL_SECONDS,
+  pingIntervalSecondsDefault: PING_INTERVAL_SECONDS_DEFAULT,
+  pingAccelerationSeconds: PING_ACCELERATION_SECONDS,
+  disconnectGraceSeconds: DISCONNECT_GRACE_SECONDS,
+  suspensionFreshnessSeconds: SUSPENSION_FRESHNESS_SECONDS,
+  locationFreshnessSeconds: LOCATION_FRESHNESS_SECONDS,
+  suspensionsBeforeHostCheckin: SUSPENSIONS_BEFORE_HOST_CHECKIN,
+  pendingPingTtlSeconds: PENDING_PING_TTL_SECONDS,
+  quickPresetDurationSeconds: QUICK_PRESET_DURATION_SECONDS,
+  headStartSecondsDefault: HEAD_START_SECONDS_DEFAULT,
+  standardDurationSeconds: STANDARD_DURATION_SECONDS,
+  zoneShrinkIntervalSecondsDefault: ZONE_SHRINK_INTERVAL_SECONDS_DEFAULT,
+  pingAreaRadiusM: PING_AREA_RADIUS_M,
+  clockSkewMs: CLOCK_SKEW_MS,
+  staleFixMs: STALE_FIX_MS,
+  maxPlausibleSpeedMps: MAX_PLAUSIBLE_SPEED_MPS,
+  wrongScanMax: WRONG_SCAN_MAX,
+  wrongScanLockSeconds: WRONG_SCAN_LOCK_SECONDS,
+  wsTicketTtlMs: WS_TICKET_TTL_MS,
+  reconnectMaxAttempts: RECONNECT_MAX_ATTEMPTS,
+  reconnectBackoffBaseMs: RECONNECT_BACKOFF_BASE_MS,
+  reconnectBackoffCeilingMs: RECONNECT_BACKOFF_CEILING_MS,
+  heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
+  heartbeatMissedLimit: HEARTBEAT_MISSED_LIMIT,
+  balancedHunterTable: BALANCED_HUNTER_TABLE,
+  wsMessageRateLimits: WS_MESSAGE_RATE_LIMITS,
+  httpRateLimits: HTTP_RATE_LIMITS,
+} as const;

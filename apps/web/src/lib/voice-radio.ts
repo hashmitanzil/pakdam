@@ -1,425 +1,401 @@
 /**
- * Free voice radio (D-M1) — WebRTC peer-to-peer, team-only.
+ * Voice radio — WebRTC push-to-talk, team-only (PROTOCOL-MAP §6, R8).
  *
- * HOW IT WORKS (no paid service, no server relay, no recording):
- *  - Audio flows DIRECTLY between teammates over WebRTC
- *    (RTCPeerConnection). The game Worker NEVER receives audio: it
- *    only forwards tiny SDP/ICE signalling payloads (`voice.signal`)
- *    from one seat to one teammate, and the Durable Object rejects
- *    any signal whose sender and recipient are not on the same team.
- *  - NAT traversal uses FREE PUBLIC STUN ONLY
- *    (stun:stun.l.google.com:19302 + stun1) — a STUN server only
- *    tells a peer its own public address so the two can connect
- *    directly; it carries no audio and needs no account, key or
- *    payment. There is deliberately NO TURN server: if the two
- *    peers cannot connect directly (e.g. both behind symmetric NAT),
- *    the peer connection fails and the UI says so in plain words —
- *    the game and the text radio keep working.
- *  - Push-to-talk, SCRAM-style: hold to talk, ≤ 10 s per burst
- *    (VOICE_MAX_BURST_MS). The mic track is DISABLED except while
- *    the button is held, so nothing is sent between bursts.
- *  - Mesh: every voice-enabled teammate connects to every other
- *    voice-enabled teammate. Exactly one side offers: when A enables
- *    voice it sends `join` to each teammate; a teammate that is
- *    already voice-enabled replies with an `offer`. No glare, no
- *    central mixer.
- *  - Privacy: no recording, no storage — no MediaRecorder anywhere
- *    in this file, audio is never written to disk, localStorage or
- *    the server. Mute silences both directions (mic off + remote
- *    playback muted).
+ * Audio flows DIRECTLY between teammates over WebRTC. The Worker/DO never
+ * receives audio: it only forwards tiny SDP/ICE signalling payloads
+ * (`voice.signal`) from one seat to one teammate, and the DO rejects any
+ * signal whose sender and recipient are not on the same team.
  *
- * This file has NO React and NO DOM except the default deps (real
- * RTCPeerConnection / getUserMedia / <audio> playback). Tests inject
- * mock deps, so the state machine is unit-testable in Node.
+ * NAT: FREE PUBLIC STUN ONLY (VOICE_STUN_SERVERS from @pakdam/shared).
+ * No TURN relay, no server, no recording, no storage. If direct P2P fails
+ * (e.g. both behind symmetric NAT), the peer connection fails and the UI
+ * says so in plain words — the game and the text radio keep working.
+ * No MediaRecorder anywhere — audio is never written to disk, localStorage
+ * or the server.
+ *
+ * Push-to-talk: hold to talk, max 10 s per burst (VOICE_MAX_BURST_MS).
+ * The mic track is DISABLED except while the button is held. Mute silences
+ * both directions (mic off + remote playback muted).
+ *
+ * Mesh + exactly-one-offerer: every voice-enabled teammate connects to
+ * every other voice-enabled teammate. When A enables voice it sends `join`
+ * to each teammate; a teammate already voice-enabled replies with an
+ * `offer` (so exactly one side offers — no glare). `join`/`leave` are
+ * presence (no SDP); `offer`/`answer` carry SDP (≤ 8 KB); `ice` carries one
+ * ICE candidate. Payloads carry player ids only — never audio, never
+ * coordinates, never a token.
+ *
+ * PTT states: idle / listening / talking (see `PttState`); the radio
+ * status is `off | ready | talking | unavailable | failed`
+ * (VoiceRadioStatus from @pakdam/shared).
  */
-import type { VoiceIceCandidate, VoiceSignalKind } from '@pakdam/shared';
+import {
+  VOICE_MAX_BURST_MS,
+  VOICE_SDP_MAX_BYTES,
+  VOICE_STUN_SERVERS,
+  type VoiceRadioStatus,
+  type VoiceSignalKind,
+} from '@pakdam/shared';
 
-/** One push-to-talk burst, SCRAM-style: hold to talk, max 10 s. */
-export const VOICE_MAX_BURST_MS = 10_000;
-/** Free public STUN only — no account, no key, no payment, no TURN.
- *  A STUN server only reveals each peer's own public address; it
- *  never carries audio. If direct P2P fails, voice falls back to
- *  text radio — never to a paid relay. */
-export const VOICE_STUN_URLS = [
-  'stun:stun.l.google.com:19302',
-  'stun:stun1.l.google.com:19302',
-] as const;
+export type { VoiceRadioStatus, VoiceSignalKind };
 
-export type VoiceStatus =
-  | 'off' // voice not enabled on this device
-  | 'ready' // mic acquired, mesh up (or joining), hold to talk
-  | 'talking' // holding the button — mic live to the team
-  | 'unavailable' // this browser/device cannot do WebRTC voice
-  | 'failed'; // mic denied / P2P failed — text radio still works
+export const VOICE_FAILURE_COPY =
+  "Voice didn't connect — text radio still works.";
 
-export interface VoiceSignalOut {
+/** Push-to-talk button state. */
+export type PttState = 'idle' | 'listening' | 'talking';
+
+export interface VoiceSignal {
+  fromPlayerId: string;
+  toPlayerId: string;
   kind: VoiceSignalKind;
   sdp?: string;
-  candidate?: VoiceIceCandidate;
-}
-export interface VoiceSignalIn extends VoiceSignalOut {
-  fromPlayerId: string;
-}
-export interface VoiceTeammate {
-  playerId: string;
-  displayName: string;
+  candidate?: unknown;
 }
 
-export interface VoiceStatusInfo {
-  status: VoiceStatus;
-  /** Plain-words reason for 'unavailable' / 'failed' (shown in UI). */
-  detail: string;
-  /** Teammates with a live peer connection right now. */
-  connectedPeerIds: string[];
-  /** Teammates whose peer connection failed (direct P2P blocked). */
-  failedPeerIds: string[];
-  muted: boolean;
-  talking: boolean;
-}
-
-export type VoiceStatusListener = (info: VoiceStatusInfo) => void;
-
-/** Minimal surfaces of the WebRTC APIs this manager uses — real
- *  RTCPeerConnection / MediaStreamTrack satisfy them, and tests inject
- *  mocks with the same shape. */
-export interface VoiceMediaTrack {
-  enabled: boolean;
-  stop(): void;
-}
-export interface VoiceMediaStream {
-  getAudioTracks(): VoiceMediaTrack[];
-}
-export interface VoicePeerConnection {
-  addTrack(track: VoiceMediaTrack, stream: VoiceMediaStream): void;
-  createOffer(): Promise<{ type: 'offer'; sdp?: string }>;
-  createAnswer(): Promise<{ type: 'answer'; sdp?: string }>;
-  setLocalDescription(desc: { type: 'offer' | 'answer'; sdp?: string }): Promise<void>;
-  setRemoteDescription(desc: { type: 'offer' | 'answer'; sdp?: string }): Promise<void>;
-  addIceCandidate(candidate: VoiceIceCandidate): Promise<void>;
-  close(): void;
-  onicecandidate: ((ev: { candidate: VoiceIceCandidate | null }) => void) | null;
-  ontrack: ((ev: { streams: VoiceMediaStream[] }) => void) | null;
-  onconnectionstatechange: (() => void) | null;
-  connectionState: string;
-}
-export interface VoiceRtcDeps {
-  createPeerConnection(config: { iceServers: { urls: string[] }[] }): VoicePeerConnection;
-  getUserMedia(constraints: { audio: { echoCancellation: boolean; noiseSuppression: boolean } }): Promise<VoiceMediaStream>;
-  /** Play one teammate's incoming audio. Default: an <audio> element. */
-  playRemoteAudio(stream: VoiceMediaStream): void;
-  /** Mute/unmute all remote playback (default: the <audio> elements). */
-  setRemoteMuted(muted: boolean): void;
-}
-
-function defaultDeps(): VoiceRtcDeps | null {
-  if (typeof window === 'undefined') return null;
-  const RTCPeerConnectionCtor =
-    window.RTCPeerConnection ??
-    (window as unknown as { webkitRTCPeerConnection?: typeof RTCPeerConnection }).webkitRTCPeerConnection;
-  if (!RTCPeerConnectionCtor || !navigator.mediaDevices?.getUserMedia) return null;
-  const audioElements: HTMLAudioElement[] = [];
-  return {
-    createPeerConnection: (config) => new RTCPeerConnectionCtor(config) as unknown as VoicePeerConnection,
-    getUserMedia: (constraints) => navigator.mediaDevices.getUserMedia(constraints) as unknown as Promise<VoiceMediaStream>,
-    playRemoteAudio: (stream) => {
-      const el = document.createElement('audio');
-      el.srcObject = stream as unknown as MediaStream;
-      el.autoplay = true;
-      // playsinline keeps iOS Safari from forcing fullscreen playback.
-      el.setAttribute('playsinline', '');
-      document.body.appendChild(el);
-      audioElements.push(el);
-      void el.play().catch(() => { /* autoplay blocked until a gesture — the PTT hold is the gesture */ });
-    },
-    setRemoteMuted: (muted) => { for (const el of audioElements) el.muted = muted; },
-  };
-}
-
-/** True in a browser that can do WebRTC voice at all. */
-export function isVoiceSupported(): boolean {
-  return defaultDeps() !== null;
+export interface VoiceRadioOptions {
+  myPlayerId: string;
+  /** Team-mate ids (team-only: never signal a player on the other team). */
+  teammateIds: string[];
+  /** Sends a signalling payload to one teammate (via the WS client). */
+  sendSignal: (signal: VoiceSignal) => boolean;
+  onStatusChange?: (status: VoiceRadioStatus, detail?: string) => void;
+  onPttChange?: (state: PttState) => void;
+  onTalkingChange?: (talking: boolean) => void;
 }
 
 export class VoiceRadio {
-  private readonly myPlayerId: string;
-  private readonly deps: VoiceRtcDeps | null;
-  private readonly sendSignal: (toPlayerId: string, signal: VoiceSignalOut) => boolean;
-  private readonly onStatus: VoiceStatusListener;
-  private teammates: VoiceTeammate[] = [];
-  private peers = new Map<string, VoicePeerConnection>();
-  private peerState = new Map<string, 'connecting' | 'connected' | 'failed'>();
-  private stream: VoiceMediaStream | null = null;
-  private track: VoiceMediaTrack | null = null;
-  private status: VoiceStatus = 'off';
+  readonly myPlayerId: string;
+
+  private status: VoiceRadioStatus = 'off';
   private detail = '';
+  private ptt: PttState = 'idle';
   private muted = false;
-  private talking = false;
+  private micStream: MediaStream | null = null;
+  private micTrack: MediaStreamTrack | null = null;
+  private peers = new Map<string, RTCPeerConnection>();
+  private remoteStreams = new Map<string, MediaStream>();
+  private connectedPeerIds = new Set<string>();
+  private failedPeerIds = new Set<string>();
   private burstTimer: ReturnType<typeof setTimeout> | null = null;
+  private burstStartedAtMs = 0;
+  private handledSignals = new Set<string>();
+  private teammates: string[];
+  private readonly options: VoiceRadioOptions;
 
-  constructor(
-    myPlayerId: string,
-    sendSignal: (toPlayerId: string, signal: VoiceSignalOut) => boolean,
-    onStatus: VoiceStatusListener = () => { /* no listener */ },
-    deps: VoiceRtcDeps | null = defaultDeps(),
-  ) {
-    this.myPlayerId = myPlayerId;
-    this.sendSignal = sendSignal;
-    this.onStatus = onStatus;
-    this.deps = deps;
+  constructor(options: VoiceRadioOptions) {
+    this.options = options;
+    this.myPlayerId = options.myPlayerId;
+    this.teammates = [...options.teammateIds];
   }
 
-  getStatus(): VoiceStatusInfo {
-    return {
-      status: this.status,
-      detail: this.detail,
-      connectedPeerIds: [...this.peerState.entries()].filter(([, v]) => v === 'connected').map(([k]) => k),
-      failedPeerIds: [...this.peerState.entries()].filter(([, v]) => v === 'failed').map(([k]) => k),
-      muted: this.muted,
-      talking: this.talking,
-    };
+  get radioStatus(): VoiceRadioStatus {
+    return this.status;
   }
 
-  private emit(): void {
-    this.onStatus(this.getStatus());
+  get statusDetail(): string {
+    return this.detail;
   }
 
-  private fail(detail: string): void {
-    this.stopBurstTimer();
-    this.talking = false;
-    if (this.track) this.track.enabled = false;
-    this.status = 'failed';
-    this.detail = detail;
-    this.emit();
+  get pttState(): PttState {
+    return this.ptt;
   }
 
-  /** Enable voice for this device: ask for the mic, then announce
-   *  to every teammate (`join`) so voice-enabled teammates offer a
-   *  peer connection. Returns false (status 'failed'/'unavailable',
-   *  text radio unaffected) when voice cannot start. */
-  async enable(teammates: VoiceTeammate[]): Promise<boolean> {
-    this.teammates = teammates.filter((t) => t.playerId !== this.myPlayerId);
-    if (!this.deps) {
-      this.status = 'unavailable';
-      this.detail = 'This browser cannot do voice calls — use the text radio below.';
-      this.emit();
-      return false;
-    }
+  get isMuted(): boolean {
+    return this.muted;
+  }
+
+  get isTalking(): boolean {
+    return this.ptt === 'talking';
+  }
+
+  get connectedPeers(): string[] {
+    return [...this.connectedPeerIds];
+  }
+
+  get failedPeers(): string[] {
+    return [...this.failedPeerIds];
+  }
+
+  /** `Connected: N of M teammates.` */
+  get connectionSummary(): string {
+    return `Connected: ${this.connectedPeerIds.size} of ${this.teammates.length} teammates.`;
+  }
+
+  /** Enable voice: ask for the mic, keep the track disabled until held, then send `join` to each teammate. */
+  async enable(): Promise<boolean> {
     if (this.status === 'ready' || this.status === 'talking') return true;
-    let stream: VoiceMediaStream;
     try {
-      stream = await this.deps.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true },
+      });
+      this.micStream = stream;
+      this.micTrack = stream.getAudioTracks()[0] ?? null;
+      if (this.micTrack) this.micTrack.enabled = false; // disabled except while held
+      this.setStatus('ready');
+      for (const teammateId of this.teammates) {
+        this.options.sendSignal({
+          fromPlayerId: this.myPlayerId,
+          toPlayerId: teammateId,
+          kind: 'join',
+        });
+      }
+      return true;
     } catch {
-      this.status = 'failed';
-      this.detail = 'Microphone unavailable — check the browser microphone permission, then try again. Text radio still works.';
-      this.emit();
+      this.setStatus('unavailable', 'Microphone unavailable — text radio still works.');
       return false;
     }
-    const tracks = stream.getAudioTracks();
-    if (tracks.length === 0) {
-      this.status = 'failed';
-      this.detail = 'No microphone track — text radio still works.';
-      this.emit();
-      return false;
-    }
-    this.stream = stream;
-    this.track = tracks[0]!;
-    // Mic stays DISABLED until the talk button is held (push-to-talk).
-    this.track.enabled = false;
-    this.status = 'ready';
-    this.detail = '';
-    this.emit();
-    for (const t of this.teammates) this.sendSignal(t.playerId, { kind: 'join' });
-    return true;
   }
 
-  /** Leave voice: tell teammates, close every peer connection, stop
-   *  the mic. Text radio is untouched. */
+  /** Disable: send `leave` to each teammate, close every peer connection, stop the mic. */
   disable(): void {
-    this.stopBurstTimer();
-    this.talking = false;
-    for (const t of this.teammates) this.sendSignal(t.playerId, { kind: 'leave' });
+    this.stopTalking();
+    for (const teammateId of this.teammates) {
+      this.options.sendSignal({
+        fromPlayerId: this.myPlayerId,
+        toPlayerId: teammateId,
+        kind: 'leave',
+      });
+    }
     for (const pc of this.peers.values()) {
-      try { pc.close(); } catch { /* already closed */ }
+      try {
+        pc.close();
+      } catch {
+        // Already closed.
+      }
     }
     this.peers.clear();
-    this.peerState.clear();
-    if (this.track) {
-      this.track.enabled = false;
-      try { this.track.stop(); } catch { /* already stopped */ }
+    this.remoteStreams.clear();
+    this.connectedPeerIds.clear();
+    this.failedPeerIds.clear();
+    if (this.micStream) {
+      for (const track of this.micStream.getTracks()) track.stop();
+      this.micStream = null;
+      this.micTrack = null;
     }
-    this.track = null;
-    this.stream = null;
-    this.status = 'off';
-    this.detail = '';
-    this.emit();
+    this.setStatus('off');
+    this.setPtt('idle');
   }
 
-  /** Hold to talk: mic live to the team, auto-stops at 10 s. */
-  startTalk(): boolean {
-    if (this.status !== 'ready' || this.muted || !this.track) return false;
-    this.track.enabled = true;
-    this.talking = true;
-    this.status = 'talking';
-    this.emit();
-    this.stopBurstTimer();
-    this.burstTimer = setTimeout(() => {
-      // Burst cap (SCRAM-style): the mic cuts at 10 s — release and
-      // press again to talk more. Never silently keep transmitting.
-      this.stopTalk();
-      this.detail = 'Talk burst ended at 10 seconds — release and press again to talk more.';
-      this.emit();
-    }, VOICE_MAX_BURST_MS);
+  /** Replace the teammate list (e.g. after a roster change). */
+  setTeammates(teammateIds: string[]): void {
+    this.teammates = [...teammateIds];
+  }
+
+  /** Hold to talk: enables the mic track for at most one 10 s burst. */
+  startTalking(): boolean {
+    if (this.status !== 'ready' || this.muted || !this.micTrack) return false;
+    this.micTrack.enabled = true;
+    this.burstStartedAtMs = Date.now();
+    this.setPtt('talking');
+    this.setStatus('talking');
+    this.burstTimer = setTimeout(() => this.stopTalking(), VOICE_MAX_BURST_MS);
     return true;
   }
 
-  /** Release the talk button: mic off immediately. */
-  stopTalk(): void {
-    this.stopBurstTimer();
-    if (this.track) this.track.enabled = false;
-    this.talking = false;
-    if (this.status === 'talking') {
-      this.status = 'ready';
-      this.detail = '';
-    }
-    this.emit();
-  }
-
-  /** Mute: mic off (and stops a burst) + teammates' audio muted. */
-  setMuted(muted: boolean): void {
-    this.muted = muted;
-    if (muted) {
-      this.stopBurstTimer();
-      this.talking = false;
-      if (this.track) this.track.enabled = false;
-      if (this.status === 'talking') this.status = 'ready';
-    }
-    this.deps?.setRemoteMuted(muted);
-    this.emit();
-  }
-
-  /** One incoming `voice.signal` from a teammate (already checked by
-   *  the DO to be same-team; re-checked here so a forged / stale
-   *  client message can never open a peer connection to a stranger).
-   *  Unknown senders and our own echoes are ignored. */
-  async handleSignal(signal: VoiceSignalIn): Promise<void> {
-    const from = signal.fromPlayerId;
-    if (from === this.myPlayerId) return;
-    if (!this.teammates.some((t) => t.playerId === from)) return;
-    if (this.status === 'off' || this.status === 'unavailable' || this.status === 'failed') return;
-    if (!this.deps || !this.stream || !this.track) return;
-    switch (signal.kind) {
-      case 'join': {
-        // The joiner is voice-enabled: WE offer (exactly one offerer).
-        const pc = this.ensurePeer(from);
-        try {
-          const offer = await pc.createOffer();
-          await pc.setLocalDescription(offer);
-          if (offer.sdp) this.sendSignal(from, { kind: 'offer', sdp: offer.sdp });
-        } catch {
-          this.markPeerFailed(from, 'Could not start a voice call to a teammate — text radio still works.');
-        }
-        return;
-      }
-      case 'leave': {
-        this.closePeer(from);
-        return;
-      }
-      case 'offer': {
-        if (typeof signal.sdp !== 'string') return;
-        const pc = this.ensurePeer(from);
-        try {
-          await pc.setRemoteDescription({ type: 'offer', sdp: signal.sdp });
-          const answer = await pc.createAnswer();
-          await pc.setLocalDescription(answer);
-          if (answer.sdp) this.sendSignal(from, { kind: 'answer', sdp: answer.sdp });
-        } catch {
-          this.markPeerFailed(from, 'Could not answer a voice call — text radio still works.');
-        }
-        return;
-      }
-      case 'answer': {
-        if (typeof signal.sdp !== 'string') return;
-        const pc = this.peers.get(from);
-        if (!pc) return;
-        try {
-          await pc.setRemoteDescription({ type: 'answer', sdp: signal.sdp });
-        } catch {
-          this.markPeerFailed(from, 'Voice call setup failed — text radio still works.');
-        }
-        return;
-      }
-      case 'ice': {
-        if (!signal.candidate) return;
-        const pc = this.peers.get(from);
-        if (!pc) return;
-        try {
-          await pc.addIceCandidate(signal.candidate);
-        } catch {
-          // One bad candidate never kills the call — the rest may
-          // still connect. Ignore it.
-        }
-        return;
-      }
-    }
-  }
-
-  private ensurePeer(peerId: string): VoicePeerConnection {
-    const existing = this.peers.get(peerId);
-    if (existing) return existing;
-    const pc = this.deps!.createPeerConnection({
-      // STUN ONLY — no TURN relay, no credentials, nothing paid.
-      iceServers: VOICE_STUN_URLS.map((urls) => ({ urls: [urls] })),
-    });
-    if (this.track && this.stream) pc.addTrack(this.track, this.stream);
-    this.peerState.set(peerId, 'connecting');
-    pc.onicecandidate = (ev) => {
-      if (ev.candidate) this.sendSignal(peerId, { kind: 'ice', candidate: ev.candidate });
-    };
-    pc.ontrack = (ev) => {
-      const remote = ev.streams[0];
-      if (remote) this.deps!.playRemoteAudio(remote);
-    };
-    pc.onconnectionstatechange = () => {
-      if (pc.connectionState === 'connected') {
-        this.peerState.set(peerId, 'connected');
-        this.emit();
-      } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        // Direct P2P blocked (e.g. symmetric NAT on both sides) with
-        // no TURN to fall back to: say so plainly, close the peer,
-        // keep the game + text radio running. Never retry in a loop.
-        this.markPeerFailed(peerId, 'Voice could not connect directly to a teammate (network blocks direct calls) — text radio still works.');
-      }
-    };
-    this.peers.set(peerId, pc);
-    this.emit();
-    return pc;
-  }
-
-  private markPeerFailed(peerId: string, detail: string): void {
-    this.peerState.set(peerId, 'failed');
-    this.closePeerConnection(peerId);
-    this.detail = detail;
-    this.emit();
-  }
-
-  private closePeer(peerId: string): void {
-    this.closePeerConnection(peerId);
-    this.peerState.delete(peerId);
-    this.emit();
-  }
-
-  private closePeerConnection(peerId: string): void {
-    const pc = this.peers.get(peerId);
-    if (pc) {
-      try { pc.close(); } catch { /* already closed */ }
-      this.peers.delete(peerId);
-    }
-  }
-
-  private stopBurstTimer(): void {
+  /** Release to talk: disables the mic track. */
+  stopTalking(): void {
     if (this.burstTimer !== null) {
       clearTimeout(this.burstTimer);
       this.burstTimer = null;
     }
+    if (this.micTrack) this.micTrack.enabled = false;
+    if (this.status === 'talking') this.setStatus('ready');
+    this.setPtt(this.muted ? 'idle' : 'listening');
+    this.options.onTalkingChange?.(false);
+  }
+
+  /** Seconds elapsed in the current burst (0 when not talking). */
+  burstElapsedSeconds(): number {
+    if (this.ptt !== 'talking') return 0;
+    return Math.min(
+      VOICE_MAX_BURST_MS / 1000,
+      (Date.now() - this.burstStartedAtMs) / 1000,
+    );
+  }
+
+  /** Mute silences both directions (mic off + remote playback muted). */
+  setMuted(muted: boolean): void {
+    this.muted = muted;
+    if (muted) this.stopTalking();
+    if (this.micTrack) this.micTrack.enabled = !muted && this.ptt === 'talking';
+    for (const stream of this.remoteStreams.values()) {
+      for (const track of stream.getAudioTracks()) track.enabled = !muted;
+    }
+  }
+
+  /**
+   * Handle an incoming `voice.signal`. Re-checks same-team membership
+   * locally (unknown senders and own echoes ignored; ignored unless status
+   * is ready/talking). Consumes each signal exactly once (ICE bursts send
+   * many). Never triggers a snapshot.
+   */
+  async handleSignal(signal: VoiceSignal): Promise<void> {
+    if (signal.toPlayerId !== this.myPlayerId) return; // not for me
+    if (signal.fromPlayerId === this.myPlayerId) return; // own echo
+    if (!this.teammates.includes(signal.fromPlayerId)) return; // not a teammate
+    if (this.status !== 'ready' && this.status !== 'talking') return;
+    const nonce = `${signal.fromPlayerId}:${signal.kind}:${typeof signal.sdp === 'string' ? signal.sdp.slice(0, 32) : ''}:${JSON.stringify(signal.candidate ?? null)}`;
+    if (this.handledSignals.has(nonce)) return;
+    this.handledSignals.add(nonce);
+    if (this.handledSignals.size > 500) {
+      // Bound the set; ICE bursts are short-lived.
+      this.handledSignals.clear();
+    }
+
+    switch (signal.kind) {
+      case 'join': {
+        // A teammate already voice-enabled replies with an offer — exactly
+        // one side offers, so there is no glare.
+        await this.createOffer(signal.fromPlayerId);
+        break;
+      }
+      case 'leave': {
+        this.closePeer(signal.fromPlayerId);
+        break;
+      }
+      case 'offer': {
+        if (!signal.sdp || signal.sdp.length > VOICE_SDP_MAX_BYTES) return;
+        await this.answerOffer(signal.fromPlayerId, signal.sdp);
+        break;
+      }
+      case 'answer': {
+        if (!signal.sdp || signal.sdp.length > VOICE_SDP_MAX_BYTES) return;
+        const pc = this.peers.get(signal.fromPlayerId);
+        if (pc && pc.signalingState === 'have-local-offer') {
+          try {
+            await pc.setRemoteDescription({ type: 'answer', sdp: signal.sdp });
+          } catch {
+            this.markFailed(signal.fromPlayerId);
+          }
+        }
+        break;
+      }
+      case 'ice': {
+        const pc = this.peers.get(signal.fromPlayerId);
+        if (pc && signal.candidate) {
+          try {
+            await pc.addIceCandidate(signal.candidate as RTCIceCandidateInit);
+          } catch {
+            // Stale candidate — ignore.
+          }
+        }
+        break;
+      }
+    }
+  }
+
+  /** The remote audio stream for a teammate (attach to an <audio> element). */
+  getRemoteStream(peerId: string): MediaStream | undefined {
+    return this.remoteStreams.get(peerId);
+  }
+
+  private async createOffer(peerId: string): Promise<void> {
+    const pc = this.getOrCreatePeer(peerId);
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      this.options.sendSignal({
+        fromPlayerId: this.myPlayerId,
+        toPlayerId: peerId,
+        kind: 'offer',
+        sdp: offer.sdp,
+      });
+    } catch {
+      this.markFailed(peerId);
+    }
+  }
+
+  private async answerOffer(peerId: string, sdp: string): Promise<void> {
+    const pc = this.getOrCreatePeer(peerId);
+    try {
+      await pc.setRemoteDescription({ type: 'offer', sdp });
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      this.options.sendSignal({
+        fromPlayerId: this.myPlayerId,
+        toPlayerId: peerId,
+        kind: 'answer',
+        sdp: answer.sdp,
+      });
+    } catch {
+      this.markFailed(peerId);
+    }
+  }
+
+  private getOrCreatePeer(peerId: string): RTCPeerConnection {
+    const existing = this.peers.get(peerId);
+    if (existing) return existing;
+    const pc = new RTCPeerConnection({
+      iceServers: VOICE_STUN_SERVERS.map((url) => ({ urls: url })),
+    });
+    if (this.micStream) {
+      for (const track of this.micStream.getTracks()) pc.addTrack(track, this.micStream);
+    }
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.options.sendSignal({
+          fromPlayerId: this.myPlayerId,
+          toPlayerId: peerId,
+          kind: 'ice',
+          candidate: event.candidate.toJSON(),
+        });
+      }
+    };
+    pc.ontrack = (event) => {
+      const stream = event.streams[0];
+      if (stream) {
+        this.remoteStreams.set(peerId, stream);
+        for (const track of stream.getAudioTracks()) track.enabled = !this.muted;
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'connected') {
+        this.connectedPeerIds.add(peerId);
+        this.failedPeerIds.delete(peerId);
+        if (this.status === 'failed' && this.failedPeerIds.size === 0) {
+          this.setStatus('ready');
+        }
+      } else if (
+        pc.connectionState === 'failed' ||
+        pc.connectionState === 'disconnected'
+      ) {
+        this.markFailed(peerId);
+      }
+    };
+    this.peers.set(peerId, pc);
+    return pc;
+  }
+
+  private closePeer(peerId: string): void {
+    const pc = this.peers.get(peerId);
+    if (pc) {
+      try {
+        pc.close();
+      } catch {
+        // Already closed.
+      }
+      this.peers.delete(peerId);
+    }
+    this.remoteStreams.delete(peerId);
+    this.connectedPeerIds.delete(peerId);
+  }
+
+  private markFailed(peerId: string): void {
+    this.failedPeerIds.add(peerId);
+    this.connectedPeerIds.delete(peerId);
+    this.setStatus('failed', VOICE_FAILURE_COPY);
+  }
+
+  private setStatus(status: VoiceRadioStatus, detail = ''): void {
+    this.status = status;
+    this.detail = detail;
+    this.options.onStatusChange?.(status, detail);
+  }
+
+  private setPtt(state: PttState): void {
+    this.ptt = state;
+    this.options.onPttChange?.(state);
+    if (state === 'talking') this.options.onTalkingChange?.(true);
   }
 }

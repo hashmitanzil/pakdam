@@ -1,73 +1,50 @@
-// ESLint flat config — Pakdam monorepo (fix round, MEDIUM-3).
-// Real gate: `npm run lint` runs this; CI runs it on every push/PR.
-// Rules are deliberately narrow: no-unused-vars (underscore-prefixed
-// intentional discards are allowed — the codebase uses them for hash
-// stripping), no-explicit-any, no non-null assertion in new code is
-// NOT enforced (existing code uses `!` in tests and engine code).
-import js from '@eslint/js';
-import tseslint from 'typescript-eslint';
-import reactHooks from 'eslint-plugin-react-hooks';
+// Flat ESLint config for the Pakdam monorepo.
+// The fresh project vendors nothing — no vendored-file ignores are needed.
+import js from "@eslint/js";
+import tseslint from "typescript-eslint";
+import reactHooks from "eslint-plugin-react-hooks";
 
 export default tseslint.config(
+  js.configs.recommended,
+  ...tseslint.configs.recommended,
+  // Only the two classic hooks rules: the codebase's disable directives
+  // reference exhaustive-deps, and the v7 `recommended-latest` bundle
+  // adds new rules (set-state-in-effect, refs, immutability, …) this tree
+  // was never written to satisfy — do not enable that bundle here.
   {
+    plugins: { "react-hooks": reactHooks },
+    rules: {
+      "react-hooks/rules-of-hooks": "error",
+      "react-hooks/exhaustive-deps": "warn",
+    },
+  },
+  {
+    // Generated, not source: `next build` writes next-env.d.ts, and the
+    // Serwist build writes public/sw.js (the bundled service worker).
     ignores: [
-      '**/dist/**',
-      '**/.next/**',
-      '**/node_modules/**',
-      // Wrangler dev/build output (generated bundles — never linted).
-      'workers/.wrangler/**',
-      'apps/web/public/sw.js',
-      'apps/web/public/workbox-*.js',
-      'apps/web/next-env.d.ts',
-      // Third-party libraries vendored into public/ — never linted.
-      // (MapLibre GL JS, bundled with the Ola map in
-      // apps/web/public/vendor/maplibre/ — moved there from
-      // public/offline-map/vendor/ when the offline pack was deleted,
-      // 2026-11-19.)
-      'apps/web/public/vendor/maplibre/**',
-      // Scratch probe script (apps/web/probe-gps.mjs) — kept for the
-      // live GPS-mock retry, not part of the app.
-      'apps/web/probe-gps.mjs',
-      // Regenerable tsc scratch output from the websocket-reconnect
-      // test (see apps/web/src/lib/__tests__/websocket-reconnect.test.ts
-      // header: "rm -rf .scratch-web-test", "Do NOT commit").
-      // It regenerates wherever tsc is run from, so both locations
-      // are ignored.
-      '.scratch-web-test/**',
-      'apps/web/.scratch-web-test/**',
+      "**/node_modules/**",
+      "**/dist/**",
+      "**/.next/**",
+      "**/build/**",
+      "**/next-env.d.ts",
+      "**/public/sw.js",
     ],
   },
   {
-    // k6 load scripts run in k6's JS runtime, not Node or a browser:
-    // __ENV and __VU are k6 globals, and console exists there.
-    files: ['workers/load/**/*.js'],
-    languageOptions: {
-      globals: { __ENV: 'readonly', __VU: 'readonly', console: 'readonly' },
-    },
-  },
-  {
-    // .ts files use hooks too (useLiveRoom.ts, websocket.ts both end
-    // useEffect calls with an exhaustive-deps disable). Registering the
-    // plugin only for tsx/jsx left those disables as build-blocking
-    // "Definition for rule 'react-hooks/exhaustive-deps' was not found"
-    // errors in .ts files (recovery report, 2026-11-17).
-    files: ['**/*.ts', '**/*.tsx', '**/*.jsx'],
-    plugins: { 'react-hooks': reactHooks },
-    rules: { ...reactHooks.configs.recommended.rules },
-  },
-  js.configs.recommended,
-  ...tseslint.configs.recommended,
-  {
-    files: ['**/*.ts', '**/*.tsx'],
-    languageOptions: {
-      parserOptions: { ecmaFeatures: { jsx: true } },
-    },
     rules: {
-      '@typescript-eslint/no-unused-vars': [
-        'error',
-        { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' },
+      "no-console": ["warn", { allow: ["warn", "error"] }],
+      // The codebase marks intentionally-unused bindings with a leading
+      // underscore (destructured-out hashes, unused callback params).
+      // Those are deliberate; only a non-underscore unused binding errors.
+      "@typescript-eslint/no-unused-vars": [
+        "error",
+        {
+          argsIgnorePattern: "^_",
+          varsIgnorePattern: "^_",
+          caughtErrorsIgnorePattern: "^_",
+          destructuredArrayIgnorePattern: "^_",
+        },
       ],
-      '@typescript-eslint/no-explicit-any': 'error',
     },
   },
 );

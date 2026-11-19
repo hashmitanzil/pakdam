@@ -1,15 +1,12 @@
+# pnpm workspace definition.
+# NOTE: pnpm 12 reads `allowBuilds` from THIS file, not from any package.json
+# `pnpm` field — do not move it into package.json.
 packages:
   - "apps/*"
   - "packages/*"
   - "workers"
 
-# pnpm 12: build approvals live here as the `allowBuilds` map.
-# `onlyBuiltDependencies` is the old pnpm 10/11 setting and does NOT
-# work in pnpm 12 (neither in package.json nor here — verified
-# 2026-11-19: install still failed with ERR_PNPM_IGNORED_BUILDS).
-# These three are first-party packages; all approved 2026-11-19.
-# Without this map, `pnpm install` fails with ERR_PNPM_IGNORED_BUILDS.
 allowBuilds:
-  '@sentry/cli': true
-  esbuild: true
-  workerd: true
+  "@sentry/cli": true
+  "esbuild": true
+  "workerd": true

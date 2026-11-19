@@ -1,39 +1,122 @@
-import type { GeoPolygon } from '@pakdam/shared';
+/**
+ * Pure point / zone math for the host-setup map (SCRAM-SPEC §5e–§6).
+ *
+ * No I/O, no React, no map instance — the PlayAreaMap and ZoneEditor
+ * components own the map; this module only turns tap points into zone
+ * geometry. Canonical circle/polygon helpers come from @pakdam/engine.
+ */
+import {
+  circlePolygon,
+  polygonCentroid,
+  scalePolygonTowardCentroid,
+  zoneDiameterMeters,
+  type GeoPoint,
+  type GeoPolygon,
+} from '@pakdam/engine';
+import {
+  ZONE_RADIUS_DEFAULT_M,
+  ZONE_RADIUS_MIN_M,
+  haversineMeters,
+} from '@pakdam/shared';
+
+export type { GeoPoint, GeoPolygon };
+
+/** A drawn zone needs at least 3 taps — 3 taps = a triangle. */
+export const DRAW_MIN_POINTS = 3;
+/** Cap on placed corners; the editor's Corners stepper stops here. */
+export const DRAW_MAX_POINTS = 12;
+
+/** True once the drawn shape closes (3+ points). */
+export function isCompleteDrawPolygon(points: readonly GeoPoint[]): boolean {
+  return points.length >= DRAW_MIN_POINTS;
+}
+
+/** Drawn tap points as a zone boundary (a copy; [] until 3 points). */
+export function drawPointsToBoundary(points: readonly GeoPoint[]): GeoPolygon {
+  if (!isCompleteDrawPolygon(points)) return [];
+  return points.map((p) => ({ lat: p.lat, lng: p.lng }));
+}
+
+/** Radius of a zone boundary (half its widest span); default when empty. */
+export function boundaryRadiusMeters(boundary: readonly GeoPoint[]): number {
+  if (boundary.length < 3) return ZONE_RADIUS_DEFAULT_M;
+  return Math.round(zoneDiameterMeters(boundary as GeoPolygon) / 2);
+}
+
+/** Centre of a zone boundary; Ranchi/Doranda when there is no boundary. */
+export function boundaryCentre(boundary: readonly GeoPoint[]): GeoPoint {
+  if (boundary.length === 0) return { lat: 23.36, lng: 85.33 };
+  return polygonCentroid(boundary as GeoPolygon);
+}
+
+/** Circle boundary for a centre + radius (the Circle shape). */
+export function circleBoundary(centre: GeoPoint, radiusMeters: number): GeoPolygon {
+  return circlePolygon(centre, clampRadiusMeters(radiusMeters));
+}
+
+/** Zone radius, clamped to the founder minimum (100 m); no maximum. */
+export function clampRadiusMeters(radiusMeters: number): number {
+  if (!Number.isFinite(radiusMeters)) return ZONE_RADIUS_DEFAULT_M;
+  return Math.max(ZONE_RADIUS_MIN_M, Math.round(radiusMeters));
+}
+
+/** Auto final size = ~25% of the start radius (after two quarter-shrinks). */
+export function autoFinalRadiusMeters(startRadiusMeters: number): number {
+  return Math.max(25, Math.round(clampRadiusMeters(startRadiusMeters) * 0.25));
+}
+
+/** Final-size ring for a drawn polygon: the drawn shape scaled toward its
+ *  centroid by final/start, so the preview keeps the drawn shape. */
+export function drawFinalBoundary(
+  points: readonly GeoPoint[],
+  finalRadiusMeters: number,
+): GeoPolygon {
+  const boundary = drawPointsToBoundary(points);
+  if (boundary.length < 3) return [];
+  const startRadius = boundaryRadiusMeters(boundary);
+  if (startRadius <= 0) return boundary;
+  return scalePolygonTowardCentroid(
+    boundary,
+    Math.min(1, finalRadiusMeters / startRadius),
+  );
+}
 
 /**
- * Tap-to-place draw points — pure helpers for the Draw zone editor
- * (founder spec, 2026-11-19). No default shape: the host taps the map
- * and a numbered point drops (1, 2, 3…); 3 taps enclose a triangle,
- * a 4th tap makes 4 corners, a 5th makes 5, open-ended. Undo removes
- * the last point, Redraw clears all points, DONE applies the polygon.
- * These helpers are pure (no React, no map) so the web-lib suite can
- * pin the semantics without a constructed map; the Playwright specs
- * cover the map UI itself.
+ * Size range of a drawn polygon as `min–max m across` (nearest/farthest
+ * vertex from the centroid, doubled) — the Corners stepper sub-label.
  */
-
-/** Append a tapped point. Points are never reordered — the number a
- *  point shows is its position in this list, so Undo (pop the last)
- *  always removes the most recently placed point. */
-export function addDrawPoint(points: GeoPolygon, lat: number, lng: number): GeoPolygon {
-  return [...points, { lat, lng }];
+export function drawSizeRangeLabel(points: readonly GeoPoint[]): string {
+  if (points.length === 0) return '';
+  const centre = polygonCentroid(points as GeoPolygon);
+  let min = Number.POSITIVE_INFINITY;
+  let max = 0;
+  for (const p of points) {
+    const d = haversineMeters(centre, p);
+    min = Math.min(min, d);
+    max = Math.max(max, d);
+  }
+  const fmt = (m: number): string =>
+    m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
+  return `${fmt(min * 2)}–${fmt(max * 2)} across`;
 }
 
-/** Undo: drop the most recently placed point. Empty stays empty. */
-export function undoDrawPoint(points: GeoPolygon): GeoPolygon {
-  return points.slice(0, -1);
+/** Final-size percent of the start radius (null = Auto). */
+export function finalSizePercent(
+  startRadiusMeters: number,
+  finalRadiusMeters: number | null,
+): number | null {
+  if (finalRadiusMeters === null) return null;
+  if (startRadiusMeters <= 0) return null;
+  return Math.max(0, Math.min(100, Math.round((finalRadiusMeters / startRadiusMeters) * 100)));
 }
 
-/** A draft applies only once it encloses an area: 3 points minimum.
- *  0–2 points can never be a zone. */
-export function canApplyDraw(points: GeoPolygon): boolean {
-  return points.length >= 3;
-}
-
-/** True when the draft is exactly the applied shape (same points, in
- *  order) — the editor shows "Zone applied" only then, and "tap DONE
- *  to apply" while they differ. */
-export function drawPointsEqual(a: GeoPolygon | null, b: GeoPolygon | null): boolean {
-  if (a === b) return true;
-  if (!a || !b || a.length !== b.length) return false;
-  return a.every((p, i) => p.lat === b[i]!.lat && p.lng === b[i]!.lng);
+/** Final radius in metres from a stored percent (null = Auto). */
+export function finalRadiusFromPercent(
+  startRadiusMeters: number,
+  percent: number | null,
+): number {
+  if (percent === null || percent === undefined) {
+    return autoFinalRadiusMeters(startRadiusMeters);
+  }
+  return Math.max(25, Math.round((clampRadiusMeters(startRadiusMeters) * percent) / 100));
 }

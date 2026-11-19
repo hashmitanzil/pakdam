@@ -1,158 +1,113 @@
-# Pakdam — Forge Mission 001 (Phase 0 PWA)
+# Pakdam
 
-Real-world GPS hide-and-seek / manhunt. Web PWA only, foreground-only
-gameplay. Guest-only and free: join with a display name + room code, no
-account, no sign-in (sign-in is a later decision — OD-022 stays open).
-Name **Pakdam** and brand colour **red** are provisional (founder,
-2026-11-16). Trademark NOT cleared — IP India search + lawyer opinion
-required before public use.
+Pakdam is a real-world GPS hide-and-seek game played on phones in a city
+neighbourhood. One host creates a room, players join with a 6-letter code,
+teams are assigned at start, and the match runs on a live map against a clock
+inside a shrinking play zone. Two modes only — **Classic** and **Infection** —
+for 3–30 players (minimum 3 to start).
 
-> **Status (corrected 2026-11-18): Phase 0 PWA, live transport WIRED.**
-> What is built: the pure-TS authoritative engine + shared
-> types/validation, the full Next.js PWA (create, lobby, live game with
-> map/radar/radio, catch, results, leaderboards, profile, safety, help),
-> the Cloudflare Workers + Durable Object handler (one DO per room,
-> routes: create / join / by-code lookup / ws-ticket / get-state /
-> start / catch-token / WebSocket), the web pages wired to it
-> (`createLivePakdamSocket()` called from lobby, play, catch and
-> results; per-tab session credentials; demo loop only when
-> `NEXT_PUBLIC_WORKER_URL` is unset), the Worker → Supabase client
-> (`workers/src/supabase.ts`, plain-fetch PostgREST, best-effort game
-> writes), and the canonical Supabase schema (migrations 0001 + 0003
-> + 0004 to apply; 0002 RLS is HELD in `supabase/migrations-deferred/`
-> — see below).
-> What is NOT built: the live Workers/DO deployment, the live Supabase
-> project, Supabase Auth (method OPEN), real multi-device realtime end
-> to end (code exists and is unit-tested + wrangler-dev smoke 14/14;
-> not deployed, no live game played yet), legal classification, pen
-> test. Deploying the parts does not prove the game works until the
-> two-phone field test passes — see `docs/DEPLOYMENT-RUNBOOK.md` §1
-> and §3. See `docs/STATUS.md` for the exact built / not-built list.
+Free, guest-only, no accounts, no payment, no paywall. Private invite-only,
+join by code. There is no public lobby, no leaderboard, no points store — the
+match, its catches and its result are the whole product.
 
-## Quick start (local demo — no accounts, no keys)
+## Stack
 
-```bash
-cd pakdam-app
-pnpm install --frozen-lockfile
-npm run typecheck   # shared + engine + workers + web
-npm test            # builds shared/engine/workers, runs engine + workers unit tests
-npm run build       # production build (shared -> engine -> workers -> web)
-npm run dev         # http://localhost:3000
+- **Web:** Next.js 15.5 PWA on Vercel (`apps/web`) — SCRAM base + ShadowHunt
+  minimalism, Pakdam red, single dark theme. Ola Maps dark vector style
+  (`default-dark-standard`) via MapLibre GL JS.
+- **Live backend:** Cloudflare Worker + one Durable Object per room
+  (`workers/`) — the DO is the sole authority for presence, match state,
+  timers, teams, pings, catches, zone transitions and completion.
+- **Shared code:** `packages/shared` (frozen wire protocol v2.1, types,
+  validation) and `packages/engine` (pure game rules: state machine, roles,
+  zone/shrink, pings, catches, scoring, suspension).
+- **Durable records:** Supabase (Mumbai) + PostGIS (`supabase/migrations/`) —
+  the Worker talks to it over plain `fetch` to PostgREST, no client SDK.
+  Persistence is best-effort by design: a failed insert never fails a game
+  request. The web app never reads Supabase directly.
+
+## Behaviour
+
+The short behaviour spec is `pakdam-fresh/BEHAVIOUR.md` — read it first.
+The full protocol reference (payloads, validation, DO ops, calibration) is
+`../pakdam-scram-rebuild/PROTOCOL-MAP.md`; the frontend design spec is
+`../pakdam-scram-rebuild/SCRAM-SPEC.md`. Where they disagree, the decided
+Pakdam rule in `BEHAVIOUR.md` wins.
+
+Key rules, built in from the start (do not defer any of these):
+
+- DO-owned WS ticket registry — tickets validated/redeemed by the room's DO,
+  never per-isolate Worker memory. Sticky routing is not viable on Workers.
+- Resume a suspended player on hello/reconnect; a suspended Runner must be
+  able to confirm a catch.
+- Catch flow: tag → QR → Runner confirms → manual fallback, **no catch code**.
+  Catch token ≥ 128 bits entropy, hash `sha256(catchId + ':' + raw)`.
+- Readiness gate: active seats ≥ 3 **and** every active seat ready.
+- Random next zone per shrink, never concentric.
+- Pings stay until the next ping, with age shown.
+- Team-only voice radio (WebRTC P2P, free public STUN only, no TURN, no
+  recording) + team-only text radio (≤ 140 chars, last 50, ephemeral).
+- Heartbeat actually configured — real interval + missed limit, both sides.
+- Per-route HTTP rate limiting on every route.
+- Snapshot privacy: no raw coordinates, no pending pings, no token hashes;
+  a seat sees its own role only.
+- CSP / HSTS headers on the Worker.
+- Demo parity: demo pings auto-fire on schedule; demo shrink uses the
+  random-offset draw; demo SOS says plainly it notifies nobody.
+
+## Install
+
+```sh
+pnpm install
+cp .env.example .env.local   # fill in real values; never commit .env.local
 ```
 
-Play it: Create a game → share the room code → Join as a guest on the
-same device (or a second tab) → Ready → Countdown → Head start →
-Active. Keep the PWA open and the screen on: location stops when the
-tab is hidden or the phone locks. That is a Phase 0 limitation, not a
-bug.
+Requires Node.js 22 and pnpm 12.21.0 (`packageManager` is pinned in
+`package.json`; `corepack enable` picks it up).
 
-**Maps:** ONE bundled offline map (founder decision, 2026-11-17):
-MapLibre GL JS + bundled **Esri World Street Map raster tiles,
-808 tiles, zooms 12–17, bbox 23.325–23.38 N / 85.285–85.355 E,
-~13 MB**, served from `apps/web/public/offline-map/tiles/` via
-`apps/web/public/offline-map/style.json`, covering Doranda + Hinoo,
-Ranchi. (A 2.2 MB PMTiles vector file also sits in that folder as a
-documented spare — nothing loads it.) No live tile provider, no
-fallback, no switcher, no reload — no
-Google/Mapbox/MapTiler. If the device has no WebGL, an honest error
-shows instead of a blank map. No latitude/longitude numbers are
-shown anywhere in the UI — the zone centre reads "set", never
-numbers.
+## Develop
 
-## Founder rules (the short version — see `docs/DECISIONS.md`)
+```sh
+pnpm dev        # web app (apps/web) on http://localhost:3000
+```
 
-- **Catch:** in person first — the Runner taps "Got tagged", their QR
-  opens, the Hunter scans it to complete the tag (hunter + runner +
-  time recorded). If the camera is unavailable, the Runner confirms
-  manually in a dialogue box. There is NO catch code anywhere.
-- **Outside the zone:** a 30-second return countdown appears on the
-  player's screen; get back inside before it ends, or they are
-  ejected from the game. Enforced, not just displayed.
-- **Location:** default sharing while a round is running (foreground
-  only). Pings go out on the host's ping schedule; own team sees each
-  other live; the other team only via pings; Runners never see Hunters.
-  A "Refresh my location" button sends one fresh fix. The phone checks
-  the zone locally — only an outside-zone crossing sends one alert,
-  which starts the 30-second countdown. No custom cadence.
-- **Pings:** a delivered ping stays on the hunter's map until the next
-  ping replaces it — never removed on a timer. Its age counts up
-  ("0:27 ago"). Show ping history ON keeps earlier pings visible
-  (dimmer); OFF shows only the latest.
-- **Game modes:** Classic + Infection in the pilot. Breach and Zombie
-  are DEFERRED — not playable, not shown as playable.
+With `NEXT_PUBLIC_WORKER_URL` unset the app runs in local demo mode (offline
+fallback). Set it to the Worker URL for live mode (Worker + DO); a live room
+is never silently downgraded to demo mid-room.
 
-## Deploy the web app — Vercel via GitHub (founder does this)
+## Test / typecheck / lint / build
 
-The founder creates the GitHub repo and connects Vercel himself. This
-repo is ready for that — see `docs/DEPLOYMENT-RUNBOOK.md` §8 for the
-full founder checklist.
+```sh
+pnpm typecheck   # strict TypeScript across all workspaces
+pnpm lint        # flat ESLint config (eslint.config.mjs)
+pnpm test        # unit tests across all workspaces
+pnpm build       # production build of every workspace
+```
 
-1. Create a GitHub repo and push this folder (`pakdam-app/`) as the
-   repo root. Do not commit `node_modules/`, `.next/`, `dist/` or any
-   `.env` — `.gitignore` already excludes them.
-2. In Vercel: **Import Project** → pick the repo. Root Directory: the
-   repo root (default). Vercel reads `vercel.json` in this folder:
-   install `pnpm install --frozen-lockfile`, build `pnpm run build` (builds shared →
-   engine → workers → web), output `apps/web/.next`.
-3. Set the environment variables in Vercel (names only — no values in
-   this repo): `NEXT_PUBLIC_SITE_URL` = your real `*.vercel.app` URL
-   (required — the build refuses the `https://pakdam.example`
-   placeholder unless `PAKDAM_ALLOW_PLACEHOLDER_URL=1` is set, which is
-   dev/CI-only and must NEVER be set in a real deploy),
-   `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
-   `NEXT_PUBLIC_WORKER_URL` (= the deployed Worker URL from the
-   Cloudflare step — this is what switches the web app from the demo
-   loop to the live Worker transport; the old name `WORKERS_API_URL`
-   is dead and no code reads it, and `MAP_TILE_URL` is dead too — the
-   map is bundled, nothing reads either name). The Supabase names are
-   still unread by the web app — set them anyway so the wiring work
-   has them to read.
-4. Deploy, then smoke-test the routes in `docs/DEPLOYMENT-RUNBOOK.md`
-   §8. Vercel hosts the website only — the live game server is still
-   Cloudflare Workers + Durable Object (see below).
+CI (`.github/workflows/ci.yml`) runs install → typecheck → lint → unit tests
+→ production build on every push to `main` and every pull request.
 
-## Live game server — Cloudflare Workers + Durable Object
+## Deploy
 
-Vercel does not replace the game server. The live server is one
-Durable Object per room (WebSocket, server-authoritative, no exact
-opponent positions to clients). The full standalone setup is in
-`docs/CLOUDFLARE-SETUP.md` — the founder creates the Cloudflare
-account and deploys it; nothing here deploys anything. Free tiers
-first (Vercel Hobby free, Supabase Free, Workers Free); paid triggers
-at the external pilot (Workers Paid $5 + Supabase Pro $25).
+- **Web (Vercel):** `vercel.json` points at `apps/web`; region `bom1`
+  (Mumbai). Build-time env: `NEXT_PUBLIC_WORKER_URL`,
+  `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`,
+  `NEXT_PUBLIC_SITE_URL`, `NEXT_PUBLIC_OLA_MAPS_API_KEY`.
+- **Worker (Cloudflare):** `wrangler deploy` from `workers/` (name `pakdam`,
+  DO binding `ROOM_DO`). `SUPABASE_URL` is a plain `[vars]` value in
+  `wrangler.toml`; `SUPABASE_SERVICE_ROLE_KEY` is a secret
+  (`wrangler secret put SUPABASE_SERVICE_ROLE_KEY`).
+- **Supabase (Mumbai):** apply migrations in order — `0001_init`,
+  `0003_indexes`, `0004_postgis`. **Do NOT apply a 0002 migration: RLS is
+  HELD** until the auth-method decision (OD-022) lands; guest seats have no
+  profile, so the held policies could never satisfy them. If the schema ever
+  changes, write a new numbered migration — never edit 0001/0003/0004 in place
+  on a live project.
 
-## Supabase (founder does this)
+## The old tree is never a source to copy from
 
-Create the project in **Mumbai** (region: founder decision, 2026-11-17
-— chosen in the Supabase dashboard at project creation, not in a
-file). Run migrations **in order: `0001_init.sql` first, then
-`0003_indexes.sql`, then `0004_postgis.sql`** — and **SKIP
-`0002_rls.sql`**: it is HELD until the auth method closes (OD-022)
-and lives in `supabase/migrations-deferred/`, outside the deploy
-set, so a plain `supabase db push` can no longer apply it by
-accident — still verify the push output lists ONLY 0001, 0003 and
-0004 before confirming. Applying 0002 now would deny every guest
-read. Copy the anon / service keys into Vercel / Wrangler by NAME
-only (see `docs/DEPLOYMENT-RUNBOOK.md` §5). Note: 0004 (PostGIS)
-has never been applied or syntax-checked against a live Postgres —
-verify it on first apply.
-
-## Calibration — OPEN, do not invent
-
-GPS accuracy tiers, catch distance, ping schedule, grace, catch-token
-TTL and rate limits are in `packages/shared/src/calibration.ts`. Every
-value there is a placeholder labelled `OPEN — TO BE MEASURED`. No
-threshold in this repo is a measured fact.
-
-## Docs in this repo
-
-- `docs/DEPLOYMENT-RUNBOOK.md` — the deploy runbook (Vercel via
-  GitHub + founder checklist, Supabase, Cloudflare, smoke, rollback)
-- `docs/CLOUDFLARE-SETUP.md` — standalone Cloudflare Workers + DO
-  setup (account, wrangler, deploy, check it worked, troubleshooting,
-  rollback)
-- `docs/CANONICAL-SCHEMA.md` — the one schema (v2.1 Issue 6 fix)
-- `docs/DECISIONS.md` — ADRs in brief + every v2.1 correction applied
-  + founder decisions (catch, outside-zone, location, pings)
-- `docs/STATUS.md` — exactly what is built / not built
-- `docs/API.md` — exact REST + WebSocket contract (v2.1 Issue 8 fix)
+The previous build (`pakdam-app/`, now in recoverable trash) is a **behaviour
+reference only**. Do not read it, do not copy its code, do not import its
+files. Every file in this project is written fresh from `BEHAVIOUR.md` and
+the two reference specs above. If a behaviour is unclear, ask — do not go
+digging in the old tree.

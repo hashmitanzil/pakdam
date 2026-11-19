@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Pakdam">
+  <rect width="512" height="512" rx="112" fill="#0A0A0B"/>
+  <rect x="24" y="24" width="464" height="464" rx="96" fill="none" stroke="#EF4444" stroke-width="16"/>
+  <path d="M176 384 V128 h104 a84 84 0 0 1 0 168 H176" fill="none" stroke="#EF4444" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="368" cy="360" r="26" fill="#FFFFFF"/>
+</svg>

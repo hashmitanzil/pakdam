@@ -1,65 +1,61 @@
+/**
+ * PlayerDots — the dots on the play map (SCRAM-SPEC §8c).
+ *
+ * Honest by construction: snapshots carry no coordinates, so no dot here
+ * is ever placed at an invented position. Each dot is a chip:
+ *
+ * - own team, live: a green dot with the name and the last-fix freshness
+ *   (`Last fix 0:20 ago`, `Location unknown`, `Suspended`).
+ * - other team, ping-only: a white-ringed dot with the name and the ping
+ *   age (`TEO · 0:20 ago`). Pings stay until the next ping replaces them.
+ * - me: a red dot labelled `YOU`.
+ *
+ * The play page decides which dots a role may see: runners never receive
+ * hunter dots, and hunters never receive a runner's live position — only
+ * pings. This component only renders what it is given.
+ */
 'use client';
-import { formatAgeAgo, freshnessState } from '@/components/match/freshness';
-import type { ConnectionState } from '@pakdam/shared';
-import styles from './hud.module.css';
 
-export interface DotEntry {
+export interface PlayerDot {
   playerId: string;
   displayName: string;
-  role: 'hunter' | 'runner';
-  reportedAt: string | null;
-  connectionState: ConnectionState;
+  /** 'me' | 'teammate' (own team, live) | 'ping' (other team, ping-only). */
+  tone: 'me' | 'teammate' | 'ping';
+  /** Age / freshness label, e.g. `0:20 ago` or `Last fix 0:20 ago`. */
+  label: string;
+  suspended?: boolean;
 }
 
-/**
- * Named coarse dots (Worker 3, 2026-11-17) — the SCRAM-style roster strip:
- * a name with a freshness age ("0:27 ago", counting up), never a position.
- * Hunters see Runners; Runners see only their fellow Runners — Runners
- * never see Hunter positions, and nobody sees an exact pin. A dot stays
- * until that player's next report replaces it — it is never removed on a
- * timer (founder decision, 2026-11-17). Freshness is words (Live / Stale
- * / Suspended), never colour alone; Hunters are ◆ H solid, Runners ▲ R
- * hatched.
- */
-export default function PlayerDots({
-  entries,
-  title,
-  emptyText,
-}: {
-  entries: DotEntry[];
-  title: string;
-  emptyText: string;
-}) {
+export interface PlayerDotsProps {
+  dots: PlayerDot[];
+}
+
+function dotColor(tone: PlayerDot['tone'], suspended?: boolean): string {
+  if (suspended) return 'bg-[#A1A1AA]';
+  if (tone === 'me') return 'bg-[#EF4444]';
+  if (tone === 'teammate') return 'bg-[#22C55E]';
+  return 'bg-white ring-2 ring-[#EF4444]';
+}
+
+export function PlayerDots({ dots }: PlayerDotsProps) {
+  if (dots.length === 0) return null;
   return (
-    <section className="card" aria-label={title}>
-      <h2 style={{ margin: '0 0 4px' }}>{title}</h2>
-      <p className="small" style={{ margin: 0 }}>
-        Names and last-reported times only — coarse areas on the map, never exact positions.
-      </p>
-      {entries.length === 0 ? (
-        <p>{emptyText}</p>
-      ) : (
-        <ul className={styles.dotsList}>
-          {entries.map((e) => {
-            const fresh = freshnessState(e.connectionState, e.reportedAt);
-            const marker = e.role === 'hunter' ? '◆ H' : '▲ R';
-            return (
-              <li key={e.playerId} className={styles.dotsRow}>
-                <span>
-                  <span className="team-marker" aria-label={e.role === 'hunter' ? 'Hunter' : 'Runner'}>
-                    {marker}
-                  </span>{' '}
-                  <span className={styles.dotsName}>{e.displayName}</span>{' '}
-                  <span className="small">
-                    · {fresh.kind === 'fresh' ? 'Live' : fresh.kind === 'stale' ? 'Stale' : fresh.kind === 'suspended' ? 'Suspended — location unknown' : 'Location never reported'}
-                  </span>
-                </span>
-                <span className={styles.dotsAge}>{formatAgeAgo(e.reportedAt)}</span>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </section>
+    <div className="pointer-events-none absolute left-3 top-3 z-10 flex max-w-[calc(100%-6rem)] flex-wrap gap-1.5">
+      {dots.map((dot) => (
+        <span
+          key={dot.playerId}
+          className="flex items-center gap-1.5 rounded-full border border-[#26262B] bg-black/70 px-2 py-1 text-[12px] font-semibold text-white backdrop-blur-sm"
+        >
+          <span
+            aria-hidden
+            className={`inline-block h-2.5 w-2.5 shrink-0 rounded-full ${dotColor(dot.tone, dot.suspended)}`}
+          />
+          <span className="uppercase">{dot.displayName}</span>
+          <span className="pakdam-numeric font-normal text-[#A1A1AA]">
+            {dot.suspended ? 'Suspended' : dot.label}
+          </span>
+        </span>
+      ))}
+    </div>
   );
 }

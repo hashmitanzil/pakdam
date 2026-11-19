@@ -1,663 +1,1116 @@
 /**
- * DEMO MODE store — OFFLINE FALLBACK ONLY (wiring 2026-11-17).
- * This is NOT the primary path: when a Worker URL is configured
- * (NEXT_PUBLIC_WORKER_URL) the PWA plays through the real Worker /
- * Durable Object backend (apps/web/src/lib/websocket.ts:
- * createLivePakdamSocket, plus the REST helpers in
- * lib/live-room-client.ts), and this store is used ONLY when no
- * Worker is configured, or when a create/join hits a Worker that is
- * unreachable (network failure). A live room is never silently
- * downgraded to this store mid-room. Everything here is local only:
- * the engine runs in the browser, rooms persist to localStorage, and
- * a reload wipes nothing but a live room never lives here.
- * Production uses the Workers/DO backend (workers/) — this store is NOT it.
- * Privacy: rooms persist to localStorage WITHOUT any coordinates (HNT-068).
- * Location fixes are held in memory only and dropped on match end.
+ * Demo store — PROTOCOL-MAP §9. The OFFLINE fallback only: a local engine
+ * in the browser. A live room is never silently downgraded to demo mid-room.
+ * Demo and live state are never mixed in one room.
  *
- * SERVER PARITY (2026-11-18, demo divergences fixed in place — retiring
- * the demo would have meant rewriting every create/join/host/play/catch
- * demo branch, so the store was made to behave like the DO instead):
- * - Roles are assigned ONCE, at HEAD_START (workers/src/room-do.ts
- *   startMatch) — never re-drawn on the HEAD_START→ACTIVE flip or on a
- *   safety resume.
- * - The match clock starts at HEAD_START (startedAt/endsAt set there,
- *   like startMatch), NOT at ACTIVE. tickDemoRoom is the demo's alarm:
- *   getRoom runs it, so the 1 s play/catch polling flips HEAD_START→
- *   ACTIVE when the head start elapses and completes the match when
- *   endsAt is reached (resolveModeOutcome, timeExpired=true — the
- *   Runners win if any survive the clock), exactly like the DO's
- *   alarmTick. Nothing completes while SAFETY_PAUSED.
- * - A safety pause freezes the clock: pause records pausedAt +
- *   pausedFrom (the phase paused from); resume shifts startedAt,
- *   endsAt and headStartStartedAt forward by the pause and returns to
- *   pausedFrom (server safety.resume, GL-08) — it never hard-codes
- *   ACTIVE and never restarts the head start. While paused, reads
- *   project the deadlines forward by the elapsed pause so the HUD
- *   shows a frozen clock (projection only — nothing is persisted
- *   until resume).
- * - Catches mirror the DO's catch.request / catch.confirm rules: the
- *   requester must be a Hunter, the target a free Runner, phase
- *   ACTIVE, one pending catch per Runner (a re-request by the SAME
- *   Hunter returns the open claim — the demo's idempotency; a
- *   different Hunter gets CONFLICT, GL-05), and an already-caught
- *   Runner cannot be claimed again. Confirming is authenticated:
- *   'qr-scan' needs the claiming Hunter AND a scan this tab just
- *   verified (verifyCatchScan — token hash + expiry, single-use via
- *   the verified-scan record); 'manual-confirm' is Runner-only
- *   (server GL-04); no-how is the host resolving a DISPUTED catch
- *   (server resolveDisputedCatch, resolution 'host-review'). An
- *   expired QR never confirms: expiry is enforced lazily on every
- *   catch operation and by the tick, like the DO. Callers pass
- *   `actorId` — a confirm/dispute with no actor is FORBIDDEN.
- *   `nowMs` on the clock-sensitive functions is an injectable clock
- *   for tests only; production callers omit it.
+ * Persistence: rooms persist to localStorage under `pakdam.demo.rooms.v1`
+ * WITHOUT any coordinates (HNT-068); location fixes are held in memory only
+ * and dropped on match end; raw catch tokens are in-memory only
+ * (`rawCatchTokens` map), verified scans in-memory only, catch idempotency
+ * keys in-memory only.
+ *
+ * Demo parity with the DO (built in from the start, §12):
+ * - Demo pings AUTO-FIRE on schedule (the old demo needed a button).
+ * - Demo shrink uses the RANDOM-OFFSET draw, never concentric (§4.5).
+ * - Demo SOS says plainly it notifies nobody (§4.8).
+ * - P0-1: demo resumes a suspended player on catch-page arrival and on
+ *   tab-visible. P0-2: catch auto-select + name-only picker (see
+ *   `resolveEffectiveRunner` / `listCatchPickerNames`).
+ * - F2: demo guests auto-navigate to /play when the phase leaves LOBBY —
+ *   pages poll with `pollDemoRoom` (1 s) and `watchDemoPhase`.
  */
-import { assignRoles, balancedHunterCount, transition, resolveCatch, expireCatch, issueCatchToken, verifyCatchToken, recordSuspension, applyConfirmedTag, resolveModeOutcome, modeTurnsRunner } from '@pakdam/engine';
-import { CALIBRATION_OPEN, generateRoomCode, resolveHostToggles, validateRoomConfig } from '@pakdam/shared';
-import type { CatchEvent, MatchPhase, Player, Room, RoomConfig, TeamAssignment } from '@pakdam/shared';
+import {
+  CATCH_TOKEN_TTL_SECONDS,
+  DEFAULT_ROOM_CONFIG,
+  MATCH_PHASE_TRANSITIONS,
+  MIN_PLAYERS,
+  PING_AREA_RADIUS_M,
+  SHRINK_RADIUS_FACTOR,
+  TERMINAL_PHASES,
+  balancedHunterCount,
+  isValidDisplayName,
+  newCatchToken,
+  newId,
+  validateRoomConfig,
+  type CatchEvent,
+  type CatchView,
+  type GeoPoint,
+  type GeoPolygon,
+  type LocationFix,
+  type MatchPhase,
+  type MatchResult,
+  type Ping,
+  type Player,
+  type Room,
+  type RoomConfig,
+} from '@pakdam/shared';
 
-export interface DemoRoom { room: Room; players: Player[]; catches: CatchEvent[]; checkins: string[]; events: { at: string; text: string }[]; /** When the head start began (ISO) — the play page advances HEAD_START→ACTIVE from this + the configured headStartSeconds, so a reload does not restart the head start. Null in rooms created before this field existed. */ headStartStartedAt: string | null; /** Phase the match was in when safety-paused (server `pausedFrom`, room-do.ts safety.resume) — resume returns here, never hard-codes ACTIVE. Null when not paused. */ pausedFrom: MatchPhase | null; /** Per-catch QR expiry (ms epoch) — the token's expiresAtMs from issueCatchToken. Persisted (a timestamp, not a secret); the raw token itself stays in-memory only, like the server's pendingTokens. Rooms created before this field existed have none and fall back to requestedAt + TTL. */ catchExpiresAtMs: Record<string, number> }
-const KEY = 'pakdam.demo.rooms.v1';
-const rawCatchTokens = new Map<string, string>(); // in-memory only — raw tokens are NEVER persisted (HNT-049/050)
-/** Catch ids whose QR was verified by a scan in THIS tab (verifyCatchScan).
- *  A 'qr-scan' confirm consumes the entry: a confirm with no verified
- *  scan behind it is rejected, so the scan — not a bare button tap — is
- *  what proves the two players were together. In-memory only, like the
- *  raw tokens; a reload clears it, and the Hunter simply scans again. */
+export type { CatchEvent, CatchView, GeoPoint, GeoPolygon, LocationFix, MatchPhase, MatchResult, Ping, Player, Room, RoomConfig };
+
+const DEMO_ROOMS_KEY = 'pakdam.demo.rooms.v1';
+const DEMO_PLAYER_ID_KEY = 'pakdam.playerId';
+
+/** One demo room: the room + roster + local-only state (never persisted with coordinates). */
+export interface DemoRoom {
+  room: Room;
+  players: Player[];
+  catches: CatchEvent[];
+  /** Last DELIVERED ping per Runner (timestamps only, no coordinates). */
+  lastPingAtMs: Record<string, number>;
+  /** Delivered pings, kept until the next ping replaces them (§4.6). */
+  pings: Ping[];
+  /** Per-player outside-zone countdown state (memory only). */
+  outsideSinceMs: Record<string, number>;
+  outsideAccumMs: Record<string, number>;
+  /** Phase paused from (safety pause resumes here, never hard-coded ACTIVE). */
+  pausedFrom: MatchPhase | null;
+  /** Demo SOS notifies NOBODY — it only sets this local flag. */
+  sosActive: boolean;
+  sosByPlayerId: string | null;
+  /** Announcements while away (demo: local only). */
+  announcements: { text: string; byPlayerId: string; sentAt: string }[];
+  /** Shrinks already applied (the stored shrinkPhases are size placeholders only). */
+  appliedShrinks: number;
+}
+
+/** In-memory only: raw catch tokens (never persisted), verified scans, latest fixes, idempotency keys. */
+const rawCatchTokens = new Map<string, string>();
 const verifiedCatchScans = new Set<string>();
-/** Idempotency keys seen by requestCatch (demo equivalent of the DO's
- *  (seat, commandId) store): a retry with the same key returns the
- *  original claim instead of opening a second one. In-memory only. */
+const latestFixes = new Map<string, LocationFix>();
 const catchIdempotency = new Map<string, string>();
-/** Rooms written before pausedFrom / catchExpiresAtMs existed get the
- *  defaults so old localStorage rooms keep working. */
-function normalise(dr: DemoRoom): DemoRoom {
-  if (dr.pausedFrom === undefined) dr.pausedFrom = null;
-  if (dr.catchExpiresAtMs === undefined) dr.catchExpiresAtMs = {};
-  if (dr.headStartStartedAt === undefined) dr.headStartStartedAt = null;
-  return dr;
-}
-function load(): Record<string, DemoRoom> {
-  if (typeof window === 'undefined') return {};
+
+// -- Persistence (no coordinates ever written) -------------------------------
+
+function readRooms(): DemoRoom[] {
+  if (typeof window === 'undefined') return [];
   try {
-    const all = JSON.parse(localStorage.getItem(KEY) ?? '{}') as Record<string, DemoRoom>;
-    for (const dr of Object.values(all)) normalise(dr);
-    return all;
-  } catch { return {}; }
-}
-function save(all: Record<string, DemoRoom>): void { localStorage.setItem(KEY, JSON.stringify(all)); }
-function shiftIso(iso: string | null, ms: number): string | null {
-  return iso ? new Date(Date.parse(iso) + ms).toISOString() : null;
-}
-/** QR expiry for a catch: the stored expiresAtMs, else the legacy
- *  requestedAt + TTL fallback (rooms / catches from before the field). */
-function catchExpiresAtMs(dr: DemoRoom, c: CatchEvent): number {
-  return dr.catchExpiresAtMs[c.catchId] ?? (new Date(c.requestedAt).getTime() + CALIBRATION_OPEN.catchTokenTtlSeconds * 1000);
-}
-/** Lazily expire one overdue pending catch (DO catch.confirm does the
- *  same check on every attempt). Returns true when it expired. */
-function expireCatchIfOverdue(dr: DemoRoom, c: CatchEvent, nowMs: number): boolean {
-  if ((c.state === 'requested' || c.state === 'awaiting-confirmation') && nowMs > catchExpiresAtMs(dr, c)) {
-    Object.assign(c, expireCatch(c));
-    return true;
+    const raw = window.localStorage.getItem(DEMO_ROOMS_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as DemoRoom[]) : [];
+  } catch {
+    return [];
   }
-  return false;
 }
-/** While SAFETY_PAUSED the match clock is frozen: reads project
- *  startedAt / endsAt / headStartStartedAt forward by the pause so
- *  far, so the HUD, the head-start countdown and the shrink clock all
- *  stand still. Projection ONLY — the stored values are untouched
- *  until resume shifts them for real (setPhase). */
-function projectPausedClock(dr: DemoRoom, nowMs: number): DemoRoom {
-  if (dr.room.phase !== 'SAFETY_PAUSED' || !dr.room.pausedAt) return dr;
-  const shiftMs = nowMs - Date.parse(dr.room.pausedAt);
-  if (shiftMs <= 0) return dr;
+
+function writeRooms(rooms: DemoRoom[]): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(DEMO_ROOMS_KEY, JSON.stringify(rooms));
+  } catch {
+    // Storage full — demo state is best-effort.
+  }
+}
+
+function saveRoom(room: DemoRoom): void {
+  const rooms = readRooms().filter((r) => r.room.roomId !== room.room.roomId);
+  rooms.push(room);
+  writeRooms(rooms);
+}
+
+// -- Geometry helpers (local; the engine package owns the canonical ones) ---
+
+function haversineMeters(a: GeoPoint, b: GeoPoint): number {
+  const R = 6_371_000;
+  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
+  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
+  const la1 = (a.lat * Math.PI) / 180;
+  const la2 = (b.lat * Math.PI) / 180;
+  const h =
+    Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLng / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+function pointInPolygon(point: GeoPoint, polygon: GeoPolygon): boolean {
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const a = polygon[i];
+    const b = polygon[j];
+    if (!a || !b) continue;
+    const crosses =
+      a.lng > point.lng !== b.lng > point.lng &&
+      point.lat <
+        ((b.lat - a.lat) * (point.lng - a.lng)) / (b.lng - a.lng) + a.lat;
+    if (crosses) inside = !inside;
+  }
+  return inside;
+}
+
+function polygonCentroid(polygon: GeoPolygon): GeoPoint {
+  let lat = 0;
+  let lng = 0;
+  for (const p of polygon) {
+    lat += p.lat;
+    lng += p.lng;
+  }
+  return { lat: lat / polygon.length, lng: lng / polygon.length };
+}
+
+function scalePolygonToward(polygon: GeoPolygon, centre: GeoPoint, factor: number): GeoPolygon {
+  return polygon.map((p) => ({
+    lat: centre.lat + (p.lat - centre.lat) * factor,
+    lng: centre.lng + (p.lng - centre.lng) * factor,
+  }));
+}
+
+function polygonFullyInside(inner: GeoPolygon, outer: GeoPolygon): boolean {
+  return inner.every((p) => pointInPolygon(p, outer));
+}
+
+function offsetPolygon(polygon: GeoPolygon, dLat: number, dLng: number): GeoPolygon {
+  return polygon.map((p) => ({ lat: p.lat + dLat, lng: p.lng + dLng }));
+}
+
+/**
+ * Random-offset next zone (§4.5, PUBG-style): scale the boundary toward its
+ * centroid by the shrink factor, then move the smaller shape to a RANDOMLY
+ * selected position fully inside the current boundary — NEVER concentric.
+ * Draws within 10 m of the current centre are discarded and re-drawn (up to
+ * 50 attempts); fallbacks: 8 compass-direction offsets, then the concentric
+ * scaled copy only as a last resort.
+ */
+export function randomOffsetShrinkBoundary(boundary: GeoPolygon): GeoPolygon {
+  if (boundary.length < 3) return boundary;
+  const centroid = polygonCentroid(boundary);
+  const scaled = scalePolygonToward(boundary, centroid, SHRINK_RADIUS_FACTOR);
+  const scaledCentroid = polygonCentroid(scaled);
+  // Max offset: the smaller shape must stay fully inside the old boundary.
+  // Approximate with the radius of the old boundary (widest vertex distance).
+  let maxOffsetM = 0;
+  for (const p of boundary) {
+    maxOffsetM = Math.max(maxOffsetM, haversineMeters(centroid, p));
+  }
+  maxOffsetM = Math.max(0, maxOffsetM * (1 - SHRINK_RADIUS_FACTOR));
+  const metresToDegLat = 180 / (6_371_000 * Math.PI); // matches the haversine R in @pakdam/shared — a built circle measures its nominal radius
+  for (let attempt = 0; attempt < 50; attempt++) {
+    const angle = Math.random() * 2 * Math.PI;
+    const distance = Math.sqrt(Math.random()) * maxOffsetM;
+    const dLat = Math.cos(angle) * distance * metresToDegLat;
+    const dLng =
+      (Math.sin(angle) * distance * metresToDegLat) /
+      Math.cos((centroid.lat * Math.PI) / 180);
+    const candidate = offsetPolygon(scaled, dLat, dLng);
+    const candidateCentroid = polygonCentroid(candidate);
+    if (haversineMeters(candidateCentroid, scaledCentroid) < 10) continue; // near-concentric — re-draw
+    if (polygonFullyInside(candidate, boundary)) return candidate;
+  }
+  // Fallback: 8 compass-direction deterministic offsets.
+  for (let k = 0; k < 8; k++) {
+    const angle = (k * Math.PI) / 4;
+    const dLat = Math.cos(angle) * maxOffsetM * 0.5 * metresToDegLat;
+    const dLng =
+      (Math.sin(angle) * maxOffsetM * 0.5 * metresToDegLat) /
+      Math.cos((centroid.lat * Math.PI) / 180);
+    const candidate = offsetPolygon(scaled, dLat, dLng);
+    if (polygonFullyInside(candidate, boundary)) return candidate;
+  }
+  return scaled; // last resort: concentric scaled copy
+}
+
+export function circlePolygon(
+  centre: GeoPoint,
+  radiusMeters: number,
+  points = 32,
+): GeoPolygon {
+  const out: GeoPolygon = [];
+  // Metres per degree of latitude matching the haversine R (6,371,000 m)
+  // in @pakdam/shared — see packages/engine/src/zone.ts. A 500 m circle
+  // built with 111,320 measured back as 499 m.
+  const metresPerDegLat = (6_371_000 * Math.PI) / 180;
+  const dLat = radiusMeters / metresPerDegLat;
+  const dLng = radiusMeters / (metresPerDegLat * Math.cos((centre.lat * Math.PI) / 180));
+  for (let i = 0; i < points; i++) {
+    const angle = (i * 2 * Math.PI) / points;
+    out.push({
+      lat: centre.lat + Math.sin(angle) * dLat,
+      lng: centre.lng + Math.cos(angle) * dLng,
+    });
+  }
+  return out;
+}
+
+// -- Room lifecycle -----------------------------------------------------------
+
+function generateRoomCode(): string {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+function newPlayer(
+  roomId: string,
+  displayName: string,
+  isHost: boolean,
+): Player {
+  const now = new Date().toISOString();
   return {
-    ...dr,
-    room: { ...dr.room, startedAt: shiftIso(dr.room.startedAt, shiftMs), endsAt: shiftIso(dr.room.endsAt, shiftMs) },
-    headStartStartedAt: shiftIso(dr.headStartStartedAt, shiftMs),
+    playerId: newId(),
+    roomId,
+    kind: 'guest',
+    displayName,
+    isHost,
+    matchRole: null,
+    team: null,
+    reconnectTokenHash: '',
+    joinedAt: now,
+    leftAt: null,
+    ejectedAt: null,
+    connectionState: 'connected',
+    lastFixAt: null,
+    locationQuality: null,
+    isReady: false,
+    briefingConfirmed: false,
+    ageGatePassed: true,
+    suspensionCount: 0,
   };
 }
-/**
- * Demo alarm tick — the DO alarmTick's local equivalent. Runs on every
- * getRoom / getRoomByCode read (the play and catch pages poll those
- * every second), so a demo match advances without a server:
- *  1. overdue pending catches expire;
- *  2. HEAD_START flips to ACTIVE when the head start elapses
- *     (from startedAt — the clock starts at HEAD_START, like
- *     startMatch — falling back to headStartStartedAt for legacy
- *     rooms whose startedAt was only set at ACTIVE);
- *  3. a live phase whose endsAt has passed completes via RESOLVING,
- *     with the mode-aware time-expired outcome (computeOutcome:
- *     Runners win if any survive the clock).
- * Never fires while SAFETY_PAUSED (the tick needs no pause logic —
- * resume shifts the deadlines, so a paused room cannot reach them).
- * Returns the stored room (unprojected) or null. listRooms does NOT
- * tick: a list read must not write.
- */
-export function tickDemoRoom(roomId: string, nowMs: number = Date.now()): DemoRoom | null {
-  const all = load(); const dr = all[roomId]; if (!dr) return null;
-  if (dr.room.phase === 'SAFETY_PAUSED') return dr;
-  let changed = false;
-  for (const c of dr.catches) if (expireCatchIfOverdue(dr, c, nowMs)) changed = true;
-  if (dr.room.phase === 'HEAD_START') {
-    const headStartBase = dr.room.startedAt ?? dr.headStartStartedAt;
-    if (headStartBase && nowMs >= Date.parse(headStartBase) + dr.room.config.headStartSeconds * 1000) {
-      dr.room.phase = transition(dr.room.phase, 'ACTIVE'); dr.room.version += 1; changed = true;
-      dr.events.push({ at: new Date(nowMs).toISOString(), text: 'Head start over — the match is live' });
-    }
+
+/** Create a demo room. The host seat is created ready + briefing confirmed. */
+export function createRoom(
+  displayName: string,
+  config: RoomConfig = DEFAULT_ROOM_CONFIG,
+): DemoRoom {
+  if (!isValidDisplayName(displayName)) {
+    throw new Error('Enter a name between 1 and 30 characters.');
   }
-  if ((dr.room.phase === 'ACTIVE' || dr.room.phase === 'HEAD_START') && dr.room.endsAt && nowMs >= Date.parse(dr.room.endsAt)) {
-    const caught = dr.catches.filter((x) => x.state === 'confirmed').map((x) => x.runnerPlayerId);
-    const result = {
-      ...resolveModeOutcome(dr.players, caught, true, dr.room.config.mode),
-      durationSeconds: dr.room.startedAt ? Math.max(0, Math.floor((nowMs - Date.parse(dr.room.startedAt)) / 1000)) : 0,
-    };
-    dr.room.phase = transition(dr.room.phase, 'RESOLVING');
-    dr.room.result = result;
-    dr.room.phase = transition(dr.room.phase, 'COMPLETED');
-    dr.room.version += 1; changed = true;
-    dr.events.push({ at: new Date(nowMs).toISOString(), text: `Time up — match complete (${result.outcome === 'hunters-win' ? 'Hunters win' : 'Runners win'})` });
+  const issues = validateRoomConfig({ ...config, hostOnSiteConfirmed: true });
+  if (issues.length > 0) throw new Error(`Setup not accepted: ${issues[0]}`);
+  const roomId = newId();
+  const host = newPlayer(roomId, displayName.trim(), true);
+  host.isReady = true;
+  host.briefingConfirmed = true;
+  const room: Room = {
+    roomId,
+    roomCode: generateRoomCode(),
+    hostPlayerId: host.playerId,
+    phase: 'LOBBY',
+    version: 1,
+    config,
+    createdAt: new Date().toISOString(),
+    startedAt: null,
+    endsAt: null,
+    pausedAt: null,
+    result: null,
+  };
+  const demo: DemoRoom = {
+    room,
+    players: [host],
+    catches: [],
+    lastPingAtMs: {},
+    pings: [],
+    outsideSinceMs: {},
+    outsideAccumMs: {},
+    pausedFrom: null,
+    sosActive: false,
+    sosByPlayerId: null,
+    announcements: [],
+    appliedShrinks: 0,
+  };
+  saveRoom(demo);
+  setCurrentPlayerId(host.playerId);
+  return demo;
+}
+
+/** Join a demo room. Rejoining with an existing display name (case-insensitive) RESTORES the seat; an ejected seat stays ejected. */
+export function joinRoom(
+  roomId: string,
+  displayName: string,
+): { room: DemoRoom; player: Player; restored: boolean } {
+  const demo = getRoom(roomId);
+  if (!demo) throw new Error('Game not found or ended.');
+  if (demo.room.phase !== 'LOBBY') throw new Error('Full, or no longer open.');
+  const name = displayName.trim();
+  if (!isValidDisplayName(name)) {
+    throw new Error('Enter a name between 1 and 30 characters.');
   }
-  if (changed) save(all);
-  return dr;
-}
-export function listRooms(): DemoRoom[] { return Object.values(load()).map((dr) => projectPausedClock(dr, Date.now())); }
-export function getRoom(roomId: string, nowMs: number = Date.now()): DemoRoom | null {
-  const dr = tickDemoRoom(roomId, nowMs);
-  return dr ? projectPausedClock(dr, nowMs) : null;
-}
-export function getRoomByCode(code: string, nowMs: number = Date.now()): DemoRoom | null {
-  const found = Object.values(load()).find((r) => r.room.roomCode === code.toUpperCase()) ?? null;
-  if (!found) return null;
-  const dr = tickDemoRoom(found.room.roomId, nowMs);
-  return dr ? projectPausedClock(dr, nowMs) : null;
-}
-function uid(): string { return crypto.randomUUID(); }
-/** Room invite code — crypto randomness (shared `generateRoomCode`),
- *  never Math.random: a code must not be guessable. */
-function code(): string { return generateRoomCode(); }
-export function createRoom(hostName: string, config: RoomConfig): DemoRoom {
-  // No venue/area name: the game starts from the host's GPS + a zone on
-  // the map (redesign 2026-11-17). RoomConfig has no venueName field any
-  // more and the old 'Play zone' shim is deleted — nothing fills one in.
-  // Host-setup toggles saved before they existed are normalised to
-  // their legacy defaults (all OFF) so old rooms keep their behaviour.
-  const errors = validateRoomConfig(config);
-  if (errors.length) throw new Error(errors.join('; '));
-  const toggles = resolveHostToggles(config);
-  const stored: RoomConfig = { ...config, ...toggles };
-  const roomId = uid();
-  const host: Player = { playerId: uid(), roomId, kind: 'host-account', displayName: hostName, isHost: true, matchRole: null, team: null, reconnectTokenHash: 'demo-' + uid(), joinedAt: new Date().toISOString(), leftAt: null, connectionState: 'connected', lastFixAt: null, locationQuality: 'unknown', isReady: true, briefingConfirmed: true, ageGatePassed: true, suspensionCount: 0, ejectedAt: null };
-  const room: Room = { roomId, roomCode: code(), hostPlayerId: host.playerId, phase: 'LOBBY', version: 1, config: stored, createdAt: new Date().toISOString(), startedAt: null, endsAt: null, pausedAt: null, result: null };
-  const dr: DemoRoom = { room, players: [host], catches: [], checkins: [], events: [{ at: new Date().toISOString(), text: `Room created by ${hostName}` }], headStartStartedAt: null, pausedFrom: null, catchExpiresAtMs: {} };
-  const all = load(); all[roomId] = dr; save(all); return dr;
-}
-export function joinRoom(roomId: string, displayName: string): Player {
-  const all = load(); const dr = all[roomId]; if (!dr) throw new Error('ROOM_NOT_FOUND');
-  const trimmed = displayName.trim();
-  // Rejoining with an existing display name RESTORES that player's
-  // seat — same playerId, same role, host powers if host — instead of
-  // creating a duplicate (founder bug, 2026-11-17: rejoining as the
-  // host name created a duplicate non-host player and the host lost
-  // the Start button). Matching is case-insensitive on the trimmed
-  // name; a player who left rejoins as connected again (ejectedAt,
-  // if set, stays — rejoining never un-ejects). The restore runs
-  // before the room-full check (the seat is already theirs) and in
-  // any phase (it is a resume, not a new join); brand-new players
-  // still need a free seat and an open lobby.
-  const existing = dr.players.find((p) => p.displayName.trim().toLowerCase() === trimmed.toLowerCase());
+  const existing = demo.players.find(
+    (p) => p.displayName.toLowerCase() === name.toLowerCase(),
+  );
   if (existing) {
     existing.leftAt = null;
-    // An ejected seat must NOT flip back to 'connected' while
-    // ejectedAt is set (same rule as the DO, QA BE-09): an ejected
-    // Runner rejoining looked live again while still ejected.
-    existing.connectionState = existing.ejectedAt ? existing.connectionState : 'connected';
-    dr.events.push({ at: new Date().toISOString(), text: `${existing.displayName} rejoined` });
-    save(all); return existing;
+    existing.connectionState = 'connected';
+    saveRoom(demo);
+    setCurrentPlayerId(existing.playerId);
+    return { room: demo, player: existing, restored: true };
   }
-  // Room-full counts ACTIVE seats only (QA 2026-11-17, MP-FULL-COUNT):
-  // players who left stay in the roster with leftAt set, and the old
-  // `players.length` check counted them — a room with leavers reported
-  // "full" with free seats.
-  if (dr.players.filter((p) => !p.leftAt).length >= dr.room.config.maxPlayers) throw new Error('Room is full');
-  if (dr.room.phase !== 'LOBBY') throw new Error('Room is not open for joining');
-  const p: Player = { playerId: uid(), roomId, kind: 'guest', displayName: trimmed, isHost: false, matchRole: null, team: null, reconnectTokenHash: 'demo-' + uid(), joinedAt: new Date().toISOString(), leftAt: null, connectionState: 'connected', lastFixAt: null, locationQuality: 'unknown', isReady: false, briefingConfirmed: false, ageGatePassed: true, suspensionCount: 0, ejectedAt: null };
-  dr.players.push(p); dr.events.push({ at: new Date().toISOString(), text: `${trimmed} joined` }); save(all); return p;
+  const active = demo.players.filter((p) => p.leftAt === null);
+  if (active.length >= demo.room.config.maxPlayers) {
+    throw new Error('Full, or no longer open.');
+  }
+  const player = newPlayer(roomId, name, false);
+  demo.players.push(player);
+  saveRoom(demo);
+  setCurrentPlayerId(player.playerId);
+  return { room: demo, player, restored: false };
 }
-export function setPhase(roomId: string, to: MatchPhase, nowMs: number = Date.now()): DemoRoom {
-  const all = load(); const dr = all[roomId]; if (!dr) throw new Error('ROOM_NOT_FOUND');
-  const from = dr.room.phase;
-  // Resume from a safety pause returns to the phase the match was
-  // paused from (server safety.resume, GL-08) — the caller asks for
-  // ACTIVE, the store resolves it to HEAD_START when the pause began
-  // there, so a pause during the head start never skips the rest of
-  // it. transition() still enforces the legal edge either way.
-  let target = to;
-  if (from === 'SAFETY_PAUSED' && to === 'ACTIVE') target = dr.pausedFrom ?? 'ACTIVE';
-  dr.room.phase = transition(from, target); dr.room.version += 1;
-  const nowIso = new Date(nowMs).toISOString();
-  if (target === 'SAFETY_PAUSED') {
-    // Pause freezes the clock: the pause start and the phase paused
-    // from are recorded; resume shifts the deadlines (below). The
-    // tick never completes a paused room, and reads project the
-    // deadlines forward while paused (projectPausedClock).
-    dr.room.pausedAt = nowIso;
-    dr.pausedFrom = from;
-  } else if (from === 'SAFETY_PAUSED' && (target === 'ACTIVE' || target === 'HEAD_START')) {
-    // Resume: shift the match clock forward by the pause (server
-    // safety.resume) — a pause eats no match time and the head start
-    // does not expire while everyone is standing still. Roles are
-    // NOT re-drawn here (they were drawn once, at HEAD_START).
-    const pauseMs = Math.max(0, nowMs - (dr.room.pausedAt ? Date.parse(dr.room.pausedAt) : nowMs));
-    dr.room.startedAt = shiftIso(dr.room.startedAt, pauseMs);
-    dr.room.endsAt = shiftIso(dr.room.endsAt, pauseMs);
-    dr.headStartStartedAt = shiftIso(dr.headStartStartedAt, pauseMs);
-    dr.room.pausedAt = null;
-    dr.pausedFrom = null;
-    dr.events.push({ at: nowIso, text: `Safety pause lifted — the game resumes (${target === 'HEAD_START' ? 'head start' : 'active play'})` });
-  }
-  // The match clock starts at HEAD_START (server startMatch), NOT at
-  // ACTIVE: startedAt/endsAt are set on the fresh HEAD_START entry,
-  // and the ACTIVE flip never resets them — the old code reset both
-  // on every entry to ACTIVE, so a safety resume silently granted a
-  // whole new match duration. A legacy room that reached ACTIVE
-  // without HEAD_START (startedAt still null) gets its clock here,
-  // once, instead of never having one.
-  const freshHeadStart = target === 'HEAD_START' && from === 'COUNTDOWN';
-  if (freshHeadStart) {
-    if (!dr.room.startedAt) {
-      dr.room.startedAt = nowIso;
-      dr.room.endsAt = new Date(nowMs + dr.room.config.durationSeconds * 1000).toISOString();
+
+/** The demo's alarm: runs on every getRoom / getRoomByCode read. `listRooms` does NOT tick (a list read must not write). */
+export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRoom {
+  const { room } = demo;
+  if (TERMINAL_PHASES.includes(room.phase)) return demo;
+  if (room.phase === 'SAFETY_PAUSED') return demo; // nothing completes while paused
+
+  // Expire overdue pending catches.
+  for (const c of demo.catches) {
+    if (
+      (c.state === 'requested' || c.state === 'awaiting-confirmation') &&
+      nowMs - new Date(c.requestedAt).getTime() > CATCH_TOKEN_TTL_SECONDS * 1000
+    ) {
+      c.state = 'expired';
     }
-    dr.headStartStartedAt = nowIso;
-  } else if (target === 'ACTIVE' && from === 'HEAD_START' && !dr.room.startedAt) {
-    dr.room.startedAt = nowIso;
-    dr.room.endsAt = new Date(nowMs + dr.room.config.durationSeconds * 1000).toISOString();
   }
-  if (freshHeadStart || (target === 'ACTIVE' && from === 'HEAD_START' && !dr.players.some((p) => p.matchRole))) {
-    // Roles are assigned ONCE, when the game starts (HEAD_START) — the
-    // head start IS the match starting. They are NEVER re-drawn on the
-    // HEAD_START -> ACTIVE step: re-assigning there re-shuffled the
-    // Hunters (4 of 5 probe trials changed Hunter between head start
-    // and active play, 2026-11-17 final verification), so the role a
-    // player revealed during the head start could flip when play
-    // began. The ACTIVE arm above only assigns when NO role exists
-    // yet (a room that reached ACTIVE without HEAD_START, e.g. a
-    // legacy room) — otherwise the HEAD_START draw stands. The DO
-    // assigns once in startMatch for the same reason.
-    // Roles are assigned when the game starts, honouring the host's
-    // team assignment AND the Balance / Random toggles:
-    // - Balance ON: the Hunter count is set from the roster that
-    //   actually joined (provisional table, calibration OPEN).
-    // - Random ON (teamAssignment 'random' + randomDraw): Hunters are
-    //   drawn at random (a real shuffle). Random OFF in legacy rooms
-    //   keeps the deterministic join-order draw existing rooms rely
-    //   on (the host is first, so the host is the Hunter).
-    // - Host picks (teamAssignment 'selected'): the host-picked Hunters
-    //   are used when exactly the effective count were picked; if the
-    //   balance changed the count, the pick is trimmed to the effective
-    //   count, and if too few (or none) were picked the shortfall is
-    //   drawn at random — the match never fails to start over a stale
-    //   pick. The stored hunterCount is updated to the effective count
-    //   so the dashboard and summary agree with the game. Classic
-    //   and Infection are the only modes; neither forces a Hunter
-    //   count, so Balance can raise the count here.
-    const c = dr.room.config;
-    const toggles = resolveHostToggles(c);
-    let effective = toggles.balanceHunters ? balancedHunterCount(dr.players.length) : c.hunterCount;
-    effective = Math.max(1, Math.min(effective, dr.players.length - 1));
-    const picked = c.selectedHunterIds;
-    let note = '';
-    if (c.teamAssignment === 'selected' && picked.length === effective) {
-      dr.players = assignRoles(dr.players, effective, { teamAssignment: 'selected', selectedHunterIds: picked });
-      note = `Host picked ${effective} Hunter${effective === 1 ? '' : 's'} in the lobby.`;
-    } else {
-      if (c.teamAssignment === 'selected' && picked.length > effective) {
-        note = `Host-picked Hunters trimmed to ${effective} (balanced count for ${dr.players.length} players).`;
-      } else if (c.teamAssignment === 'selected') {
-        note = `Only ${picked.length} Hunter${picked.length === 1 ? '' : 's'} picked for a ${effective}-Hunter game — drawing at random instead.`;
-      } else if (toggles.randomDraw) {
-        note = `${effective} Hunter${effective === 1 ? '' : 's'} drawn at random.`;
-      }
-      if (toggles.balanceHunters && effective !== c.hunterCount) {
-        note += ` Balance set the Hunter count from the roster (${dr.players.length} players).`;
-      }
-      dr.players = assignRoles(dr.players, effective, { teamAssignment: 'random', shuffle: toggles.randomDraw });
+
+  // HEAD_START → ACTIVE when the head start elapses.
+  if (room.phase === 'HEAD_START' && room.startedAt) {
+    const headStartEndsAt =
+      new Date(room.startedAt).getTime() + room.config.headStartSeconds * 1000;
+    if (nowMs >= headStartEndsAt) {
+      setPhase(demo, 'ACTIVE');
     }
-    dr.room.config.hunterCount = effective;
-    if (note) dr.events.push({ at: new Date().toISOString(), text: `Roles assigned — ${note}` });
   }
-  save(all); return dr;
-}
-/** Host changes how teams are picked (lobby only). Switching to Random
- *  clears any host-picked Hunters. */
-export function setTeamAssignment(roomId: string, assignment: TeamAssignment): DemoRoom {
-  const all = load(); const dr = all[roomId]; if (!dr) throw new Error('ROOM_NOT_FOUND');
-  if (dr.room.phase !== 'LOBBY') throw new Error('INVALID_STATE: teams can only be changed in the lobby');
-  dr.room.config.teamAssignment = assignment;
-  if (assignment === 'random') dr.room.config.selectedHunterIds = [];
-  dr.events.push({ at: new Date().toISOString(), text: `Host set team assignment to ${assignment === 'selected' ? 'Selected (host picks the Hunters)' : 'Random'}` });
-  save(all); return dr;
-}
-/** Host picks exactly hunterCount Hunters from the joined players
- *  (lobby only, teamAssignment 'selected'). */
-export function setSelectedHunters(roomId: string, playerIds: string[]): DemoRoom {
-  const all = load(); const dr = all[roomId]; if (!dr) throw new Error('ROOM_NOT_FOUND');
-  if (dr.room.phase !== 'LOBBY') throw new Error('INVALID_STATE: Hunters can only be picked in the lobby');
-  if (dr.room.config.teamAssignment !== 'selected') throw new Error('INVALID_STATE: team assignment is Random — switch to Selected first');
-  if (playerIds.length !== dr.room.config.hunterCount) throw new Error(`VALIDATION_FAILED: pick exactly ${dr.room.config.hunterCount} Hunter(s)`);
-  const joined = new Set(dr.players.map((p) => p.playerId));
-  if (playerIds.some((id) => !joined.has(id))) throw new Error('VALIDATION_FAILED: picked Hunters must be joined players');
-  if (new Set(playerIds).size !== playerIds.length) throw new Error('VALIDATION_FAILED: picked Hunters must not repeat a player');
-  dr.room.config.selectedHunterIds = [...playerIds];
-  const names = playerIds.map((id) => dr.players.find((p) => p.playerId === id)?.displayName ?? id).join(', ');
-  dr.events.push({ at: new Date().toISOString(), text: `Host picked Hunters: ${names}` });
-  save(all); return dr;
-}
-/** Host changes the game settings from the lobby settings sheet
- *  (lobby only — never after the match starts). The new config is
- *  validated exactly like a fresh room. If the Hunter count or the
- *  team assignment changed, any host-picked Hunters are cleared: the
- *  old pick may no longer hold the right number of players. */
-export function updateRoomConfig(roomId: string, config: RoomConfig): DemoRoom {
-  const all = load(); const dr = all[roomId]; if (!dr) throw new Error('ROOM_NOT_FOUND');
-  if (dr.room.phase !== 'LOBBY') throw new Error('INVALID_STATE: settings can only be changed in the lobby');
-  const trimmed: RoomConfig = { ...config, selectedHunterIds: config.selectedHunterIds.slice(0, config.hunterCount) };
-  const errors = validateRoomConfig(trimmed);
-  if (errors.length) throw new Error(errors.join('; '));
-  const hunterCountChanged = trimmed.hunterCount !== dr.room.config.hunterCount;
-  const assignmentChanged = trimmed.teamAssignment !== dr.room.config.teamAssignment;
-  const toggles = resolveHostToggles(trimmed);
-  dr.room.config = { ...trimmed, ...toggles };
-  if (hunterCountChanged || assignmentChanged) dr.room.config.selectedHunterIds = [];
-  dr.room.version += 1;
-  dr.events.push({ at: new Date().toISOString(), text: 'Host updated the game settings' });
-  save(all); return dr;
-}
-export function toggleReady(roomId: string, playerId: string): void {
-  const all = load(); const dr = all[roomId]; if (!dr) return;
-  const p = dr.players.find((x) => x.playerId === playerId); if (p) { p.isReady = !p.isReady; p.briefingConfirmed = true; save(all); }
-}
-export function requestCatch(roomId: string, hunterId: string, runnerId: string, opts?: { idempotencyKey?: string; nowMs?: number }): CatchEvent {
-  const nowMs = opts?.nowMs ?? Date.now();
-  const all = load(); const dr = all[roomId]; if (!dr) throw new Error('ROOM_NOT_FOUND');
-  // Idempotent retry: the same key returns the original claim instead
-  // of opening a second one (DO (seat, commandId) dedupe).
-  if (opts?.idempotencyKey) {
-    const priorId = catchIdempotency.get(`${roomId}:${opts.idempotencyKey}`);
-    const prior = priorId ? dr.catches.find((x) => x.catchId === priorId) : undefined;
-    if (prior) return prior;
+
+  // Match end at endsAt via RESOLVING with the mode-aware outcome.
+  if (
+    (room.phase === 'ACTIVE' || room.phase === 'HEAD_START') &&
+    room.endsAt &&
+    nowMs >= new Date(room.endsAt).getTime()
+  ) {
+    completeMatch(demo, nowMs);
   }
-  // Server catch.request rules (room-do.ts): only a Hunter may claim,
-  // only while ACTIVE, only on a Runner who is free, present and not
-  // suspended — and one pending catch per Runner, whoever the Hunter
-  // is (GL-05). A re-request by the SAME Hunter returns the open
-  // claim (idempotent — a double-tap never opens a second claim); a
-  // different Hunter gets CONFLICT, like the server.
-  if (dr.room.phase !== 'ACTIVE') throw new Error(`INVALID_STATE: catches are not possible while the match is ${dr.room.phase}`);
-  const hunter = dr.players.find((p) => p.playerId === hunterId);
-  if (!hunter || hunter.matchRole !== 'hunter') throw new Error('FORBIDDEN: only a Hunter may request a catch');
-  if (hunter.ejectedAt || hunter.leftAt) throw new Error('INVALID_STATE: an ejected or departed Hunter may not request a catch');
-  const runner = dr.players.find((p) => p.playerId === runnerId);
-  if (!runner || runner.matchRole !== 'runner' || runner.leftAt || runner.ejectedAt) throw new Error('VALIDATION_FAILED: runnerId is not a Runner in this room');
-  if (runner.connectionState === 'suspended') throw new Error('Catch cannot complete while the Runner is suspended — they must reopen the PWA first');
-  if (dr.catches.some((c) => c.runnerPlayerId === runnerId && c.state === 'confirmed')) throw new Error('INVALID_STATE: Runner is already caught');
-  const pending = dr.catches.find((c) => c.runnerPlayerId === runnerId && (c.state === 'requested' || c.state === 'awaiting-confirmation'));
-  if (pending) {
-    if (pending.hunterPlayerId === hunterId) return pending;
-    throw new Error('CONFLICT: a catch is already pending for this Runner');
+
+  // Scheduled pings, ACTIVE only, play zone on, interval > 0 — AUTO-FIRE.
+  if (
+    room.phase === 'ACTIVE' &&
+    room.config.playZoneEnabled &&
+    room.config.pingIntervalSeconds > 0 &&
+    room.startedAt
+  ) {
+    const intervalMs = room.config.pingIntervalSeconds * 1000;
+    for (const runner of demo.players.filter(
+      (p) => p.matchRole === 'runner' && p.leftAt === null && p.ejectedAt === null,
+    )) {
+      const last = demo.lastPingAtMs[runner.playerId] ?? new Date(room.startedAt).getTime();
+      if (nowMs - last >= intervalMs) {
+        fireDemoPing(demo, runner.playerId, nowMs);
+      }
+    }
   }
-  // BUG FIX (fix round, found by the Playwright full-loop spec): the token
-  // MUST be issued for this catch's own id. The old code issued it for a
-  // throwaway uid() and gave the CatchEvent a different uid(), so
-  // verifyCatchToken(catchId, raw, hash) could never match and the Hunter's
-  // QR scan verification always failed. The DO handler (workers/src/room-do.ts)
-  // already did this correctly; only the demo store had the mismatch.
-  const catchId = uid();
-  const tok = issueCatchToken(catchId, CALIBRATION_OPEN.catchTokenTtlSeconds, nowMs);
-  const c: CatchEvent = { catchId, roomId, hunterPlayerId: hunterId, runnerPlayerId: runnerId, state: 'awaiting-confirmation', qrTokenHash: tok.hash, requestedAt: new Date(nowMs).toISOString(), confirmedAt: null, disputedAt: null, resolution: null, gpsEvidence: 'absent' };
-  rawCatchTokens.set(c.catchId, tok.raw);
-  dr.catchExpiresAtMs[c.catchId] = tok.expiresAtMs;
-  if (opts?.idempotencyKey) catchIdempotency.set(`${roomId}:${opts.idempotencyKey}`, c.catchId);
-  dr.catches.push(c);
-  // Runner confirmation is ALWAYS required (founder-corrected catch
-  // flow, 2026-11-17): a tag never counts at once — the catch stays
-  // pending until the Runner confirms or disputes it.
-  save(all); return c;
+
+  // Zone shrink on schedule (random-offset draw, never concentric).
+  if (
+    room.phase === 'ACTIVE' &&
+    room.config.zoneShrinkEnabled &&
+    room.startedAt &&
+    room.config.zone.boundary.length >= 3
+  ) {
+    const startedAtMs = new Date(room.startedAt).getTime();
+    const intervalMs = room.config.zoneShrinkIntervalSeconds * 1000;
+    const elapsed = nowMs - startedAtMs;
+    const shrinkCount = Math.floor(elapsed / intervalMs);
+    if (shrinkCount > demo.appliedShrinks) {
+      const next = randomOffsetShrinkBoundary(demo.room.config.zone.boundary);
+      demo.room.config = {
+        ...demo.room.config,
+        zone: { ...demo.room.config.zone, boundary: next },
+      };
+      demo.appliedShrinks = shrinkCount;
+      demo.room.version += 1;
+    }
+  }
+
+  saveRoom(demo);
+  return demo;
 }
-/** Shared tail of a confirmed catch: apply the mode rule (out vs turn)
- *  and complete the match when the mode's win rule is met. The win
- *  completion only runs while the match is live (server
- *  maybeCompleteOnWin) — confirming a disputed catch after the match
- *  already ended records the tag but never rewrites the result. */
-function applyConfirmedCatch(dr: DemoRoom, c: CatchEvent): void {
-  const tag = applyConfirmedTag(dr.players, c.runnerPlayerId, dr.room.config.mode);
-  dr.players = tag.players;
-  if (dr.room.phase !== 'ACTIVE' && dr.room.phase !== 'HEAD_START') return;
-  const caught = dr.catches.filter((x) => x.state === 'confirmed').map((x) => x.runnerPlayerId);
-  const result = resolveModeOutcome(dr.players, caught, false, dr.room.config.mode);
-  if (result.outcome === 'hunters-win') {
-    dr.room.phase = 'RESOLVING';
-    dr.room.result = { ...result, durationSeconds: dr.room.startedAt ? Math.floor((Date.now() - new Date(dr.room.startedAt).getTime()) / 1000) : 0 };
-    dr.room.phase = 'COMPLETED';
-  }
+
+/** Fire one demo ping for a free Runner (coarse 150 m area around the zone centre — labelled simulated by the UI). */
+export function fireDemoPing(
+  demo: DemoRoom,
+  runnerPlayerId: string,
+  nowMs: number = Date.now(),
+): Ping | null {
+  const runner = demo.players.find((p) => p.playerId === runnerPlayerId);
+  if (!runner || runner.matchRole !== 'runner') return null;
+  const boundary = demo.room.config.zone.boundary;
+  const centre =
+    boundary.length >= 3 ? polygonCentroid(boundary) : { lat: 23.36, lng: 85.33 };
+  const ping: Ping = {
+    pingId: newId(),
+    roomId: demo.room.roomId,
+    subjectPlayerId: runnerPlayerId,
+    recipientRole: 'hunters',
+    uncertainty: { centre, radiusMeters: PING_AREA_RADIUS_M },
+    ageSeconds: 0,
+    qualityAtPing: null,
+    createdAt: new Date(nowMs).toISOString(),
+    expiresAt: new Date(nowMs + 300_000).toISOString(),
+  };
+  // Pings stay until the next ping replaces them — replace, never timer-remove.
+  demo.pings = demo.pings.filter((p) => p.subjectPlayerId !== runnerPlayerId);
+  demo.pings.push(ping);
+  demo.lastPingAtMs[runnerPlayerId] = nowMs;
+  return ping;
 }
-/**
- * Confirm a pending catch. Authenticated, like the DO's catch.confirm
- * (and resolveDisputedCatch for the host path) — a call with no actor
- * is FORBIDDEN, and the actor must be entitled to the path it takes:
- * - 'qr-scan': the claiming Hunter, and only after this tab verified
- *   the Runner's QR for this catch (verifyCatchScan records it; the
- *   entry is consumed here, so one scan completes one claim). A
- *   confirm with no verified scan behind it is rejected — the scan,
- *   not a bare call, proves the two players were together.
- * - 'manual-confirm': the named Runner only (server GL-04 — the
- *   camera-unavailable fallback is the Runner's own consent).
- * - 'host-review' (how omitted): the host resolving a DISPUTED catch
- *   after checking with both players in person (server
- *   resolveDisputedCatch); the catch must be disputed.
- * Every path first expires an overdue claim (the DO does the same on
- * confirm — an expired QR never confirms), requires a pending claim
- * (a second confirm is CONFLICT, never a double-apply), and — for
- * the QR / manual paths — requires the match to be ACTIVE with the
- * Runner still a free, non-suspended Runner (server GL-09).
- */
-export function confirmCatch(roomId: string, catchId: string, how?: 'qr-scan' | 'manual-confirm' | 'host-review', actorId?: string, nowMs: number = Date.now()): void {
-  const all = load(); const dr = all[roomId]; if (!dr) return;
-  const c = dr.catches.find((x) => x.catchId === catchId); if (!c) return;
-  if (!actorId) throw new Error('FORBIDDEN: a catch confirm needs the confirming player');
-  if (expireCatchIfOverdue(dr, c, nowMs)) { save(all); throw new Error('VALIDATION_FAILED: this QR expired — ask the Hunter to request a new one'); }
-  // No `how` means the host resolving a disputed catch — default it
-  // BEFORE the state guards, or the disputed guard below would
-  // reject the very call it is meant to allow.
-  const resolution = how ?? 'host-review';
-  if (c.state === 'confirmed') throw new Error(`CONFLICT: catch is already ${c.state}`);
-  if (c.state === 'disputed' && resolution !== 'host-review') throw new Error(`CONFLICT: catch is ${c.state} — only the host can resolve it after checking with both players`);
-  if (c.state !== 'requested' && c.state !== 'awaiting-confirmation' && !(c.state === 'disputed' && resolution === 'host-review')) {
-    throw new Error(`CONFLICT: catch is ${c.state}`);
+
+export function getRoom(roomId: string): DemoRoom | null {
+  const demo = readRooms().find((r) => r.room.roomId === roomId) ?? null;
+  if (!demo) return null;
+  return tickDemoRoom(demo);
+}
+
+export function getRoomByCode(code: string): DemoRoom | null {
+  const normalized = code.trim().toUpperCase();
+  const demo =
+    readRooms().find((r) => r.room.roomCode === normalized) ?? null;
+  if (!demo) return null;
+  return tickDemoRoom(demo);
+}
+
+export function listRooms(): DemoRoom[] {
+  return readRooms();
+}
+
+/** Enforces the state machine; resume from SAFETY_PAUSED returns to `pausedFrom`; clock starts at HEAD_START; roles assigned ONCE at HEAD_START. */
+export function setPhase(demo: DemoRoom, phase: MatchPhase): void {
+  const from = demo.room.phase;
+  const allowed = MATCH_PHASE_TRANSITIONS[from] ?? [];
+  if (!allowed.includes(phase)) {
+    throw new Error(`Cannot move from ${from} to ${phase}.`);
   }
-  if (resolution === 'host-review') {
-    if (actorId !== dr.room.hostPlayerId) throw new Error('FORBIDDEN: only the host may resolve a disputed catch');
-    if (c.state !== 'disputed') throw new Error(`CONFLICT: catch is ${c.state}, not disputed`);
-    Object.assign(c, { state: 'confirmed' as const, confirmedAt: new Date(nowMs).toISOString(), resolution: 'host-review' as const });
-    dr.events.push({ at: new Date(nowMs).toISOString(), text: `Host confirmed a disputed catch after checking with both players` });
-    applyConfirmedCatch(dr, c);
-    save(all);
-    return;
+  if (phase === 'HEAD_START') {
+    assignRoles(demo);
+    const now = new Date();
+    demo.room.startedAt = now.toISOString();
+    demo.room.endsAt = new Date(
+      now.getTime() + demo.room.config.durationSeconds * 1000,
+    ).toISOString();
   }
-  if (dr.room.phase !== 'ACTIVE') throw new Error(`INVALID_STATE: catches cannot complete while the match is ${dr.room.phase}`);
-  const runner = dr.players.find((p) => p.playerId === c.runnerPlayerId);
-  if (runner?.connectionState === 'suspended') throw new Error('INVALID_STATE: Runner is suspended — a catch cannot complete while the Runner is suspended');
-  if (runner?.ejectedAt) throw new Error('INVALID_STATE: Runner was ejected from the game');
-  if (runner?.matchRole !== 'runner') throw new Error('INVALID_STATE: only a Runner can be tagged');
-  if (resolution === 'qr-scan') {
-    if (actorId !== c.hunterPlayerId) throw new Error('FORBIDDEN: only the claiming Hunter may confirm this catch with a QR scan');
-    if (!verifiedCatchScans.has(catchId)) throw new Error('VALIDATION_FAILED: no verified QR scan for this catch — scan the Runner’s QR first');
-    verifiedCatchScans.delete(catchId);
+  if (phase === 'SAFETY_PAUSED') {
+    demo.pausedFrom = from;
+    demo.room.pausedAt = new Date().toISOString();
+  }
+  if (from === 'SAFETY_PAUSED' && phase !== 'SAFETY_PAUSED') {
+    // Resume shifts the deadlines forward by the pause and returns to pausedFrom.
+    if (demo.room.pausedAt && demo.room.startedAt && demo.room.endsAt) {
+      const pauseMs = Date.now() - new Date(demo.room.pausedAt).getTime();
+      demo.room.startedAt = new Date(
+        new Date(demo.room.startedAt).getTime() + pauseMs,
+      ).toISOString();
+      demo.room.endsAt = new Date(
+        new Date(demo.room.endsAt).getTime() + pauseMs,
+      ).toISOString();
+    }
+    demo.room.pausedAt = null;
+  }
+  demo.room.phase = phase;
+  demo.room.version += 1;
+  saveRoom(demo);
+}
+
+/** Roles are assigned ONCE, at HEAD_START — never re-drawn. */
+export function assignRoles(demo: DemoRoom): void {
+  const active = demo.players.filter((p) => p.leftAt === null);
+  if (active.length < MIN_PLAYERS) throw new Error('Need at least 3 players to start.');
+  const config = demo.room.config;
+  const hunterCount =
+    config.balanceHunters === true
+      ? balancedHunterCount(active.length)
+      : Math.min(config.hunterCount, active.length - 1);
+  let hunters: Player[];
+  if (config.teamAssignment === 'selected' && config.selectedHunterIds.length === hunterCount) {
+    hunters = active.filter((p) => config.selectedHunterIds.includes(p.playerId));
   } else {
-    if (actorId !== c.runnerPlayerId) throw new Error('FORBIDDEN: only the named Runner may confirm this catch manually');
+    const shuffled = [...active];
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = shuffled[i];
+      shuffled[i] = shuffled[j] as Player;
+      shuffled[j] = tmp as Player;
+    }
+    hunters = shuffled.slice(0, hunterCount);
   }
-  Object.assign(c, resolveCatch(c, 'confirm', new Date(nowMs).toISOString(), resolution));
-  const turns = modeTurnsRunner(dr.room.config.mode);
-  dr.events.push({ at: new Date(nowMs).toISOString(), text: turns ? `Catch confirmed — Runner turned Hunter` : `Catch confirmed — Runner caught` });
-  applyConfirmedCatch(dr, c);
-  save(all);
+  for (const player of active) {
+    const isHunter = hunters.some((h) => h.playerId === player.playerId);
+    player.matchRole = isHunter ? 'hunter' : 'runner';
+    player.team = isHunter ? 'hunters' : 'runners';
+  }
+  demo.room.config = { ...config, hunterCount };
 }
-export function disputeCatch(roomId: string, catchId: string, actorId?: string, nowMs: number = Date.now()): void {
-  const all = load(); const dr = all[roomId]; if (!dr) return;
-  const c = dr.catches.find((x) => x.catchId === catchId); if (!c) return;
-  // Server catch.dispute: Runner-only, on a pending claim; an
-  // overdue claim expires instead of disputing. A dispute with no
-  // actor is FORBIDDEN. (The server also requires a reason string;
-  // the demo UI collects none — that gap stays open, see report.)
-  if (!actorId) throw new Error('FORBIDDEN: a catch dispute needs the disputing player');
-  if (actorId !== c.runnerPlayerId) throw new Error('FORBIDDEN: only the named Runner may dispute this catch');
-  if (expireCatchIfOverdue(dr, c, nowMs)) { save(all); throw new Error('VALIDATION_FAILED: this QR expired — ask the Hunter to request a new one'); }
-  if (c.state !== 'requested' && c.state !== 'awaiting-confirmation') throw new Error(`CONFLICT: catch is ${c.state}`);
-  Object.assign(c, resolveCatch(c, 'dispute', new Date(nowMs).toISOString())); save(all);
+
+/** Start gate (demo mirrors the server gate): active seats ≥ 3 AND every active seat ready AND teams set. */
+export function canStartDemoMatch(demo: DemoRoom): { canStart: boolean; reason: string | null } {
+  const active = demo.players.filter((p) => p.leftAt === null);
+  if (active.length < MIN_PLAYERS) {
+    return { canStart: false, reason: 'Need at least 3 players — share the room code above.' };
+  }
+  const notReady = active.filter((p) => !p.isReady);
+  if (notReady.length > 0) {
+    return {
+      canStart: false,
+      reason: `Waiting for: ${notReady.map((p) => p.displayName).join(', ')}.`,
+    };
+  }
+  const config = demo.room.config;
+  const teamsReady =
+    config.teamAssignment === 'random' ||
+    config.selectedHunterIds.length === config.hunterCount;
+  if (!teamsReady) {
+    return {
+      canStart: false,
+      reason: `Pick ${config.hunterCount} ${config.hunterCount === 1 ? 'Hunter' : 'Hunters'} first.`,
+    };
+  }
+  return { canStart: true, reason: null };
 }
-export function expireOldCatches(roomId: string, nowMs: number = Date.now()): void {
-  const all = load(); const dr = all[roomId]; if (!dr) return;
-  dr.catches.forEach((c) => { expireCatchIfOverdue(dr, c, nowMs); });
-  save(all);
+
+/** Host starts the match: LOBBY → READY_CHECK → COUNTDOWN → HEAD_START (walked at once in demo). */
+export function startDemoMatch(demo: DemoRoom): void {
+  const gate = canStartDemoMatch(demo);
+  if (!gate.canStart) throw new Error(gate.reason ?? 'Cannot start yet.');
+  setPhase(demo, 'READY_CHECK');
+  setPhase(demo, 'COUNTDOWN');
+  setPhase(demo, 'HEAD_START');
 }
-export function getCatchRaw(catchId: string): string | undefined { return rawCatchTokens.get(catchId); }
-/** Verify a scanned QR token against the open claim. There is NO typed
- *  code in Pakdam — the token lives only inside the Runner's QR, and
- *  this is the only place it is checked. The check is hash + expiry +
- *  pending state: an expired QR fails even with the right token, and
- *  the claim is marked expired when the check finds it overdue. A
- *  successful verify records the scan so confirmCatch('qr-scan') can
- *  accept it — verification alone never confirms a catch. */
-export function verifyCatchScan(roomId: string, catchId: string, raw: string, nowMs: number = Date.now()): boolean {
-  const all = load(); const dr = all[roomId]; if (!dr) return false;
-  const c = dr.catches.find((x) => x.catchId === catchId); if (!c || !c.qrTokenHash) return false;
-  if (expireCatchIfOverdue(dr, c, nowMs)) { save(all); return false; }
-  if (c.state !== 'requested' && c.state !== 'awaiting-confirmation') return false;
-  const ok = verifyCatchToken(catchId, raw, c.qrTokenHash);
-  if (ok) verifiedCatchScans.add(catchId);
-  return ok;
+
+export function setTeamAssignment(
+  demo: DemoRoom,
+  teamAssignment: 'random' | 'selected',
+): void {
+  if (demo.room.phase !== 'LOBBY') throw new Error('Teams can only change in the lobby.');
+  demo.room.config = {
+    ...demo.room.config,
+    teamAssignment,
+    selectedHunterIds: teamAssignment === 'random' ? [] : demo.room.config.selectedHunterIds,
+  };
+  saveRoom(demo);
 }
-export function recordPlayerSuspension(roomId: string, playerId: string): string {
-  const all = load(); const dr = all[roomId]; if (!dr) return '';
-  const p = dr.players.find((x) => x.playerId === playerId); if (!p) return '';
-  const { player, outcome } = recordSuspension(p, CALIBRATION_OPEN.suspensionCountBeforeHostCheckin);
-  dr.players = dr.players.map((x) => (x.playerId === playerId ? player : x));
-  dr.events.push({ at: new Date().toISOString(), text: outcome.reason }); save(all); return outcome.reason;
+
+export function setSelectedHunters(demo: DemoRoom, playerIds: string[]): void {
+  if (demo.room.phase !== 'LOBBY') throw new Error('Teams can only change in the lobby.');
+  const config = demo.room.config;
+  if (playerIds.length !== config.hunterCount) {
+    throw new Error(`Pick exactly ${config.hunterCount} Hunters.`);
+  }
+  const unique = new Set(playerIds);
+  if (unique.size !== playerIds.length) throw new Error('Pick each Hunter once.');
+  const joined = demo.players.filter((p) => p.leftAt === null).map((p) => p.playerId);
+  if (!playerIds.every((id) => joined.includes(id))) {
+    throw new Error('Pick players who have joined.');
+  }
+  demo.room.config = { ...config, selectedHunterIds: playerIds };
+  saveRoom(demo);
 }
-/** Resume a suspended player: reopening the PWA (or tapping the
- *  play page's "Resume sharing" button) brings them back to
- *  `connected` — this is what makes the catch page's "they must
- *  reopen the PWA first" satisfiable. A suspended player who returns
- *  is location-known again; the timer kept running while they were
- *  away, and the suspension count stays on the record. Returns true
- *  only when a suspended player was actually resumed. */
-export function resumePlayer(roomId: string, playerId: string): boolean {
-  const all = load(); const dr = all[roomId]; if (!dr) return false;
-  const p = dr.players.find((x) => x.playerId === playerId); if (!p || p.connectionState !== 'suspended') return false;
-  p.connectionState = 'connected';
-  p.lastFixAt = new Date().toISOString();
-  dr.events.push({ at: new Date().toISOString(), text: `${p.displayName} reopened the app — back to connected` });
-  save(all); return true;
+
+/** Lobby only; re-validates; hunter-count/team-assignment change clears the pick. */
+export function updateRoomConfig(demo: DemoRoom, config: RoomConfig): void {
+  if (demo.room.phase !== 'LOBBY') throw new Error('Settings can only change in the lobby.');
+  const issues = validateRoomConfig({ ...config, hostOnSiteConfirmed: true });
+  if (issues.length > 0) throw new Error(`Setup not accepted: ${issues[0]}`);
+  const old = demo.room.config;
+  const pickCleared =
+    config.hunterCount !== old.hunterCount || config.teamAssignment !== old.teamAssignment;
+  demo.room.config = {
+    ...config,
+    selectedHunterIds: pickCleared ? [] : config.selectedHunterIds,
+  };
+  demo.room.version += 1;
+  saveRoom(demo);
 }
-export function hostCheckin(roomId: string, note: string): void {
-  const all = load(); const dr = all[roomId]; if (!dr) return;
-  dr.checkins.push(`${new Date().toISOString()} — ${note}`); dr.events.push({ at: new Date().toISOString(), text: `Host check-in: ${note}` }); save(all);
+
+/** Flips isReady AND sets briefingConfirmed: true (one tap does both). */
+export function toggleReady(demo: DemoRoom, playerId: string): void {
+  const player = demo.players.find((p) => p.playerId === playerId);
+  if (!player) throw new Error('Player not found.');
+  player.isReady = !player.isReady;
+  if (player.isReady) player.briefingConfirmed = true;
+  saveRoom(demo);
 }
-/** Record that a player just sent a fresh location fix (the manual
- *  "Refresh my location" button, founder rule 2026-11-17). Timestamp
- *  ONLY — no coordinates are ever stored in this demo store (HNT-068).
- *  In production the same tap calls PakdamSocket.sendLocationUpdate
- *  (apps/web/src/lib/websocket.ts) with the fresh fix; here the
- *  timestamp is what the dots and freshness rows show ("Last updated
- *  just now"). Also marks the player connected again. */
-export function recordPlayerFix(roomId: string, playerId: string): void {
-  const all = load(); const dr = all[roomId]; if (!dr) return;
-  const p = dr.players.find((x) => x.playerId === playerId); if (!p) return;
-  p.lastFixAt = new Date().toISOString(); p.connectionState = 'connected'; save(all);
+
+// -- Catches (P0-2) -----------------------------------------------------------
+
+export interface CatchRequestResult {
+  catch: CatchEvent;
+  /** Raw one-time token — in-memory only, for the Runner's QR. Never persisted, never shown as text. */
+  rawToken: string;
 }
-/** Record a device-side zone-exit alert (founder rule, 2026-11-17).
- *  The player's phone checked locally whether its fix is inside the
- *  zone — no location was sent for the check itself. Only on crossing
- *  outside does the phone send exactly ONE alert, and this is it: the
- *  event log records the crossing, which is what starts the 30-second
- *  return countdown on the server (first-seen-outside). The caller
- *  guards to once per crossing (the flag resets when the player is
- *  back inside). In production the same crossing sends one
- *  location.update with the fix via PakdamSocket, and the Durable
- *  Object records first-seen-outside from it (workers/src/room-do.ts). */
-export function recordZoneExit(roomId: string, playerId: string): void {
-  const all = load(); const dr = all[roomId]; if (!dr) return;
-  const p = dr.players.find((x) => x.playerId === playerId); if (!p) return;
-  dr.events.push({ at: new Date().toISOString(), text: `${p.displayName} left the play zone — 30-second return countdown started` }); save(all);
-}
-export function leaveRoom(roomId: string, playerId: string): void {
-  const all = load(); const dr = all[roomId]; if (!dr) return;
-  const p = dr.players.find((x) => x.playerId === playerId);
-  if (p) { p.leftAt = new Date().toISOString(); p.connectionState = 'disconnected'; }
-  // QA 2026-11-17 (MP-HOST-LEAVE): the host leaving orphaned the room
-  // (same gap as the DO) — transfer host to the earliest-joined player
-  // still in the room so someone can still start / resume. A lone host
-  // leaving transfers to nobody; the room keeps its (departed) host id.
-  if (p?.isHost) {
-    const successor = dr.players
-      .filter((x) => x.playerId !== playerId && !x.leftAt && !x.ejectedAt)
-      .sort((a, b) => Date.parse(a.joinedAt) - Date.parse(b.joinedAt))[0];
-    if (successor) {
-      p.isHost = false;
-      successor.isHost = true;
-      dr.room.hostPlayerId = successor.playerId;
-      dr.events.push({ at: new Date().toISOString(), text: `Host transferred to ${successor.displayName} — ${p.displayName} left` });
+
+/** Hunter claims a Runner. Same-Hunter re-request returns the open claim; a different Hunter gets CONFLICT. */
+export function requestCatch(
+  demo: DemoRoom,
+  hunterPlayerId: string,
+  runnerPlayerId: string,
+  idempotencyKey?: string,
+): CatchRequestResult {
+  if (idempotencyKey) {
+    const existingId = catchIdempotency.get(idempotencyKey);
+    const existing = demo.catches.find((c) => c.catchId === existingId);
+    if (existing) {
+      return { catch: existing, rawToken: rawCatchTokens.get(existing.catchId) ?? '' };
     }
   }
-  save(all);
-}
-/** Eject a player for staying outside the play zone past the 30-second
- *  return countdown (founder rule, 2026-11-17 — the countdown and the
- *  ejection are both enforced here, not just displayed). Sets
- *  ejectedAt: the player stays in the room record (leftAt stays null)
- *  but is out of play — the roster and results show them as ejected,
- *  they are no longer a free Runner, and no catch can target them.
- *  If the ejection leaves no Runner free, the match completes as a
- *  Hunters win — the same completion as every Runner caught, because
- *  no Runner is left in play (resolveModeOutcome already excludes
- *  ejected players from survivors). Returns true when the player was
- *  ejected, false when they were already ejected, not found, or the
- *  match is not running (no ejection while paused or in the lobby). */
-export function ejectPlayer(roomId: string, playerId: string): boolean {
-  const all = load(); const dr = all[roomId]; if (!dr) return false;
-  const p = dr.players.find((x) => x.playerId === playerId); if (!p || p.ejectedAt) return false;
-  if (dr.room.phase !== 'ACTIVE' && dr.room.phase !== 'HEAD_START') return false;
-  p.ejectedAt = new Date().toISOString();
-  dr.events.push({ at: new Date().toISOString(), text: `${p.displayName} was ejected — outside the play zone for 30 seconds` });
-  const caught = dr.catches.filter((x) => x.state === 'confirmed').map((x) => x.runnerPlayerId);
-  const result = resolveModeOutcome(dr.players, caught, false, dr.room.config.mode);
-  if (result.outcome === 'hunters-win') {
-    dr.room.phase = 'RESOLVING';
-    dr.room.result = { ...result, durationSeconds: dr.room.startedAt ? Math.floor((Date.now() - new Date(dr.room.startedAt).getTime()) / 1000) : 0 };
-    dr.room.phase = 'COMPLETED';
-    dr.events.push({ at: new Date().toISOString(), text: 'Match complete — Hunters win (no Runner left in play)' });
+  if (demo.room.phase !== 'ACTIVE') throw new Error('Catches only count while the match is live.');
+  const hunter = demo.players.find((p) => p.playerId === hunterPlayerId);
+  const runner = demo.players.find((p) => p.playerId === runnerPlayerId);
+  if (!hunter || hunter.matchRole !== 'hunter') throw new Error('Only a Hunter can claim a tag.');
+  if (!runner || runner.matchRole !== 'runner') throw new Error('That player is not a free Runner.');
+  if (runner.leftAt !== null || runner.ejectedAt !== null) {
+    throw new Error('That player is no longer in play.');
   }
-  save(all); return true;
+  if (runner.connectionState === 'suspended') {
+    throw new Error('That player is suspended — wait for them to come back.');
+  }
+  const open = demo.catches.find(
+    (c) =>
+      c.runnerPlayerId === runnerPlayerId &&
+      (c.state === 'requested' || c.state === 'awaiting-confirmation'),
+  );
+  if (open) {
+    if (open.hunterPlayerId === hunterPlayerId) {
+      return { catch: open, rawToken: rawCatchTokens.get(open.catchId) ?? '' };
+    }
+    throw new Error('That Runner already has an open claim.');
+  }
+  const rawToken = newCatchToken();
+  const catchEvent: CatchEvent = {
+    catchId: newId(),
+    roomId: demo.room.roomId,
+    hunterPlayerId,
+    runnerPlayerId,
+    state: 'awaiting-confirmation',
+    qrTokenHash: '',
+    requestedAt: new Date().toISOString(),
+    confirmedAt: null,
+    disputedAt: null,
+    resolution: null,
+    gpsEvidence: 'absent',
+  };
+  // Hash construction mirrors the server's sha256(catchId + ':' + raw);
+  // the demo uses a deterministic local digest (see hashCatchTokenSync)
+  // because Web Crypto is async. Never used for a live catch.
+  catchEvent.qrTokenHash = hashCatchTokenSync(catchEvent.catchId, rawToken);
+  demo.catches.push(catchEvent);
+  rawCatchTokens.set(catchEvent.catchId, rawToken);
+  if (idempotencyKey) catchIdempotency.set(idempotencyKey, catchEvent.catchId);
+  saveRoom(demo);
+  return { catch: catchEvent, rawToken };
 }
-/** Per-tab player identity (founder bug, 2026-11-17): sessionStorage,
- *  NOT localStorage. localStorage is shared across every tab of the
- *  origin, so a second player joining in another tab overwrote the
- *  host tab's identity — the host lost the Start button the moment
- *  anyone else joined on the same device. sessionStorage belongs to
- *  one tab: each tab keeps its own player, and a reload in the same
- *  tab still restores the room and the role (sessionStorage survives
- *  a reload). A brand-new tab starts with no identity and rejoins by
- *  display name — joinRoom restores the seat, host powers included. */
-const PLAYER_KEY = 'pakdam.playerId';
+
+/** Synchronous hash for the demo store (Web Crypto is async; the demo uses a stable non-crypto digest for local verification only). */
+function hashCatchTokenSync(catchId: string, raw: string): string {
+  // Demo-only: the server uses sha256(catchId + ':' + raw). The demo keeps
+  // the same input string and a deterministic digest so verifyCatchScan can
+  // check it without async crypto. Never used for a live catch.
+  const input = `${catchId}:${raw}`;
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+  return `demo-${(h2 >>> 0).toString(16)}${(h1 >>> 0).toString(16)}`;
+}
+
+/** The raw token for a Runner's QR (in-memory only). */
+export function getCatchRaw(catchId: string): string | null {
+  return rawCatchTokens.get(catchId) ?? null;
+}
+
+/** A scan verifies hash + expiry + pending state; success records the scan for confirmCatch('qr-scan'). Verification alone never confirms. */
+export function verifyCatchScan(catchId: string, rawToken: string): boolean {
+  const demo = readRooms()
+    .flatMap((r) => r.catches)
+    .find((c) => c.catchId === catchId);
+  if (!demo) return false;
+  if (demo.state !== 'requested' && demo.state !== 'awaiting-confirmation') return false;
+  const ageMs = Date.now() - new Date(demo.requestedAt).getTime();
+  if (ageMs > CATCH_TOKEN_TTL_SECONDS * 1000) return false;
+  if (hashCatchTokenSync(catchId, rawToken) !== demo.qrTokenHash) return false;
+  verifiedCatchScans.add(catchId);
+  return true;
+}
+
+export type ConfirmCatchHow = 'qr-scan' | 'manual-confirm' | 'host-review';
+
+/**
+ * Confirm a catch. 'qr-scan': claiming Hunter + verified scan (consumed).
+ * 'manual-confirm': named Runner only. 'host-review': host only, disputed
+ * only. A second confirm is CONFLICT. Applies the mode rule + win check.
+ */
+export function confirmCatch(
+  demo: DemoRoom,
+  catchId: string,
+  actorPlayerId: string,
+  how: ConfirmCatchHow,
+): CatchEvent {
+  const c = demo.catches.find((x) => x.catchId === catchId);
+  if (!c) throw new Error('Catch not found.');
+  if (c.state === 'confirmed') throw new Error('That tag was already confirmed.');
+  if (c.state !== 'requested' && c.state !== 'awaiting-confirmation' && c.state !== 'disputed') {
+    throw new Error('That claim is no longer open.');
+  }
+  const actor = demo.players.find((p) => p.playerId === actorPlayerId);
+  if (!actor) throw new Error('Player not found.');
+  if (how === 'qr-scan') {
+    if (actorPlayerId !== c.hunterPlayerId) throw new Error('Only the claiming Hunter can confirm a scan.');
+    if (!verifiedCatchScans.has(catchId)) throw new Error('Scan the Runner’s QR first.');
+    verifiedCatchScans.delete(catchId);
+  } else if (how === 'manual-confirm') {
+    if (actorPlayerId !== c.runnerPlayerId) throw new Error('Only the tagged Runner can confirm manually.');
+    if (c.state === 'disputed') throw new Error('A disputed tag goes to the host.');
+  } else {
+    if (!actor.isHost) throw new Error('Only the host can resolve a disputed tag.');
+    if (c.state !== 'disputed') throw new Error('Only a disputed tag goes to host review.');
+  }
+  if (demo.room.phase !== 'ACTIVE' && how !== 'host-review') {
+    throw new Error('Catches only count while the match is live.');
+  }
+  const runner = demo.players.find((p) => p.playerId === c.runnerPlayerId);
+  if (runner && runner.connectionState === 'suspended' && how !== 'host-review') {
+    throw new Error('That player is suspended — wait for them to come back.');
+  }
+  c.state = 'confirmed';
+  c.resolution = 'confirmed';
+  c.confirmedAt = new Date().toISOString();
+  applyConfirmedTag(demo, c);
+  saveRoom(demo);
+  return c;
+}
+
+/** Runner disputes a pending claim; an overdue claim expires instead. */
+export function disputeCatch(
+  demo: DemoRoom,
+  catchId: string,
+  actorPlayerId: string,
+): CatchEvent {
+  const c = demo.catches.find((x) => x.catchId === catchId);
+  if (!c) throw new Error('Catch not found.');
+  if (actorPlayerId !== c.runnerPlayerId) {
+    throw new Error('Only the tagged Runner can dispute.');
+  }
+  if (c.state !== 'requested' && c.state !== 'awaiting-confirmation') {
+    throw new Error('That claim is no longer open.');
+  }
+  c.state = 'disputed';
+  c.disputedAt = new Date().toISOString();
+  saveRoom(demo);
+  return c;
+}
+
+/**
+ * Host rejects a disputed catch (demo parity with the live resolve path,
+ * `resolveLiveCatch(…, 'rejected')` → DO `resolve-catch`). Host-only,
+ * disputed-only. The claim is voided — the Runner stays free and no tag
+ * is applied. Mirrors `packages/engine` host resolution, which sets
+ * state 'rejected' + resolution 'rejected'.
+ */
+export function rejectCatch(
+  demo: DemoRoom,
+  catchId: string,
+  actorPlayerId: string,
+): CatchEvent {
+  const c = demo.catches.find((x) => x.catchId === catchId);
+  if (!c) throw new Error('Catch not found.');
+  const actor = demo.players.find((p) => p.playerId === actorPlayerId);
+  if (!actor) throw new Error('Player not found.');
+  if (!actor.isHost) throw new Error('Only the host can resolve a disputed tag.');
+  if (c.state !== 'disputed') throw new Error('Only a disputed tag goes to host review.');
+  c.state = 'rejected';
+  c.resolution = 'rejected';
+  saveRoom(demo);
+  return c;
+}
+
+function applyConfirmedTag(demo: DemoRoom, c: CatchEvent): void {
+  const runner = demo.players.find((p) => p.playerId === c.runnerPlayerId);
+  if (!runner) return;
+  if (demo.room.config.mode === 'infection') {
+    // Infection: a tagged Runner flips to the Hunters.
+    runner.matchRole = 'hunter';
+    runner.team = 'hunters';
+  }
+  // Classic: the runner is out — recorded by the confirmed catch itself
+  // (freeRunners excludes confirmed-caught runners). Nothing else mutates.
+  maybeCompleteOnWin(demo);
+}
+
+function freeRunners(demo: DemoRoom): Player[] {
+  const caughtIds = new Set(
+    demo.catches.filter((c) => c.state === 'confirmed').map((c) => c.runnerPlayerId),
+  );
+  return demo.players.filter(
+    (p) =>
+      p.matchRole === 'runner' &&
+      p.leftAt === null &&
+      p.ejectedAt === null &&
+      !caughtIds.has(p.playerId),
+  );
+}
+
+function maybeCompleteOnWin(demo: DemoRoom): void {
+  if (demo.room.phase !== 'ACTIVE') return;
+  if (freeRunners(demo).length === 0) {
+    completeMatch(demo, Date.now());
+  }
+}
+
+function completeMatch(demo: DemoRoom, nowMs: number): void {
+  const caughtRunnerIds = demo.catches
+    .filter((c) => c.state === 'confirmed')
+    .map((c) => c.runnerPlayerId);
+  const survivingRunnerIds = freeRunners(demo).map((p) => p.playerId);
+  const outcome =
+    survivingRunnerIds.length === 0 ? 'hunters-win' : 'runners-win';
+  const durationSeconds = demo.room.startedAt
+    ? Math.max(0, Math.floor((nowMs - new Date(demo.room.startedAt).getTime()) / 1000))
+    : 0;
+  demo.room.result = { outcome, durationSeconds, caughtRunnerIds, survivingRunnerIds };
+  demo.room.phase = 'COMPLETED';
+  demo.room.version += 1;
+  latestFixes.clear();
+  saveRoom(demo);
+}
+
+// -- P0-2: catch auto-select + name-only picker -------------------------------
+
+export interface EffectiveRunnerResolution {
+  /** The Runner to show, or null when the picker must render instead. */
+  runnerId: string | null;
+  /** Which rule resolved it (for the UI to explain nothing — it just renders). */
+  source: 'url-param' | 'open-claim' | 'picker-choice' | 'latest-confirmed' | 'picker';
+}
+
+/**
+ * The effective Runner, in order: (1) `?runner=` param; (2) an open claim
+ * involving ME — as Runner (bare link lands on their own Step 2) or as
+ * Hunter (returns to my open claim's Step 3); (3) the Step 1 picker choice;
+ * (4) my most recent CONFIRMED catch involving me. With none of those, the
+ * Step 1 picker renders instead of a "No Runner selected" dead end.
+ */
+export function resolveEffectiveRunner(
+  demo: DemoRoom,
+  myPlayerId: string,
+  options?: { urlRunnerId?: string | null; pickerChoiceId?: string | null },
+): EffectiveRunnerResolution {
+  const open = demo.catches.find(
+    (c) =>
+      (c.state === 'requested' || c.state === 'awaiting-confirmation') &&
+      (c.runnerPlayerId === myPlayerId || c.hunterPlayerId === myPlayerId),
+  );
+  if (options?.urlRunnerId) {
+    const exists = demo.players.some((p) => p.playerId === options.urlRunnerId);
+    if (exists) return { runnerId: options.urlRunnerId, source: 'url-param' };
+  }
+  if (open) return { runnerId: open.runnerPlayerId, source: 'open-claim' };
+  if (options?.pickerChoiceId) {
+    const exists = demo.players.some((p) => p.playerId === options.pickerChoiceId);
+    if (exists) return { runnerId: options.pickerChoiceId, source: 'picker-choice' };
+  }
+  const latestConfirmed = [...demo.catches]
+    .reverse()
+    .find(
+      (c) =>
+        c.state === 'confirmed' &&
+        (c.runnerPlayerId === myPlayerId || c.hunterPlayerId === myPlayerId),
+    );
+  if (latestConfirmed) {
+    return { runnerId: latestConfirmed.runnerPlayerId, source: 'latest-confirmed' };
+  }
+  return { runnerId: null, source: 'picker' };
+}
+
+/**
+ * Name-only picker (P0-2): display names ONLY, no roles. Exclusions are
+ * only self, ejected/left players, already-caught Runners. A pick that
+ * turns out not to be a Runner is rejected by the server (live) or by
+ * `requestCatch` (demo) with a plain-language error — no role is revealed.
+ */
+export function listCatchPickerNames(
+  demo: DemoRoom,
+  myPlayerId: string,
+): { playerId: string; displayName: string }[] {
+  const caughtIds = new Set(
+    demo.catches.filter((c) => c.state === 'confirmed').map((c) => c.runnerPlayerId),
+  );
+  return demo.players
+    .filter(
+      (p) =>
+        p.playerId !== myPlayerId &&
+        p.leftAt === null &&
+        p.ejectedAt === null &&
+        !caughtIds.has(p.playerId),
+    )
+    .map((p) => ({ playerId: p.playerId, displayName: p.displayName }));
+}
+
+// -- Suspension (P0-1) ---------------------------------------------------------
+
+export function recordPlayerSuspension(
+  demo: DemoRoom,
+  playerId: string,
+  reason: string,
+): void {
+  const player = demo.players.find((p) => p.playerId === playerId);
+  if (!player) return;
+  if (player.connectionState === 'suspended') return;
+  player.connectionState = 'suspended';
+  player.suspensionCount += 1;
+  demo.announcements.push({
+    text: `${player.displayName} is suspended (${reason}) — location unknown.`,
+    byPlayerId: playerId,
+    sentAt: new Date().toISOString(),
+  });
+  saveRoom(demo);
+}
+
+/** Resume is a no-op unless the player is actually suspended; returns true only when a suspended player was actually resumed. */
+export function resumePlayer(demo: DemoRoom, playerId: string): boolean {
+  const player = demo.players.find((p) => p.playerId === playerId);
+  if (!player || player.connectionState !== 'suspended') return false;
+  player.connectionState = 'connected';
+  player.lastFixAt = new Date().toISOString();
+  saveRoom(demo);
+  return true;
+}
+
+/** Demo resume on catch-page arrival and on tab-visible (P0-1). */
+export function resumePlayerOnCatchPageArrival(
+  demo: DemoRoom,
+  playerId: string,
+): boolean {
+  return resumePlayer(demo, playerId);
+}
+
+/** Timestamp ONLY (no coordinates stored); marks the player connected again. */
+export function recordPlayerFix(
+  demo: DemoRoom,
+  playerId: string,
+  fix: LocationFix,
+): void {
+  const player = demo.players.find((p) => p.playerId === playerId);
+  if (!player) return;
+  latestFixes.set(playerId, fix);
+  player.connectionState = 'connected';
+  player.lastFixAt = new Date(fix.timestampMs).toISOString();
+  saveRoom(demo);
+}
+
+/** Logs the crossing (starts the 30 s countdown); the caller guards to once per crossing. */
+export function recordZoneExit(demo: DemoRoom, playerId: string, nowMs: number = Date.now()): void {
+  if (demo.outsideSinceMs[playerId] !== undefined) return;
+  demo.outsideSinceMs[playerId] = nowMs;
+  saveRoom(demo);
+}
+
+/** Leave: marks leftAt + disconnected; host-leave transfers host to the earliest-joined remaining player. */
+export function leaveRoom(demo: DemoRoom, playerId: string): void {
+  const player = demo.players.find((p) => p.playerId === playerId);
+  if (!player) return;
+  player.leftAt = new Date().toISOString();
+  player.connectionState = 'disconnected';
+  if (player.isHost) {
+    player.isHost = false;
+    const next = demo.players
+      .filter((p) => p.leftAt === null)
+      .sort((a, b) => a.joinedAt.localeCompare(b.joinedAt))[0];
+    if (next) {
+      next.isHost = true;
+      demo.room.hostPlayerId = next.playerId;
+    }
+  }
+  saveRoom(demo);
+}
+
+/** Eject (ACTIVE/HEAD_START only); if no Runner is left free, completes as Hunters win. */
+export function ejectPlayer(demo: DemoRoom, playerId: string): void {
+  if (demo.room.phase !== 'ACTIVE' && demo.room.phase !== 'HEAD_START') return;
+  const player = demo.players.find((p) => p.playerId === playerId);
+  if (!player || player.ejectedAt !== null) return;
+  player.ejectedAt = new Date().toISOString();
+  delete demo.outsideSinceMs[playerId];
+  delete demo.outsideAccumMs[playerId];
+  maybeCompleteOnWin(demo);
+  saveRoom(demo);
+}
+
+/** Safety pause (any player); SOS notifies NOBODY in demo — the UI must say so plainly. */
+export function safetyPauseDemo(demo: DemoRoom, _playerId: string): void {
+  if (demo.room.phase !== 'HEAD_START' && demo.room.phase !== 'ACTIVE') return;
+  setPhase(demo, 'SAFETY_PAUSED');
+}
+
+export function safetyResumeDemo(demo: DemoRoom): void {
+  if (demo.room.phase !== 'SAFETY_PAUSED') return;
+  setPhase(demo, demo.pausedFrom ?? 'ACTIVE');
+}
+
+export function sosDemo(demo: DemoRoom, playerId: string): void {
+  demo.sosActive = true;
+  demo.sosByPlayerId = playerId;
+  saveRoom(demo);
+}
+
+export const SOS_DEMO_COPY =
+  'SOS noted on this device only — nobody was notified. SOS alerts your host in this game. Pakdam is NOT an emergency service and does not call police or ambulance. If you are in danger, call your local emergency number.';
+
+/** Host check-in (demo event log only). */
+export function hostCheckin(demo: DemoRoom, playerId: string, text: string): void {
+  demo.announcements.push({ text, byPlayerId: playerId, sentAt: new Date().toISOString() });
+  saveRoom(demo);
+}
+
+// -- F2: phase polling / auto-navigate ----------------------------------------
+
+/**
+ * Poll the demo room every 1 s (lobby, play and catch pages). Returns the
+ * room or null. Callers navigate to /play when `phase` leaves LOBBY —
+ * guarded to fire once (see `watchDemoPhase`).
+ */
+export function pollDemoRoom(roomId: string): DemoRoom | null {
+  return getRoom(roomId);
+}
+
+export interface PhaseWatchHandle {
+  stop(): void;
+}
+
+/**
+ * F2: watch a demo room's phase; when it leaves LOBBY, call `onLeaveLobby`
+ * once (the guest auto-navigates to /play). Polls every 1 s.
+ */
+export function watchDemoPhase(
+  roomId: string,
+  onLeaveLobby: (room: DemoRoom) => void,
+  intervalMs = 1000,
+): PhaseWatchHandle {
+  let fired = false;
+  const timer = setInterval(() => {
+    const demo = getRoom(roomId);
+    if (!demo) return;
+    if (!fired && demo.room.phase !== 'LOBBY') {
+      fired = true;
+      onLeaveLobby(demo);
+    }
+  }, intervalMs);
+  return {
+    stop() {
+      clearInterval(timer);
+    },
+  };
+}
+
+// -- Per-tab player identity ----------------------------------------------------
+
 export function currentPlayerId(): string | null {
   if (typeof window === 'undefined') return null;
-  return sessionStorage.getItem(PLAYER_KEY);
+  return window.sessionStorage.getItem(DEMO_PLAYER_ID_KEY);
 }
-export function setCurrentPlayerId(id: string): void {
-  sessionStorage.setItem(PLAYER_KEY, id);
-}
-export function clearCurrentPlayerId(): void {
-  sessionStorage.removeItem(PLAYER_KEY);
+
+export function setCurrentPlayerId(playerId: string): void {
+  if (typeof window === 'undefined') return;
+  window.sessionStorage.setItem(DEMO_PLAYER_ID_KEY, playerId);
 }

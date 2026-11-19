@@ -1,49 +1,53 @@
-// No-Forge-Office e2e — TEXT/DOM assertions only, no screenshots.
-// The Forge Office tab/section is being removed from the game UI:
-// no Forge board, no Mission 001, no correction register, no release
-// gates in any player-facing tab. These specs pin that removal —
-// they fail if any Forge Office surface comes back on any key route.
-// (Source grep 2026-11-17: zero "forge" matches in apps/web/src
-// outside comments, and zero matches for the other phrases.)
+/**
+ * no-forge-office.spec.ts — the Pakdam PWA contains no Forge-office
+ * references: no office UI, no Hermes, no Forge branding on any screen.
+ * Text-only (visible text), no screenshots.
+ *
+ * The check runs over visible text on every screen because the PWA is a
+ * standalone game; the Forge office lives elsewhere and must not leak in.
+ */
 import { test, expect } from '@playwright/test';
+import {
+  LIVE,
+  expectNoForgeOfficeText,
+  startDemoMatch,
+} from './helpers';
 
-const KEY_ROUTES = [
-  '/',
- '/create', '/join', '/host',
-  '/leaderboards',
-];
+test.describe('no Forge office in the PWA (demo)', () => {
+  test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
 
-const FORGE_PATTERNS = [
-  /Forge Office/i,
-  /Forge board/i,
-  /Mission 001/i,
-  /correction register/i,
-  /release gates/i,
-];
+  test('Home and Mode select have no Forge-office references', async ({ page }) => {
+    await page.goto('/');
+    await expectNoForgeOfficeText(page);
+    await expect(page).toHaveTitle(/Pakdam/);
+    await page.getByRole('button', { name: /HOST A GAME/ }).click();
+    await expectNoForgeOfficeText(page);
+  });
 
-test('no Forge Office surface on any key player-facing route', async ({ page }) => {
-  for (const route of KEY_ROUTES) {
-    await page.goto(route);
-    await expect(page.getByRole('heading').first()).toBeVisible();
-    const bodyText = await page.locator('body').innerText();
-    for (const pattern of FORGE_PATTERNS) {
-      expect(bodyText, `${route}: must not mention ${pattern}`).not.toMatch(pattern);
+  test('lobby, play, catch and results have no Forge-office references', async ({
+    context,
+  }) => {
+    const { hostPage, roomId } = await startDemoMatch(context);
+    await expectNoForgeOfficeText(hostPage);
+    await hostPage.goto(`/room/${roomId}`);
+    await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
+    await expectNoForgeOfficeText(hostPage);
+    await hostPage.goto(`/room/${roomId}/catch`);
+    await expect(hostPage.getByRole('heading', { name: 'Catch' })).toBeVisible();
+    await expectNoForgeOfficeText(hostPage);
+    await hostPage.goto(`/room/${roomId}/results`);
+    await expect(hostPage.getByText('Match hasn’t finished yet.')).toBeVisible();
+    await expectNoForgeOfficeText(hostPage);
+  });
+
+  test('no Forge-office word appears in any page title or heading', async ({ context }) => {
+    const { hostPage } = await startDemoMatch(context);
+    const headings = await hostPage.evaluate(() =>
+      [...document.querySelectorAll('h1, h2, title')].map((el) => el.textContent ?? ''),
+    );
+    for (const heading of headings) {
+      expect(heading.toLowerCase()).not.toContain('forge');
+      expect(heading.toLowerCase()).not.toContain('hermes');
     }
-    // The bare word must not appear either — no tab, section or link.
-    expect(bodyText, `${route}: must not mention Forge at all`).not.toMatch(/Forge/i);
-    await expect(page.getByRole('link', { name: /Forge/i })).toHaveCount(0);
-    await expect(page.getByRole('button', { name: /Forge/i })).toHaveCount(0);
-  }
-});
-
-test('top bar has no Forge entry, and there is no footer at all', async ({ page }) => {
-  await page.goto('/');
-  // The real navigation is present and Forge-free: brand + Host a
-  // Game CTA only (strip-down 2026-11-19 — the info-page links are gone).
-  await expect(page.getByRole('link', { name: /Host a Game/ }).first()).toBeVisible();
-  const navLinks = await page.locator('header nav a, header a').allInnerTexts();
-  expect(navLinks.join(' | ')).not.toMatch(/Forge/i);
-  // The footer was removed in the strip-down: no footer element, no
-  // footer links at all — so no Forge entry can hide there either.
-  await expect(page.locator('footer')).toHaveCount(0);
+  });
 });

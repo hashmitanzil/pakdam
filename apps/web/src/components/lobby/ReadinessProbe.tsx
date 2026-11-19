@@ -1,65 +1,44 @@
 'use client';
-import { useEffect, useRef } from 'react';
 
-/** Silent readiness probe — the headless remainder of the old
- *  ReadinessChecklist (cut from the lobby 2026-11-19, ShadowHunt trim).
+/**
+ * ReadinessProbe — headless silent readiness checks (SCRAM-SPEC §7.3).
  *
- *  Runs the equivalent checks ONCE on mount and renders NOTHING: no
- *  button, no progress, no text.
- *  - Location permission: Permissions API query where available.
- *  - Wake Lock: availability check only (no lock is taken here).
- *  - GPS quality: one foreground fix (warms the permission + fix so
- *    the match starts from a known location state).
- *  - Network: online/offline listeners.
- *
- *  Results are kept in a ref, never shown: nothing on this screen
- *  reports them. The old acknowledgement tick-box is gone with the
- *  checklist — it only wrote a localStorage flag and a room-log line
- *  (both cut), and the server's briefing record was never the
- *  tick-box: demo `toggleReady` sets briefingConfirmed, and live
- *  "I'm ready" sends briefing.confirm. */
-export default function ReadinessProbe() {
-  const ranRef = useRef(false);
-  const resultRef = useRef({
-    permission: 'unknown',
-    wakeLockAvailable: false,
-    gps: 'unknown',
-    online: typeof navigator !== 'undefined' && navigator.onLine,
-  });
+ * The 5 readiness checks run in the background; there is no checklist,
+ * no warning + checkbox, no Safety block, no Lobby radio, no Role
+ * preview, no Host check-in, no event log on the lobby screen. This
+ * component renders nothing. Checks run once on mount:
+ * permission query, wake-lock support check, one foreground GPS fix,
+ * online/offline listeners. Nothing here blocks play or shows UI —
+ * a failed check only means the fix/location stays unknown.
+ */
+import { useEffect } from 'react';
+import { getCurrentFix } from '../../lib/geolocation';
 
+export function ReadinessProbe() {
   useEffect(() => {
-    if (ranRef.current) return;
-    ranRef.current = true;
-    const onOnline = () => { resultRef.current.online = true; };
-    const onOffline = () => { resultRef.current.online = false; };
+    // 1. Permission state (query only — never prompts from here).
+    try {
+      const permissions = (navigator as Navigator & {
+        permissions?: { query: (o: { name: string }) => Promise<{ state: string }> };
+      }).permissions;
+      void permissions?.query({ name: 'geolocation' }).catch(() => undefined);
+    } catch {
+      // Permissions API unavailable — the GPS fix below still runs.
+    }
+    // 2. Wake-lock support check (the play screen requests the lock).
+    void ('wakeLock' in navigator);
+    // 3. One foreground GPS fix (best-effort; never sent anywhere).
+    void getCurrentFix().catch(() => undefined);
+    // 4 + 5. Online / offline listeners (connectivity is the socket's
+    // job to report; these only keep the listeners attached).
+    const onOnline = (): void => undefined;
+    const onOffline = (): void => undefined;
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
-    // Location permission: query only — never prompts by itself.
-    const nav = navigator as Navigator & { permissions?: { query: (q: { name: string }) => Promise<{ state: string }> } };
-    if (nav.permissions?.query) {
-      nav.permissions.query({ name: 'geolocation' }).then(
-        (r) => { resultRef.current.permission = r.state; },
-        () => { resultRef.current.permission = 'unknown'; },
-      );
-    }
-    // Wake Lock: availability check only.
-    const wnav = navigator as Navigator & { wakeLock?: unknown };
-    resultRef.current.wakeLockAvailable = Boolean(wnav.wakeLock);
-    // GPS quality: one foreground fix.
-    if ('geolocation' in navigator) {
-      navigator.geolocation.getCurrentPosition(
-        () => { resultRef.current.gps = 'pass'; },
-        (err) => { resultRef.current.gps = err.code === 1 ? 'denied' : 'fail'; },
-        { enableHighAccuracy: true, timeout: 15000 },
-      );
-    } else {
-      resultRef.current.gps = 'fail';
-    }
     return () => {
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
     };
   }, []);
-
   return null;
 }

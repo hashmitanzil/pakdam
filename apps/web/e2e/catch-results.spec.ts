@@ -1,141 +1,127 @@
-// Catch + results e2e — TEXT/DOM assertions only, no screenshots.
-// Covers the brief's catch flow (tag in person → Runner taps Got
-// tagged → QR opens → Hunter scans; camera-unavailable path is the
-// manual-confirm fallback) and the results page (awards, round card,
-// trail card, no one-tap rematch). There is NO one-time code anywhere:
-// no code to type, no code input on the catch page.
-import { test, expect, type Page } from '@playwright/test';
-import { roomState, setPlayer, startMatch } from './helpers';
+/**
+ * catch-results.spec.ts — catch → confirm → results (red hero, one-line
+ * stats, max-6 timeline, START A FRESH GAME). Demo-only. Text-only.
+ *
+ * The match is ended by moving the demo room's endsAt into the past in
+ * localStorage (the demo tick completes it on the next 1 s poll); the
+ * stats duration is real elapsed time, so it is asserted by pattern, not
+ * by an exact value.
+ */
+import { test, expect } from '@playwright/test';
+import {
+  LIVE,
+  GUEST_NAMES,
+  HOST_NAME,
+  forceDemoMatchEnd,
+  startDemoMatch,
+} from './helpers';
+import type { Page } from '@playwright/test';
 
-/** Run one full catch for a Runner via the manual-confirm fallback
- *  (camera unavailable in headless Chromium, same as a real phone
- *  whose camera cannot scan). `catchPage` stays a second tab so the
- *  play tab never hard-navigates away (that would suspend the player). */
-async function manualCatch(
-  catchPage: Page,
-  roomId: string,
-  hunterId: string,
-  runner: { playerId: string; displayName: string },
-): Promise<void> {
-  await setPlayer(catchPage, hunterId);
-  await catchPage.goto(`/room/${roomId}/catch?runner=${runner.playerId}`);
-  await expect(catchPage.getByRole('heading', { name: `Catch — ${runner.displayName}` })).toBeVisible();
-  await catchPage.getByRole('button', { name: /Request a catch/i }).click();
-  await expect(catchPage.getByText(/Claim state:/)).toContainText('Awaiting confirmation');
+test.describe('catch → results (demo)', () => {
+  test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
 
-  await setPlayer(catchPage, runner.playerId);
-  await catchPage.goto(`/room/${roomId}/catch?runner=${runner.playerId}`);
-  await expect(catchPage.getByRole('heading', { name: /You are the Runner/ })).toBeVisible();
-  await catchPage.getByRole('button', { name: /Got tagged.*show my QR/i }).click();
-  await expect(catchPage.getByRole('heading', { name: /Show this to the Hunter/ })).toBeVisible();
-  await expect(catchPage.getByRole('img', { name: /Catch QR code/ })).toBeVisible();
-  await catchPage.getByRole('button', { name: /Confirm manually.*camera unavailable/i }).click();
-  await catchPage.getByRole('button', { name: /Yes, I was tagged/i }).click();
-  await expect(catchPage.getByRole('heading', { name: /Catch confirmed/ })).toBeVisible();
-  await expect(catchPage.getByText(/Confirmed.*catch counts/).first()).toBeVisible();
-}
-
-test('catch flow via manual confirm → results with awards, no one-time code', async ({ page, context }) => {
-  test.setTimeout(180_000);
-  const { roomId, hunterId, runners } = await startMatch(page, context, { pickHunters: 'host' });
-  expect(runners.length).toBeGreaterThanOrEqual(3);
-
-  // No one-time code anywhere on the catch page: no code input, no
-  // "enter a code" instruction — the only paths are QR scan or
-  // manual confirm.
-  const catchPage = await context.newPage();
-  await catchPage.goto('/');
-  await setPlayer(catchPage, hunterId);
-  await catchPage.goto(`/room/${roomId}/catch?runner=${runners[0]!.playerId}`);
-  await expect(catchPage.getByText(/enter (a|the|your).*code/i)).toHaveCount(0);
-  await expect(catchPage.locator('input[type="text"]')).toHaveCount(0);
-
-  for (const runner of runners) {
-    await manualCatch(catchPage, roomId, hunterId, runner);
+  async function setupMatch(context: import('@playwright/test').BrowserContext) {
+    const { hostPage, guestPages, roomId, roles } = await startDemoMatch(context);
+    const names = [HOST_NAME, ...GUEST_NAMES];
+    const pages = [hostPage, ...guestPages];
+    const hunterIdx = names.findIndex((n) => roles.get(n) === 'hunter');
+    const runnerIdxs = names.map((n, i) => (roles.get(n) === 'runner' ? i : -1)).filter((i) => i >= 0);
+    const hunterPage = pages[hunterIdx]!;
+    const runnerPages = runnerIdxs.map((i) => pages[i]!);
+    const runnerNames = runnerIdxs.map((i) => names[i]!);
+    const hunterName = names[hunterIdx]!;
+    return { hostPage, roomId, hunterPage, runnerPages, runnerNames, hunterName };
   }
-  await catchPage.close();
 
-  const finished = await roomState(page);
-  expect(finished!.room.phase).toBe('COMPLETED');
+  async function catchRunner(hunterPage: Page, runnerPage: Page, roomId: string, runnerName: string) {
+    await hunterPage.goto(`/room/${roomId}/catch`);
+    await hunterPage.getByRole('button', { name: runnerName }).click();
+    await hunterPage
+      .getByRole('button', { name: `I TAGGED ${runnerName.toUpperCase()}` })
+      .click();
+    await runnerPage.goto(`/room/${roomId}/catch`);
+    await runnerPage.getByRole('button', { name: 'YES, I WAS TAGGED' }).click();
+    await expect(runnerPage.getByText('✓ Catch confirmed')).toBeVisible();
+    await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
+  }
 
-  await page.goto(`/room/${roomId}/results`);
-  await expect(page.getByRole('heading', { name: /Hunters win/ })).toBeVisible();
-  await expect(page.getByText(new RegExp(`Caught Runners: ${runners.length}`)).first()).toBeVisible();
-  await expect(page.getByText(new RegExp(`Confirmed catches: ${runners.length}`)).first()).toBeVisible();
+  async function goToResults(page: Page, roomId: string) {
+    await page.goto(`/room/${roomId}/results`);
+    await expect(page.getByText('MATCH OVER')).toBeVisible();
+  }
 
-  // Awards, computed from the real match data.
-  const awards = page.getByRole('region', { name: 'Standout players' });
-  await expect(awards).toContainText('Most tags:');
-  await expect(awards).toContainText(`Test Host`);
-  await expect(awards).toContainText(`${runners.length} confirmed tags`);
-  await expect(awards).toContainText('Never caught:');
-  await expect(awards).toContainText(/Nobody.*every Runner was caught/);
-  await expect(awards).toContainText('Clean sweep:');
-  await expect(awards).toContainText(/Yes.*every Runner was caught/);
-  await expect(awards).toContainText('First catch:');
-  await expect(awards).toContainText(`Test Host caught ${runners[0]!.displayName}`);
-  await expect(awards).toContainText('Longest survivor / last Runner standing:');
-  await expect(awards).toContainText(/No Runner survived/);
-
-  // Shareable cards: round recap + trail card, no locations/routes.
-  await expect(page.locator('pre', { hasText: 'round recap' })).toContainText('Clean sweep');
-  await expect(page.locator('pre', { hasText: 'trail card' })).toContainText('Most tags: Test Host');
-  await expect(page.getByText(/No locations or routes are shared/i).first()).toBeVisible();
-
-  // No one-tap rematch in Phase 0 (HNT-031 is P1) — only fresh setup.
-  await expect(page.getByRole('button', { name: /rematch/i })).toHaveCount(0);
-  await expect(page.getByRole('link', { name: /Play again — start a fresh game/ })).toBeVisible();
-});
-
-test('catch: QR opens after Got tagged; a disputed catch is not confirmed', async ({ page, context }) => {
-  test.setTimeout(120_000);
-  const { roomId, hunterId, runners } = await startMatch(page, context, { pickHunters: 'host' });
-  const runner = runners[0]!;
-
-  const catchPage = await context.newPage();
-  await catchPage.goto('/');
-  await setPlayer(catchPage, hunterId);
-  await catchPage.goto(`/room/${roomId}/catch?runner=${runner.playerId}`);
-  await catchPage.getByRole('button', { name: /Request a catch/i }).click();
-  await expect(catchPage.getByText(/Claim state:/)).toContainText('Awaiting confirmation');
-
-  await setPlayer(catchPage, runner.playerId);
-  await catchPage.goto(`/room/${roomId}/catch?runner=${runner.playerId}`);
-  await catchPage.getByRole('button', { name: /Got tagged.*show my QR/i }).click();
-  await expect(catchPage.getByRole('heading', { name: /Show this to the Hunter/ })).toBeVisible();
-  await expect(catchPage.getByRole('img', { name: /Catch QR code/ })).toBeVisible();
-  await expect(catchPage.getByText(/QR lifetime:/)).toBeVisible();
-  // Dispute instead of confirming: the catch is not counted.
-  await catchPage.getByRole('button', { name: /Dispute/ }).first().click();
-  await expect(catchPage.getByText(/Catch disputed.*host will review it/i)).toBeVisible();
-  const state = await roomState(catchPage);
-  expect(state!.catches.find((c) => c.runnerPlayerId === runner.playerId)?.state).toBe('disputed');
-  expect(state!.room.phase).toBe('ACTIVE');
-  await catchPage.close();
-});
-
-test('infection: a caught Runner turns Hunter and the HUD count drops', async ({ page, context }) => {
-  test.setTimeout(180_000);
-  const { roomId, hunterId, runners } = await startMatch(page, context, {
-    pickHunters: 'host',
-    configureDraft: async (p) => {
-      await p.getByRole('radio', { name: /Infection/ }).check();
-    },
+  test('one tag then time up: Runners Win, one-line stats, timeline, fresh game', async ({
+    context,
+  }) => {
+    const { hostPage, roomId, hunterPage, runnerPages, runnerNames, hunterName } =
+      await setupMatch(context);
+    await catchRunner(hunterPage, runnerPages[0]!, roomId, runnerNames[0]!);
+    await forceDemoMatchEnd(hostPage, roomId);
+    await goToResults(hostPage, roomId);
+    await expect(hostPage.getByText('Runners Win!', { exact: true })).toBeVisible();
+    await expect(hostPage.getByText(/Classic Mode · Room [A-Z0-9]{6}/)).toBeVisible();
+    // One-line stats: "<elapsed> · 1 tag · 1 runner never caught".
+    await expect(hostPage.getByText(/· 1 tag · 1 runner never caught/)).toBeVisible();
+    await expect(hostPage.getByRole('heading', { name: 'What happened' })).toBeVisible();
+    await expect(hostPage.getByText('Match started — 3 players')).toBeVisible();
+    await expect(hostPage.getByText(`${hunterName} tagged ${runnerNames[0]}`)).toBeVisible();
+    await expect(hostPage.getByText('Time up — runners win')).toBeVisible();
+    // Max 6 timeline entries.
+    await expect(hostPage.locator('.border-l-2')).toHaveCount(3);
+    await hostPage.getByRole('button', { name: 'START A FRESH GAME' }).click();
+    await expect(hostPage).toHaveURL(/\/$/);
+    await expect(hostPage.getByRole('button', { name: /HOST A GAME/ })).toBeVisible();
   });
-  const state0 = await roomState(page);
-  expect(state0!.room.config.mode).toBe('infection');
-  const hud = page.getByRole('region', { name: 'Match status' });
-  await expect(hud).toContainText(`${runners.length} of ${runners.length} Runners`);
 
-  const catchPage = await context.newPage();
-  await catchPage.goto('/');
-  await manualCatch(catchPage, roomId, hunterId, runners[0]!);
-  await catchPage.close();
+  test('all runners caught: Hunters Win, Last runner caught, no never-caught line', async ({
+    context,
+  }) => {
+    const { hostPage, roomId, hunterPage, runnerPages, runnerNames } = await setupMatch(context);
+    await catchRunner(hunterPage, runnerPages[0]!, roomId, runnerNames[0]!);
+    // Tag someone else: the hunter's done card offers the next claim.
+    await hunterPage.getByRole('button', { name: 'Tag someone else' }).click();
+    await hunterPage.getByRole('button', { name: runnerNames[1]! }).click();
+    await hunterPage
+      .getByRole('button', { name: `I TAGGED ${runnerNames[1]!.toUpperCase()}` })
+      .click();
+    await runnerPages[1]!.goto(`/room/${roomId}/catch`);
+    await runnerPages[1]!.getByRole('button', { name: 'YES, I WAS TAGGED' }).click();
+    // Catching the last free runner completes the match at once, so the
+    // catch page may show the done card or the match-over card — either
+    // proves the confirm landed.
+    await expect(
+      runnerPages[1]!.getByText(/✓ Catch confirmed|Match over — see the results page/),
+    ).toBeVisible();
+    // Catching the last free runner completes the match at once.
+    await goToResults(hostPage, roomId);
+    await expect(hostPage.getByText('Hunters Win!', { exact: true })).toBeVisible();
+    await expect(hostPage.getByText(/· 2 tags/)).toBeVisible();
+    await expect(hostPage.getByText(/never caught/)).toBeHidden();
+    await expect(hostPage.getByText('Last runner caught')).toBeVisible();
+    await expect(hostPage.locator('.border-l-2')).toHaveCount(4);
+  });
 
-  // The turned Runner is a Hunter now — not a free Runner any more.
-  const state1 = await roomState(page);
-  expect(state1!.players.find((p) => p.playerId === runners[0]!.playerId)?.matchRole).toBe('hunter');
-  expect(state1!.room.phase).toBe('ACTIVE');
-  await expect(hud).toContainText(`${runners.length - 1} of ${runners.length - 1} Runners`);
-  expect(state1!.events.some((e) => /turned Hunter/i.test(e.text))).toBe(true);
+  test('results before the match finishes says so and links back to the match', async ({
+    context,
+  }) => {
+    const { hostPage, roomId } = await setupMatch(context);
+    await hostPage.goto(`/room/${roomId}/results`);
+    await expect(hostPage.getByText('Match hasn’t finished yet.')).toBeVisible();
+    await hostPage.getByRole('button', { name: 'Back to the match' }).click();
+    await expect(hostPage).toHaveURL(/\/room\/[^/]+\/play/);
+  });
+
+  test('a fresh game after results gets a new room code', async ({ context }) => {
+    const { hostPage, roomId } = await setupMatch(context);
+    await forceDemoMatchEnd(hostPage, roomId);
+    await goToResults(hostPage, roomId);
+    const oldCode = (await hostPage.getByText(/Classic Mode · Room [A-Z0-9]{6}/).innerText()).slice(-6);
+    await hostPage.getByRole('button', { name: 'START A FRESH GAME' }).click();
+    await hostPage.getByRole('button', { name: /HOST A GAME/ }).click();
+    await hostPage.getByLabel('Your codename').fill('Teo');
+    await hostPage.getByRole('button', { name: /Classic/ }).click();
+    await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
+    const newCode = (await hostPage.locator('section[aria-label="Game code"] .pakdam-code').innerText()).trim();
+    expect(newCode).not.toBe(oldCode);
+  });
 });

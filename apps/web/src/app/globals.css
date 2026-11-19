@@ -1,0 +1,151 @@
+@import 'tailwindcss';
+
+/*
+ * Pakdam design tokens — SCRAM-SPEC §11, exact hex values.
+ * Single dark theme only. No light theme, no map-style picker, no
+ * appearance toggle (conflict resolutions §1).
+ */
+:root {
+  --pakdam-bg: #0a0a0b;
+  --pakdam-surface: #141416;
+  --pakdam-surface-2: #1e1e22;
+  --pakdam-border: #26262b;
+  --pakdam-text: #ffffff;
+  --pakdam-muted: #a1a1aa;
+  --pakdam-red: #ef4444;
+  --pakdam-red-pressed: #dc2626;
+  --pakdam-green: #22c55e;
+  --pakdam-orange: #f59e0b;
+  --pakdam-toggle-off: #3f3f46;
+  --pakdam-zone-fill: rgba(239, 68, 68, 0.08);
+  --pakdam-tab-active-bg: rgba(239, 68, 68, 0.15);
+
+  /* Type stacks (§11): condensed heavy sans for display, system sans for UI. */
+  --pakdam-font-display: 'Oswald', 'Arial Narrow', system-ui, sans-serif;
+  --pakdam-font-ui: -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+@theme inline {
+  --color-pakdam-bg: var(--pakdam-bg);
+  --color-pakdam-surface: var(--pakdam-surface);
+  --color-pakdam-surface-2: var(--pakdam-surface-2);
+  --color-pakdam-border: var(--pakdam-border);
+  --color-pakdam-text: var(--pakdam-text);
+  --color-pakdam-muted: var(--pakdam-muted);
+  --color-pakdam-red: var(--pakdam-red);
+  --color-pakdam-red-pressed: var(--pakdam-red-pressed);
+  --color-pakdam-green: var(--pakdam-green);
+  --color-pakdam-orange: var(--pakdam-orange);
+  --font-pakdam-display: var(--pakdam-font-display);
+  --font-pakdam-ui: var(--pakdam-font-ui);
+}
+
+html {
+  background: var(--pakdam-bg);
+}
+
+body {
+  background: var(--pakdam-bg);
+  color: var(--pakdam-text);
+  font-family: var(--pakdam-font-ui);
+  font-size: 15px;
+  line-height: 1.45;
+  min-height: 100dvh;
+  /* Safe-area insets on every screen (§11 PWA shell). */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Baseline width 360 px; must hold at 130% zoom (§11). No horizontal scroll. */
+html,
+body {
+  overflow-x: hidden;
+}
+
+/* Display type: condensed heavy sans, tight leading, uppercase headlines. */
+.pakdam-display {
+  font-family: var(--pakdam-font-display);
+  font-weight: 700;
+  letter-spacing: 0.01em;
+  line-height: 0.95;
+  text-transform: uppercase;
+}
+
+/* Small-caps labels: 11–12 px, 0.08 em letter-spacing, muted. */
+.pakdam-label {
+  color: var(--pakdam-muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+/* Room code: 36–40 px bold, 0.12 em letter-spacing. */
+.pakdam-code {
+  font-size: 38px;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  line-height: 1;
+}
+
+/* Numbers that count (timers, ages) always use tabular numbers. */
+.pakdam-numeric {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tap targets ≥ 48 px (§11). Interactive elements get a 48 px hit area. */
+button,
+[role='button'],
+input,
+select,
+textarea {
+  min-height: 48px;
+}
+
+button {
+  touch-action: manipulation;
+}
+
+:focus-visible {
+  outline: 2px solid var(--pakdam-red);
+  outline-offset: 2px;
+}
+
+/* Range inputs (sliders): red fill, grey track, white thumb with red ring. */
+input[type='range'].pakdam-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  height: 44px;
+  width: 100%;
+}
+input[type='range'].pakdam-slider::-webkit-slider-runnable-track {
+  background: var(--pakdam-surface-2);
+  border-radius: 999px;
+  height: 6px;
+}
+input[type='range'].pakdam-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  background: #ffffff;
+  border: 3px solid var(--pakdam-red);
+  border-radius: 999px;
+  height: 28px;
+  margin-top: -11px;
+  width: 28px;
+}
+input[type='range'].pakdam-slider::-moz-range-track {
+  background: var(--pakdam-surface-2);
+  border-radius: 999px;
+  height: 6px;
+}
+input[type='range'].pakdam-slider::-moz-range-thumb {
+  background: #ffffff;
+  border: 3px solid var(--pakdam-red);
+  border-radius: 999px;
+  height: 28px;
+  width: 28px;
+}
