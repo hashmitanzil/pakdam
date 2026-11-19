@@ -1,4 +1,0 @@
-# Supabase — Mumbai region is the leading candidate (data residency, see docs).
-# Region is a deployment decision, not a code value. Do not deploy without ADR-002.
-[db]
-port = 54322
