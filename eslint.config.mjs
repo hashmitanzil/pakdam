@@ -20,9 +20,11 @@ export default tseslint.config(
       'apps/web/public/workbox-*.js',
       'apps/web/next-env.d.ts',
       // Third-party libraries vendored into public/ — never linted.
-      // (MapLibre GL JS + PMTiles + basemaps, bundled with the offline
-      // map in apps/web/public/offline-map/vendor/.)
-      'apps/web/public/offline-map/vendor/**',
+      // (MapLibre GL JS, bundled with the Ola map in
+      // apps/web/public/vendor/maplibre/ — moved there from
+      // public/offline-map/vendor/ when the offline pack was deleted,
+      // 2026-11-19.)
+      'apps/web/public/vendor/maplibre/**',
       // Scratch probe script (apps/web/probe-gps.mjs) — kept for the
       // live GPS-mock retry, not part of the app.
       'apps/web/probe-gps.mjs',
