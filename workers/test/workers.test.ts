@@ -6,6 +6,7 @@ import {
   recoverState, snapshotForRecovery, snapshotForPlayer, addPlayer,
   buildWsSnapshot, snapshotLeakKeys,
   validateHello, closeCodeFor, handleWsClientMessage, newWsSession,
+  resumeSuspendedPlayer,
   noteMissedHeartbeat, alarmTick, startMatch,
   verifyReconnectToken, registerWsTicket,
   checkWsRate, completeMatch, purgeStaleFixes, ticketRenewalDue, FIX_TTL_MS,
@@ -220,6 +221,38 @@ test('WS messages: heartbeat gets heartbeat.ack; auth.refresh surfaces the ticke
   assert.equal(susp.replies[0]?.type, 'player.suspended');
   if (susp.replies[0]?.type === 'player.suspended') assert.equal(susp.replies[0].payload.reason, 'tab-hidden');
   assert.equal(susp.state.players.find((p) => p.playerId === 'r1')?.connectionState, 'suspended');
+});
+
+// D-01 (2026-11-19, catch-22 fix): a suspended seat resumes when its
+// socket (re)connects — the DO class calls resumeSuspendedPlayer from
+// the hello handler, so a Runner suspended by navigating play → catch
+// (socket close) is connected again before catch.confirm is checked.
+// Only connectionState flips; the suspension count stays on the record.
+test('D-01: hello-time resume — suspended player reconnects as connected, count preserved; healthy/unknown seats untouched', () => {
+  const state = mkState();
+  const susp = handleWsClientMessage(state, 'r1', {
+    v: 1, type: 'player.suspended', roomId: 'r1', playerId: 'r1', clientSeq: 1, clientTs: 1000,
+    payload: { reason: 'tab-hidden' },
+  }, 5000);
+  assert.equal(susp.state.players.find((p) => p.playerId === 'r1')?.connectionState, 'suspended');
+  assert.equal(susp.state.players.find((p) => p.playerId === 'r1')?.suspensionCount, 1);
+  const resumed = resumeSuspendedPlayer(susp.state, 'r1', 6000);
+  assert.equal(resumed.resumed, true);
+  assert.equal(resumed.state.players.find((p) => p.playerId === 'r1')?.connectionState, 'connected');
+  assert.equal(resumed.state.players.find((p) => p.playerId === 'r1')?.suspensionCount, 1, 'resume never decrements the suspension count');
+  assert.equal(resumed.state.serverSeq, susp.state.serverSeq + 1);
+  assert.equal(resumed.message?.type, 'player.resumed');
+  if (resumed.message?.type === 'player.resumed') assert.equal(resumed.message.payload.playerId, 'r1');
+  // A catch.confirm for the resumed Runner now passes the guard: the
+  // full catch flow (request → confirm) is covered by the HIGH-1 test
+  // above on a connected Runner; here the point is the guard input.
+  const again = resumeSuspendedPlayer(resumed.state, 'r1', 7000);
+  assert.equal(again.resumed, false, 'second hello is a no-op for a connected seat');
+  assert.equal(again.message, null);
+  assert.equal(again.state, resumed.state, 'no-op returns the state untouched');
+  const unknown = resumeSuspendedPlayer(resumed.state, 'no-such-player', 7000);
+  assert.equal(unknown.resumed, false);
+  assert.equal(unknown.state, resumed.state);
 });
 
 test('close-code mapping (17 §3.4)', () => {

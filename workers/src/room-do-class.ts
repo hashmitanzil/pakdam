@@ -2,7 +2,7 @@ import { DurableObject } from 'cloudflare:workers';
 import {
   recoverState, snapshotForRecovery, snapshotForPlayer, alarmTick,
   addPlayer, startMatch, handleWsClientMessage, validateHello,
-  buildWsSnapshot, applySuspension, buildPlayerSuspended, logGameEvent,
+  buildWsSnapshot, applySuspension, buildPlayerSuspended, resumeSuspendedPlayer, logGameEvent,
   issueHostToken, verifyHostToken, transferHost, updateRoomConfig,
   resolveDisputedCatch, endMatch, verifyReconnectToken,
   registerWsTicket, markWsTicketRedeemed, ticketRenewalDue, buildRenewalRequired,
@@ -873,6 +873,27 @@ export class RoomDurableObject extends DurableObject<RoomDoEnv> {
     if ((raw as Record<string, unknown>)['type'] === 'hello') {
       const validation = validateHello(raw);
       if (!validation.ok) { ws.close(validation.code === 'PROTOCOL_UNSUPPORTED' ? 4409 : 4400, validation.message); return; }
+      // D-01 (2026-11-19, catch-22 fix): a live socket means the
+      // player is back — resume a suspended seat on hello. Navigating
+      // play → catch closes the old socket (webSocketClose suspends
+      // the seat), so without this the Runner arrives on the Catch
+      // screen suspended and catch.confirm's suspended-Runner guard
+      // rejects the very confirm that screen exists to perform.
+      // Suspension must mean "away"; a connected socket is presence.
+      // Ticket/upgrade validation above is untouched, and the
+      // suspension count stays on the record (resumeSuspendedPlayer
+      // flips connectionState only). The resuming socket also gets a
+      // fresh snapshot directly: its upgrade-time snapshot predates
+      // this resume, and the Catch screen only re-fetches on
+      // room.state — without it the Runner would still LOOK suspended
+      // until the next event, even though the server guard now passes.
+      const resumed = resumeSuspendedPlayer(state, att.playerId, Date.now());
+      if (resumed.resumed) {
+        this.state = resumed.state;
+        await this.persist();
+        if (resumed.message) await this.broadcast(resumed.message, att.playerId);
+        try { ws.send(JSON.stringify(buildWsSnapshot(resumed.state, att.playerId, Date.now()))); } catch { /* socket gone */ }
+      }
       return;
     }
     const nowMs = Date.now();

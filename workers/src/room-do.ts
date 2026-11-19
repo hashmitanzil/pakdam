@@ -1296,6 +1296,43 @@ export function buildPlayerSuspended(
   };
 }
 
+/** Resume a suspended player when their socket (re)connects — D-01
+ *  (2026-11-19, catch-22 fix). A live socket means the player is
+ *  back: suspension must mean "away", and a connected socket is
+ *  presence. The DO class calls this from the `hello` handler, after
+ *  validateHello passes, so a Runner who was suspended by navigating
+ *  play → catch (socket close) is connected again by the time the
+ *  Catch screen's socket says hello — the catch.confirm guard
+ *  (suspended Runner ⇒ rejected) no longer blocks the confirm the
+ *  Catch screen exists to perform. Only `connectionState` flips
+ *  suspended → connected and serverSeq bumps; the suspension count
+ *  stays on the record (recordSuspension counts are history, never
+ *  decremented). Returns `resumed: false` with the state untouched
+ *  when the seat is unknown or not suspended (connected,
+ *  disconnected, ejected, left) — a hello from a healthy seat is a
+ *  no-op. The `player.resumed` message follows the
+ *  buildPlayerSuspended pattern so other clients update the same way. */
+export function resumeSuspendedPlayer(
+  s: RoomDoState, playerId: string, nowMs: number,
+): { state: RoomDoState; resumed: boolean; message: WsServerMessage | null } {
+  const p = s.players.find((x) => x.playerId === playerId);
+  if (!p || p.connectionState !== 'suspended') return { state: s, resumed: false, message: null };
+  const state: RoomDoState = {
+    ...s,
+    players: s.players.map((x) => (x.playerId === playerId ? { ...x, connectionState: 'connected' as const } : x)),
+    serverSeq: s.serverSeq + 1,
+  };
+  return {
+    state,
+    resumed: true,
+    message: {
+      v: 1, type: 'player.resumed', roomId: s.room.roomId,
+      eventId: randomEventId(), serverSeq: state.serverSeq, serverTs: nowMs,
+      payload: { playerId, serverSeq: state.serverSeq },
+    },
+  };
+}
+
 export interface WsHandleResult {
   state: RoomDoState;
   replies: WsServerMessage[];

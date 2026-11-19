@@ -188,10 +188,23 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
   };
 
   // --- demo load (demo mode only) ---
+  // F2 FIX (2026-11-19): guests in demo mode never auto-navigated when
+  // the host started — the poll only re-rendered. Mirror the live
+  // pattern (`if (s.phase !== 'LOBBY') goToPlay()`): after every
+  // getRoom read (initial load and the 1 s interval), a room past the
+  // lobby navigates to play. goToPlay is guarded by wentToPlayRef,
+  // so this fires once. A guest loading the lobby after the match
+  // started is covered by the initial-load check. Navigating on
+  // COMPLETED is safe: the play page redirects to results there.
   useEffect(() => {
     if (mode !== 'demo') return;
+    const checkPhaseAndLoad = () => {
+      const next = getRoom(roomId);
+      setDr(next);
+      if (next && next.room.phase !== 'LOBBY') goToPlay();
+    };
     try {
-      setDr(getRoom(roomId));
+      checkPhaseAndLoad();
       try {
         setPause(JSON.parse(localStorage.getItem(PAUSE_KEY(roomId)) ?? 'null') as LobbyPause);
       } catch {
@@ -200,7 +213,7 @@ export default function LobbyPage({ params }: { params: Promise<{ roomId: string
     } catch {
       setLoadError('Could not load the lobby — try again.');
     }
-    const id = setInterval(() => { setDr(getRoom(roomId)); }, 1000);
+    const id = setInterval(checkPhaseAndLoad, 1000);
     return () => { clearInterval(id); };
   }, [mode, roomId]);
 

@@ -1,7 +1,7 @@
 'use client';
 import { use, useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
-import { getRoom, requestCatch, confirmCatch, disputeCatch, verifyCatchScan, getCatchRaw, currentPlayerId, expireOldCatches } from '@/lib/demo-store';
+import { getRoom, requestCatch, confirmCatch, disputeCatch, verifyCatchScan, getCatchRaw, currentPlayerId, expireOldCatches, resumePlayer, recordPlayerSuspension } from '@/lib/demo-store';
 import { createLivePakdamSocket, getWorkerUrl, type PakdamSocket, type PakdamSocketState } from '@/lib/websocket';
 import { getSessionForRoom, type PakdamSession } from '@/lib/session-credentials';
 import { CALIBRATION_OPEN } from '@pakdam/shared';
@@ -149,6 +149,10 @@ export default function CatchPage({ params }: { params: Promise<{ roomId: string
   const [tokenError, setTokenError] = useState('');
   const [sessionCatches, setSessionCatches] = useState<CatchView[]>([]);
   const [scanDone, setScanDone] = useState(false);
+  // Catch-navigation fix (2026-11-19): the Runner picked from the
+  // Step 1 picker below (no roles are shown there — names only, the
+  // server validates the pick is a Runner). Same effect as ?runner=.
+  const [pickedRunnerId, setPickedRunnerId] = useState('');
   const socketRef = useRef<PakdamSocket | null>(null);
 
   // Decide the mode once: Worker URL set → live only, never the demo
@@ -207,6 +211,24 @@ export default function CatchPage({ params }: { params: Promise<{ roomId: string
   }, [roomId, liveMode, seat]);
 
   const me = liveMode ? seat?.playerId ?? null : currentPlayerId();
+  // D-01 (2026-11-19, catch-22 fix, demo half): the Catch screen is
+  // the only place a Runner can show their QR / confirm manually, but
+  // navigating play → catch suspends them (the play page suspends on
+  // hidden), and a suspended Runner can never confirm — so arriving
+  // here resumes them, on mount and whenever the tab becomes visible
+  // again, mirroring the play page's resume branch. resumePlayer is a
+  // no-op unless the player is actually suspended. Demo only: live
+  // mode is resumed server-side when the socket says hello.
+  useEffect(() => {
+    if (liveMode !== false || !me) return;
+    if (resumePlayer(roomId, me)) setDr(getRoom(roomId));
+    const onVis = () => {
+      if (document.hidden) recordPlayerSuspension(roomId, me);
+      else if (resumePlayer(roomId, me)) setDr(getRoom(roomId));
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => document.removeEventListener('visibilitychange', onVis);
+  }, [roomId, liveMode, me]);
   // --- unified view: live snapshot, or the demo store. Never both. ---
   const room: Room | null = liveMode ? snap?.room ?? null : dr?.room ?? null;
   const players: (PlayerView | DemoRoom['players'][number])[] = liveMode ? snap?.players ?? [] : dr?.players ?? [];
@@ -218,10 +240,46 @@ export default function CatchPage({ params }: { params: Promise<{ roomId: string
     return [...byId.values()];
   })();
   const catches: (CatchView | DemoRoom['catches'][number])[] = liveMode ? liveCatches : dr?.catches ?? [];
+  // Catch-navigation fix (2026-11-19) — the Runner is NO LONGER
+  // only the ?runner= param. Effective runner, in order:
+  //   1. ?runner= (roster Catch link, hunter pre-claim),
+  //   2. an open claim involving ME — as Runner (auto-select: the
+  //      Runner taps the bare CatchPanel link and lands on their own
+  //      Step 2) or as Hunter (bare link returns to my open claim's
+  //      Step 3). No role is leaked: the claim is already visible to
+  //      both parties (and the host) in the snapshot.
+  //   3. the Step 1 picker choice below (pickedRunnerId).
+  //   4. my most recent CONFIRMED catch involving me (so the
+  //      "✓ Catch confirmed" card survives the claim leaving the
+  //      pending set — see myLatestConfirmed below).
+  // With none of those, there is no runner and the Step 1 picker
+  // renders instead of the "No Runner selected" dead end.
+  const myPendingClaim = me ? catches.find((c) => (c.state === 'requested' || c.state === 'awaiting-confirmation') && (c.runnerPlayerId === me || c.hunterPlayerId === me)) : undefined;
+  const autoRunnerId = myPendingClaim?.runnerPlayerId ?? '';
+  // The pending auto-select evaporates the moment the claim confirms
+  // (a confirmed catch is no longer pending) — without a fallback the
+  // Runner's page would drop back to the Step 1 picker instead of the
+  // "✓ Catch confirmed" card. So a confirmed catch involving ME also
+  // pins the runner (most recent first). Same visibility as the
+  // pending claim: only catches this seat is a party to.
+  const myLatestConfirmed = me ? [...catches].reverse().find((c) => c.state === 'confirmed' && (c.runnerPlayerId === me || c.hunterPlayerId === me)) : undefined;
+  const confirmedRunnerId = myLatestConfirmed?.runnerPlayerId ?? '';
+  const effectiveRunnerId = runnerId || autoRunnerId || pickedRunnerId || confirmedRunnerId;
+  // Picker list (hunter pre-claim, Step 1): display names ONLY — no
+  // roles, because live mode masks other players' roles and this
+  // client must not (and cannot) know them. Exclusions are not role
+  // filters: self (cannot catch yourself), ejected / left players,
+  // and already-caught Runners (the server rejects all of those
+  // anyway). A pick that turns out not to be a Runner is rejected by
+  // the server on catch.request and its plain-language error is
+  // shown — no role is revealed by the rejection.
+  const confirmedRunnerIds = new Set(catches.filter((c) => c.state === 'confirmed').map((c) => c.runnerPlayerId));
+  const pickerPlayers = players.filter((p) => p.playerId !== me && !p.ejectedAt && !p.leftAt && !confirmedRunnerIds.has(p.playerId));
+  const pickedFromPicker = !runnerId && !autoRunnerId && pickedRunnerId !== '';
   // The open claim's id, computed before the early returns so the two
   // effects below run in the same order on every render (hooks must
   // never sit after a conditional return).
-  const pendingId = catches.find((c) => c.runnerPlayerId === runnerId && (c.state === 'awaiting-confirmation' || c.state === 'requested'))?.catchId;
+  const pendingId = catches.find((c) => c.runnerPlayerId === effectiveRunnerId && (c.state === 'awaiting-confirmation' || c.state === 'requested'))?.catchId;
   // Deep link from the play screen's Scan QR button: open the scanner
   // as soon as the open claim has loaded.
   useEffect(() => {
@@ -249,11 +307,11 @@ export default function CatchPage({ params }: { params: Promise<{ roomId: string
   if (!liveMode && loadError) return <div><h1>Catch</h1><p role="alert">{loadError}</p><p><button className="btn" onClick={() => { setLoadError(''); setDr(getRoom(roomId)); }}>Retry</button></p></div>;
   if (!liveMode && !dr) return <div aria-busy="true"><h1>Preparing the catch screen…</h1><div className="skeleton skeleton-lg" aria-hidden="true" /><div className="skeleton" style={{ width: '60%' }} aria-hidden="true" /><p>Loading the catch screen.</p></div>;
   if (!room) return <div><h1>Catch</h1><p role="alert">Could not load this room.</p><p><a className="btn" href="/">Back to home</a></p></div>;
-  const runner = players.find((p) => p.playerId === runnerId);
+  const runner = players.find((p) => p.playerId === effectiveRunnerId);
   const hunter = players.find((p) => p.playerId === me);
-  const pending = catches.find((c) => c.runnerPlayerId === runnerId && (c.state === 'awaiting-confirmation' || c.state === 'requested'));
-  const latestConfirmed = catches.find((c) => c.runnerPlayerId === runnerId && c.state === 'confirmed');
-  const amRunner = me === runnerId;
+  const pending = catches.find((c) => c.runnerPlayerId === effectiveRunnerId && (c.state === 'awaiting-confirmation' || c.state === 'requested'));
+  const latestConfirmed = catches.find((c) => c.runnerPlayerId === effectiveRunnerId && c.state === 'confirmed');
+  const amRunner = me === effectiveRunnerId;
   const amHost = room.hostPlayerId === me;
   const coolingDown = Date.now() < cooldownUntil;
   // Live, the Runner's role is visible only to the Runner themself
@@ -268,14 +326,14 @@ export default function CatchPage({ params }: { params: Promise<{ roomId: string
     if (!eligible) { setMsg('No Runner is eligible to catch right now — the match must be active and the Runner must not be suspended or ejected.'); return; }
     if (liveMode) {
       const sock = socketRef.current;
-      if (!sock || !sock.sendCommand('catch.request', { runnerId })) {
+      if (!sock || !sock.sendCommand('catch.request', { runnerId: effectiveRunnerId })) {
         setMsg('Not connected to the live room — the catch was not sent. Wait for the connection to return and try again.');
         return;
       }
       setMsg('Catch requested. The Runner taps “Got tagged” on their own phone to show their QR — scan it to complete the tag.');
       return;
     }
-    try { requestCatch(roomId, me, runnerId); setMsg('Catch requested. The Runner taps “Got tagged” on their own phone to show their QR — scan it to complete the tag.'); } catch (e) { setMsg(e instanceof Error ? e.message : 'Could not request a catch'); }
+    try { requestCatch(roomId, me, effectiveRunnerId); setMsg('Catch requested. The Runner taps “Got tagged” on their own phone to show their QR — scan it to complete the tag.'); } catch (e) { setMsg(e instanceof Error ? e.message : 'Could not request a catch'); }
   };
   /** Live: fetch the server-issued token and open the Runner's QR.
    *  No token is ever invented here — without the server's token
@@ -419,7 +477,7 @@ export default function CatchPage({ params }: { params: Promise<{ roomId: string
       <CatchFlow step={flowStep} stateLabel={pending ? (CLAIM_LABELS[pending.state] ?? pending.state) : latestConfirmed ? 'Confirmed — catch counts' : 'No claim yet'} />
       <p className="small">No grabbing, blocking, tackling or forced phone handling. GPS proximity is supporting evidence only — it never proves a catch.</p>
       <p className="small">Mode: {describeMode(room.config.mode).label} · {teamAssignmentLabel(room.config.teamAssignment)}{room.config.teamAssignment === 'selected' ? ` — the host picked the Hunters` : room.config.teamAssignment === 'random' ? ' — Hunters were drawn at random when the game started' : ''}. {modeTurnsRunner(room.config.mode) ? 'In this mode, a confirmed catch flips this Runner to Hunter.' : 'In this mode, a confirmed catch takes the Runner out.'}</p>
-      {runner ? <p>{runner.displayName} — {runner.connectionState === 'suspended' ? `Suspended — location unknown · ${lastReportedLabel(runner.lastFixAt)}` : lastReportedLabel(runner.lastFixAt)} · GPS evidence on this claim: {pending?.gpsEvidence ?? 'absent'}</p> : <p role="alert">No Runner selected. Go back to the game and pick a Runner from the roster.</p>}
+      {runner ? <p>{runner.displayName} — {runner.connectionState === 'suspended' ? `Suspended — location unknown · ${lastReportedLabel(runner.lastFixAt)}` : lastReportedLabel(runner.lastFixAt)} · GPS evidence on this claim: {pending?.gpsEvidence ?? 'absent'}</p> : <p role="alert">No Runner selected yet — pick a player below to claim a catch.</p>}
       {room.phase !== 'ACTIVE' ? <p className="small">The match is {room.phase} — catches are only available while the match is active.</p> : null}
 
       {!pending ? (
@@ -432,12 +490,32 @@ export default function CatchPage({ params }: { params: Promise<{ roomId: string
         ) : (
           <div className="card">
             <h2 style={{ marginTop: 0 }}>Step 1 — Claim the catch</h2>
-            <p>Tap below to claim you tagged {runner?.displayName ?? 'this Runner'} in person. The Runner then taps “Got tagged” on their own phone and shows their QR — you scan it to complete the tag.</p>
-            {/* Never disabled: a tap always answers in plain language
-                (start() explains why a catch is not possible right
-                now) or requests the catch. */}
-            <p><button className="btn" onClick={start} aria-disabled={!eligible} style={{ width: '100%', padding: 16, fontSize: 18 }}>Request a catch</button></p>
-            {!eligible && runner ? <p className="small">Catch is disabled: {runner.ejectedAt ? 'the Runner was ejected from the game.' : runner.connectionState === 'suspended' ? 'the Runner is suspended — they must reopen the PWA first; a catch cannot complete until they show their QR or confirm manually.' : 'the match is not active.'}</p> : null}
+            {!runner ? (
+              <div>
+                <p>Pick a player to claim you tagged them in person. Names only — the server checks your pick is a Runner in this room, and says so in plain language if it is not.</p>
+                {pickerPlayers.length === 0 ? (
+                  <p>No players are available to catch right now.</p>
+                ) : (
+                  <ul style={{ listStyle: 'none', padding: 0 }}>
+                    {pickerPlayers.map((p) => (
+                      <li key={p.playerId} style={{ padding: '4px 0' }}>
+                        <button type="button" className="btn btn-secondary" style={{ width: '100%', minHeight: 52 }} onClick={() => setPickedRunnerId(p.playerId)}>Catch {p.displayName}</button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            ) : (
+              <>
+                <p>Tap below to claim you tagged {runner.displayName} in person. The Runner then taps “Got tagged” on their own phone and shows their QR — you scan it to complete the tag.</p>
+                {pickedFromPicker ? <p><button type="button" className="btn btn-secondary" onClick={() => setPickedRunnerId('')}>Change Runner — pick someone else</button></p> : null}
+                {/* Never disabled: a tap always answers in plain language
+                    (start() explains why a catch is not possible right
+                    now) or requests the catch. */}
+                <p><button className="btn" onClick={start} aria-disabled={!eligible} style={{ width: '100%', padding: 16, fontSize: 18 }}>Request a catch</button></p>
+                {!eligible ? <p className="small">Catch is disabled: {runner.ejectedAt ? 'the Runner was ejected from the game.' : runner.connectionState === 'suspended' ? 'the Runner is suspended — they must reopen the PWA first; a catch cannot complete until they show their QR or confirm manually.' : 'the match is not active.'}</p> : null}
+              </>
+            )}
           </div>
         )
       ) : (
