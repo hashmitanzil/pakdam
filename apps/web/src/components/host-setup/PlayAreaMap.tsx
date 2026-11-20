@@ -92,6 +92,26 @@ function toGeoJsonCollection(polygons: GeoPolygon[]): {
   return { type: 'FeatureCollection', features: polygons.map(toGeoJson) };
 }
 
+/**
+ * Short, safe detail from a MapLibre error event (status + message).
+ * The message can contain the request URL — including the Ola api_key
+ * as a query parameter — so any `api_key=…` value is stripped before
+ * the text is ever shown. Returns null when there is nothing useful.
+ */
+function mapErrorDetail(event: unknown): string | null {
+  const err = (event as { error?: { message?: string; status?: number | string } })
+    ?.error;
+  if (!err) return null;
+  const status = err.status !== undefined ? String(err.status) : '';
+  const raw = (err.message ?? '')
+    .replace(/api_key=[^&\s"']*/gi, 'api_key=…')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 120);
+  const parts = [status ? `HTTP ${status}` : '', raw].filter(Boolean);
+  return parts.length > 0 ? parts.join(' — ') : null;
+}
+
 /** [[minLng, minLat], [maxLng, maxLat]] of a boundary, for fitBounds. */
 function boundaryBBox(polygon: GeoPolygon): [[number, number], [number, number]] {
   let minLng = Infinity;
@@ -187,6 +207,11 @@ export function PlayAreaMap({
   const lastFittedRadiusRef = useRef<number | null>(null);
   const lastLocateNonceRef = useRef(0);
   const [loaded, setLoaded] = useState(false);
+  // Mirrors `loaded` for the once-registered map event handlers, which
+  // close over the first render. A tile failing AFTER the style loaded
+  // must not destroy a working map — only a pre-load failure replaces
+  // the map with the banner.
+  const loadedRef = useRef(false);
   const [mapReady, setMapReady] = useState(isOlaConfigured());
   // A failed style/key/network must NEVER leave a blank area: surface it
   // in the map slot with a plain-words message instead. The most common
@@ -222,14 +247,23 @@ export function PlayAreaMap({
         if (cancelled) return;
         clearTimeout(loadTimer);
         ensureZoneLayers(created);
+        loadedRef.current = true;
         setLoaded(true);
         created.resize();
       });
-      created.on('error', () => {
+      created.on('error', (event: unknown) => {
         if (cancelled) return;
         clearTimeout(loadTimer);
+        // A tile/sprite/glyph failing after the style loaded is not a
+        // dead map — keep the map up (tiles retry) instead of swapping
+        // the whole slot for the failure banner. Only a failure before
+        // the style loads replaces the map, and then the banner carries
+        // the real cause (status + message, key stripped) so the exact
+        // failure can be reported instead of guessed at.
+        if (loadedRef.current) return;
+        const detail = mapErrorDetail(event);
         setMapError(
-          "Map couldn't load — check your connection and that the Ola Maps key is set and this domain is whitelisted, then reopen this screen.",
+          `Map couldn't load — check your connection and that the Ola Maps key is set and this domain is whitelisted, then reopen this screen.${detail ? ` (${detail})` : ''}`,
         );
       });
       created.on('click', (event: unknown) => {

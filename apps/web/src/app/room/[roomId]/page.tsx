@@ -132,6 +132,9 @@ export default function LobbyPage() {
             goPlay();
             return;
           }
+          // A snapshot over the socket rescues a lobby whose first HTTP
+          // fetch failed — clear any load error so the roster shows.
+          setLoadError(null);
           const state = snapshotToLiveRoomState(snapshot);
           // Don't let a stale server echo clobber a config push in flight.
           if (pendingPushRef.current && lobbyRef.current) {
@@ -140,7 +143,26 @@ export default function LobbyPage() {
             setLobby({ room: state.room, players: state.players });
           }
         },
-        onStateChange: (state) => setConn(state),
+        onServerMessage: (envelope) => {
+          // ROOT CAUSE (roster / ready / start gate): the server only
+          // sends a light `room.state` (phase/version/reason) on join,
+          // ready.set and phase changes — never a snapshot. The roster
+          // and READY pills only move when a snapshot lands, and this
+          // page previously had no `onServerMessage` handler at all, so
+          // every `room.state` was silently dropped: the host never saw
+          // a joiner arrive, readiness never showed, and the start gate
+          // kept reading stale data. A `room.state` is the signal to
+          // re-sync — pull a fresh snapshot for this seat.
+          if (envelope.type === 'room.state') {
+            socketRef.current?.requestSnapshot();
+          }
+        },
+        onStateChange: (state) => {
+          setConn(state);
+          // (Re)connected — refresh the roster from the server so a
+          // reconnect never leaves a stale or empty player list.
+          if (state === 'connected') socketRef.current?.requestSnapshot();
+        },
         onError: (error) => showNotice(error.message),
       });
       socketRef.current = socket;
