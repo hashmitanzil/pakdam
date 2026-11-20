@@ -20,6 +20,26 @@
 export const OLA_STYLE_URL =
   'https://api.olamaps.io/tiles/vector/v1/styles/default-dark-standard/style.json';
 
+/**
+ * The Ola dark style URL with the api_key appended. The style request
+ * itself must carry the key — relying only on transformRequest leaves the
+ * style fetch unauthenticated if the transform is not applied to it, and
+ * the whole map then fails to load (blank area). Tiles, sprites and
+ * glyphs still get the key via transformRequest (it skips URLs that
+ * already carry api_key, so there is no duplicate).
+ */
+export function buildOlaStyleUrl(): string {
+  const key = getOlaApiKey();
+  if (!key) return OLA_STYLE_URL;
+  try {
+    const url = new URL(OLA_STYLE_URL);
+    url.searchParams.set('api_key', key);
+    return url.toString();
+  } catch {
+    return OLA_STYLE_URL;
+  }
+}
+
 export const OLA_MAP_INITIAL_CENTRE: readonly [number, number] = [85.33, 23.36]; // Ranchi / Doranda [lng, lat]
 export const OLA_MAP_INITIAL_ZOOM = 14;
 export const OLA_MAP_FIX_ZOOM = 15;
@@ -111,7 +131,7 @@ export async function createOlaMap(
   const maplibre = await import('maplibre-gl');
   const map = new maplibre.Map({
     container: options.container,
-    style: OLA_STYLE_URL,
+    style: buildOlaStyleUrl(),
     transformRequest: (url: string, resourceType?: string) =>
       olaTransformRequest(url, resourceType),
     center: options.center

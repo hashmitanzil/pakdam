@@ -416,11 +416,37 @@ export default function SetupPage() {
 
   const onCornersChange = (next: number): void => {
     if (!zone || zone.shape !== 'draw') return;
-    if (next > zone.drawPoints.length) {
-      showNotice('Tap the map to place a corner.');
-    } else if (next < zone.drawPoints.length) {
-      onZoneChange({ ...zone, drawPoints: zone.drawPoints.slice(0, -1) });
+    const target = Math.max(0, Math.min(DRAW_MAX_POINTS, next));
+    if (target === zone.drawPoints.length) return;
+    if (target < zone.drawPoints.length) {
+      // − removes from the end (unchanged).
+      onZoneChange({ ...zone, drawPoints: zone.drawPoints.slice(0, target) });
+      return;
     }
+    // + adds a corner programmatically (it used to only show a notice,
+    // so the count could go down to 0 but never back up). The first
+    // point lands on the zone centre; later points spread around the
+    // centroid at the current radius (golden angle) so they form a rough
+    // polygon the host can then drag into shape. Tapping the map still
+    // adds a corner at the tapped location.
+    const points: GeoPoint[] = [...zone.drawPoints];
+    while (points.length < target) {
+      if (points.length === 0) {
+        points.push({ lat: zone.centre.lat, lng: zone.centre.lng });
+      } else {
+        const centroid = points.reduce(
+          (acc, p) => ({ lat: acc.lat + p.lat / points.length, lng: acc.lng + p.lng / points.length }),
+          { lat: 0, lng: 0 },
+        );
+        const angle = points.length * 2.39996; // golden angle — spreads points
+        const dLat = (zone.radiusMeters * Math.sin(angle)) / 111_320;
+        const dLng =
+          (zone.radiusMeters * Math.cos(angle)) /
+          (111_320 * Math.cos((centroid.lat * Math.PI) / 180));
+        points.push({ lat: centroid.lat + dLat, lng: centroid.lng + dLng });
+      }
+    }
+    onZoneChange({ ...zone, drawPoints: points });
   };
 
   const undoDraw = (): void => {
@@ -546,7 +572,6 @@ export default function SetupPage() {
                 locateNonce={locateNonce}
                 locating={locating}
                 onLocate={onLocate}
-                height={280}
               />
             </div>
             {gpsNote ? <p className="mt-2 text-[13px] text-[#A1A1AA]">{gpsNote}</p> : null}

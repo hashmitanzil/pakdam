@@ -1,5 +1,8 @@
 import type { Metadata, Viewport } from 'next';
 import './globals.css';
+// MapLibre GL JS requires its stylesheet for the map canvas to render.
+// Without it the style and tiles load but the canvas paints blank.
+import 'maplibre-gl/dist/maplibre-gl.css';
 
 export const metadata: Metadata = {
   title: 'Pakdam — Hide. Run. Don\'t get caught.',
