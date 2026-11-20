@@ -88,6 +88,24 @@ export const MIN_PLAYERS = 2;
 /** Maximum players in a room. */
 export const MAX_PLAYERS = 30;
 
+/**
+ * Earth geometry — the SINGLE source for every metres↔degrees conversion.
+ * EARTH_RADIUS_M is the radius `haversineMeters` uses (gps-validation.ts);
+ * METERS_PER_DEG_LAT is (R·π)/180 ≈ 111,194.9 m/deg — NOT the stale
+ * 111,320, which made a nominal 500 m zone measure ~499 m. The engine's
+ * `circlePolygon` and every web lat/lng↔metres conversion must use these,
+ * never a local literal.
+ */
+export const EARTH_RADIUS_M = 6_371_000;
+
+/** Metres per degree of latitude: (6,371,000 · π) / 180. */
+export const METERS_PER_DEG_LAT = (EARTH_RADIUS_M * Math.PI) / 180;
+
+/** Metres per degree of longitude at `latDegrees` (cos(lat) correction). */
+export function metersPerDegreeLng(latDegrees: number): number {
+  return METERS_PER_DEG_LAT * Math.cos((latDegrees * Math.PI) / 180);
+}
+
 /** Zone radius: minimum 100 m. */
 export const ZONE_RADIUS_MIN_M = 100;
 

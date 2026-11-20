@@ -19,6 +19,7 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import type { GeoPoint, GeoPolygon, ZoneShape } from '@pakdam/shared';
+import { METERS_PER_DEG_LAT, metersPerDegreeLng } from '@pakdam/shared';
 import { circlePolygon, offsetPolygon, scalePolygonTowardCentroid } from '@pakdam/engine';
 import {
   createOlaMap,
@@ -395,9 +396,9 @@ export function PlayAreaMap({
     addMarker(handle, centre, (next) => {
       const p = propsRef.current;
       if (p.shape === 'draw') {
-        const dLatM = (next.lat - p.centre.lat) * 111_320;
+        const dLatM = (next.lat - p.centre.lat) * METERS_PER_DEG_LAT;
         const dLngM =
-          (next.lng - p.centre.lng) * 111_320 * Math.cos((p.centre.lat * Math.PI) / 180);
+          (next.lng - p.centre.lng) * metersPerDegreeLng(p.centre.lat);
         const moved = offsetPolygon(drawPointsToBoundary(p.drawPoints), dLngM, dLatM);
         p.onZoneChange({
           centre: next,

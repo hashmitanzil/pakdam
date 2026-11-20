@@ -18,6 +18,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import type { PlayerView, Room, RoomConfig } from '@pakdam/shared';
+import { METERS_PER_DEG_LAT, metersPerDegreeLng } from '@pakdam/shared';
 import { PakdamSocket } from '../../../../lib/websocket';
 import type { WsSnapshotPayload } from '../../../../lib/websocket';
 import { liveErrorMessage } from '../../../../lib/live-client';
@@ -447,10 +448,9 @@ export default function SetupPage() {
           { lat: 0, lng: 0 },
         );
         const angle = points.length * 2.39996; // golden angle — spreads points
-        const dLat = (zone.radiusMeters * Math.sin(angle)) / 111_320;
+        const dLat = (zone.radiusMeters * Math.sin(angle)) / METERS_PER_DEG_LAT;
         const dLng =
-          (zone.radiusMeters * Math.cos(angle)) /
-          (111_320 * Math.cos((centroid.lat * Math.PI) / 180));
+          (zone.radiusMeters * Math.cos(angle)) / metersPerDegreeLng(centroid.lat);
         points.push({ lat: centroid.lat + dLat, lng: centroid.lng + dLng });
       }
     }

@@ -1,3 +1,5 @@
+import { METERS_PER_DEG_LAT, metersPerDegreeLng } from '@pakdam/shared';
+
 /**
  * Ola Maps helper — PROTOCOL-MAP §11 (R10).
  *
@@ -246,11 +248,9 @@ export function shouldRefly(
   lastAccuracyMeters: number | null,
 ): boolean {
   if (lastCentre === null) return true;
-  const dLat = (fix.lat - lastCentre.lat) * 111_320;
+  const dLat = (fix.lat - lastCentre.lat) * METERS_PER_DEG_LAT;
   const dLng =
-    (fix.lng - lastCentre.lng) *
-    111_320 *
-    Math.cos((fix.lat * Math.PI) / 180);
+    (fix.lng - lastCentre.lng) * metersPerDegreeLng(fix.lat);
   const movedM = Math.hypot(dLat, dLng);
   if (movedM > 25) return true;
   if (

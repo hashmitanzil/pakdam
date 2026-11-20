@@ -13,6 +13,7 @@
  */
 import {
   CLOCK_SKEW_MS,
+  EARTH_RADIUS_M,
   LOCATION_FRESHNESS_SECONDS,
   MAX_PLAUSIBLE_SPEED_MPS,
   STALE_FIX_MS,
@@ -227,7 +228,7 @@ export function verifyCatchProximity(
 
 /** Great-circle distance in metres between two points. */
 export function haversineMeters(a: GeoPoint, b: GeoPoint): number {
-  const earthRadiusM = 6_371_000;
+  const earthRadiusM = EARTH_RADIUS_M;
   const toRadians = (degrees: number): number => (degrees * Math.PI) / 180;
   const dLat = toRadians(b.lat - a.lat);
   const dLng = toRadians(b.lng - a.lng);

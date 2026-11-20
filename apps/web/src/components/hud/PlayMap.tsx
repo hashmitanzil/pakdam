@@ -12,6 +12,14 @@
  * after the style loads, and a style/key/network failure surfaces as a
  * banner with the real detail instead of failing silently.
  *
+ * A slow load never kills the map: the 12 s watchdog only shows a
+ * "still trying" note with a retry — the map keeps loading underneath.
+ * A load failure shows an overlay with a Retry button instead of
+ * unmounting the map (unmounting orphaned the map in a detached node,
+ * so a late load could never paint again). The ResizeObserver is
+ * attached from birth, not only after 'ready', so a canvas created
+ * while its container was zero-height is resized as soon as it gains size.
+ *
  * No map-style switcher, no layers button: single dark style only.
  * When the Ola key is missing, or `maplibre-gl` is not installed yet, the
  * map is not constructed at all and a one-line banner says so — never a
@@ -64,6 +72,12 @@ export interface PlayMapProps {
   reveals?: RevealMarker[];
   /** Clock (ms epoch) — expiry filtering + the next-zone countdown. */
   nowMs?: number;
+  /**
+   * Bumped by the caller when something covering the map goes away
+   * (the role-reveal overlay dismissing) — forces a resize so a
+   * canvas measured while covered can never stay blank.
+   */
+  resizeNonce?: number;
 }
 
 type MapState = 'loading' | 'ready' | 'no-key' | 'unavailable' | 'error';
@@ -145,18 +159,23 @@ function ensureLayer(map: MapLibreMapLike, layer: Record<string, unknown>): void
   }
 }
 
-export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pings, noGoAreas, myFix, teammateFixes, reveals = [], nowMs }: PlayMapProps) {
+export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pings, noGoAreas, myFix, teammateFixes, reveals = [], nowMs, resizeNonce = 0 }: PlayMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMapLike | null>(null);
   const [mapState, setMapState] = useState<MapState>('loading');
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
+  // True once the 12 s watchdog fires while the style is still loading
+  // — a note only, never a kill: the map keeps loading underneath.
+  const [slowLoad, setSlowLoad] = useState(false);
+  // Bumped by the Retry button — re-runs map creation from scratch.
+  const [retryNonce, setRetryNonce] = useState(0);
   // The zone is fitted once, on first load with a valid boundary — free
   // panning is never fought afterwards.
   const fittedRef = useRef(false);
   const loadedRef = useRef(false);
 
-  // Create the map once.
+  // Create the map once per mount / retry.
   useEffect(() => {
     const container = containerRef.current;
     if (!container || mapRef.current) return;
@@ -164,13 +183,23 @@ export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pin
       setMapState('no-key');
       return;
     }
+    loadedRef.current = false;
+    fittedRef.current = false;
     let cancelled = false;
+    // A slow load is NOT a dead map — a phone on mobile data can take
+    // well over 12 s for style + sprites + glyphs. The watchdog only
+    // shows a "still trying" note (with a Retry button); it never
+    // unmounts the map. The old code set mapState='error' here, which
+    // unmounted the map container with no way back — the map was built
+    // under the role-reveal overlay at game start, and by the time the
+    // player dismissed the reveal the timeout had already killed it.
+    // Worse, a load event arriving after that unmount set 'ready' while
+    // the map was still attached to the detached node, so the fresh
+    // container stayed blank forever.
     const loadTimer = setTimeout(() => {
-      if (!cancelled && !loadedRef.current) {
-        setMapError('Map is taking too long to load — check your connection, then reopen this screen.');
-        setMapState('error');
-      }
+      if (!cancelled && !loadedRef.current) setSlowLoad(true);
     }, 12_000);
+    let observer: ResizeObserver | null = null;
     createOlaMap({ container })
       .then((map) => {
         if (cancelled) return;
@@ -179,10 +208,17 @@ export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pin
           return;
         }
         mapRef.current = map;
+        // Resize whenever the container gains size — attached from
+        // birth, not only after 'ready': a canvas created while its
+        // container was zero-height stays blank until resize() runs,
+        // and ResizeObserver fires an initial notification on observe.
+        observer = new ResizeObserver(() => map.resize());
+        observer.observe(container);
         map.on('load', () => {
           if (cancelled) return;
           clearTimeout(loadTimer);
           loadedRef.current = true;
+          setSlowLoad(false);
           setMapReady(true);
           // 'ready' only AFTER the style loads — never before.
           setMapState('ready');
@@ -191,11 +227,13 @@ export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pin
         map.on('error', (event: unknown) => {
           if (cancelled) return;
           // A tile failing AFTER the style loaded is not a dead map —
-          // keep it up (tiles retry). Only a pre-load failure replaces
-          // the map, and then the banner carries the real cause (status
-          // + message, key stripped) so it can be reported, not guessed.
+          // keep it up (tiles retry). A pre-load failure shows the
+          // overlay with the real cause (status + message, key
+          // stripped) and a Retry button — the map container stays
+          // mounted, so a late 'load' can still paint into it.
           if (loadedRef.current) return;
           clearTimeout(loadTimer);
+          setSlowLoad(false);
           const detail = mapErrorDetail(event);
           setMapError(
             `Map couldn't load — check your connection and that the Ola Maps key is set and this domain is whitelisted, then reopen this screen.${detail ? ` (${detail})` : ''}`,
@@ -209,21 +247,20 @@ export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pin
     return () => {
       cancelled = true;
       clearTimeout(loadTimer);
+      observer?.disconnect();
       mapRef.current?.remove();
       mapRef.current = null;
     };
-    // The map is created once for the life of the screen.
-  }, []);
+    // Re-created only when the user taps Retry.
+  }, [retryNonce]);
 
-  // Resize after the container changes size (a hidden-then-shown canvas stays blank otherwise).
+  // The role-reveal overlay covers the map at game start. Dismissing it
+  // does not change the container's size, so no ResizeObserver fires —
+  // the caller bumps `resizeNonce` on dismiss and the map is resized
+  // explicitly, so a canvas measured while covered can never stay blank.
   useEffect(() => {
-    const container = containerRef.current;
-    const map = mapRef.current;
-    if (!container || !map) return;
-    const observer = new ResizeObserver(() => map.resize());
-    observer.observe(container);
-    return () => observer.disconnect();
-  }, [mapReady]);
+    if (mapRef.current && mapReady) mapRef.current.resize();
+  }, [resizeNonce, mapReady]);
 
   // Sync overlays whenever the data changes.
   useEffect(() => {
@@ -393,6 +430,15 @@ export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pin
   /** North-up + re-centre — the N button is NOT a duplicate of re-centre. */
   const resetNorth = () => centreOn(0);
 
+  /** Tear the map down and build it again (error overlay / slow-load retry). */
+  const retryMap = () => {
+    setMapError(null);
+    setSlowLoad(false);
+    setMapReady(false);
+    setMapState('loading');
+    setRetryNonce((n) => n + 1);
+  };
+
   if (mapState === 'no-key') {
     return (
       <div className="flex h-full min-h-[320px] items-center justify-center rounded-2xl border border-[#26262B] bg-[#141416] px-4 text-center">
@@ -411,15 +457,9 @@ export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pin
       </div>
     );
   }
-  if (mapState === 'error') {
-    return (
-      <div className="flex h-full min-h-[320px] flex-col items-center justify-center gap-2 rounded-2xl border border-[#26262B] bg-[#141416] px-4 text-center">
-        <p className="text-[15px] font-bold text-white">Map load failed</p>
-        <p className="text-[14px] text-[#A1A1AA]">{mapError ?? 'Map unavailable — the game still works without it.'}</p>
-      </div>
-    );
-  }
-
+  // 'error' is NOT an early return: the map container stays mounted
+  // behind the overlay, so a late 'load' can still paint into it and
+  // Retry rebuilds from a live container instead of a detached node.
   const nextZoneSeconds =
     nextZoneFiresAtMs !== null &&
     nextZoneFiresAtMs !== undefined &&
@@ -455,6 +495,35 @@ export function PlayMap({ zoneBoundary, nextZoneBoundary, nextZoneFiresAtMs, pin
           ◎
         </button>
       </div>
+      {mapState === 'error' ? (
+        <div className="absolute inset-0 z-20 flex flex-col items-center justify-center gap-2 rounded-2xl bg-[#141416]/95 px-4 text-center">
+          <p className="text-[15px] font-bold text-white">Map load failed</p>
+          <p className="text-[14px] text-[#A1A1AA]">
+            {mapError ?? 'Map unavailable — the game still works without it.'}
+          </p>
+          <button
+            type="button"
+            onClick={retryMap}
+            className="mt-1 rounded-full bg-white px-4 py-2 text-[14px] font-bold text-black"
+          >
+            Retry map
+          </button>
+        </div>
+      ) : null}
+      {mapState === 'loading' && slowLoad ? (
+        <div className="absolute bottom-3 left-3 z-10 flex items-center gap-2 rounded-full border border-[#26262B] bg-[#141416]/90 py-1.5 pl-3 pr-1.5">
+          <p className="text-[13px] font-semibold text-white">
+            Map is taking a while — still trying…
+          </p>
+          <button
+            type="button"
+            onClick={retryMap}
+            className="rounded-full bg-white px-2.5 py-1 text-[12px] font-bold text-black"
+          >
+            Retry
+          </button>
+        </div>
+      ) : null}
     </div>
   );
 }

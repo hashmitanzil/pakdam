@@ -134,6 +134,9 @@ export default function PlayPage({
   const [fixNotice, setFixNotice] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [reveal, setReveal] = useState<'hunter' | 'runner' | null>(null);
+  // Bumped when the role-reveal overlay dismisses — PlayMap resizes
+  // explicitly then, so a canvas measured while covered never stays blank.
+  const [mapResizeNonce, setMapResizeNonce] = useState(0);
   const [outsideSecondsLeft, setOutsideSecondsLeft] = useState<number | null>(null);
   const [radioUnread, setRadioUnread] = useState(0);
   const [leaveArmed, setLeaveArmed] = useState(false);
@@ -212,6 +215,9 @@ export default function PlayPage({
       window.sessionStorage.setItem(`pakdam.role-reveal.${roomId}`, reveal);
     }
     setReveal(null);
+    // The reveal covered the map at game start — resize it explicitly
+    // now that it is uncovered.
+    setMapResizeNonce((n) => n + 1);
   };
 
   // Terminal phase → results. Back to lobby if the match never started.
@@ -770,7 +776,13 @@ export default function PlayPage({
       ) : null}
 
       {tab === 'map' ? (
-        <div className="relative min-h-[420px] flex-1">
+        // Definite height (420 px), NOT min-h + flex-1: the play map's
+        // container used to be `h-full` against a flex item whose height
+        // came only from min-h/flex distribution, so MapLibre could
+        // initialise against a zero-height canvas on a real phone and
+        // stay blank. The setup map works because its container has an
+        // explicit fixed height (280 px) — the play map now does too.
+        <div className="relative h-[420px] shrink-0">
           <PlayMap
             zoneBoundary={zoneBoundary}
             // Next-zone preview (P1-18): the DO's `zone.preview`, 30 s
@@ -786,6 +798,7 @@ export default function PlayPage({
             teammateFixes={isSpectator ? {} : teammateFixes}
             reveals={reveals}
             nowMs={nowMs}
+            resizeNonce={mapResizeNonce}
           />
           <PlayerDots dots={dots} />
           <div className="absolute bottom-3 right-3 z-10 flex flex-col items-center gap-3">
@@ -943,9 +956,14 @@ export default function PlayPage({
         </div>
       </Sheet>
 
-      {/* Role reveal — once at start, full red screen (SCRAM-SPEC §8a). */}
+      {/* Role reveal — once at start, full-screen flash (SCRAM-SPEC §8a):
+          red for hunters, green for runners. */}
       {reveal && room ? (
-        <div className="fixed inset-0 z-50 flex flex-col bg-[#EF4444] px-6 pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)] text-white">
+        <div
+          className={`fixed inset-0 z-50 flex flex-col px-6 pb-[env(safe-area-inset-bottom,0px)] pt-[env(safe-area-inset-top,0px)] text-white ${
+            reveal === 'runner' ? 'bg-[#22C55E]' : 'bg-[#EF4444]'
+          }`}
+        >
           <div className="flex items-center justify-between pt-4">
             <p className="text-[17px] font-bold tracking-wide">PAKDAM</p>
             <span className="rounded-full border border-white/60 px-3 py-1 text-[13px] font-semibold">

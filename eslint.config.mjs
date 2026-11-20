@@ -32,6 +32,19 @@ export default tseslint.config(
     },
   },
   {
+    // Node.js test hooks + unit tests are plain `.mjs` run by `node --test`.
+    // They use Node globals (`URL` in the resolve hooks, `Request` in the
+    // workers rate-limit test) that the default recommended config does
+    // not declare — declare them here so `no-undef` does not flag them.
+    files: ["**/resolve-hooks.mjs", "**/test/**/*.mjs"],
+    languageOptions: {
+      globals: {
+        URL: "readonly",
+        Request: "readonly",
+      },
+    },
+  },
+  {
     // Generated, not source: `next build` writes next-env.d.ts, and the
     // Serwist build writes public/sw.js (the bundled service worker).
     // `wrangler dev` writes bundled output under workers/.wrangler/tmp —

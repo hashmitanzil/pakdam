@@ -9,6 +9,7 @@ import {
   ACCURACY_GOOD_M,
   BALANCED_HUNTER_TABLE,
   CATCH_TOKEN_HEX_LENGTH,
+  EARTH_RADIUS_M,
   MAX_GEOMETRY_POINTS,
   MAX_PLAYERS,
   MAX_ZONE_DIAMETER_M,
@@ -108,7 +109,7 @@ function boundaryDiagonalMeters(points: GeoPolygon): number {
   const h =
     sinLat * sinLat +
     Math.cos(toRadians(minLat)) * Math.cos(toRadians(maxLat)) * sinLng * sinLng;
-  return 2 * 6_371_000 * Math.asin(Math.min(1, Math.sqrt(h)));
+  return 2 * EARTH_RADIUS_M * Math.asin(Math.min(1, Math.sqrt(h)));
 }
 
 /**

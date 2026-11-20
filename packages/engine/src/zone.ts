@@ -15,6 +15,8 @@
  * never undone by rejoining.
  */
 import {
+  EARTH_RADIUS_M,
+  METERS_PER_DEG_LAT,
   MIN_NEXT_ZONE_OFFSET_M,
   OUTSIDE_ZONE_RETURN_SECONDS,
   SHRINK_COUNT_PER_ROUND,
@@ -29,15 +31,11 @@ import {
 export { haversineMeters, OUTSIDE_ZONE_RETURN_SECONDS, ZONE_RADIUS_MIN_M };
 
 /**
- * Metres per degree of latitude (equirectangular approximation). This MUST
- * match the haversine Earth radius in @pakdam/shared (R = 6,371,000 m):
- * a circle built with this constant measures its nominal radius back
- * through `zoneDiameterMeters` (haversine). The old 111,320 value made a
- * nominal 500 m zone measure 499 m in the lobby and the zone editor.
+ * Convert a point to local metres relative to an origin point.
+ * METERS_PER_DEG_LAT comes from @pakdam/shared — the same (R·π)/180 the
+ * haversine uses. Used for offsets/containment only; circles are built
+ * with the geodesic destination formula in `circlePolygon`, not here.
  */
-const METERS_PER_DEG_LAT = (6_371_000 * Math.PI) / 180;
-
-/** Convert a point to local metres relative to an origin point. */
 function toLocalMeters(point: GeoPoint, origin: GeoPoint): { x: number; y: number } {
   const cosLat = Math.cos((origin.lat * Math.PI) / 180);
   return {
@@ -119,21 +117,49 @@ export function zoneDiameterMeters(polygon: GeoPolygon): number {
   return widest;
 }
 
-/** N-point circle approximation (equirectangular + cos(lat) correction). */
+/**
+ * N-point circle approximation — TRUE geodesic destination points on a
+ * spherical earth (same R = 6_371_000 m the haversine uses, single-sourced
+ * as EARTH_RADIUS_M from @pakdam/shared — no second radius literal).
+ * Given centre (lat1, lng1), bearing θ, distance d:
+ *   lat2 = asin(sin(lat1)·cos(d/R) + cos(lat1)·sin(d/R)·cos(θ))
+ *   lng2 = lng1 + atan2(sin(θ)·sin(d/R)·cos(lat1),
+ *                       cos(d/R) − sin(lat1)·sin(lat2))
+ * Every edge point is then exactly `radiusMeters` from the centre by
+ * haversine (to floating-point precision), for ANY radius and ANY
+ * latitude — the old equirectangular (METERS_PER_DEG_LAT + cos(lat))
+ * construction drifted up to ~5 m at a 10 km radius (60°N).
+ * Longitude is normalised to (−180, 180] so a huge radius crossing the
+ * antimeridian still lands on a valid meridian.
+ */
 export function circlePolygon(
   centre: GeoPoint,
   radiusMeters: number,
   points = 64,
 ): GeoPolygon {
+  const lat1 = (centre.lat * Math.PI) / 180;
+  const lng1 = (centre.lng * Math.PI) / 180;
+  const angularDistance = radiusMeters / EARTH_RADIUS_M;
+  const sinLat1 = Math.sin(lat1);
+  const cosLat1 = Math.cos(lat1);
+  const sinAngular = Math.sin(angularDistance);
+  const cosAngular = Math.cos(angularDistance);
   const boundary: GeoPolygon = [];
   for (let i = 0; i < points; i += 1) {
-    const angle = (2 * Math.PI * i) / points;
-    boundary.push(
-      fromLocalMeters(
-        { x: radiusMeters * Math.cos(angle), y: radiusMeters * Math.sin(angle) },
-        centre,
-      ),
+    const bearing = (2 * Math.PI * i) / points;
+    const lat2 = Math.asin(
+      sinLat1 * cosAngular + cosLat1 * sinAngular * Math.cos(bearing),
     );
+    const lng2 =
+      lng1 +
+      Math.atan2(
+        Math.sin(bearing) * sinAngular * cosLat1,
+        cosAngular - sinLat1 * Math.sin(lat2),
+      );
+    boundary.push({
+      lat: (lat2 * 180) / Math.PI,
+      lng: (((lng2 * 180) / Math.PI + 540) % 360) - 180,
+    });
   }
   return boundary;
 }
