@@ -187,6 +187,9 @@ importers:
       eslint-plugin-react-hooks:
         specifier: ^7.1.1
         version: 7.1.1(eslint@9.39.5(jiti@2.7.0)(supports-color@10.2.2))(supports-color@10.2.2)
+      next:
+        specifier: ^15.5.29
+        version: 15.5.29(@babel/core@7.29.13(supports-color@10.2.2))(@opentelemetry/api@1.9.1)(@playwright/test@1.65.1)(@types/node@24.19.2)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       typescript-eslint:
         specifier: ^8.0.0
         version: 8.73.0(eslint@9.39.5(jiti@2.7.0)(supports-color@10.2.2))(supports-color@10.2.2)(typescript@5.9.3)
