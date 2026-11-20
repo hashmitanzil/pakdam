@@ -1,14 +1,15 @@
 'use client';
 
 /**
- * Lobby-is-setup (SCRAM-SPEC §5 + §7) — ONE screen.
+ * Lobby (ShadowHunt style) — the screen AFTER the lobby is created.
  *
- * Room created on entry (by the mode page / join pages); the map, mode,
- * rules, zone, teams, roster, readiness and start all live here.
- * Order on screen: map (zone) → mode → rules → teams → code → summary
- * strip → roster → I'm ready → pinned start gate. The room code sits
- * with the players, not on top — the create screen leads with the map,
- * and the code is shown once the lobby is created (on entry here).
+ * The host lands here by tapping CREATE LOBBY on the setup screen
+ * (/room/[roomId]/setup); joiners land here directly. Order on screen:
+ * code card (COPY / SHARE / SETTINGS) → summary strip → roster →
+ * I'm ready → pinned start gate. The room code appears ONLY here, never
+ * on the create screen. SETTINGS opens the HostSettingsSheet (mode +
+ * rules + teams, no map) so the host can customise the game after the
+ * lobby exists; the zone itself is edited on the setup screen.
  *
  * Live mode (Worker URL set): first paint via GET state, then the
  * PakdamSocket snapshot is the whole truth; the phase leaving LOBBY
@@ -16,13 +17,15 @@
  * watchDemoPhase (F2 — guests auto-navigate to /play when the phase
  * leaves LOBBY). A live room is never silently downgraded to demo.
  *
- * Start gate (server + client agree): active seats ≥ 3 AND every active
- * seat ready AND teams set. A blocked Start always says why in one
- * line — never a silent disabled button.
+ * Start gate (server + client agree): active seats ≥ MIN_PLAYERS (2)
+ * AND every active seat ready AND teams set AND the Hunter count leaves
+ * at least one Runner. A blocked Start always says why in one line —
+ * never a silent disabled button.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import type { PlayerView, Room, RoomConfig } from '@pakdam/shared';
+import { MIN_PLAYERS } from '@pakdam/shared';
 import { PakdamSocket } from '../../../lib/websocket';
 import type { WsSnapshotPayload } from '../../../lib/websocket';
 import { liveErrorMessage } from '../../../lib/live-client';
@@ -52,54 +55,16 @@ import {
   getSessionForRoom,
   type PakdamSession,
 } from '../../../lib/session-credentials';
-import { canZoneAutoCentreOn, getCurrentFix, watchLocation } from '../../../lib/geolocation';
-import { distanceMeters, formatDistance } from '../../../lib/utils';
-import { circlePolygon } from '@pakdam/engine';
 import { Button } from '../../../components/ui/Button';
-import { Stepper } from '../../../components/ui/Stepper';
 import { RoomCodeCard } from '../../../components/lobby/RoomCodeCard';
 import { Roster } from '../../../components/lobby/Roster';
 import { ReadinessProbe } from '../../../components/lobby/ReadinessProbe';
 import { HostSettingsSheet } from '../../../components/lobby/HostSettingsSheet';
-import { PlayAreaMap, type ZoneDraft } from '../../../components/host-setup/PlayAreaMap';
-import { RulesControls, TeamControls } from '../../../components/host-setup/SetupControls';
 import { effectiveHunterCount, formatRoomSummary } from '../../../components/host-setup/draft';
-import {
-  autoFinalRadiusMeters,
-  boundaryCentre,
-  boundaryRadiusMeters,
-  circleBoundary,
-  drawPointsToBoundary,
-  drawSizeRangeLabel,
-  DRAW_MAX_POINTS,
-  type GeoPoint,
-} from '../../../components/host-setup/drawPoints';
 
 interface LobbyState {
   room: Room;
   players: PlayerView[];
-}
-
-interface ZoneState {
-  centre: GeoPoint;
-  radiusMeters: number;
-  shape: 'circle' | 'draw';
-  drawPoints: GeoPoint[];
-}
-
-const RANCHI_DEFAULT: GeoPoint = { lat: 23.36, lng: 85.33 };
-
-function zoneFromConfig(config: RoomConfig): ZoneState {
-  return {
-    centre: boundaryCentre(config.zone.boundary),
-    radiusMeters: boundaryRadiusMeters(config.zone.boundary),
-    shape: config.zoneShape ?? 'circle',
-    drawPoints: config.zoneShape === 'draw' ? [...config.zone.boundary] : [],
-  };
-}
-
-function isDefaultCentre(centre: GeoPoint): boolean {
-  return distanceMeters(centre, RANCHI_DEFAULT) < 50;
 }
 
 export default function LobbyPage() {
@@ -112,24 +77,15 @@ export default function LobbyPage() {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [conn, setConn] = useState<string>('connecting');
   const [notice, setNotice] = useState<string | null>(null);
-  const [gpsNote, setGpsNote] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [starting, setStarting] = useState(false);
-  const [zone, setZone] = useState<ZoneState | null>(null);
-  const [userLocation, setUserLocation] = useState<GeoPoint | null>(null);
-  const [locateNonce, setLocateNonce] = useState(0);
-  const [locating, setLocating] = useState(false);
 
   const socketRef = useRef<PakdamSocket | null>(null);
   const lobbyRef = useRef<LobbyState | null>(null);
   lobbyRef.current = lobby;
-  const zoneRef = useRef<ZoneState | null>(null);
-  zoneRef.current = zone;
   const pushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingPushRef = useRef(false);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const gpsAttemptedRef = useRef(false);
-  const rulesRef = useRef<HTMLDivElement | null>(null);
   const navigatedRef = useRef(false);
 
   const showNotice = useCallback((message: string): void => {
@@ -149,12 +105,6 @@ export default function LobbyPage() {
   const isHost = me?.isHost ?? session?.isHost ?? false;
   const config = lobby?.room.config ?? null;
   const activePlayers = (lobby?.players ?? []).filter((p) => p.leftAt === null);
-  // Final size is always Auto (~25% of the start radius) — no manual control.
-  const finalRadius = config
-    ? autoFinalRadiusMeters(
-        zone?.radiusMeters ?? boundaryRadiusMeters(config.zone.boundary),
-      )
-    : null;
 
   // -- Load the seat, then live state / socket or demo polling (F2). ------
   useEffect(() => {
@@ -217,19 +167,9 @@ export default function LobbyPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
 
-  // -- Zone state: initialise once from the room config; guests follow
-  //    the server config on every version change. -----------------------
-  useEffect(() => {
-    if (lobby && !zone) setZone(zoneFromConfig(lobby.room.config));
-  }, [lobby, zone]);
-  useEffect(() => {
-    if (lobby && !isHost) setZone(zoneFromConfig(lobby.room.config));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [lobby?.room.version]);
-
-  // -- Config edits (host only). Normalised so a 'selected' team always
-  //    carries exactly hunterCount picks (the config validator requires
-  //    it) and 'random' carries none. -----------------------------------
+  // -- Config edits (host only, via the Settings sheet). Normalised so a
+  //    'selected' team always carries exactly hunterCount picks (the
+  //    config validator requires it) and 'random' carries none. ----------
   const normaliseConfig = useCallback(
     (next: RoomConfig): RoomConfig => {
       if (next.teamAssignment === 'random') {
@@ -286,7 +226,7 @@ export default function LobbyPage() {
         }
         return;
       }
-      // Live: debounce pushes while the host drags sliders.
+      // Live: debounce pushes while the host drags steppers.
       pendingPushRef.current = true;
       if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
       pushTimerRef.current = setTimeout(() => {
@@ -305,169 +245,6 @@ export default function LobbyPage() {
     },
     [config, isLive, normaliseConfig, roomId, showNotice],
   );
-  const applyConfigRef = useRef(applyConfig);
-  applyConfigRef.current = applyConfig;
-
-  const applyZoneToConfig = useCallback(
-    (draft: ZoneDraft): void => {
-      const current = lobbyRef.current;
-      if (!current) return;
-      const boundary =
-        draft.shape === 'draw'
-          ? drawPointsToBoundary(draft.drawPoints)
-          : circleBoundary(draft.centre, draft.radiusMeters);
-      if (boundary.length < 3) return;
-      applyConfig({
-        ...current.room.config,
-        zone: { ...current.room.config.zone, boundary },
-        zoneShape: draft.shape,
-        // Final size is always Auto — normalise any fixed value away.
-        finalSizePercent: null,
-      });
-    },
-    [applyConfig],
-  );
-  const applyZoneToConfigRef = useRef(applyZoneToConfig);
-  applyZoneToConfigRef.current = applyZoneToConfig;
-
-  // -- GPS: centre the zone on the host's fix (≤ ±50 m only) when the
-  //    zone is still the Ranchi default. --------------------------------
-  useEffect(() => {
-    if (!lobby || !isHost || gpsAttemptedRef.current) return;
-    gpsAttemptedRef.current = true;
-    if (!isDefaultCentre(zoneRef.current?.centre ?? RANCHI_DEFAULT)) return;
-    void getCurrentFix()
-      .then((fix) => {
-        if (!canZoneAutoCentreOn(fix)) {
-          setGpsNote('GPS is too rough here — tap the map to place the zone.');
-          return;
-        }
-        if (!isDefaultCentre(zoneRef.current?.centre ?? RANCHI_DEFAULT)) return;
-        const draft: ZoneDraft = {
-          centre: { lat: fix.lat, lng: fix.lng },
-          radiusMeters: zoneRef.current?.radiusMeters ?? 500,
-          shape: 'circle',
-          drawPoints: [],
-        };
-        setUserLocation({ lat: fix.lat, lng: fix.lng });
-        setZone(draft);
-        applyZoneToConfigRef.current(draft);
-      })
-      .catch((err: unknown) => {
-        setGpsNote(
-          err instanceof Error
-            ? err.message
-            : 'GPS is too rough here — tap the map to place the zone.',
-        );
-      });
-  }, [lobby, isHost]);
-
-  // -- Live location dot: foreground watch, updates the orange dot on the
-  //    map. Starts once on mount; stops on unmount. Only permission-denied
-  //    is surfaced; transient errors are swallowed by the watch.
-  useEffect(() => {
-    const handle = watchLocation(
-      (fix) => setUserLocation({ lat: fix.lat, lng: fix.lng }),
-      (err) => {
-        if (err.kind === 'permission-denied') setGpsNote(err.message);
-      },
-    );
-    return () => handle?.stop();
-  }, []);
-
-  // -- Zone draft handlers (map + inline controls). ----------------------
-  const onZoneChange = (draft: ZoneDraft): void => {
-    setZone(draft);
-    if (draft.shape === 'circle' || draft.drawPoints.length >= 3) {
-      applyZoneToConfig(draft);
-    }
-  };
-
-  // -- Inline zone controls (Circle | Draw lives on the lobby, no editor).
-  const switchShape = (next: 'circle' | 'draw'): void => {
-    if (!zone) return;
-    if (!isHost) {
-      showNotice('Only the host can change the game settings.');
-      return;
-    }
-    if (next === zone.shape) return;
-    if (next === 'draw') {
-      // Keep the same centre/size: sample the circle as corners.
-      const draft: ZoneDraft = {
-        centre: zone.centre,
-        radiusMeters: zone.radiusMeters,
-        shape: 'draw',
-        drawPoints: circlePolygon(zone.centre, zone.radiusMeters, 6),
-      };
-      setZone(draft);
-      applyZoneToConfig(draft);
-    } else {
-      const boundary = drawPointsToBoundary(zone.drawPoints);
-      const draft: ZoneDraft = {
-        centre: boundary.length >= 3 ? boundaryCentre(boundary) : zone.centre,
-        radiusMeters:
-          boundary.length >= 3
-            ? boundaryRadiusMeters(boundary)
-            : zone.radiusMeters,
-        shape: 'circle',
-        drawPoints: [],
-      };
-      setZone(draft);
-      applyZoneToConfig(draft);
-    }
-  };
-
-  const setRadius = (value: number): void => {
-    if (!zone) return;
-    const radius = Math.max(100, value);
-    const draft: ZoneDraft = {
-      centre: zone.centre,
-      radiusMeters: radius,
-      shape: 'circle',
-      drawPoints: [],
-    };
-    setZone(draft);
-    applyZoneToConfig(draft);
-  };
-
-  const onCornersChange = (next: number): void => {
-    if (!zone || zone.shape !== 'draw') return;
-    if (next > zone.drawPoints.length) {
-      showNotice('Tap the map to place a corner.');
-    } else if (next < zone.drawPoints.length) {
-      onZoneChange({ ...zone, drawPoints: zone.drawPoints.slice(0, -1) });
-    }
-  };
-
-  const undoDraw = (): void => {
-    if (!zone || zone.shape !== 'draw' || zone.drawPoints.length === 0) return;
-    onZoneChange({ ...zone, drawPoints: zone.drawPoints.slice(0, -1) });
-  };
-
-  const startAgainDraw = (): void => {
-    if (!zone || zone.shape !== 'draw') return;
-    onZoneChange({ ...zone, drawPoints: [] });
-  };
-
-  const onLocate = (): void => {
-    if (userLocation) {
-      // Already have a fix — just re-centre the map on it.
-      setLocateNonce((n) => n + 1);
-      return;
-    }
-    setLocating(true);
-    void getCurrentFix()
-      .then((fix) => {
-        setUserLocation({ lat: fix.lat, lng: fix.lng });
-        setLocateNonce((n) => n + 1);
-      })
-      .catch((err: unknown) => {
-        showNotice(
-          err instanceof Error ? err.message : 'Could not get your location.',
-        );
-      })
-      .finally(() => setLocating(false));
-  };
 
   // -- Readiness (one tap = ready + briefing confirmed). -----------------
   const toggleMyReady = (): void => {
@@ -621,7 +398,7 @@ export default function LobbyPage() {
       </main>
     );
   }
-  if (!lobby || !config || !zone) {
+  if (!lobby || !config) {
     return (
       <main className="mx-auto w-full max-w-[560px] px-4 pb-6 pt-6">
         <p className="text-[15px] text-[#A1A1AA]">Loading lobby…</p>
@@ -634,8 +411,8 @@ export default function LobbyPage() {
   const room = lobby.room;
   const pickingHunters = isHost && config.teamAssignment === 'selected';
   const startLabel =
-    activePlayers.length < 3
-      ? 'NEED 3+ PLAYERS TO START'
+    activePlayers.length < MIN_PLAYERS
+      ? `NEED ${MIN_PLAYERS}+ PLAYERS TO START`
       : 'WAITING FOR EVERYONE TO BE READY';
   const summary = formatRoomSummary(config, activePlayers.length);
 
@@ -682,174 +459,6 @@ export default function LobbyPage() {
       ) : null}
 
       <div className="mt-4 flex flex-col gap-3">
-        {config.playZoneEnabled !== false && zone ? (
-          <section
-            aria-label="Play zone"
-            className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4"
-          >
-            <div
-              className="grid grid-cols-2 gap-1 rounded-[14px] bg-[#1E1E22] p-1"
-              role="group"
-              aria-label="Zone shape"
-            >
-              {(['circle', 'draw'] as const).map((option) => (
-                <button
-                  key={option}
-                  type="button"
-                  aria-pressed={zone.shape === option}
-                  disabled={!isHost}
-                  onClick={() => switchShape(option)}
-                  className={`h-11 rounded-[10px] text-[15px] font-bold capitalize disabled:opacity-40 ${
-                    zone.shape === option ? 'bg-[#EF4444] text-white' : 'text-[#A1A1AA]'
-                  }`}
-                >
-                  {option}
-                </button>
-              ))}
-            </div>
-
-            <div className="mt-3">
-              <PlayAreaMap
-                centre={zone.centre}
-                radiusMeters={zone.radiusMeters}
-                shape={zone.shape}
-                drawPoints={zone.drawPoints}
-                finalRadiusMeters={null}
-                noGoAreas={config.noGoAreas}
-                editable={isHost}
-                onZoneChange={onZoneChange}
-                userLocation={userLocation}
-                locateNonce={locateNonce}
-                locating={locating}
-                onLocate={onLocate}
-                height={280}
-              />
-            </div>
-            {gpsNote ? <p className="mt-2 text-[13px] text-[#A1A1AA]">{gpsNote}</p> : null}
-
-            {zone.shape === 'circle' ? (
-              <div className="mt-3">
-                <p className="pakdam-label">Zone size</p>
-                <Stepper
-                  label="Zone size"
-                  value={zone.radiusMeters}
-                  step={50}
-                  min={100}
-                  disabled={!isHost}
-                  format={(v) => formatDistance(v)}
-                  onChange={setRadius}
-                />
-                <p className="text-[13px] text-[#A1A1AA]">
-                  {formatDistance(zone.radiusMeters * 2)} across
-                </p>
-                <p className="text-[13px] text-[#A1A1AA]">
-                  Final size Auto · {formatDistance(finalRadius ?? zone.radiusMeters)}
-                </p>
-                <p className="mt-2 text-[13px] text-[#A1A1AA]">
-                  Drag the map to move the zone. Runners have to stay inside it.
-                </p>
-              </div>
-            ) : (
-              <div className="mt-3">
-                <p className="pakdam-label">Corners</p>
-                <Stepper
-                  label="Corners"
-                  value={zone.drawPoints.length}
-                  step={1}
-                  min={0}
-                  max={DRAW_MAX_POINTS}
-                  disabled={!isHost}
-                  format={(v) => String(v)}
-                  onChange={onCornersChange}
-                />
-                <p className="text-[13px] text-[#A1A1AA]">
-                  {zone.drawPoints.length > 0
-                    ? drawSizeRangeLabel(zone.drawPoints)
-                    : 'Tap the map to place corners.'}
-                </p>
-                <p className="mt-2 text-[13px] text-[#A1A1AA]">
-                  Drag a corner to move it, or the middle to move the whole zone.
-                </p>
-                <div className="mt-1 flex items-center gap-4">
-                  <button
-                    type="button"
-                    onClick={undoDraw}
-                    disabled={!isHost || zone.drawPoints.length === 0}
-                    className="text-[15px] font-semibold text-[#A1A1AA] disabled:opacity-40"
-                  >
-                    Undo
-                  </button>
-                  <button
-                    type="button"
-                    onClick={startAgainDraw}
-                    disabled={!isHost || zone.drawPoints.length === 0}
-                    className="text-[15px] font-semibold text-[#EF4444] disabled:opacity-40"
-                  >
-                    Start again
-                  </button>
-                </div>
-              </div>
-            )}
-          </section>
-        ) : (
-          <p className="text-[13px] text-[#A1A1AA]">
-            No zone and no pings. Classic hide and seek — hunters get no locations at all.
-          </p>
-        )}
-
-        <section
-          aria-label="Game mode"
-          className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4"
-        >
-          <p className="pakdam-label">Game mode</p>
-          <div className="mt-1 flex items-center justify-between gap-3">
-            <div>
-              <p className="text-[20px] font-bold text-white">
-                {config.mode === 'classic' ? 'Classic' : 'Infection'}
-              </p>
-              <p className="text-[13px] text-[#A1A1AA]">
-                {config.mode === 'classic'
-                  ? "Tagged? You're out. Watch live."
-                  : 'Tagged? You join the Hunters.'}
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={() => {
-                if (!isHost) {
-                  showNotice('Only the host can change the game settings.');
-                  return;
-                }
-                applyConfig({
-                  ...config,
-                  mode: config.mode === 'classic' ? 'infection' : 'classic',
-                });
-              }}
-              className="shrink-0 text-[15px] font-semibold text-[#EF4444]"
-            >
-              Change
-            </button>
-          </div>
-        </section>
-
-        <div ref={rulesRef} className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4">
-          <RulesControls
-            config={config}
-            activePlayerCount={activePlayers.length}
-            isHost={isHost}
-            onChange={applyConfig}
-          />
-        </div>
-
-        <div className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4">
-          <TeamControls
-            config={config}
-            activePlayerCount={activePlayers.length}
-            isHost={isHost}
-            onChange={applyConfig}
-          />
-        </div>
-
         <RoomCodeCard
           code={room.roomCode}
           isHost={isHost}
@@ -872,10 +481,10 @@ export default function LobbyPage() {
               showNotice('Only the host can change the game settings.');
               return;
             }
-            rulesRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+            setSettingsOpen(true);
           }}
           className="flex items-center justify-between rounded-[16px] border border-[#26262B] bg-[#141416] px-4 py-3 text-left"
-          aria-label="Game summary"
+          aria-label="Game summary — open settings"
         >
           <span className="truncate text-[13px] text-[#A1A1AA]">⚙ {summary}</span>
           <span className="text-[18px] text-[#A1A1AA]" aria-hidden>

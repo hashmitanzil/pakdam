@@ -513,12 +513,18 @@ export function setPhase(demo: DemoRoom, phase: MatchPhase): void {
 /** Roles are assigned ONCE, at HEAD_START — never re-drawn. */
 export function assignRoles(demo: DemoRoom): void {
   const active = demo.players.filter((p) => p.leftAt === null);
-  if (active.length < MIN_PLAYERS) throw new Error('Need at least 3 players to start.');
+  if (active.length < MIN_PLAYERS) throw new Error(`Need at least ${MIN_PLAYERS} players to start.`);
   const config = demo.room.config;
+  // No silent clamp: a Hunter count that leaves no Runner is rejected by
+  // the start gate (canStartDemoMatch) before this runs; if it somehow
+  // reaches here, throw instead of silently drawing fewer Hunters.
   const hunterCount =
     config.balanceHunters === true
       ? balancedHunterCount(active.length)
-      : Math.min(config.hunterCount, active.length - 1);
+      : config.hunterCount;
+  if (hunterCount < 1 || hunterCount > active.length - 1) {
+    throw new Error('Hunter count must leave at least one Runner.');
+  }
   let hunters: Player[];
   if (config.teamAssignment === 'selected' && config.selectedHunterIds.length === hunterCount) {
     hunters = active.filter((p) => config.selectedHunterIds.includes(p.playerId));
@@ -544,14 +550,7 @@ export function assignRoles(demo: DemoRoom): void {
 export function canStartDemoMatch(demo: DemoRoom): { canStart: boolean; reason: string | null } {
   const active = demo.players.filter((p) => p.leftAt === null);
   if (active.length < MIN_PLAYERS) {
-    return { canStart: false, reason: 'Need at least 3 players — share the room code above.' };
-  }
-  const notReady = active.filter((p) => !p.isReady);
-  if (notReady.length > 0) {
-    return {
-      canStart: false,
-      reason: `Waiting for: ${notReady.map((p) => p.displayName).join(', ')}.`,
-    };
+    return { canStart: false, reason: `Need at least ${MIN_PLAYERS} players — share the room code above.` };
   }
   const config = demo.room.config;
   // Teams-ready uses the EFFECTIVE Hunter count (balance table when
@@ -561,6 +560,19 @@ export function canStartDemoMatch(demo: DemoRoom): { canStart: boolean; reason: 
     config.balanceHunters === true
       ? balancedHunterCount(active.length)
       : config.hunterCount;
+  if (hunterCount > active.length - 1) {
+    return {
+      canStart: false,
+      reason: 'Hunter count must leave at least one Runner — lower it or wait for more players.',
+    };
+  }
+  const notReady = active.filter((p) => !p.isReady);
+  if (notReady.length > 0) {
+    return {
+      canStart: false,
+      reason: `Waiting for: ${notReady.map((p) => p.displayName).join(', ')}.`,
+    };
+  }
   const teamsReady =
     config.teamAssignment === 'random' ||
     config.selectedHunterIds.length === hunterCount;

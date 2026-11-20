@@ -4,7 +4,7 @@ import './globals.css';
 export const metadata: Metadata = {
   title: 'Pakdam — Hide. Run. Don\'t get caught.',
   description:
-    'A real-world GPS hide-and-seek game. Free · No download · 3–30 players · No account needed.',
+    'A real-world GPS hide-and-seek game. Free · No download · 2–30 players · No account needed.',
   manifest: '/manifest.json',
   appleWebApp: {
     capable: true,

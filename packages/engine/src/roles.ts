@@ -78,8 +78,11 @@ export function resolveHunterCount(input: {
   hostHunterCount: number;
 }): number {
   if (input.balanceHunters) return balancedHunterCount(input.rosterSize);
-  const max = Math.max(1, input.rosterSize - 1);
-  return Math.min(Math.max(1, Math.floor(input.hostHunterCount)), max);
+  // No silent clamp: the host's chosen count is honoured as-is. A count
+  // that leaves no Runner is rejected by the caller (assignRoles) with a
+  // plain-words reason, and by the client start gate before that — never
+  // silently reduced to fewer Hunters than the host chose.
+  return Math.max(1, Math.floor(input.hostHunterCount));
 }
 
 /**
@@ -121,7 +124,7 @@ export function shuffled<T>(items: readonly T[], random: () => number = Math.ran
 }
 
 /**
- * Draw roles once, at head start. Needs ≥ 3 players; `hunterCount` 1..n−1.
+ * Draw roles once, at head start. Needs ≥ MIN_PLAYERS players; `hunterCount` 1..n−1.
  * - `teamAssignment 'selected'` (Random OFF): exactly `hunterCount` picked
  *   ids, all joined, no repeats. A genuinely short/stale pick is rejected;
  *   a pick whose count no longer matches the balance-derived count falls

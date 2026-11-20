@@ -91,7 +91,7 @@ export default function HomePage() {
       </section>
 
       <p className="mt-auto pt-8 text-center text-[13px] text-[#A1A1AA]">
-        Free · No download · 3–30 players · No account needed.
+        Free · No download · 2–30 players · No account needed.
       </p>
     </main>
   );

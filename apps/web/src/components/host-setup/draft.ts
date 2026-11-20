@@ -29,7 +29,7 @@ function shortMinutes(totalSeconds: number): string {
  */
 export function effectiveHunterCount(config: RoomConfig, activePlayerCount: number): number {
   if (config.balanceHunters === false) return config.hunterCount;
-  return balancedHunterCount(Math.max(3, activePlayerCount));
+  return balancedHunterCount(Math.max(2, activePlayerCount));
 }
 
 /**

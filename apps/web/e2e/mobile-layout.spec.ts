@@ -43,7 +43,7 @@ test.describe('mobile layout — 360px (demo)', () => {
     expect(code).toMatch(/^[A-Z0-9]{6}$/);
     await expectNoHorizontalOverflow(hostPage);
     await expectButtonHeight(hostPage, "I'm ready", 48);
-    await expectButtonHeight(hostPage, 'NEED 3+ PLAYERS TO START', 48);
+    await expectButtonHeight(hostPage, 'NEED 2+ PLAYERS TO START', 48);
     await expect(hostPage.locator('section[aria-label="Game code"] .pakdam-code')).toBeVisible();
   });
 

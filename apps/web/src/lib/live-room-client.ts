@@ -172,8 +172,9 @@ export async function resolveLiveCatch(
 
 /**
  * Client start gate — must agree with the server gate (§4.2): active seats
- * ≥ MIN_PLAYERS (3) AND every active seat ready AND teams set. A blocked
- * Start always says why in one line; never a silent disabled button.
+ * ≥ MIN_PLAYERS (2) AND every active seat ready AND teams set AND the
+ * Hunter count leaves at least one Runner. A blocked Start always says
+ * why in one line; never a silent disabled button.
  */
 export function canStartLiveMatch(
   players: PlayerView[],
@@ -185,7 +186,13 @@ export function canStartLiveMatch(
   if (active.length < MIN_PLAYERS) {
     return {
       canStart: false,
-      reason: `Need at least 3 players — share the room code above.`,
+      reason: `Need at least ${MIN_PLAYERS} players — share the room code above.`,
+    };
+  }
+  if (hunterCount > active.length - 1) {
+    return {
+      canStart: false,
+      reason: 'Hunter count must leave at least one Runner — lower it or wait for more players.',
     };
   }
   const notReady = active.filter((p) => !p.isReady);

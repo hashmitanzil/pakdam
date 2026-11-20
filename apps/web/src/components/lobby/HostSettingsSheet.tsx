@@ -4,10 +4,9 @@
  * HostSettingsSheet — settings re-edit sheet (ShadowHunt's sheet is the
  * model: same controls as setup, no map, DONE).
  *
- * The lobby page itself IS the settings screen; this sheet is the
- * compact re-edit path from the code card's SETTINGS button. Same
- * Rules + Team controls as the lobby, no map, no zone controls here —
- * the zone is edited inline on the lobby page itself.
+ * Opened from the lobby's SETTINGS button. Mode + rules + teams — the
+ * full game customisation after the lobby exists. No map and no zone
+ * controls here; the zone is edited on the create screen.
  */
 import type { RoomConfig } from '@pakdam/shared';
 import { Sheet } from '../ui/Sheet';
@@ -31,6 +30,33 @@ export function HostSettingsSheet({
 }: HostSettingsSheetProps) {
   return (
     <Sheet open={open} onClose={onClose} title="Settings">
+      <section aria-label="Game mode" className="mb-4">
+        <p className="pakdam-label">Game mode</p>
+        <div className="mt-1 flex items-center justify-between gap-3">
+          <div>
+            <p className="text-[20px] font-bold text-white">
+              {config.mode === 'classic' ? 'Classic' : 'Infection'}
+            </p>
+            <p className="text-[13px] text-[#A1A1AA]">
+              {config.mode === 'classic'
+                ? "Tagged? You're out. Watch live."
+                : 'Tagged? You join the Hunters.'}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => {
+              onChange({
+                ...config,
+                mode: config.mode === 'classic' ? 'infection' : 'classic',
+              });
+            }}
+            className="shrink-0 text-[15px] font-semibold text-[#EF4444]"
+          >
+            Change
+          </button>
+        </div>
+      </section>
       <RulesControls config={config} activePlayerCount={activePlayerCount} isHost onChange={onChange} />
       <TeamControls config={config} activePlayerCount={activePlayerCount} isHost onChange={onChange} />
       <div className="mt-6">

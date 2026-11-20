@@ -73,25 +73,44 @@ export async function expectDemoMode(page: Page): Promise<void> {
 }
 
 /**
- * Host flow: Home → HOST A GAME → codename → mode card → lobby-is-setup.
- * Returns the room id (from the URL) and the 6-letter code (from the card).
+ * Host flow up to the create screen (setup): Home → HOST A GAME →
+ * codename → mode card → /room/[id]/setup. The code is NOT visible here
+ * — it appears only on the lobby screen, after CREATE LOBBY. Returns
+ * the room id (from the URL).
+ */
+export async function createHostSetupRoom(
+  page: Page,
+  hostName: string = HOST_NAME,
+  mode: 'Classic' | 'Infection' = 'Classic',
+): Promise<{ roomId: string }> {
+  await page.goto('/');
+  await page.getByRole('button', { name: /HOST A GAME/ }).click();
+  await expect(page.getByRole('heading', { name: 'Pick a mode' })).toBeVisible();
+  await page.getByLabel('Your codename').fill(hostName);
+  await page.getByRole('button', { name: mode }).click();
+  await page.waitForURL(/\/room\/[^/]+\/setup/);
+  await expect(page.getByRole('heading', { name: 'Create lobby' })).toBeVisible();
+  const roomId = page.url().split('/room/')[1]?.split('/setup')[0] ?? '';
+  expect(roomId).not.toBe('');
+  return { roomId };
+}
+
+/**
+ * Host flow: Home → HOST A GAME → codename → mode card → create screen
+ * → CREATE LOBBY → lobby. Returns the room id and the 6-letter code
+ * (read from the lobby's code card).
  */
 export async function createHostRoom(
   page: Page,
   hostName: string = HOST_NAME,
   mode: 'Classic' | 'Infection' = 'Classic',
 ): Promise<{ roomId: string; code: string }> {
-  await page.goto('/');
-  await page.getByRole('button', { name: /HOST A GAME/ }).click();
-  await expect(page.getByRole('heading', { name: 'Pick a mode' })).toBeVisible();
-  await page.getByLabel('Your codename').fill(hostName);
-  await page.getByRole('button', { name: mode }).click();
+  const { roomId } = await createHostSetupRoom(page, hostName, mode);
+  await page.getByRole('button', { name: 'CREATE LOBBY', exact: true }).click();
   await page.waitForURL(/\/room\/[^/]+$/);
   await expect(page.getByRole('heading', { name: 'Lobby' })).toBeVisible();
   const code = (await page.locator('section[aria-label="Game code"] .pakdam-code').innerText()).trim();
   expect(code).toMatch(/^[A-Z0-9]{6}$/);
-  const roomId = page.url().split('/room/')[1]?.split(/[?#]/)[0] ?? '';
-  expect(roomId).not.toBe('');
   return { roomId, code };
 }
 
@@ -129,13 +148,19 @@ export async function setupThreePlayerLobby(
   opts: { mode?: 'Classic' | 'Infection'; headStartNone?: boolean; roundShort?: boolean } = {},
 ): Promise<LobbySetup> {
   const hostPage = await context.newPage();
-  const { roomId, code } = await createHostRoom(hostPage, HOST_NAME, opts.mode ?? 'Classic');
+  // Steppers live on the create screen — set them there, then CREATE LOBBY.
+  const { roomId } = await createHostSetupRoom(hostPage, HOST_NAME, opts.mode ?? 'Classic');
   if (opts.roundShort !== false) {
     await setStepper(hostPage, 'Round length', 0); // index 0 = 10 min
   }
   if (opts.headStartNone !== false) {
     await setStepper(hostPage, 'Head start', 0); // index 0 = None
   }
+  await hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }).click();
+  await hostPage.waitForURL(/\/room\/[^/]+$/);
+  await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
+  const code = (await hostPage.locator('section[aria-label="Game code"] .pakdam-code').innerText()).trim();
+  expect(code).toMatch(/^[A-Z0-9]{6}$/);
   const guestPages = [
     await joinRoomAsGuest(context, code, GUEST_NAMES[0]),
     await joinRoomAsGuest(context, code, GUEST_NAMES[1]),

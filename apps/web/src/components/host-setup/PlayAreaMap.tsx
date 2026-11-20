@@ -187,12 +187,25 @@ export function PlayAreaMap({
   const lastLocateNonceRef = useRef(0);
   const [loaded, setLoaded] = useState(false);
   const [mapReady, setMapReady] = useState(isOlaConfigured());
+  // A failed style/key/network must NEVER leave a blank area: surface it
+  // in the map slot with a plain-words message instead. The most common
+  // cause is a wrong or unwhitelisted Ola key (tiles fail 401), which the
+  // MapLibre 'error' event reports — but a hanging style request fires no
+  // event at all, so a load timeout covers that case too.
+  const [mapError, setMapError] = useState<string | null>(null);
 
   // Create the map once.
   useEffect(() => {
     if (!isOlaConfigured()) return;
     let cancelled = false;
     let map: MapLibreMapLike | null = null;
+    const loadTimer = setTimeout(() => {
+      if (!cancelled) {
+        setMapError(
+          "Map is taking too long to load — check your connection, then reopen this screen.",
+        );
+      }
+    }, 12_000);
     void (async () => {
       const container = containerRef.current;
       if (!container) return;
@@ -206,9 +219,17 @@ export function PlayAreaMap({
       maplibreRef.current = await import('maplibre-gl');
       created.on('load', () => {
         if (cancelled) return;
+        clearTimeout(loadTimer);
         ensureZoneLayers(created);
         setLoaded(true);
         created.resize();
+      });
+      created.on('error', () => {
+        if (cancelled) return;
+        clearTimeout(loadTimer);
+        setMapError(
+          "Map couldn't load — check your connection and that the Ola Maps key is set and this domain is whitelisted, then reopen this screen.",
+        );
       });
       created.on('click', (event: unknown) => {
         const e = event as { lngLat?: { lng: number; lat: number } };
@@ -240,6 +261,7 @@ export function PlayAreaMap({
     })();
     return () => {
       cancelled = true;
+      clearTimeout(loadTimer);
       for (const m of markersRef.current) m.remove();
       markersRef.current = [];
       dotMarkerRef.current?.remove();
@@ -445,6 +467,19 @@ export function PlayAreaMap({
         role="status"
       >
         Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.
+      </div>
+    );
+  }
+
+  if (mapError) {
+    return (
+      <div
+        className="flex flex-col items-center justify-center gap-2 rounded-[16px] border border-[#26262B] bg-[#141416] px-4 text-center"
+        style={{ height }}
+        role="alert"
+      >
+        <p className="text-[15px] font-bold text-white">Map load failed</p>
+        <p className="text-[13px] text-[#A1A1AA]">{mapError}</p>
       </div>
     );
   }

@@ -297,8 +297,8 @@ export function classifyAccuracy(accuracyMeters: number): LocationQuality {
 }
 
 /**
- * Hunter balance table: 3–4 → 1, 5–8 → 2, 9–16 → 3, 17–24 → 4, 25–30 → 5.
- * OPEN calibration. Returns 1 for rosters below 3 (never called with < 3 at start).
+ * Hunter balance table: 2–4 → 1, 5–8 → 2, 9–16 → 3, 17–24 → 4, 25–30 → 5.
+ * OPEN calibration. Returns 1 for rosters below 2 (never called with < 2 at start).
  */
 export function balancedHunterCount(playerCount: number): number {
   for (const row of BALANCED_HUNTER_TABLE) {

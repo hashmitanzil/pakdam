@@ -146,7 +146,14 @@ export function TeamControls({
   const set = (patch: Partial<RoomConfig>): void => onChange({ ...config, ...patch });
   const balance = config.balanceHunters !== false;
   const random = config.randomDraw !== false;
-  const maxHunters = Math.max(1, activePlayerCount - 1);
+  // The stepper cap is the ROOM capacity (maxPlayers − 1), never the
+  // current roster. The host sets the count during setup, before players
+  // join — capping by the roster pinned it to 1 while the host was alone
+  // (the default hunterCount is 2, so + was dead and it could only go
+  // down). The roster constraint is enforced at START, not during setup:
+  // the start gate blocks with a plain-words reason when the count would
+  // leave no Runner.
+  const maxHunters = Math.max(1, config.maxPlayers - 1);
   return (
     <section aria-label="Players">
       <div className="mt-4 flex items-center justify-between gap-3 first:mt-0">

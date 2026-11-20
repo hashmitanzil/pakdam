@@ -83,7 +83,7 @@ export const VOICE_SDP_MAX_BYTES = 8_192;
 // ---------------------------------------------------------------------------
 
 /** Minimum players to start a match. Server gate AND client gate must agree. */
-export const MIN_PLAYERS = 3;
+export const MIN_PLAYERS = 2;
 
 /** Maximum players in a room. */
 export const MAX_PLAYERS = 30;
@@ -227,7 +227,7 @@ export const WRONG_SCAN_LOCK_SECONDS = 30;
  */
 export const BALANCED_HUNTER_TABLE: readonly { readonly minPlayers: number; readonly maxPlayers: number; readonly hunters: number }[] =
   [
-    { minPlayers: 3, maxPlayers: 4, hunters: 1 },
+    { minPlayers: 2, maxPlayers: 4, hunters: 1 },
     { minPlayers: 5, maxPlayers: 8, hunters: 2 },
     { minPlayers: 9, maxPlayers: 16, hunters: 3 },
     { minPlayers: 17, maxPlayers: 24, hunters: 4 },

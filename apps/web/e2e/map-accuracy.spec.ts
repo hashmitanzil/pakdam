@@ -2,13 +2,14 @@
  * map-accuracy.spec.ts — zone accuracy rules (BEHAVIOUR.md §2): radius
  * min 100 m, no maximum, Auto final size ≈ 25%, next zone hidden until
  * the shrink preview, and the ±50 m GPS rule. Demo-only. Text-only.
- * The zone is edited inline on the lobby (Zone size stepper below the
- * map); there is no separate editor dialog.
+ * The zone is edited inline on the create screen (Zone size stepper
+ * below the map); the summary strip that reflects it lives on the
+ * lobby. There is no separate editor dialog.
  */
 import { test, expect } from '@playwright/test';
 import {
   LIVE,
-  createHostRoom,
+  createHostSetupRoom,
   startDemoMatch,
 } from './helpers';
 
@@ -17,17 +18,19 @@ test.describe('zone accuracy (demo)', () => {
 
   test('default zone is 500 m → 125 m (Auto final size is 25%)', async ({ context }) => {
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     await expect(
       hostPage.getByRole('group', { name: 'Zone size' }).getByText('500 m'),
     ).toBeVisible();
     await expect(hostPage.getByText('Final size Auto · 125 m')).toBeVisible();
+    await hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }).click();
+    await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
     await expect(hostPage.getByLabel('Game summary')).toContainText('500m zone');
   });
 
   test('Zone size stepper stops at the 100 m minimum', async ({ context }) => {
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     const decrease = hostPage.getByRole('button', { name: 'Decrease Zone size' });
     for (let i = 0; i < 8; i++) await decrease.click(); // 500 → 100 m
     await expect(
@@ -41,13 +44,15 @@ test.describe('zone accuracy (demo)', () => {
     context,
   }) => {
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     const increase = hostPage.getByRole('button', { name: 'Increase Zone size' });
     for (let i = 0; i < 12; i++) await increase.click(); // 500 → 1100 m
     await expect(
       hostPage.getByRole('group', { name: 'Zone size' }).getByText('1.1 km'),
     ).toBeVisible();
     // Inline editing applies live — no Done step.
+    await hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }).click();
+    await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
     await expect(hostPage.getByLabel('Game summary')).toContainText('1100m zone');
   });
 
@@ -55,7 +60,7 @@ test.describe('zone accuracy (demo)', () => {
     context,
   }) => {
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     await expect(hostPage.getByText('Final size Auto · 125 m')).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Increase Final size' })).toBeHidden();
     await expect(hostPage.getByText('Fixed — tap for Auto')).toBeHidden();
@@ -82,11 +87,13 @@ test.describe('zone accuracy (demo)', () => {
       permissions: ['geolocation'],
     });
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     // getCurrentFix runs a staged chain (up to ~45 s) before giving up.
     await expect(
       hostPage.getByText('GPS is too rough here — tap the map to place the zone.'),
     ).toBeVisible({ timeout: 70000 });
+    await hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }).click();
+    await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
     await expect(hostPage.getByLabel('Game summary')).toContainText('500m zone');
     await context.close();
   });

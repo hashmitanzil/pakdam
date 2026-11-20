@@ -9,7 +9,7 @@
 
 Pakdam is a real-world GPS hide-and-seek game played on phones in a city neighbourhood. One host creates a room,
 players join with a code, teams are assigned at start, and the match runs on a live map against a clock inside a
-shrinking play zone. Two modes only — **Classic** and **Infection** — for 3–30 players (minimum 3 to start).
+shrinking play zone. Two modes only — **Classic** and **Infection** — for 2–30 players (minimum 2 to start).
 In Classic a tagged Runner is out; Hunters win when every Runner is caught, Runners win if any survive the clock.
 In Infection a tagged Runner flips to the Hunters; Hunters win when no Runner is left. There is no public lobby,
 no leaderboard, no points store — the match, its catches and its result are the whole product.

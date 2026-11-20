@@ -5,9 +5,10 @@
  *
  * The card tap IS the action: it creates the room (live when a Worker
  * URL is set, demo otherwise) with the picked mode and the host's
- * codename, then navigates to the lobby-is-setup screen. The host's
- * codename is asked here because room creation needs a display name;
- * there is no separate setup form — setup lives in the lobby.
+ * codename, then navigates to the create screen (/room/[roomId]/setup)
+ * where the host configures the game. The lobby screen (/room/[roomId])
+ * comes only after the host taps CREATE LOBBY — the code appears there,
+ * never here or on the create screen.
  */
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -57,7 +58,7 @@ export default function ModeSelectPage() {
       };
       if (isLiveTransportEnabled()) {
         const session = await createLiveRoom(name, config);
-        router.push(`/room/${session.roomId}`);
+        router.push(`/room/${session.roomId}/setup`);
       } else {
         const demo = createDemoRoom(name, config);
         storeDemoSeat({
@@ -68,7 +69,7 @@ export default function ModeSelectPage() {
           isHost: true,
           roomCode: demo.room.roomCode,
         });
-        router.push(`/room/${demo.room.roomId}`);
+        router.push(`/room/${demo.room.roomId}/setup`);
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not create the room — try again.');

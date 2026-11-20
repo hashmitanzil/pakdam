@@ -13,6 +13,7 @@ import {
   HOST_NAME,
   collectPageErrors,
   createHostRoom,
+  createHostSetupRoom,
   expectDemoMode,
   expectNoPageErrors,
   joinRoomAsGuest,
@@ -43,7 +44,36 @@ test.describe('join + lobby (demo)', () => {
     expectNoPageErrors(errors);
   });
 
-  test('lobby-is-setup renders: code card, summary strip, rules, roster, ready, blocked start', async ({
+  test('create screen renders: map, mode card, rules, teams, CREATE LOBBY', async ({
+    context,
+  }) => {
+    const hostPage = await context.newPage();
+    await createHostSetupRoom(hostPage);
+    // Map on top (Circle | Draw above it).
+    await expect(hostPage.getByRole('region', { name: 'Play area map' })).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: 'Circle', exact: true })).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: 'Draw', exact: true })).toBeVisible();
+    // No room code on the create screen — the room does not exist yet.
+    await expect(hostPage.getByText('Game code')).toBeHidden();
+    // Mode card.
+    await expect(hostPage.getByText('Game mode')).toBeVisible();
+    await expect(hostPage.getByText("Tagged? You're out. Watch live.")).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: 'Change', exact: true })).toBeVisible();
+    // Rules + teams.
+    await expect(hostPage.getByText('Round length')).toBeVisible();
+    await expect(hostPage.getByText('Head start')).toBeVisible();
+    await expect(hostPage.getByText('Pings every')).toBeVisible();
+    await expect(hostPage.getByText('Zone shrinks')).toBeVisible();
+    await expect(hostPage.getByText('Play zone')).toBeVisible();
+    await expect(hostPage.getByText('Balance hunters')).toBeVisible();
+    await expect(hostPage.getByText('Random hunters')).toBeVisible();
+    await expect(hostPage.getByText('Show ping history')).toBeVisible();
+    await expect(
+      hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }),
+    ).toBeVisible();
+  });
+
+  test('lobby renders: code card, summary strip, roster, ready, blocked start', async ({
     context,
   }) => {
     const hostPage = await context.newPage();
@@ -58,19 +88,6 @@ test.describe('join + lobby (demo)', () => {
     await expect(hostPage.getByLabel('Game summary')).toContainText(
       '500m zone · 1 hunter · 3m pulse · 30m',
     );
-    // Mode card.
-    await expect(hostPage.getByText('Game mode')).toBeVisible();
-    await expect(hostPage.getByText("Tagged? You're out. Watch live.")).toBeVisible();
-    await expect(hostPage.getByRole('button', { name: 'Change', exact: true })).toBeVisible();
-    // Rules + teams.
-    await expect(hostPage.getByText('Round length')).toBeVisible();
-    await expect(hostPage.getByText('Head start')).toBeVisible();
-    await expect(hostPage.getByText('Pings every')).toBeVisible();
-    await expect(hostPage.getByText('Zone shrinks')).toBeVisible();
-    await expect(hostPage.getByText('Play zone')).toBeVisible();
-    await expect(hostPage.getByText('Balance hunters')).toBeVisible();
-    await expect(hostPage.getByText('Random hunters')).toBeVisible();
-    await expect(hostPage.getByText('Show ping history')).toBeVisible();
     // Roster + readiness + blocked start (1 player). The host is created
     // ready, so the lobby opens on the flipped ready state.
     await expect(hostPage.getByRole('heading', { name: 'Players' })).toBeVisible();
@@ -79,7 +96,7 @@ test.describe('join + lobby (demo)', () => {
       hostPage.getByRole('button', { name: /I'm ready — tap to change/ }),
     ).toBeVisible();
     await expect(
-      hostPage.getByRole('button', { name: 'NEED 3+ PLAYERS TO START' }),
+      hostPage.getByRole('button', { name: 'NEED 2+ PLAYERS TO START' }),
     ).toBeVisible();
   });
 
@@ -113,14 +130,22 @@ test.describe('join + lobby (demo)', () => {
     await expect(hostPage.getByText('READY', { exact: true })).toBeVisible();
   });
 
-  test('start gate blocked below 3 players, and the tap says why', async ({ context }) => {
+  test('start gate blocked below 2 players, and the tap says why', async ({ context }) => {
     const hostPage = await context.newPage();
     await createHostRoom(hostPage);
-    await hostPage.getByRole('button', { name: 'NEED 3+ PLAYERS TO START' }).click();
+    await hostPage.getByRole('button', { name: 'NEED 2+ PLAYERS TO START' }).click();
     await expect(
-      hostPage.getByText('Need at least 3 players — share the room code above.'),
+      hostPage.getByText('Need at least 2 players — share the room code above.'),
     ).toBeVisible();
     await expect(hostPage).toHaveURL(/\/room\/[^/]+$/);
+  });
+
+  test('start gate opens with 2 players when both are ready', async ({ context }) => {
+    const hostPage = await context.newPage();
+    const { code } = await createHostRoom(hostPage);
+    const guestPage = await joinRoomAsGuest(context, code, GUEST_NAMES[0]);
+    await readyAll([hostPage, guestPage]);
+    await expect(hostPage.getByRole('button', { name: 'START GAME', exact: true })).toBeVisible();
   });
 
   test('start gate blocked until everyone is ready, and the tap names who is waiting', async ({
