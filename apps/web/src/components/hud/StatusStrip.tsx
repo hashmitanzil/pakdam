@@ -8,6 +8,7 @@
  */
 'use client';
 
+import { memo } from 'react';
 import type { MatchPhase, RoomConfig } from '@pakdam/shared';
 import { formatCountdown, formatDistance } from '@/lib/utils';
 import { formatTimeLeft } from '@/components/match/freshness';
@@ -33,7 +34,10 @@ export interface StatusStripProps {
   isRunner: boolean;
 }
 
-export function StatusStrip({
+/** Memoized: the parent re-renders every second on its clock tick (and
+ *  on every GPS fix) — this strip only needs the tick, and skips the
+ *  fix-only renders once its props are stable. */
+export const StatusStrip = memo(function StatusStrip({
   phase,
   config,
   startedAt,
@@ -126,4 +130,4 @@ export function StatusStrip({
       </div>
     </div>
   );
-}
+});

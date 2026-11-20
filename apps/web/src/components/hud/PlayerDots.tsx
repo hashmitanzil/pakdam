@@ -19,6 +19,8 @@
  */
 'use client';
 
+import { memo } from 'react';
+
 export interface PlayerDot {
   playerId: string;
   displayName: string;
@@ -45,7 +47,11 @@ function dotColor(tone: PlayerDot['tone'], suspended?: boolean): string {
   return 'bg-[#EF4444]';
 }
 
-export function PlayerDots({ dots }: PlayerDotsProps) {
+/** Memoized: the parent re-renders every second on its clock tick — the
+ *  dots only re-render when the dots array itself changes (it is rebuilt
+ *  by the page each tick for the age labels, so this skips the fix-only
+ *  and tab-change renders, not the tick). */
+export const PlayerDots = memo(function PlayerDots({ dots }: PlayerDotsProps) {
   if (dots.length === 0) return null;
   return (
     <div className="pointer-events-none absolute left-3 top-3 z-10 flex max-w-[calc(100%-6rem)] flex-wrap gap-1.5">
@@ -66,4 +72,4 @@ export function PlayerDots({ dots }: PlayerDotsProps) {
       ))}
     </div>
   );
-}
+});

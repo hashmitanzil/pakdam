@@ -9,6 +9,7 @@
  */
 'use client';
 
+import { memo } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import type { VoiceRadio, PttState } from '@/lib/voice-radio';
 import { formatAgeLabel } from '@pakdam/shared';
@@ -23,7 +24,9 @@ export interface PTTButtonProps {
   disabled?: boolean;
 }
 
-export function PTTButton({
+/** Memoized: the parent re-renders every second on its clock tick and on
+ *  every GPS fix — the mic must not re-render (or drop a press) on those. */
+export const PTTButton = memo(function PTTButton({
   radio,
   pttState,
   burstSeconds,
@@ -79,4 +82,4 @@ export function PTTButton({
       ) : null}
     </div>
   );
-}
+});

@@ -1,6 +1,6 @@
 /**
  * live-hud.spec.ts — the play HUD: role reveal, status strip, bottom tabs,
- * radio, SOS / safety pause, suspended banner, per-role catch buttons.
+ * radio, safety pause, suspended banner, per-role catch buttons.
  * Demo-only. Text-only: DOM text and roles, no screenshots.
  *
  * NOTE (flagged in the report): the PTT mic renders only with a live voice
@@ -138,33 +138,18 @@ test.describe('live HUD (demo)', () => {
     void roomId;
   });
 
-  test('PTT mic is absent in demo (no live voice radio); SOS is always visible', async ({
-    context,
-  }) => {
+  test('PTT mic is absent in demo (no live voice radio)', async ({ context }) => {
     const { hostPage } = await startDemoMatch(context);
     await expect(hostPage.getByRole('button', { name: 'Hold to talk' })).toBeHidden();
-    await expect(
-      hostPage.getByRole('button', { name: 'SOS — alerts the host' }),
-    ).toBeVisible();
   });
 
-  test('More sheet: SOS says plainly it notifies nobody in demo', async ({ context }) => {
+  test('More sheet: safety pause and Leave game', async ({ context }) => {
     const { guestPages } = await startDemoMatch(context);
     const guest = guestPages[0]!;
     await guest.getByRole('navigation', { name: 'Game' }).getByRole('button', { name: '···' }).click();
     const sheet = guest.getByRole('dialog', { name: 'More' });
     await expect(sheet.getByText('Safety pause')).toBeVisible();
     await expect(sheet.getByText('Pauses the match for everyone and freezes the clock.')).toBeVisible();
-    await expect(
-      sheet.getByText(
-        'SOS noted on this device only — nobody was notified. SOS alerts your host in this game. Pakdam is NOT an emergency service and does not call police or ambulance. If you are in danger, call your local emergency number.',
-      ),
-    ).toBeVisible();
-    await sheet.getByRole('button', { name: 'SOS', exact: true }).click();
-    await expect(sheet.getByRole('button', { name: 'SOS sent' })).toBeVisible();
-    await expect(sheet.getByText('SOS sent — the host has been alerted.')).toBeVisible();
-    await expect(sheet.getByText('Tell everyone')).toBeVisible();
-    await expect(sheet.getByRole('button', { name: 'I’m safe' })).toBeVisible();
     await expect(sheet.getByRole('button', { name: 'Leave game' })).toBeVisible();
   });
 

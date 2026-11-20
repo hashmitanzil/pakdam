@@ -71,21 +71,15 @@ test.describe('brutal phone end-to-end (demo)', () => {
     await expect(hostPage.getByRole('button', { name: /HOST A GAME/ })).toBeVisible();
   });
 
-  test('phone HUD basics: reveal, tabs, More sheet, SOS copy', async ({ context }) => {
+  test('phone HUD basics: reveal, tabs, More sheet', async ({ context }) => {
     const { hostPage } = await startDemoMatch(context);
     // The reveal was dismissed by startDemoMatch; the HUD is underneath.
     await expect(hostPage.getByText('Time left')).toBeVisible();
-    await expect(hostPage.getByRole('button', { name: 'SOS — alerts the host' })).toBeVisible();
     const nav = hostPage.getByRole('navigation', { name: 'Game' });
     await nav.getByRole('button', { name: 'Radio' }).click();
     await expect(hostPage.getByRole('heading', { name: 'Radio' })).toBeVisible();
     await nav.getByRole('button', { name: '···' }).click();
     const sheet = hostPage.getByRole('dialog', { name: 'More' });
     await expect(sheet.getByText('Safety pause')).toBeVisible();
-    await expect(
-      sheet.getByText(
-        'SOS noted on this device only — nobody was notified. SOS alerts your host in this game. Pakdam is NOT an emergency service and does not call police or ambulance. If you are in danger, call your local emergency number.',
-      ),
-    ).toBeVisible();
   });
 });

@@ -250,6 +250,11 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
   if (TERMINAL_PHASES.includes(room.phase)) return demo;
   if (room.phase === 'SAFETY_PAUSED') return demo; // nothing completes while paused
 
+  // Only written back when something actually changed — the play page
+  // polls every 1 s, and the old code stringified + rewrote the whole
+  // room to localStorage on every poll even in a completely idle game.
+  let changed = false;
+
   // Expire overdue pending catches.
   for (const c of demo.catches) {
     if (
@@ -257,6 +262,7 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
       nowMs - new Date(c.requestedAt).getTime() > CATCH_TOKEN_TTL_SECONDS * 1000
     ) {
       c.state = 'expired';
+      changed = true;
     }
   }
 
@@ -266,6 +272,7 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
       new Date(room.startedAt).getTime() + room.config.headStartSeconds * 1000;
     if (nowMs >= headStartEndsAt) {
       setPhase(demo, 'ACTIVE');
+      changed = true;
     }
   }
 
@@ -276,10 +283,15 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
     nowMs >= new Date(room.endsAt).getTime()
   ) {
     completeMatch(demo, nowMs);
+    changed = true;
   }
 
   // Scheduled pings, ACTIVE only, play zone on, interval > 0 — AUTO-FIRE.
   // Mutual: free Runners ping to Hunters, free Hunters ping to Runners.
+  // The ping clock starts at ACTIVE (head start end), never at match
+  // start — the first ping is due one interval after the head start ends,
+  // so no ping can fire the instant ACTIVE begins because its interval
+  // elapsed during HEAD_START.
   if (
     room.phase === 'ACTIVE' &&
     room.config.playZoneEnabled &&
@@ -287,20 +299,22 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
     room.startedAt
   ) {
     const intervalMs = room.config.pingIntervalSeconds * 1000;
+    const activeAtMs =
+      new Date(room.startedAt).getTime() + room.config.headStartSeconds * 1000;
     for (const runner of demo.players.filter(
       (p) => p.matchRole === 'runner' && p.leftAt === null && p.ejectedAt === null,
     )) {
-      const last = demo.lastPingAtMs[runner.playerId] ?? new Date(room.startedAt).getTime();
+      const last = demo.lastPingAtMs[runner.playerId] ?? activeAtMs;
       if (nowMs - last >= intervalMs) {
-        fireDemoPing(demo, runner.playerId, nowMs);
+        if (fireDemoPing(demo, runner.playerId, nowMs)) changed = true;
       }
     }
     for (const hunter of demo.players.filter(
       (p) => p.matchRole === 'hunter' && p.leftAt === null && p.ejectedAt === null,
     )) {
-      const last = demo.lastPingAtMs[hunter.playerId] ?? new Date(room.startedAt).getTime();
+      const last = demo.lastPingAtMs[hunter.playerId] ?? activeAtMs;
       if (nowMs - last >= intervalMs) {
-        fireDemoPing(demo, hunter.playerId, nowMs);
+        if (fireDemoPing(demo, hunter.playerId, nowMs)) changed = true;
       }
     }
   }
@@ -324,10 +338,11 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
       };
       demo.appliedShrinks = shrinkCount;
       demo.room.version += 1;
+      changed = true;
     }
   }
 
-  saveRoom(demo);
+  if (changed) saveRoom(demo);
   return demo;
 }
 
@@ -337,6 +352,9 @@ export function fireDemoPing(
   subjectPlayerId: string,
   nowMs: number = Date.now(),
 ): Ping | null {
+  // Pings are ACTIVE-only: never fire during HEAD_START, even if a caller
+  // forgets the tick's phase check.
+  if (demo.room.phase !== 'ACTIVE') return null;
   const subject = demo.players.find((p) => p.playerId === subjectPlayerId);
   if (!subject || (subject.matchRole !== 'runner' && subject.matchRole !== 'hunter')) return null;
   const fix = latestFixes.get(subjectPlayerId);

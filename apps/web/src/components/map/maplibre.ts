@@ -153,19 +153,59 @@ export function cleanOlaStyle(style: unknown): Record<string, unknown> | null {
   return { ...(style as Record<string, unknown>), layers: cleaned };
 }
 
+/** Style-JSON pre-fetch budget (ms) — see fetchCleanedOlaStyle. */
+const OLA_STYLE_FETCH_TIMEOUT_MS = 8_000;
+
+/** Dynamic-import budget (ms) for the `maplibre-gl` chunk — see createOlaMap. */
+const MAPLIBRE_IMPORT_TIMEOUT_MS = 30_000;
+
+/**
+ * A promise that rejects after `ms` with `message`. The rejection is
+ * pre-handled (noop catch) so the losing side of a `Promise.race`
+ * never surfaces as an unhandled rejection.
+ */
+function timeoutAfter(
+  ms: number,
+  message: string,
+): { promise: Promise<never>; cancel: () => void } {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const promise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  promise.catch(() => undefined);
+  return {
+    promise,
+    cancel: () => {
+      if (timer !== undefined) clearTimeout(timer);
+    },
+  };
+}
+
 /**
  * Fetch the Ola style JSON (key appended, like every other Ola request)
  * and return the cleaned style object, or null when the fetch / parse
  * fails. Callers fall back to the style URL on null so the existing
  * error banner still shows the real failure detail.
+ *
+ * BOUNDED (root cause, after v13): the pre-fetch used to have no
+ * timeout, so a stalled fetch on flaky mobile data wedged map creation
+ * forever — the play map sat in 'loading' with no error event and no
+ * way back. After `timeoutMs` the fetch is aborted and this resolves
+ * null, so the caller falls back to the style URL instead of hanging.
  */
-export async function fetchCleanedOlaStyle(): Promise<Record<string, unknown> | null> {
+export async function fetchCleanedOlaStyle(
+  timeoutMs: number = OLA_STYLE_FETCH_TIMEOUT_MS,
+): Promise<Record<string, unknown> | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch(buildOlaStyleUrl());
+    const response = await fetch(buildOlaStyleUrl(), { signal: controller.signal });
     if (!response.ok) return null;
     return cleanOlaStyle((await response.json()) as unknown);
   } catch {
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 export interface MapLibreMapLike {
@@ -202,6 +242,13 @@ export interface CreateOlaMapOptions {
   /** True when a GPS fix is held — starts at zoom 15 instead of 14. */
   hasFix?: boolean;
   zoom?: number;
+  /**
+   * Aborted when the caller unmounts / retries while creation is still
+   * in flight — the map is then never constructed, so a cancelled
+   * attempt can never orphan a live Map (and its WebGL context) in a
+   * detached container.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -209,33 +256,56 @@ export interface CreateOlaMapOptions {
  * the Ola key is missing. Callers must call `map.resize()` after the
  * container resizes or is hidden-then-shown, or the canvas stays blank
  * though tiles loaded.
+ *
+ * BOUNDED (root cause, after v13): neither await inside may hang
+ * forever. The style pre-fetch is capped at 8 s (falls back to the
+ * style URL on timeout) and the lazy `maplibre-gl` import — a ~1 MB
+ * chunk fetched at map-creation time — is capped at 30 s and rejects
+ * with a plain-words error. Before this, a stalled fetch/import on
+ * flaky mobile data wedged the play map in 'loading' forever with no
+ * error event, and a rejection landed in a dead-end generic banner.
+ * `new Map` throwing (e.g. 'Failed to initialize WebGL') propagates
+ * as a rejection too, so the caller can show the real cause + Retry.
  */
 export async function createOlaMap(
   options: CreateOlaMapOptions,
 ): Promise<MapLibreMapLike | null> {
   if (!isOlaConfigured()) return null;
-  const maplibre = await import('maplibre-gl');
-  // The Ola style declares a `3d_model_data` layer whose source layer
-  // `3d_model` does not exist in the vectordata tiles — MapLibre refuses
-  // the whole style if it is passed the URL as-is. Fetch + strip first
-  // and pass the cleaned style OBJECT; on a fetch failure fall back to
-  // the URL so the caller's error banner shows the real detail.
   const cleanedStyle = await fetchCleanedOlaStyle();
-  const map = new maplibre.Map({
-    container: options.container,
-    style: (cleanedStyle ?? buildOlaStyleUrl()) as unknown as import('maplibre-gl').StyleSpecification,
-    transformRequest: (url: string, resourceType?: string) =>
-      olaTransformRequest(url, resourceType),
-    center: options.center
-      ? [options.center[0], options.center[1]]
-      : [OLA_MAP_INITIAL_CENTRE[0], OLA_MAP_INITIAL_CENTRE[1]],
-    zoom: options.zoom ?? (options.hasFix ? OLA_MAP_FIX_ZOOM : OLA_MAP_INITIAL_ZOOM),
-    minZoom: OLA_MAP_MIN_ZOOM,
-    maxZoom: OLA_MAP_MAX_ZOOM,
-    dragRotate: false,
-    touchPitch: false,
-  }) as unknown as MapLibreMapLike;
-  return map;
+  if (options.signal?.aborted) return null;
+  const importGuard = timeoutAfter(
+    MAPLIBRE_IMPORT_TIMEOUT_MS,
+    'Map library download timed out after 30s — check your connection and retry',
+  );
+  try {
+    const maplibre = await Promise.race([
+      import('maplibre-gl'),
+      importGuard.promise,
+    ]);
+    if (options.signal?.aborted) return null;
+    // The Ola style declares a `3d_model_data` layer whose source layer
+    // `3d_model` does not exist in the vectordata tiles — MapLibre refuses
+    // the whole style if it is passed the URL as-is. Fetch + strip first
+    // and pass the cleaned style OBJECT; on a fetch failure fall back to
+    // the URL so the caller's error banner shows the real detail.
+    const map = new maplibre.Map({
+      container: options.container,
+      style: (cleanedStyle ?? buildOlaStyleUrl()) as unknown as import('maplibre-gl').StyleSpecification,
+      transformRequest: (url: string, resourceType?: string) =>
+        olaTransformRequest(url, resourceType),
+      center: options.center
+        ? [options.center[0], options.center[1]]
+        : [OLA_MAP_INITIAL_CENTRE[0], OLA_MAP_INITIAL_CENTRE[1]],
+      zoom: options.zoom ?? (options.hasFix ? OLA_MAP_FIX_ZOOM : OLA_MAP_INITIAL_ZOOM),
+      minZoom: OLA_MAP_MIN_ZOOM,
+      maxZoom: OLA_MAP_MAX_ZOOM,
+      dragRotate: false,
+      touchPitch: false,
+    }) as unknown as MapLibreMapLike;
+    return map;
+  } finally {
+    importGuard.cancel();
+  }
 }
 
 /**

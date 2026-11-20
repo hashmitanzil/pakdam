@@ -11,7 +11,7 @@
  */
 'use client';
 
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import type { RadioMessage, Team, VoiceRadioStatus } from '@pakdam/shared';
 import { QUICK_SIGNALS, RADIO_MAX_CHARS } from '@pakdam/shared';
 import type { PttState, VoiceRadio } from '@/lib/voice-radio';
@@ -42,7 +42,10 @@ export interface RadioStripProps {
   onSendRadio: (text: string, kind?: 'quick' | 'text') => void;
 }
 
-export function RadioStrip({
+/** Memoized: the parent re-renders every second on its clock tick — the
+ *  radio tab is not even visible then, and must not re-render (or reset
+ *  its draft input) on ticks, GPS fixes, or tab-bar taps. */
+export const RadioStrip = memo(function RadioStrip({
   team,
   channelLine,
   messages,
@@ -192,4 +195,4 @@ export function RadioStrip({
       </div>
     </div>
   );
-}
+});

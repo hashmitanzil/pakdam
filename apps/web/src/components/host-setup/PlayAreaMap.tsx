@@ -240,7 +240,14 @@ export function PlayAreaMap({
         container,
         center: [OLA_MAP_INITIAL_CENTRE[0], OLA_MAP_INITIAL_CENTRE[1]],
       });
-      if (cancelled || !created) return;
+      // A map constructed after the screen went away must be removed —
+      // otherwise it keeps its WebGL context alive in a detached
+      // container, and repeated fast navigation can exhaust the
+      // browser's context budget so the NEXT map fails to initialise.
+      if (cancelled || !created) {
+        created?.remove();
+        return;
+      }
       map = created;
       mapRef.current = created;
       maplibreRef.current = await import('maplibre-gl');

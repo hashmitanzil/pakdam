@@ -2,7 +2,7 @@
  * Play — the live HUD (SCRAM-SPEC §8, BEHAVIOUR §2).
  *
  * One status strip, the Ola dark map, bottom tabs (Map / Radio / ···),
- * floating PTT mic + SOS, and one catch action per role. Role reveal
+ * floating PTT mic, and one catch action per role. Role reveal
  * shows once at start (again if an Infection tag flips my role).
  *
  * Live mode: the snapshot is the whole truth; the client never sets phase,
@@ -15,7 +15,7 @@
  */
 'use client';
 
-import { use, useEffect, useMemo, useRef, useState } from 'react';
+import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   OUTSIDE_ZONE_RETURN_SECONDS,
@@ -24,6 +24,7 @@ import {
   type LocationFix,
   type MatchPhase,
   type Ping,
+  type PlayerView,
   type VoiceRadioStatus,
 } from '@pakdam/shared';
 import {
@@ -45,7 +46,7 @@ import { BottomTabs, type BottomTabId } from '@/components/ui/BottomTabs';
 import { Sheet } from '@/components/ui/Sheet';
 import { Button } from '@/components/ui/Button';
 import { formatSuspendedLabel, formatOutsideCountdown } from '@/components/match/freshness';
-import { formatDurationShort, ageLabelFromTimestamp } from '@/lib/utils';
+import { formatDurationShort, ageLabelFromTimestamp, haversineMeters } from '@/lib/utils';
 import { watchLocation, isFixSendableToServer } from '@/lib/geolocation';
 import { requestWakeLock } from '@/lib/wake-lock';
 import { clearSession } from '@/lib/session-credentials';
@@ -53,18 +54,23 @@ import {
   ejectPlayer,
   endDemoMatch,
   getRoom,
-  hostCheckin,
   leaveRoom,
   recordPlayerFix,
   resumePlayer,
   safetyPauseDemo,
   safetyResumeDemo,
-  sosDemo,
 } from '@/lib/demo-store';
 import { VoiceRadio, type PttState, type VoiceSignal } from '@/lib/voice-radio';
 import type { PakdamSocket } from '@/lib/websocket';
 
 const TERMINAL: MatchPhase[] = ['COMPLETED', 'CANCELLED', 'ABANDONED', 'EXPIRED'];
+
+/** Stable empty identities — a fresh `[]` / `{}` literal every render
+ *  would bust every memo and map effect downstream. */
+const EMPTY_POLYGON: GeoPolygon = [];
+const EMPTY_POLYGONS: GeoPolygon[] = [];
+const EMPTY_FIXES: Record<string, LocationFix> = {};
+const EMPTY_TEAMMATES: PlayerView[] = [];
 
 export default function PlayPage({
   params,
@@ -140,7 +146,6 @@ export default function PlayPage({
   const [outsideSecondsLeft, setOutsideSecondsLeft] = useState<number | null>(null);
   const [radioUnread, setRadioUnread] = useState(0);
   const [leaveArmed, setLeaveArmed] = useState(false);
-  const [sosSent, setSosSent] = useState(false);
   // Hold-to-reveal (P1-19): press-and-hold ~1 s, then sendReveal fires.
   const [revealHolding, setRevealHolding] = useState(false);
   const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -160,9 +165,24 @@ export default function PlayPage({
   const isRunner = myRole === 'runner';
   const socketRef = useRef<PakdamSocket | null>(null);
   const myFixRef = useRef<LocationFix | null>(null);
+  // Last fix actually shown on screen — the display throttle below.
+  const lastShownFixRef = useRef<{ fix: LocationFix; atMs: number } | null>(null);
   const outsideAccumRef = useRef(0);
   const outsideEjectedRef = useRef(false);
   const seenRadioRef = useRef(0);
+
+  // Stable derived identities, defined early: the outside-zone effect
+  // below depends on the boundary, not on the whole room object (fresh
+  // per snapshot), and a fresh `[]` fallback each render would bust
+  // every memo downstream.
+  const zoneBoundary = useMemo(
+    () => room?.config.zone.boundary ?? EMPTY_POLYGON,
+    [room],
+  );
+  const noGoAreas = useMemo(
+    () => room?.config.noGoAreas ?? EMPTY_POLYGONS,
+    [room],
+  );
 
   useEffect(() => {
     socketRef.current = socket;
@@ -210,7 +230,7 @@ export default function PlayPage({
     if (shown !== myRole) setReveal(myRole);
   }, [myRole, phase, roomId]);
 
-  const dismissReveal = () => {
+  const dismissReveal = useCallback(() => {
     if (reveal) {
       window.sessionStorage.setItem(`pakdam.role-reveal.${roomId}`, reveal);
     }
@@ -218,7 +238,7 @@ export default function PlayPage({
     // The reveal covered the map at game start — resize it explicitly
     // now that it is uncovered.
     setMapResizeNonce((n) => n + 1);
-  };
+  }, [reveal, roomId]);
 
   // Terminal phase → results. Back to lobby if the match never started.
   useEffect(() => {
@@ -236,7 +256,17 @@ export default function PlayPage({
     const handle = watchLocation(
       (fix) => {
         myFixRef.current = fix;
-        setMyFix(fix);
+        // Display throttle: the dot only needs to move when the fix
+        // actually moved (≥ 5 m) or 5 s passed — before this, EVERY raw
+        // GPS fix re-rendered the whole page and rebuilt the map
+        // overlays, up to ~1×/s even standing still. Sending to the
+        // server still happens per fix below; only the display waits.
+        const lastShown = lastShownFixRef.current;
+        const movedM = lastShown ? haversineMeters(lastShown.fix, fix) : Infinity;
+        if (movedM >= 5 || !lastShown || fix.timestampMs - lastShown.atMs >= 5000) {
+          lastShownFixRef.current = { fix, atMs: fix.timestampMs };
+          setMyFix(fix);
+        }
         if (isFixSendableToServer(fix)) {
           if (mode === 'live') {
             socketRef.current?.sendLocationUpdate(fix);
@@ -268,7 +298,7 @@ export default function PlayPage({
       return;
     }
     const fix = myFixRef.current;
-    const boundary = room?.config.zone.boundary ?? [];
+    const boundary = zoneBoundary;
     if (!fix || boundary.length < 3) return;
     if (isPointInZone(fix, boundary)) {
       outsideAccumRef.current = 0;
@@ -298,7 +328,7 @@ export default function PlayPage({
     }
     // Runs on every clock tick.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nowMs, phase, room, mode, roomId, myPlayerId]);
+  }, [nowMs, phase, zoneBoundary, mode, roomId, myPlayerId]);
 
   // Voice radio (live only). The DO rejects cross-team signals, and role
   // secrecy hides other seats' teams — so we signal every other active
@@ -367,8 +397,15 @@ export default function PlayPage({
   // roster; Balance OFF honours the host's stepper) — never the raw
   // `config.hunterCount`, which the server does not draw while Balance
   // is ON. The HUD "runners left" and the role-reveal text use this.
-  const hunterCount = room ? effectiveHunterCount(room.config, activePlayers.length) : 0;
-  const runnersTotal = Math.max(0, activePlayers.length - hunterCount);
+  // Memoized: trivial math, but it must not re-run on every clock tick.
+  const hunterCount = useMemo(
+    () => (room ? effectiveHunterCount(room.config, activePlayers.length) : 0),
+    [room, activePlayers.length],
+  );
+  const runnersTotal = useMemo(
+    () => Math.max(0, activePlayers.length - hunterCount),
+    [activePlayers.length, hunterCount],
+  );
   const caughtIds = useMemo(
     () =>
       new Set(
@@ -377,6 +414,41 @@ export default function PlayPage({
           .map((c) => c.runnerPlayerId),
       ),
     [sessionCatches],
+  );
+  // Roster + tagger lookups, built once per roster/catch set — the old
+  // code ran `players.find` / `sessionCatches.find` per player per
+  // render (O(n·m)) in the list and the dots below.
+  const playerById = useMemo(
+    () => new Map(players.map((p) => [p.playerId, p])),
+    [players],
+  );
+  const taggerByRunnerId = useMemo(() => {
+    const m = new Map<string, string>();
+    for (const c of sessionCatches) {
+      if (c.state === 'confirmed') m.set(c.runnerPlayerId, c.hunterPlayerId);
+    }
+    return m;
+  }, [sessionCatches]);
+  // Players list (More sheet): every player still in the room, with
+  // Alive / Tagged status. "Tagged" reuses the same settled-catch source
+  // as `caughtIds` above and the results page's "[hunter] tagged
+  // [runner]" list — a confirmed catch against the player, with the
+  // tagger's name resolved from the same roster. No new tag source.
+  // Works in both modes: live `sessionCatches` come from the snapshot's
+  // `decidedCatches`, demo ones from the demo store's catches.
+  const playerStatuses = useMemo(
+    () =>
+      activePlayers.map((p) => {
+        const hunterId = taggerByRunnerId.get(p.playerId);
+        return {
+          player: p,
+          taggerName:
+            hunterId === undefined
+              ? null
+              : (playerById.get(hunterId)?.displayName ?? 'a Hunter'),
+        };
+      }),
+    [activePlayers, taggerByRunnerId, playerById],
   );
   // Ejected Runners only subtract in demo (live role secrecy hides who is a Runner).
   const ejectedRunnerCount =
@@ -390,15 +462,16 @@ export default function PlayPage({
   // or by the confirmed catch itself, so a tagged Runner can never act
   // again even if they reach the play page another way. (Infection flips a
   // tagged Runner to Hunter, so `isRunner` is false there and this never
-  // applies.) Radio and SOS stay available — they are safety/communication,
-  // not playing actions.
+  // applies.) Radio stays available — it is communication, not a playing
+  // action.
   const amCaught = isRunner && myPlayerId !== null && caughtIds.has(myPlayerId);
   const isSpectator = spectateParam || amCaught;
 
   const startedAtMs = room?.startedAt ? new Date(room.startedAt).getTime() : null;
-  const zoneBoundary = room?.config.zone.boundary ?? [];
-  const zoneRadiusM =
-    zoneBoundary.length >= 3 ? zoneDiameterMeters(zoneBoundary) / 2 : null;
+  const zoneRadiusM = useMemo(
+    () => (zoneBoundary.length >= 3 ? zoneDiameterMeters(zoneBoundary) / 2 : null),
+    [zoneBoundary],
+  );
 
   const lastPingAtMs = useMemo(() => {
     if (mode === 'demo' && demo) {
@@ -409,22 +482,35 @@ export default function PlayPage({
     return Math.min(...pings.map((p) => new Date(p.createdAt).getTime()));
   }, [mode, demo, pings]);
 
-  const nextPingAtMs =
-    startedAtMs === null || !room
-      ? null
-      : engineNextPingAtMs(lastPingAtMs, startedAtMs, room.config.pingIntervalSeconds);
-  const nextShrinkAtMs =
-    startedAtMs === null || !room
-      ? null
-      : engineNextShrinkAtMs(
-          startedAtMs,
-          room.config.durationSeconds,
-          room.config.zoneShrinkIntervalSeconds,
-          room.config.zoneShrinkEnabled,
-          safetyState.paused && safetyState.pausedAt
-            ? new Date(safetyState.pausedAt).getTime()
-            : nowMs,
-        );
+  // The ping clock starts at ACTIVE (head start end), never at match
+  // start — the first ping is due one interval after the head start ends.
+  const nextPingAtMs = useMemo(
+    () =>
+      startedAtMs === null || !room
+        ? null
+        : engineNextPingAtMs(
+            lastPingAtMs,
+            startedAtMs,
+            room.config.pingIntervalSeconds,
+            startedAtMs + room.config.headStartSeconds * 1000,
+          ),
+    [startedAtMs, room, lastPingAtMs],
+  );
+  const nextShrinkAtMs = useMemo(
+    () =>
+      startedAtMs === null || !room
+        ? null
+        : engineNextShrinkAtMs(
+            startedAtMs,
+            room.config.durationSeconds,
+            room.config.zoneShrinkIntervalSeconds,
+            room.config.zoneShrinkEnabled,
+            safetyState.paused && safetyState.pausedAt
+              ? new Date(safetyState.pausedAt).getTime()
+              : nowMs,
+          ),
+    [startedAtMs, room, safetyState.paused, safetyState.pausedAt, nowMs],
+  );
 
   // Pings are mutual and role-scoped: the server only delivers pings
   // addressed to my role (Runner pings to Hunters, Hunter pings to
@@ -475,7 +561,7 @@ export default function PlayPage({
       // the live teammate view) and never while spectating.
       if (!amCaught) {
         for (const teammateId of teammateIds) {
-          const p = players.find((pl) => pl.playerId === teammateId);
+          const p = playerById.get(teammateId);
           if (!p || p.leftAt !== null) continue;
           const lastFixMs = p.lastFixAt ? new Date(p.lastFixAt).getTime() : null;
           out.push({
@@ -492,7 +578,7 @@ export default function PlayPage({
       }
     }
     for (const ping of visiblePings) {
-      const subject = players.find((p) => p.playerId === ping.subjectPlayerId);
+      const subject = playerById.get(ping.subjectPlayerId);
       if (!subject) continue;
       out.push({
         playerId: `ping-${ping.pingId}`,
@@ -506,7 +592,7 @@ export default function PlayPage({
       });
     }
     return out;
-  }, [players, myPlayer, myPlayerId, teammateIds, visiblePings, nowMs, amCaught, isSpectator, mode]);
+  }, [playerById, myPlayer, myPlayerId, teammateIds, visiblePings, nowMs, amCaught, isSpectator, mode]);
 
   const myLastFixMs = myPlayer?.lastFixAt ? new Date(myPlayer.lastFixAt).getTime() : null;
   const isSuspended = myPlayer?.connectionState === 'suspended';
@@ -515,36 +601,48 @@ export default function PlayPage({
     () =>
       mode === 'demo'
         ? players.filter((p) => p.team === myTeam && p.playerId !== myPlayerId && p.leftAt === null)
-        : [],
+        : EMPTY_TEAMMATES,
     [mode, players, myTeam, myPlayerId],
   );
-  const channelLine = `${myTeam === 'hunters' ? 'Hunters' : 'Runners'} channel · ${
-    mode === 'demo' ? teammates.length : (voiceRadio?.connectedPeers.length ?? 0)
-  } on air`;
+  const channelLine = useMemo(
+    () =>
+      `${myTeam === 'hunters' ? 'Hunters' : 'Runners'} channel · ${
+        mode === 'demo' ? teammates.length : (voiceRadio?.connectedPeers.length ?? 0)
+      } on air`,
+    [myTeam, mode, teammates.length, voiceRadio],
+  );
   const canSendRadio =
     myTeam === 'hunters' ? room?.config.huntersCanTalk !== false : true;
-  const radioNotices =
-    phase === 'HEAD_START' && room
-      ? [
-          `just now · Runners have a ${formatDurationShort(room.config.headStartSeconds)} head start. Hold tight.`,
-        ]
-      : [];
+  const radioNotices = useMemo(
+    () =>
+      phase === 'HEAD_START' && room
+        ? [
+            `just now · Runners have a ${formatDurationShort(room.config.headStartSeconds)} head start. Hold tight.`,
+          ]
+        : [],
+    [phase, room],
+  );
+  // Live reveals, filtered once — the old JSX filtered the list twice
+  // per render (once for the count, once for the names).
+  const liveReveals = useMemo(
+    () => reveals.filter((r) => r.expiresAtMs > nowMs),
+    [reveals, nowMs],
+  );
+  // Who paused the match — up here with the other memos, never after
+  // the early returns below (hooks must run on every render).
+  const pausedByName = useMemo(
+    () =>
+      safetyState.pausedBy
+        ? (playerById.get(safetyState.pausedBy)?.displayName ?? null)
+        : null,
+    [safetyState.pausedBy, playerById],
+  );
 
   // -- Safety actions ---------------------------------------------------------
-  const handleSos = () => {
-    if (mode === 'live') {
-      if (socketRef.current?.safetySos()) setSosSent(true);
-      else setNotice('Not connected — SOS was not sent. Wait for the reconnect, then tap again.');
-    } else {
-      const current = getRoom(roomId);
-      if (current) {
-        sosDemo(current, myPlayerId);
-        refreshDemo();
-        setSosSent(true);
-      }
-    }
-  };
-  const handlePause = () => {
+  // Stable callbacks (useCallback): an inline handler is a new function
+  // every render, which re-renders every memoized child that receives it
+  // — and a tap landing mid-render waits for that render to finish.
+  const handlePause = useCallback(() => {
     if (mode === 'live') {
       if (!socketRef.current?.safetyPause()) {
         setNotice('Not connected — pause was not sent. Wait for the reconnect, then tap again.');
@@ -556,8 +654,8 @@ export default function PlayPage({
         refreshDemo();
       }
     }
-  };
-  const handleResume = () => {
+  }, [mode, roomId, myPlayerId, refreshDemo]);
+  const handleResume = useCallback(() => {
     if (mode === 'live') {
       if (!socketRef.current?.safetyResume()) {
         setNotice('Not connected — resume was not sent. Wait for the reconnect, then tap again.');
@@ -569,23 +667,8 @@ export default function PlayPage({
         refreshDemo();
       }
     }
-  };
-  const handleAnnounceSafe = () => {
-    if (mode === 'live') {
-      // Failure feedback, like SOS / pause / resume: a silent no-send
-      // leaves the player thinking the host was told.
-      if (!socketRef.current?.sendCheckIn()) {
-        setNotice('Not connected — "I\'m safe" was not sent. Wait for the reconnect, then tap again.');
-      }
-    } else {
-      const current = getRoom(roomId);
-      if (current) {
-        hostCheckin(current, myPlayerId, "I'm safe");
-        refreshDemo();
-      }
-    }
-  };
-  const handleLeave = () => {
+  }, [mode, roomId, refreshDemo]);
+  const handleLeave = useCallback(() => {
     if (!leaveArmed) {
       setLeaveArmed(true);
       return;
@@ -600,8 +683,8 @@ export default function PlayPage({
     }
     clearSession(roomId);
     router.push('/');
-  };
-  const handleEndRound = () => {
+  }, [leaveArmed, mode, roomId, myPlayerId, leave, router]);
+  const handleEndRound = useCallback(() => {
     if (!isHost) return;
     if (mode === 'live') {
       void endLiveMatch(roomId).catch(() => {
@@ -614,12 +697,16 @@ export default function PlayPage({
       endDemoMatch(current);
       refreshDemo();
     }
-  };
+  }, [isHost, mode, roomId, refreshDemo]);
+  const handleEndRoundFromSheet = useCallback(() => {
+    setTab('map');
+    handleEndRound();
+  }, [handleEndRound]);
   // Hold-to-reveal (P1-19): press-and-hold ~1 s, then the reveal is sent.
   // Releasing early cancels — a tap never reveals by accident. The hook
   // sends my current fix (live only); a false return means no fresh fix
   // or no connection, and the player is told so.
-  const startRevealHold = () => {
+  const startRevealHold = useCallback(() => {
     if (revealTimerRef.current) return;
     setRevealHolding(true);
     revealTimerRef.current = setTimeout(() => {
@@ -632,15 +719,15 @@ export default function PlayPage({
           : 'Reveal was not sent — make sure your location is on, then hold again.',
       );
     }, 1000);
-  };
-  const cancelRevealHold = () => {
+  }, [sendReveal]);
+  const cancelRevealHold = useCallback(() => {
     if (revealTimerRef.current) {
       clearTimeout(revealTimerRef.current);
       revealTimerRef.current = null;
     }
     setRevealHolding(false);
-  };
-  const handleResumeSharing = () => {
+  }, []);
+  const handleResumeSharing = useCallback(() => {
     if (mode !== 'demo') return;
     const current = getRoom(roomId);
     if (!current) return;
@@ -648,7 +735,28 @@ export default function PlayPage({
     const fix = myFixRef.current;
     if (fix) recordPlayerFix(current, myPlayerId, fix);
     refreshDemo();
-  };
+  }, [mode, roomId, myPlayerId, refreshDemo]);
+  // Stable tab / navigation callbacks — inline arrows here re-rendered
+  // the memoized tab bar and buttons on every clock tick.
+  const handleTabChange = useCallback((next: BottomTabId) => setTab(next), []);
+  const closeMoreSheet = useCallback(() => setTab('map'), []);
+  const goCatchQr = useCallback(
+    () => router.push(`/room/${roomId}/catch?scan=1`),
+    [router, roomId],
+  );
+  const goCatch = useCallback(() => router.push(`/room/${roomId}/catch`), [router, roomId]);
+  const handleToggleMute = useCallback(() => {
+    const next = !muted;
+    voiceRadio?.setMuted(next);
+    setMuted(next);
+  }, [muted, voiceRadio]);
+  const handleEnableVoice = useCallback(() => {
+    void voiceRadio?.enable();
+  }, [voiceRadio]);
+  const handleSendRadio = useCallback(
+    (text: string, kind?: 'quick' | 'text') => sendRadio(text, kind),
+    [sendRadio],
+  );
 
   // -- Loading / no-seat ------------------------------------------------------
   if (loading) {
@@ -675,14 +783,6 @@ export default function PlayPage({
       </main>
     );
   }
-
-  const pausedByName = safetyState.pausedBy
-    ? (players.find((p) => p.playerId === safetyState.pausedBy)?.displayName ?? null)
-    : null;
-  const sosByName =
-    mode === 'demo' && demo?.sosByPlayerId
-      ? (players.find((p) => p.playerId === demo.sosByPlayerId)?.displayName ?? null)
-      : null;
 
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pb-24 pt-3">
@@ -791,25 +891,17 @@ export default function PlayPage({
             nextZoneBoundary={nextZonePreview?.boundary ?? null}
             nextZoneFiresAtMs={nextZonePreview?.firesAtMs ?? null}
             pings={visiblePings}
-            noGoAreas={room.config.noGoAreas}
+            noGoAreas={noGoAreas}
             myFix={myFix}
             // Teammates' live positions (green dots). A spectator sees no
             // live dots, so nothing is passed while spectating.
-            teammateFixes={isSpectator ? {} : teammateFixes}
+            teammateFixes={isSpectator ? EMPTY_FIXES : teammateFixes}
             reveals={reveals}
             nowMs={nowMs}
             resizeNonce={mapResizeNonce}
           />
           <PlayerDots dots={dots} />
           <div className="absolute bottom-3 right-3 z-10 flex flex-col items-center gap-3">
-            <button
-              type="button"
-              aria-label="SOS — alerts the host"
-              onClick={handleSos}
-              className="flex h-11 w-11 items-center justify-center rounded-full border-2 border-[#EF4444] bg-[#141416]/90 text-[13px] font-bold text-[#EF4444]"
-            >
-              SOS
-            </button>
             <PTTButton
               radio={mode === 'live' ? voiceRadio : null}
               pttState={pttState}
@@ -837,26 +929,20 @@ export default function PlayPage({
             pttState={pttState}
             burstSeconds={burstSeconds}
             muted={muted}
-            onToggleMute={() => {
-              const next = !muted;
-              voiceRadio?.setMuted(next);
-              setMuted(next);
-            }}
-            onEnableVoice={() => {
-              void voiceRadio?.enable();
-            }}
-            onSendRadio={(text, kind) => sendRadio(text, kind)}
+            onToggleMute={handleToggleMute}
+            onEnableVoice={handleEnableVoice}
+            onSendRadio={handleSendRadio}
           />
         </div>
       ) : null}
 
       {tab === 'map' && isHunter && !isSpectator ? (
-        <Button variant="primary" onClick={() => router.push(`/room/${roomId}/catch?scan=1`)}>
+        <Button variant="primary" onClick={goCatchQr}>
           CATCH BY QR
         </Button>
       ) : null}
       {tab === 'map' && isRunner && !isSpectator ? (
-        <Button variant="primary" onClick={() => router.push(`/room/${roomId}/catch`)}>
+        <Button variant="primary" onClick={goCatch}>
           Got Tagged
         </Button>
       ) : null}
@@ -870,8 +956,10 @@ export default function PlayPage({
           position with everyone. Releasing early cancels — a tap never
           reveals by accident. Live only: the hook's sendReveal has no
           demo path (it returns false there), so the button stays hidden
-          in demo instead of always failing. */}
-      {tab === 'map' && mode === 'live' && myRole && !isSpectator ? (
+          in demo instead of always failing. ACTIVE only: a reveal is a
+          manual ping (150 m circle, whole room), so it must never fire
+          during the head start. */}
+      {tab === 'map' && mode === 'live' && myRole && !isSpectator && room?.phase === 'ACTIVE' ? (
         <button
           type="button"
           aria-label="Hold to reveal your position"
@@ -890,14 +978,9 @@ export default function PlayPage({
 
       {/* Incoming reveals: someone shared their position — amber ring on
           the map, named here. Expired reveals drop off on their own. */}
-      {tab === 'map' &&
-      reveals.filter((r) => r.expiresAtMs > nowMs).length > 0 ? (
+      {tab === 'map' && liveReveals.length > 0 ? (
         <p className="text-center text-[13px] text-[#F59E0B]">
-          {reveals
-            .filter((r) => r.expiresAtMs > nowMs)
-            .map((r) => r.displayName)
-            .join(', ')}{' '}
-          revealed their position
+          {liveReveals.map((r) => r.displayName).join(', ')} revealed their position
         </p>
       ) : null}
 
@@ -910,10 +993,10 @@ export default function PlayPage({
       <BottomTabs
         active={tab}
         radioUnread={radioUnread}
-        onChange={(next) => setTab(next)}
+        onChange={handleTabChange}
       />
 
-      <Sheet open={tab === 'more'} onClose={() => setTab('map')} title="More">
+      <Sheet open={tab === 'more'} onClose={closeMoreSheet} title="More">
         <div className="flex flex-col gap-4">
           {/* Host only: end the round early (POST …/lifecycle, host-only).
               The match completes with the mode-aware outcome and the play
@@ -921,30 +1004,55 @@ export default function PlayPage({
           {isHost && (phase === 'HEAD_START' || phase === 'ACTIVE' || phase === 'SAFETY_PAUSED') ? (
             <button
               type="button"
-              onClick={() => {
-                setTab('map');
-                handleEndRound();
-              }}
+              onClick={handleEndRoundFromSheet}
               className="self-start text-[15px] font-semibold text-[#EF4444]"
             >
               End the round
             </button>
           ) : null}
+          {/* Players — the complete roster still in the room, each with
+              an Alive / Tagged status. Tagged names its tagger, from the
+              same confirmed-catch data as the results page. */}
+          <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
+            <p className="text-[15px] font-bold text-white">
+              Players · {playerStatuses.length}
+            </p>
+            <ul className="mt-3 flex flex-col gap-3">
+              {playerStatuses.map(({ player, taggerName }) => (
+                <li
+                  key={player.playerId}
+                  className="flex items-start justify-between gap-3"
+                >
+                  <span className="min-w-0 truncate text-[15px] font-semibold text-white">
+                    {player.displayName}
+                    {player.playerId === myPlayerId ? ' (you)' : ''}
+                  </span>
+                  {taggerName ? (
+                    <span className="flex shrink-0 flex-col items-end gap-1">
+                      <span className="rounded-full bg-[#EF4444] px-2 py-0.5 text-[12px] font-bold text-white">
+                        Tagged
+                      </span>
+                      <span className="text-[12px] text-[#A1A1AA]">
+                        Tagged by {taggerName}
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="shrink-0 rounded-full bg-[#22C55E] px-2 py-0.5 text-[12px] font-bold text-black">
+                      Alive
+                    </span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          </div>
           <SafetyControls
             phase={phase}
             paused={safetyState.paused}
             pausedByName={pausedByName}
             pausedFrom={demo?.pausedFrom ?? null}
-            sosActive={safetyState.sosActive}
-            sosByName={sosByName}
-            isHost={isHost}
-            sosIsMine={sosSent && safetyState.sosActive}
-            isDemo={mode === 'demo'}
             canPause={phase === 'HEAD_START' || phase === 'ACTIVE' || phase === 'SAFETY_PAUSED'}
-            onSos={handleSos}
             onPause={handlePause}
             onResume={handleResume}
-            onAnnounceSafe={handleAnnounceSafe}
           />
           <button
             type="button"

@@ -19,7 +19,7 @@
  */
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type {
   Announcement,
   CatchView,
@@ -118,6 +118,11 @@ const IDLE_SAFETY: SafetyState = {
   sosActive: false,
 };
 
+/** Stable empty identities — a fresh `[]` / `{}` literal per snapshot
+ *  would bust every memo downstream. */
+const EMPTY_STRING_ARRAY: string[] = [];
+const EMPTY_FIXES: Record<string, LocationFix> = {};
+
 function toCatchView(
   c: { catchId: string; roomId: string; hunterPlayerId: string; runnerPlayerId: string; state: CatchView['state']; requestedAt: string; confirmedAt: string | null; disputedAt: string | null; resolution: CatchView['resolution']; gpsEvidence: CatchView['gpsEvidence'] },
 ): CatchView {
@@ -178,6 +183,14 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
 
   const [socket, setSocket] = useState<PakdamSocket | null>(null);
   const socketRef = useRef<PakdamSocket | null>(null);
+  // Last applied payloads, by exact content: a re-fetched snapshot (or
+  // a demo poll) with byte-identical content changes nothing, so the
+  // ~12 setters below — and the full play-page re-render + map overlay
+  // rebuild they trigger — are skipped outright. Identical JSON means
+  // identical derived state, so skipping can never go stale; any real
+  // change produces different JSON and applies normally.
+  const lastSnapshotJsonRef = useRef<string | null>(null);
+  const lastDemoJsonRef = useRef<string | null>(null);
   // Player list for resolving a reveal sender's display name inside the
   // socket callback (created once per room/session, so state would be stale).
   const playersRef = useRef<PlayerView[]>([]);
@@ -188,6 +201,11 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   myPlayerIdRef.current = myPlayerId;
 
   const applySnapshot = useCallback((snapshot: WsSnapshotPayload) => {
+    // Duplicate snapshot (welcome → re-request, reconnect re-fetch):
+    // same content, nothing to apply — skip the whole fan-out.
+    const json = JSON.stringify(snapshot);
+    if (json === lastSnapshotJsonRef.current) return;
+    lastSnapshotJsonRef.current = json;
     setRoom(snapshot.room);
     setPlayers(snapshot.players);
     setPhase(snapshot.phase);
@@ -196,8 +214,8 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     setLocationStatus(snapshot.locationStatus);
     // Teammates' live view (teammates only, never an opponent; empty for
     // a caught Runner). `??` tolerates a server that predates these fields.
-    setTeammateIds(snapshot.teammateIds ?? []);
-    setTeammateFixes(snapshot.teammateFixes ?? {});
+    setTeammateIds(snapshot.teammateIds ?? EMPTY_STRING_ARRAY);
+    setTeammateFixes(snapshot.teammateFixes ?? EMPTY_FIXES);
     // A snapshot rescues a transient first-paint GET failure (P1-23):
     // the error clears as soon as live truth lands.
     setError(null);
@@ -258,6 +276,13 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       setLoading(false);
       return;
     }
+    // The demo poll runs every 1 s and re-parses localStorage, so `next`
+    // is a fresh object every time even when nothing changed — without
+    // this guard the poll re-rendered the whole play page (and rebuilt
+    // the map overlays) every second of an idle game.
+    const json = JSON.stringify(next);
+    if (json === lastDemoJsonRef.current) return;
+    lastDemoJsonRef.current = json;
     setDemo(next);
     setRoom(next.room);
     setPlayers(next.players);
@@ -291,7 +316,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
             )
             .map((p) => p.playerId),
     );
-    setTeammateFixes({});
+    setTeammateFixes(EMPTY_FIXES);
     setLocationStatus(
       Object.fromEntries(
         next.players.map((p) => [
@@ -530,7 +555,10 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     (text: string, kind: 'quick' | 'text' = 'text'): boolean => {
       if (mode === 'demo') {
         // Demo radio is local-only: no server, no other tab hears it.
-        const me = players.find((p) => p.playerId === myPlayerIdRef.current);
+        // The sender name comes from the roster ref, not the `players`
+        // state — depending on `players` rebuilt this callback on every
+        // snapshot and re-rendered the radio tab with it.
+        const me = playersRef.current.find((p) => p.playerId === myPlayerIdRef.current);
         const message: RadioMessage = {
           messageId: crypto.randomUUID(),
           roomId,
@@ -545,7 +573,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       }
       return socketRef.current?.sendRadio(text, kind) ?? false;
     },
-    [mode, players, roomId],
+    [mode, roomId],
   );
 
   const sendReveal = useCallback(
@@ -562,7 +590,10 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     socketRef.current?.leave();
   }, []);
 
-  const myPlayer = players.find((p) => p.playerId === myPlayerId);
+  const myPlayer = useMemo(
+    () => players.find((p) => p.playerId === myPlayerId),
+    [players, myPlayerId],
+  );
 
   return {
     session,

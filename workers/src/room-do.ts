@@ -2036,6 +2036,11 @@ export class RoomStore {
    * pending for an offline Hunter until they reconnect.
    */
   pendingPingsFor(playerId: string, _nowMs: number): Ping[] {
+    // Pings are ACTIVE-only: nothing is delivered during HEAD_START (or
+    // any pre-start phase). A ping generated in ACTIVE may still be
+    // re-delivered while SAFETY_PAUSED — the pause froze a live game,
+    // it did not rewind it to the head start.
+    if (this.room.phase !== 'ACTIVE' && this.room.phase !== 'SAFETY_PAUSED') return [];
     const me = this.player(playerId);
     if (!me || me.matchRole === null) return [];
     const role: 'hunters' | 'runners' = me.matchRole === 'hunter' ? 'hunters' : 'runners';
@@ -2310,11 +2315,16 @@ export class RoomStore {
     }
 
     // (6) Scheduled pings — ACTIVE only, one per free Runner per interval.
+    // The ping clock starts at ACTIVE, not at match start: the first ping
+    // is due one interval after the head start ENDS, so no ping can be
+    // due — or fire the instant ACTIVE begins — because its interval
+    // elapsed during HEAD_START.
     if (
       this.room.phase === 'ACTIVE' &&
       this.room.config.playZoneEnabled !== false &&
       this.room.config.pingIntervalSeconds > 0
     ) {
+      const activeAtMs = startedAtMs + this.room.config.headStartSeconds * 1000;
       const free = freeRunnerIds(this.state.players, this.caughtRunnerIds());
       const pendingSubjects = new Set(this.mem.pendingPings.map((p) => p.subjectPlayerId));
       const due = dueRunnerIds({
@@ -2324,6 +2334,7 @@ export class RoomStore {
         startedAtMs,
         intervalSeconds: this.room.config.pingIntervalSeconds,
         nowMs,
+        activeAtMs,
       });
       for (const runnerId of due) {
         const runner = this.player(runnerId);
@@ -2366,6 +2377,7 @@ export class RoomStore {
         startedAtMs,
         intervalSeconds: this.room.config.pingIntervalSeconds,
         nowMs,
+        activeAtMs,
       });
       for (const hunterId of dueHunters) {
         const hunter = this.player(hunterId);
@@ -2722,8 +2734,12 @@ export class RoomStore {
           events.push(this.errorEvent(playerId, check.code ?? 'VALIDATION_FAILED', check.errors.join(' ') || 'Reveal needs a fresh fix.', false, undefined, nowMs));
           break;
         }
-        if (this.room.phase !== 'HEAD_START' && this.room.phase !== 'ACTIVE') {
-          events.push(this.errorEvent(playerId, 'INVALID_STATE', 'Reveals are for live play only.', false, undefined, nowMs));
+        // Reveals are a manual ping (a 150 m circle around the sender's
+        // exact fix, shown to the whole room) — ACTIVE only, never during
+        // HEAD_START, or a Runner could hand the Hunters their position
+        // before the hunt starts (and vice versa).
+        if (this.room.phase !== 'ACTIVE') {
+          events.push(this.errorEvent(playerId, 'INVALID_STATE', 'Reveals start once the head start ends.', false, undefined, nowMs));
           break;
         }
         this.mem.latestFix[playerId] = fix;

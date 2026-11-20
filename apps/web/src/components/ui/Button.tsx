@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 
 /**
@@ -28,7 +29,9 @@ const variants: Record<ButtonVariant, string> = {
     'bg-[#1E1E22] text-[#A1A1AA] h-14 border border-[#26262B]',
 };
 
-export function Button({
+/** Memoized: the play page re-renders every second on its clock tick —
+ *  a button with stable props must not re-render with it. */
+export const Button = memo(function Button({
   variant = 'primary',
   className = '',
   children,
@@ -39,4 +42,4 @@ export function Button({
       {children}
     </button>
   );
-}
+});

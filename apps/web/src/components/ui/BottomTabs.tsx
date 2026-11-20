@@ -1,5 +1,7 @@
 'use client';
 
+import { memo } from 'react';
+
 /**
  * Bottom tabs — SCRAM-SPEC §8d / §11.
  * Three tabs: Map | Radio | ··· (More). Dark bar (#141416), top border
@@ -22,7 +24,9 @@ const tabs: { id: BottomTabId; label: string; icon: string }[] = [
   { id: 'more', label: '···', icon: '···' },
 ];
 
-export function BottomTabs({ active, onChange, radioUnread = 0 }: BottomTabsProps) {
+/** Memoized: the parent re-renders every second on its clock tick — the
+ *  tab bar only re-renders when the active tab or unread count changes. */
+export const BottomTabs = memo(function BottomTabs({ active, onChange, radioUnread = 0 }: BottomTabsProps) {
   return (
     <nav
       aria-label="Game"
@@ -60,4 +64,4 @@ export function BottomTabs({ active, onChange, radioUnread = 0 }: BottomTabsProp
       </div>
     </nav>
   );
-}
+});

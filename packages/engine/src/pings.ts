@@ -14,7 +14,11 @@
  *
  * Schedule: ACTIVE phase only, play zone ON, `pingIntervalSeconds > 0`;
  * one ping per free player per interval; the first ping lands one interval
- * after match start (`lastPingAtMs` defaults to `startedAt`).
+ * after ACTIVE starts (`lastPingAtMs` defaults to `activeAtMs` — the end
+ * of the head start — never to `startedAt`). The ping clock does NOT run
+ * during HEAD_START: anchoring on `startedAt` would make the first ping
+ * due the instant ACTIVE begins (or show a "Next ping 0:00" countdown
+ * during the head start), leaking the schedule across the head start.
  *
  * Display rule (founder decision): once a ping IS delivered and shown, it
  * stays on the recipient's map until the next ping replaces it — the client
@@ -32,15 +36,20 @@ import {
 
 export { PING_AREA_RADIUS_M, PENDING_PING_TTL_SECONDS };
 
-/** Is this ping due yet? First ping lands one interval after match start. */
+/**
+ * Is this ping due yet? First ping lands one interval after ACTIVE starts.
+ * `activeAtMs` is the end of the head start (startedAt + headStartSeconds);
+ * when omitted it falls back to `startedAtMs` (head start of 0).
+ */
 export function isPingDue(
   lastPingAtMs: number | null,
   startedAtMs: number,
   intervalSeconds: number,
   nowMs: number,
+  activeAtMs?: number,
 ): boolean {
   if (intervalSeconds <= 0) return false;
-  const last = lastPingAtMs ?? startedAtMs;
+  const last = lastPingAtMs ?? activeAtMs ?? startedAtMs;
   return nowMs - last >= intervalSeconds * 1000;
 }
 
@@ -49,9 +58,10 @@ export function nextPingAtMs(
   lastPingAtMs: number | null,
   startedAtMs: number,
   intervalSeconds: number,
+  activeAtMs?: number,
 ): number | null {
   if (intervalSeconds <= 0) return null;
-  const last = lastPingAtMs ?? startedAtMs;
+  const last = lastPingAtMs ?? activeAtMs ?? startedAtMs;
   return last + intervalSeconds * 1000;
 }
 
@@ -143,11 +153,13 @@ function dueSubjectIds(input: {
   startedAtMs: number;
   intervalSeconds: number;
   nowMs: number;
+  /** End of the head start; the first ping is due one interval after this. */
+  activeAtMs?: number;
 }): string[] {
   return input.freePlayerIds.filter((id) => {
     if (input.fixes[id] === undefined || input.fixes[id] === null) return false;
     const last = input.lastPingAtMs[id] ?? null;
-    return isPingDue(last, input.startedAtMs, input.intervalSeconds, input.nowMs);
+    return isPingDue(last, input.startedAtMs, input.intervalSeconds, input.nowMs, input.activeAtMs);
   });
 }
 
@@ -162,6 +174,7 @@ export function dueRunnerIds(input: {
   startedAtMs: number;
   intervalSeconds: number;
   nowMs: number;
+  activeAtMs?: number;
 }): string[] {
   return dueSubjectIds({ ...input, freePlayerIds: input.freeRunnerIds });
 }
@@ -178,6 +191,7 @@ export function dueHunterIds(input: {
   startedAtMs: number;
   intervalSeconds: number;
   nowMs: number;
+  activeAtMs?: number;
 }): string[] {
   return dueSubjectIds({ ...input, freePlayerIds: input.freeHunterIds });
 }
