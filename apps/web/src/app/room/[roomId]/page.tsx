@@ -247,6 +247,28 @@ export default function LobbyPage() {
   );
 
   // -- Readiness (one tap = ready + briefing confirmed). -----------------
+  // Full retry: re-fetch the room state (repopulates the roster) AND
+  // reconnect the socket. A socket-only retry cannot fix an empty roster
+  // if the state fetch never landed — the founder's lobby showed no
+  // players and a stuck "Not connected" banner, so Retry must do both.
+  const retryConnection = useCallback((): void => {
+    if (!session) return;
+    if (session.mode === 'live') {
+      void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken ?? '')
+        .then((state) => {
+          setLobby({ room: state.room, players: state.players });
+          if (state.room.phase !== 'LOBBY') goPlay();
+        })
+        .catch((err: unknown) => {
+          showNotice(err instanceof Error ? err.message : 'Could not reload the lobby — try again.');
+        });
+      void socketRef.current?.retry();
+    } else {
+      const demo = getRoom(roomId);
+      if (demo) setLobby({ room: demo.room, players: demo.players });
+    }
+  }, [goPlay, roomId, session, showNotice]);
+
   const toggleMyReady = (): void => {
     if (!me || !session) return;
     if (!isLive) {
@@ -410,10 +432,15 @@ export default function LobbyPage() {
 
   const room = lobby.room;
   const pickingHunters = isHost && config.teamAssignment === 'selected';
+  // Start button label: "NEED 2+…" only while under the minimum. Once
+  // 2 players have joined the label is START GAME — grey (blocked) until
+  // the gate passes, red once it does. Tapping the grey button shows the
+  // gate reason (who is not ready / what is missing), so the label
+  // change does not bypass the readiness + teams gate.
   const startLabel =
     activePlayers.length < MIN_PLAYERS
       ? `NEED ${MIN_PLAYERS}+ PLAYERS TO START`
-      : 'WAITING FOR EVERYONE TO BE READY';
+      : 'START GAME';
   const summary = formatRoomSummary(config, activePlayers.length);
 
   return (
@@ -444,7 +471,7 @@ export default function LobbyPage() {
           {conn === 'reconnect-failed' ? (
             <button
               type="button"
-              onClick={() => void socketRef.current?.retry()}
+              onClick={retryConnection}
               className="ml-2 font-semibold text-[#EF4444]"
             >
               Retry
@@ -516,6 +543,12 @@ export default function LobbyPage() {
               if (target) removePlayer(targetId, target.displayName);
             }}
           />
+          {activePlayers.length === 0 ? (
+            <p className="mt-3 text-[13px] text-[#A1A1AA]">
+              No players showing yet — if this stays empty, your connection
+              dropped. Tap Retry above to reload the lobby.
+            </p>
+          ) : null}
         </section>
 
         <button

@@ -205,6 +205,33 @@ export const STANDARD_DURATION_SECONDS = 1800;
 /** Zone shrink interval default: 600 s (10 min). OPEN. */
 export const ZONE_SHRINK_INTERVAL_SECONDS_DEFAULT = 600;
 
+/**
+ * Shrink grid (minutes) the "Shrinks every" stepper offers: 1, 3, 5, 10,
+ * 15, 20. OPEN.
+ */
+export const SHRINK_INTERVAL_MINUTES_GRID: readonly number[] = [1, 3, 5, 10, 15, 20];
+
+/**
+ * Shrink interval that follows the round length: one shrink per third of
+ * the game (3 shrinks per round), snapped to the nearest grid minute and
+ * clamped to the valid 60–3600 s range. So a 10-min round shrinks every
+ * ~3 min, a 30-min round every 10 min, a 60-min round every 20 min.
+ * The host changing the round length re-derives this automatically.
+ */
+export function shrinkIntervalForDurationSeconds(durationSeconds: number): number {
+  const targetMinutes = durationSeconds / 3 / 60;
+  let best = SHRINK_INTERVAL_MINUTES_GRID[0] ?? 10;
+  let bestDist = Math.abs(best - targetMinutes);
+  for (const entry of SHRINK_INTERVAL_MINUTES_GRID) {
+    const dist = Math.abs(entry - targetMinutes);
+    if (dist < bestDist) {
+      bestDist = dist;
+      best = entry;
+    }
+  }
+  return Math.max(60, Math.min(3600, best * 60));
+}
+
 /** Ping area radius: 150 m coarse area, never an exact pin. OPEN. */
 export const PING_AREA_RADIUS_M = 150;
 

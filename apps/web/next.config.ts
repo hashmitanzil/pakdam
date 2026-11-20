@@ -47,8 +47,8 @@ const nextConfig: NextConfig = {
       "default-src 'self'",
       "script-src 'self' 'unsafe-inline'",
       "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' data: blob: https://api.olamaps.io",
-      `connect-src 'self' ${workerOrigins.join(' ')} https://api.olamaps.io`,
+      "img-src 'self' data: blob: https://api.olamaps.io https://app.olamaps.io",
+      `connect-src 'self' ${workerOrigins.join(' ')} https://api.olamaps.io https://app.olamaps.io`,
       "font-src 'self'",
       "object-src 'none'",
       "base-uri 'self'",
@@ -75,7 +75,19 @@ const nextConfig: NextConfig = {
           { key: 'Content-Security-Policy', value: csp },
           { key: 'X-Content-Type-Options', value: 'nosniff' },
           { key: 'X-Frame-Options', value: 'DENY' },
-          { key: 'Referrer-Policy', value: 'no-referrer' },
+          {
+            key: 'Referrer-Policy',
+            // strict-origin-when-cross-origin (NOT no-referrer): Ola's
+            // domain whitelist is checked against the request's origin /
+            // referer, and `no-referrer` strips the Referer entirely — so
+            // Ola rejected the style/tiles even though the key and the
+            // domain were correct. This is the remaining map blocker
+            // after the v8 CSP blob-worker fix: the map worked in the
+            // morning (v1, no headers at all) and broke once v4 added
+            // `no-referrer`. Sending only the origin (no path, no query)
+            // satisfies Ola's domain check while leaking nothing.
+            value: 'strict-origin-when-cross-origin',
+          },
           {
             key: 'Permissions-Policy',
             // The game needs these three for itself (GPS, QR camera, voice

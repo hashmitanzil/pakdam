@@ -6,7 +6,11 @@
  * All number settings are ShadowHunt-style − / + steppers — no sliders.
  */
 import type { ReactNode } from 'react';
-import { balancedHunterCount, type RoomConfig } from '@pakdam/shared';
+import {
+  balancedHunterCount,
+  shrinkIntervalForDurationSeconds,
+  type RoomConfig,
+} from '@pakdam/shared';
 import { Stepper } from '../ui/Stepper';
 import { Toggle } from '../ui/Toggle';
 import { formatDurationShort } from '../../lib/utils';
@@ -53,9 +57,17 @@ export function RulesControls({ config, isHost, onChange }: SetupControlsProps) 
           label="Round length"
           disabled={!isHost}
           format={(v) => formatDurationShort(v)}
-          onChange={(v) => set({ durationSeconds: v })}
+          onChange={(v) =>
+            set({
+              durationSeconds: v,
+              // Shrink time follows the round length (3 shrinks per game):
+              // changing the round re-derives the shrink interval, so a
+              // short game shrinks faster and a long game slower.
+              zoneShrinkIntervalSeconds: shrinkIntervalForDurationSeconds(v),
+            })
+          }
         />,
-        'Runners win if they last this long.',
+        'Runners win if they last this long. The shrink time follows it — 3 shrinks per game.',
       )}
       {row(
         'Head start',
@@ -113,7 +125,7 @@ export function RulesControls({ config, isHost, onChange }: SetupControlsProps) 
               format={(v) => formatDurationShort(v * 60)}
               onChange={(v) => set({ zoneShrinkIntervalSeconds: v * 60 })}
             />,
-            'How long players get between each shrink.',
+            'Auto from the round length — 3 shrinks per game. You can still change it below.',
           )
         : null}
       <div className="mt-4 flex items-center justify-between gap-3">

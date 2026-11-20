@@ -1,47 +1,95 @@
 'use client';
 
 /**
- * Home (SCRAM-SPEC §3) — two actions and a headline, nothing else.
+ * Home (SCRAM-SPEC §3) — headline, hero visual, two actions.
  *
  * HOST A GAME → Mode select (the room is created when a mode card is
- * tapped, with the host's codename). Join Room → the join screen for
- * that code, where the codename is entered. No counters, no Find-a-Room,
- * no paywall, no extra blocks.
+ * tapped, with the host's codename). JOIN A GAME → the join screen
+ * (/join), where the lobby code AND the codename are entered together.
+ * The home page itself takes no code — the code lives only on the join
+ * screen (and on invite deep-links, /join/<CODE>).
+ *
+ * Hero: a pure-CSS radar — concentric rings pulsing out from a red
+ * target dot, green runner dots and red hunter dots floating around
+ * it, over a breathing red glow. No assets, no images, cheap on a
+ * phone. Entrance is a staggered fade-and-rise; motion respects
+ * prefers-reduced-motion (see globals.css).
  */
-import { useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { isValidRoomCode } from '@pakdam/shared';
 import { Button } from '../components/ui/Button';
 
 export default function HomePage() {
   const router = useRouter();
-  const [code, setCode] = useState('');
-  const [error, setError] = useState<string | null>(null);
-
-  const join = (): void => {
-    const normalized = code.trim().toUpperCase();
-    if (!isValidRoomCode(normalized)) {
-      setError("That code didn't match a room — check it and try again.");
-      return;
-    }
-    router.push(`/join/${normalized}`);
-  };
 
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col px-4 pb-6 pt-6">
-      <header className="flex items-center justify-between">
+      <header className="pakdam-anim-rise flex items-center justify-between">
         <span className="pakdam-display text-[22px] text-white">Pakdam</span>
       </header>
 
-      <p className="pakdam-label mt-10">Your city is the battlefield</p>
-      <h1 className="pakdam-display mt-3 text-[52px] text-white">
+      {/* Hero visual: radar rings + floating runner/hunter dots. */}
+      <div
+        className="relative mt-6 flex h-44 items-center justify-center overflow-hidden"
+        aria-hidden
+      >
+        {/* Breathing red glow behind the target. */}
+        <span className="pakdam-anim-glow absolute h-40 w-40 rounded-full bg-[#EF4444]/25 blur-2xl" />
+        {/* Radar rings, staggered so they ripple outward in turn. */}
+        <span className="pakdam-anim-ring absolute h-40 w-40 rounded-full border border-[#EF4444]/50" />
+        <span
+          className="pakdam-anim-ring absolute h-40 w-40 rounded-full border border-[#EF4444]/40"
+          style={{ animationDelay: '0.9s' }}
+        />
+        <span
+          className="pakdam-anim-ring absolute h-40 w-40 rounded-full border border-[#EF4444]/30"
+          style={{ animationDelay: '1.8s' }}
+        />
+        {/* Faint static rings for depth (3D-ish layering). */}
+        <span className="absolute h-28 w-28 rounded-full border border-[#26262B]" />
+        <span className="absolute h-16 w-16 rounded-full border border-[#26262B]" />
+        {/* The target: red centre dot. */}
+        <span className="absolute h-4 w-4 rounded-full bg-[#EF4444] shadow-[0_0_18px_rgba(239,68,68,0.9)]" />
+        {/* Floating dots: green runners, red hunters. */}
+        <span
+          className="pakdam-anim-float absolute left-[22%] top-[18%] h-3 w-3 rounded-full bg-[#22C55E] shadow-[0_0_10px_rgba(34,197,94,0.8)]"
+          style={{ animationDelay: '0.4s' }}
+        />
+        <span
+          className="pakdam-anim-float absolute right-[20%] top-[26%] h-3 w-3 rounded-full bg-[#EF4444] shadow-[0_0_10px_rgba(239,68,68,0.8)]"
+          style={{ animationDelay: '1.1s' }}
+        />
+        <span
+          className="pakdam-anim-float absolute bottom-[20%] left-[30%] h-2.5 w-2.5 rounded-full bg-[#22C55E]/80"
+          style={{ animationDelay: '1.7s' }}
+        />
+        <span
+          className="pakdam-anim-float absolute bottom-[28%] right-[28%] h-2.5 w-2.5 rounded-full bg-[#EF4444]/80"
+          style={{ animationDelay: '2.2s' }}
+        />
+      </div>
+
+      <p
+        className="pakdam-anim-rise pakdam-label mt-4"
+        style={{ animationDelay: '0.05s' }}
+      >
+        Your city is the battlefield
+      </p>
+      <h1
+        className="pakdam-anim-rise pakdam-display mt-3 text-[52px] text-white"
+        style={{ animationDelay: '0.12s' }}
+      >
         You are the
         <br />
         <span className="text-[#EF4444]">Target.</span>
       </h1>
-      <p className="mt-3 text-[15px] text-[#A1A1AA]">Hide. Run. Don&apos;t get caught.</p>
+      <p
+        className="pakdam-anim-rise mt-3 text-[15px] text-[#A1A1AA]"
+        style={{ animationDelay: '0.19s' }}
+      >
+        Hide. Run. Don&apos;t get caught.
+      </p>
 
-      <div className="mt-8">
+      <div className="pakdam-anim-rise mt-8" style={{ animationDelay: '0.26s' }}>
         <Button variant="primary" onClick={() => router.push('/create/mode')}>
           <span className="flex w-full items-center justify-between">
             <span className="text-left">
@@ -57,38 +105,21 @@ export default function HomePage() {
         </Button>
       </div>
 
-      <section
-        aria-label="Join Room"
-        className="mt-3 rounded-[16px] border border-[#26262B] bg-[#141416] p-4"
-      >
-        <p className="text-[17px] font-bold text-white">Join Room</p>
-        <p className="mt-1 text-[13px] text-[#A1A1AA]">Enter a code to join a match.</p>
-        <div className="mt-3 flex gap-2">
-          <input
-            value={code}
-            onChange={(event) => {
-              setCode(event.target.value.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 6));
-              setError(null);
-            }}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') join();
-            }}
-            placeholder="ABC123"
-            aria-label="Room code"
-            autoCapitalize="characters"
-            autoComplete="off"
-            className="h-14 min-w-0 flex-1 rounded-[14px] border border-[#26262B] bg-[#1E1E22] px-4 text-center text-[20px] font-bold uppercase tracking-[0.2em] text-white placeholder:text-[#A1A1AA]"
-          />
-          <button
-            type="button"
-            onClick={join}
-            className="h-14 shrink-0 rounded-[14px] bg-[#EF4444] px-6 text-[17px] font-bold text-white active:bg-[#DC2626]"
-          >
-            JOIN
-          </button>
-        </div>
-        {error ? <p className="mt-2 text-[13px] text-[#EF4444]">{error}</p> : null}
-      </section>
+      <div className="pakdam-anim-rise mt-3" style={{ animationDelay: '0.33s' }}>
+        <Button variant="blocked" onClick={() => router.push('/join')}>
+          <span className="flex w-full items-center justify-between">
+            <span className="text-left">
+              <span className="block text-[17px] font-bold text-white">JOIN A GAME</span>
+              <span className="mt-1 block text-[13px] font-medium text-[#A1A1AA]">
+                ENTER A ROOM CODE TO JOIN
+              </span>
+            </span>
+            <span aria-hidden className="text-[20px] text-white">
+              →
+            </span>
+          </span>
+        </Button>
+      </div>
 
       <p className="mt-auto pt-8 text-center text-[13px] text-[#A1A1AA]">
         Free · No download · 2–30 players · No account needed.
