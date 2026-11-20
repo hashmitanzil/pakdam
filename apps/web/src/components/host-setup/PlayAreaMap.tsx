@@ -17,7 +17,7 @@
  * - The map never auto-centres on a fix worse than ±50 m; centring is
  *   the caller's job (it passes `centre` in).
  */
-import { useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useRef, useState } from 'react';
 import type { GeoPoint, GeoPolygon, ZoneShape } from '@pakdam/shared';
 import { METERS_PER_DEG_LAT, metersPerDegreeLng } from '@pakdam/shared';
 import { circlePolygon, offsetPolygon, scalePolygonTowardCentroid } from '@pakdam/engine';
@@ -79,6 +79,14 @@ type GeoJsonPolygon = {
   geometry: { type: 'Polygon'; coordinates: [number, number][][] };
   properties: Record<string, unknown>;
 };
+
+/** Minimal Marker surface used here (B16: update in place via setLngLat). */
+interface MarkerLike {
+  remove(): void;
+  setLngLat(lngLat: [number, number]): MarkerLike;
+  on(event: string, handler: () => void): MarkerLike;
+  getLngLat(): { lat: number; lng: number };
+}
 
 function toGeoJson(polygon: GeoPolygon): GeoJsonPolygon {
   const ring: [number, number][] = polygon.map((p) => [p.lng, p.lat]);
@@ -182,7 +190,8 @@ function ensureZoneLayers(map: MapLibreMapLike): void {
   }
 }
 
-export function PlayAreaMap({
+/** Memoized (B14): setup re-renders on every poll tick — the map only re-renders when its zone / location props change. */
+export const PlayAreaMap = memo(function PlayAreaMap({
   centre,
   radiusMeters,
   shape,
@@ -199,14 +208,23 @@ export function PlayAreaMap({
 }: PlayAreaMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMapLike | null>(null);
-  const markersRef = useRef<{ remove: () => void }[]>([]);
-  const dotMarkerRef = useRef<{ remove: () => void } | null>(null);
+  // B16: markers keyed by role ('centre' + 'corner-i') and updated IN
+  // PLACE with setLngLat — the old effect removed and recreated every
+  // marker on each centre/draw change, which dropped an in-progress drag.
+  const markersRef = useRef(new Map<string, MarkerLike>());
+  const dotMarkerRef = useRef<MarkerLike | null>(null);
   const maplibreRef = useRef<typeof import('maplibre-gl') | null>(null);
   const propsRef = useRef({ centre, radiusMeters, shape, drawPoints, editable, onZoneChange });
   propsRef.current = { centre, radiusMeters, shape, drawPoints, editable, onZoneChange };
   const lastFlownRef = useRef<{ lng: number; lat: number } | null>(null);
   const lastFittedRadiusRef = useRef<number | null>(null);
   const lastLocateNonceRef = useRef(0);
+  // B16: true while the user drags the map or a marker — camera moves
+  // (fitBounds / flyTo) are skipped until the drag ends, so a 500 ms
+  // animation never fights the user's finger.
+  const draggingRef = useRef(false);
+  // B22: bumped by the Retry button — re-runs map creation.
+  const [retryNonce, setRetryNonce] = useState(0);
   const [loaded, setLoaded] = useState(false);
   // Mirrors `loaded` for the once-registered map event handlers, which
   // close over the first render. A tile failing AFTER the style loaded
@@ -221,11 +239,15 @@ export function PlayAreaMap({
   // event at all, so a load timeout covers that case too.
   const [mapError, setMapError] = useState<string | null>(null);
 
-  // Create the map once.
+  // Create the map once (B22: re-created when the user taps Retry).
   useEffect(() => {
     if (!isOlaConfigured()) return;
     let cancelled = false;
     let map: MapLibreMapLike | null = null;
+    let observer: ResizeObserver | null = null;
+    // Captured for the cleanup below (the ref itself never changes
+    // identity, but the rule wants the value copied into the effect).
+    const markers = markersRef.current;
     const loadTimer = setTimeout(() => {
       if (!cancelled) {
         setMapError(
@@ -251,6 +273,17 @@ export function PlayAreaMap({
       map = created;
       mapRef.current = created;
       maplibreRef.current = await import('maplibre-gl');
+      // B16: resize ONLY when the container's size changes — the old
+      // code called map.resize() on every centre/radius/draw change.
+      observer = new ResizeObserver(() => created.resize());
+      observer.observe(container);
+      // B16: a camera move must never fight the user's drag.
+      created.on('dragstart', () => {
+        draggingRef.current = true;
+      });
+      created.on('dragend', () => {
+        draggingRef.current = false;
+      });
       created.on('load', () => {
         if (cancelled) return;
         clearTimeout(loadTimer);
@@ -305,15 +338,17 @@ export function PlayAreaMap({
     return () => {
       cancelled = true;
       clearTimeout(loadTimer);
-      for (const m of markersRef.current) m.remove();
-      markersRef.current = [];
+      observer?.disconnect();
+      for (const m of markers.values()) m.remove();
+      markers.clear();
       dotMarkerRef.current?.remove();
       dotMarkerRef.current = null;
       map?.remove();
       mapRef.current = null;
     };
+    // Re-created only when the user taps Retry (centre is first-paint only).
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [retryNonce]);
 
   // Zone / final-ring / no-go overlays + radius auto-zoom.
   useEffect(() => {
@@ -344,7 +379,11 @@ export function PlayAreaMap({
     nogoSource?.setData(toGeoJsonCollection(noGoAreas));
     // Radius changed (or first load): zoom to fit the whole zone in view.
     // Otherwise re-centre only when the caller's centre moved (> 25 m) —
-    // free panning is never fought.
+    // free panning is never fought. B16: skipped entirely while the user
+    // is dragging (map or marker) — a 500 ms camera animation must not
+    // fight the drag — and resize() is NOT called here at all: the
+    // ResizeObserver on the container owns that now.
+    if (draggingRef.current) return;
     if (radiusMeters !== lastFittedRadiusRef.current && boundary.length >= 3) {
       map.fitBounds(boundaryBBox(boundary), { padding: 40, duration: 500 });
       lastFittedRadiusRef.current = radiusMeters;
@@ -355,82 +394,62 @@ export function PlayAreaMap({
       lastFlownRef.current = { lng: centre.lng, lat: centre.lat };
       map.flyTo({ center: [centre.lng, centre.lat], duration: 500 });
     }
-    map.resize();
   }, [loaded, centre, radiusMeters, shape, drawPoints, finalRadiusMeters, noGoAreas]);
 
   // Draggable markers: numbered corners (Draw) + centre handle (both modes).
+  // B16: markers are created once per key and MOVED with setLngLat on
+  // every centre/draw change — the old effect removed and recreated all
+  // of them on every change, which dropped an in-progress drag and
+  // re-created DOM nodes the user was holding.
   useEffect(() => {
     const map = mapRef.current;
     const maplibre = maplibreRef.current;
     if (!map || !loaded || !maplibre) return;
-    for (const m of markersRef.current) m.remove();
-    markersRef.current = [];
-    if (!editable) return;
-    const addMarker = (
-      element: HTMLElement,
+    const markers = markersRef.current;
+    if (!editable) {
+      for (const m of markers.values()) m.remove();
+      markers.clear();
+      return;
+    }
+    const getMarker = (
+      key: string,
+      element: () => HTMLElement,
       point: GeoPoint,
       onDragEnd: (next: GeoPoint) => void,
-    ): void => {
+    ): MarkerLike => {
+      const existing = markers.get(key);
+      if (existing) {
+        existing.setLngLat([point.lng, point.lat]);
+        return existing;
+      }
+      const el = element();
       // A click on a marker must not also count as a map tap (which
       // would place a corner / move the centre under the marker).
-      element.addEventListener('click', (event) => event.stopPropagation());
-      const marker = new maplibre.Marker({ element, draggable: true })
+      el.addEventListener('click', (event) => event.stopPropagation());
+      const marker = new maplibre.Marker({ element: el, draggable: true })
         .setLngLat([point.lng, point.lat])
-        .addTo(map as unknown as import('maplibre-gl').Map);
+        .addTo(map as unknown as import('maplibre-gl').Map) as unknown as MarkerLike;
+      marker.on('dragstart', () => {
+        draggingRef.current = true;
+      });
       marker.on('dragend', () => {
+        draggingRef.current = false;
         const ll = marker.getLngLat();
         onDragEnd({ lat: ll.lat, lng: ll.lng });
       });
-      markersRef.current.push(marker);
+      markers.set(key, marker);
+      return marker;
     };
     // Centre handle: moves the centre (Circle) or the whole drawn shape (Draw).
-    const handle = document.createElement('div');
-    handle.textContent = '↔';
-    handle.setAttribute('aria-label', 'Move zone');
-    Object.assign(handle.style, {
-      width: '28px',
-      height: '28px',
-      borderRadius: '999px',
-      background: '#EF4444',
-      color: '#fff',
-      border: '2px solid #fff',
-      display: 'flex',
-      alignItems: 'center',
-      justifyContent: 'center',
-      fontSize: '14px',
-      cursor: 'grab',
-    });
-    addMarker(handle, centre, (next) => {
-      const p = propsRef.current;
-      if (p.shape === 'draw') {
-        const dLatM = (next.lat - p.centre.lat) * METERS_PER_DEG_LAT;
-        const dLngM =
-          (next.lng - p.centre.lng) * metersPerDegreeLng(p.centre.lat);
-        const moved = offsetPolygon(drawPointsToBoundary(p.drawPoints), dLngM, dLatM);
-        p.onZoneChange({
-          centre: next,
-          radiusMeters: p.radiusMeters,
-          shape: 'draw',
-          drawPoints: moved,
-        });
-      } else {
-        p.onZoneChange({
-          centre: next,
-          radiusMeters: p.radiusMeters,
-          shape: 'circle',
-          drawPoints: [],
-        });
-      }
-    });
-    // Numbered corners, Draw mode only.
-    if (shape === 'draw') {
-      drawPoints.forEach((point, index) => {
-        const el = document.createElement('div');
-        el.textContent = String(index + 1);
-        el.setAttribute('aria-label', `Corner ${index + 1}`);
-        Object.assign(el.style, {
-          width: '26px',
-          height: '26px',
+    getMarker(
+      'centre',
+      () => {
+        const handle = document.createElement('div');
+        handle.textContent = '↔';
+        handle.setAttribute('aria-label', 'Move zone');
+        Object.assign(handle.style, {
+          width: '28px',
+          height: '28px',
           borderRadius: '999px',
           background: '#EF4444',
           color: '#fff',
@@ -438,40 +457,106 @@ export function PlayAreaMap({
           display: 'flex',
           alignItems: 'center',
           justifyContent: 'center',
-          fontSize: '13px',
-          fontWeight: '700',
+          fontSize: '14px',
           cursor: 'grab',
         });
-        addMarker(el, point, (next) => {
-          const p = propsRef.current;
-          const nextPoints = [...p.drawPoints];
-          nextPoints[index] = next;
+        return handle;
+      },
+      centre,
+      (next) => {
+        const p = propsRef.current;
+        if (p.shape === 'draw') {
+          const dLatM = (next.lat - p.centre.lat) * METERS_PER_DEG_LAT;
+          const dLngM =
+            (next.lng - p.centre.lng) * metersPerDegreeLng(p.centre.lat);
+          const moved = offsetPolygon(drawPointsToBoundary(p.drawPoints), dLngM, dLatM);
           p.onZoneChange({
-            centre: p.centre,
+            centre: next,
             radiusMeters: p.radiusMeters,
             shape: 'draw',
-            drawPoints: nextPoints,
+            drawPoints: moved,
           });
-        });
+        } else {
+          p.onZoneChange({
+            centre: next,
+            radiusMeters: p.radiusMeters,
+            shape: 'circle',
+            drawPoints: [],
+          });
+        }
+      },
+    );
+    // Numbered corners, Draw mode only.
+    if (shape === 'draw') {
+      drawPoints.forEach((point, index) => {
+        getMarker(
+          `corner-${index}`,
+          () => {
+            const el = document.createElement('div');
+            el.textContent = String(index + 1);
+            el.setAttribute('aria-label', `Corner ${index + 1}`);
+            Object.assign(el.style, {
+              width: '26px',
+              height: '26px',
+              borderRadius: '999px',
+              background: '#EF4444',
+              color: '#fff',
+              border: '2px solid #fff',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              fontSize: '13px',
+              fontWeight: '700',
+              cursor: 'grab',
+            });
+            return el;
+          },
+          point,
+          (next) => {
+            const p = propsRef.current;
+            const nextPoints = [...p.drawPoints];
+            nextPoints[index] = next;
+            p.onZoneChange({
+              centre: p.centre,
+              radiusMeters: p.radiusMeters,
+              shape: 'draw',
+              drawPoints: nextPoints,
+            });
+          },
+        );
       });
     }
-    return () => {
-      for (const m of markersRef.current) m.remove();
-      markersRef.current = [];
-    };
+    // Drop corners that no longer exist (Undo / Start again / − stepper
+    // only ever remove from the end, so surviving indices keep their
+    // marker — and their drag — intact).
+    for (const key of [...markers.keys()]) {
+      if (key === 'centre') continue;
+      const index = Number(key.slice('corner-'.length));
+      if (shape !== 'draw' || Number.isNaN(index) || index >= drawPoints.length) {
+        markers.get(key)?.remove();
+        markers.delete(key);
+      }
+    }
   }, [loaded, editable, shape, drawPoints, centre]);
 
   // Live location dot (orange, ShadowHunt style) — follows the fix, never
   // moves the camera on its own; only a target-button tap flies to it.
+  // B16: the dot marker is created once and MOVED with setLngLat —
+  // the old effect removed and recreated it on every fix.
   useEffect(() => {
     const map = mapRef.current;
     const maplibre = maplibreRef.current;
-    if (!map || !loaded || !maplibre || !userLocation) {
+    if (!map || !loaded || !maplibre) return;
+    if (!userLocation) {
       dotMarkerRef.current?.remove();
       dotMarkerRef.current = null;
       return;
     }
-    dotMarkerRef.current?.remove();
+    const existing = dotMarkerRef.current;
+    if (existing) {
+      existing.setLngLat([userLocation.lng, userLocation.lat]);
+      return;
+    }
     const el = document.createElement('div');
     el.setAttribute('aria-label', 'Your location');
     Object.assign(el.style, {
@@ -484,12 +569,8 @@ export function PlayAreaMap({
     });
     const marker = new maplibre.Marker({ element: el })
       .setLngLat([userLocation.lng, userLocation.lat])
-      .addTo(map as unknown as import('maplibre-gl').Map);
+      .addTo(map as unknown as import('maplibre-gl').Map) as unknown as MarkerLike;
     dotMarkerRef.current = marker;
-    return () => {
-      marker.remove();
-      dotMarkerRef.current = null;
-    };
   }, [loaded, userLocation]);
 
   // Target-button tap: fly to the live location dot. The nonce guard keeps
@@ -502,27 +583,50 @@ export function PlayAreaMap({
     map.flyTo({ center: [userLocation.lng, userLocation.lat], duration: 500 });
   }, [locateNonce, loaded, userLocation]);
 
+  // B22: tear the map down and build it again — the container stays
+  // mounted, so a retry can always paint into it (the old error path
+  // unmounted the container, so no retry could ever work).
+  const retryMap = (): void => {
+    setMapError(null);
+    setLoaded(false);
+    loadedRef.current = false;
+    setMapReady(isOlaConfigured());
+    setRetryNonce((n) => n + 1);
+  };
+
+  // B22: the container stays mounted in EVERY state (no-key / error
+  // included) — failure UI is an overlay on top of it, with a Retry
+  // button, exactly like PlayMap. The old early returns unmounted the
+  // container on error, so a late load could never paint again.
   if (!mapReady) {
     return (
-      <div
-        className="flex w-full items-center justify-center rounded-[16px] border border-[#26262B] bg-[#141416] px-4 text-center text-[13px] text-[#A1A1AA]"
-        style={{ height }}
-        role="status"
-      >
-        Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.
-      </div>
-    );
-  }
-
-  if (mapError) {
-    return (
-      <div
-        className="flex w-full flex-col items-center justify-center gap-2 rounded-[16px] border border-[#26262B] bg-[#141416] px-4 text-center"
-        style={{ height }}
-        role="alert"
-      >
-        <p className="text-[15px] font-bold text-white">Map load failed</p>
-        <p className="text-[13px] text-[#A1A1AA]">{mapError}</p>
+      <div>
+        <div className="relative">
+          <div
+            ref={containerRef}
+            className="w-full overflow-hidden rounded-[16px] border border-[#26262B] bg-[#141416]"
+            style={{ height }}
+            aria-label="Play zone map"
+          />
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-[16px] bg-[#141416]/95 px-4 text-center">
+            <p className="text-[15px] font-bold text-white">Map needs an Ola Maps key</p>
+            <p className="text-[13px] text-[#A1A1AA]">
+              Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.
+            </p>
+            <button
+              type="button"
+              onClick={retryMap}
+              className="mt-1 rounded-full bg-white px-4 py-2 text-[14px] font-bold text-black"
+            >
+              Retry map
+            </button>
+          </div>
+        </div>
+        <p className="mt-2 text-[13px] text-[#A1A1AA]">
+          {shape === 'draw'
+            ? `Tap the map to place numbered corners — 3 taps make a triangle. (${drawPoints.length} placed)`
+            : 'Tap the map to move the zone centre.'}
+        </p>
       </div>
     );
   }
@@ -536,6 +640,22 @@ export function PlayAreaMap({
           style={{ height }}
           aria-label="Play zone map"
         />
+        {mapError ? (
+          <div
+            className="absolute inset-0 flex flex-col items-center justify-center gap-2 rounded-[16px] bg-[#141416]/95 px-4 text-center"
+            role="alert"
+          >
+            <p className="text-[15px] font-bold text-white">Map load failed</p>
+            <p className="text-[13px] text-[#A1A1AA]">{mapError}</p>
+            <button
+              type="button"
+              onClick={retryMap}
+              className="mt-1 rounded-full bg-white px-4 py-2 text-[14px] font-bold text-black"
+            >
+              Retry map
+            </button>
+          </div>
+        ) : null}
         <button
           type="button"
           onClick={() => onLocate?.()}
@@ -569,4 +689,4 @@ export function PlayAreaMap({
       </p>
     </div>
   );
-}
+});

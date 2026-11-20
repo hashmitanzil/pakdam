@@ -31,22 +31,39 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
 
   // Scores (P1-27): live calls GET /v1/rooms/:id/results (the server
   // computes them); demo scores locally with the same engine rule.
+  // B24: the fetch starts in parallel with the room-state first paint
+  // (on mount, not after `result` lands) — it used to wait for the
+  // room state and then run a second sequential GET. A 404 just means
+  // no result exists yet; the effect re-runs when `result` arrives.
   const [liveScores, setLiveScores] = useState<Record<string, number> | null>(null);
   const [scoresError, setScoresError] = useState<string | null>(null);
+  // Retry nonce: re-runs the fetch below after a scores failure.
+  const [scoresRetryNonce, setScoresRetryNonce] = useState(0);
   useEffect(() => {
-    if (mode !== 'live' || !result || !session?.reconnectToken) return;
+    if (mode !== 'live' || !session?.reconnectToken) return;
+    if (liveScores) return;
     let cancelled = false;
     fetchLiveResults(roomId, session.playerId, session.reconnectToken)
       .then((res) => {
         if (!cancelled) setLiveScores(res.scores);
       })
-      .catch(() => {
-        if (!cancelled) setScoresError('Scores could not be loaded.');
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        // 404 = no result recorded yet (match still running) — not an
+        // error; the effect re-runs when `result` lands. Once a result
+        // exists, a 404 is a real scores failure.
+        if (err instanceof Error && 'status' in err && (err as { status: number }).status === 404 && !result) return;
+        setScoresError('Scores could not be loaded.');
       });
     return () => {
       cancelled = true;
     };
-  }, [mode, result, roomId, session?.playerId, session?.reconnectToken]);
+  }, [mode, result, roomId, session?.playerId, session?.reconnectToken, liveScores, scoresRetryNonce]);
+
+  const retryScores = () => {
+    setScoresError(null);
+    setScoresRetryNonce((n) => n + 1);
+  };
 
   const demoScores = useMemo(() => {
     if (mode !== 'demo' || !demo || !result) return null;
@@ -226,7 +243,9 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
       <p className="text-[15px] text-[#A1A1AA]">{stats}</p>
 
       {/* Scores (P1-27): the server computes them (GET …/results); the
-          page never called the endpoint before. Highest first. */}
+          page never called the endpoint before. Highest first. While
+          they load, a skeleton holds the space (B24) instead of the
+          section popping in after the room state. */}
       {scores ? (
         <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
           <h2 className="mb-3 text-[18px] font-bold text-white">Scores</h2>
@@ -254,7 +273,24 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
           </ul>
         </div>
       ) : scoresError ? (
-        <p className="text-[14px] text-[#A1A1AA]">{scoresError}</p>
+        <div className="flex flex-col gap-3 rounded-2xl border border-[#26262B] bg-[#141416] p-4">
+          <p className="text-[14px] text-[#A1A1AA]">{scoresError}</p>
+          <Button variant="outline" onClick={retryScores}>
+            Retry
+          </Button>
+        </div>
+      ) : mode === 'live' ? (
+        <div
+          className="rounded-2xl border border-[#26262B] bg-[#141416] p-4"
+          aria-label="Loading scores"
+        >
+          <div className="mb-3 h-5 w-20 animate-pulse rounded bg-[#1E1E22]" />
+          <div className="flex flex-col gap-2">
+            <div className="h-5 w-full animate-pulse rounded bg-[#1E1E22]" />
+            <div className="h-5 w-4/5 animate-pulse rounded bg-[#1E1E22]" />
+            <div className="h-5 w-3/5 animate-pulse rounded bg-[#1E1E22]" />
+          </div>
+        </div>
       ) : null}
 
       {/* What happened — max 6, newest last. */}

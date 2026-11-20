@@ -20,7 +20,7 @@ import {
   type WsSnapshotPayload,
 } from '@pakdam/shared';
 import { getWorkerUrl } from './websocket';
-import { getSessionForRoom, storeLiveSeat } from './session-credentials';
+import { clearHostToken, getSessionForRoom, storeLiveSeat } from './session-credentials';
 import { fetchHostToken, LiveHttpError, liveErrorMessage, readLiveErrorMessage } from './live-client';
 import type { PakdamSocket } from './websocket';
 
@@ -66,15 +66,39 @@ async function postHost<T>(
 ): Promise<T> {
   const workerUrl = getWorkerUrl();
   if (!workerUrl) throw new Error('Live transport is not configured.');
-  const response = await fetch(`${workerUrl}/v1/rooms/${roomId}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    throw new LiveHttpError(response.status, await readLiveErrorMessage(response));
+  const doPost = async (payload: Record<string, unknown>): Promise<T> => {
+    const response = await fetch(`${workerUrl}/v1/rooms/${roomId}${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+      throw new LiveHttpError(response.status, await readLiveErrorMessage(response));
+    }
+    return (await response.json()) as T;
+  };
+  try {
+    return await doPost(body);
+  } catch (err) {
+    // Stale host token: the background mint rotates it, so a cached
+    // token can die (two tabs, a rejoin) and every retry with the same
+    // token 403s again. Drop the dead token, mint once, retry once.
+    // A failed re-mint surfaces the ORIGINAL 403, not the mint error.
+    if (
+      err instanceof LiveHttpError &&
+      err.status === 403 &&
+      typeof body.hostToken === 'string'
+    ) {
+      try {
+        clearHostToken(roomId);
+        const fresh = await getHostTokenLive(roomId);
+        return await doPost({ ...body, hostToken: fresh });
+      } catch {
+        throw err;
+      }
+    }
+    throw err;
   }
-  return (await response.json()) as T;
 }
 
 /** Recover the host token when the stored one is missing (join never returns one). */

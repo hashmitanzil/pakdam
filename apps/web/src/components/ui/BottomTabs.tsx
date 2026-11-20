@@ -41,7 +41,7 @@ export const BottomTabs = memo(function BottomTabs({ active, onChange, radioUnre
               type="button"
               aria-current={isActive ? 'page' : undefined}
               onClick={() => onChange(tab.id)}
-              className={`relative flex h-16 flex-col items-center justify-center gap-1 ${
+              className={`relative flex h-16 flex-col items-center justify-center gap-1 transition-transform active:scale-95 active:bg-white/5 ${
                 isActive
                   ? 'bg-[rgba(239,68,68,0.15)] text-[#EF4444]'
                   : 'text-[#A1A1AA]'

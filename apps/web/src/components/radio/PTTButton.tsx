@@ -6,10 +6,13 @@
  * The mic track is disabled except while held. Renders nothing when there
  * is no live voice radio (demo mode has no signalling channel, so there is
  * no one to talk to — text radio still works there).
+ *
+ * B18: the 250 ms burst counter lives HERE, in local state — it used to
+ * live in the play page and re-render the whole page 4×/s while talking.
  */
 'use client';
 
-import { memo } from 'react';
+import { memo, useEffect, useState } from 'react';
 import type { PointerEvent as ReactPointerEvent } from 'react';
 import type { VoiceRadio, PttState } from '@/lib/voice-radio';
 import { formatAgeLabel } from '@pakdam/shared';
@@ -18,8 +21,6 @@ export interface PTTButtonProps {
   /** Live voice radio, or null in demo mode (renders nothing). */
   radio: VoiceRadio | null;
   pttState: PttState;
-  /** Seconds into the current burst. */
-  burstSeconds: number;
   size?: 'large' | 'small';
   disabled?: boolean;
 }
@@ -29,10 +30,22 @@ export interface PTTButtonProps {
 export const PTTButton = memo(function PTTButton({
   radio,
   pttState,
-  burstSeconds,
   size = 'large',
   disabled = false,
 }: PTTButtonProps) {
+  // B18: burst elapsed, counted locally at 250 ms while talking — only
+  // this button re-renders, never the page.
+  const [burstSeconds, setBurstSeconds] = useState(0);
+  useEffect(() => {
+    if (pttState !== 'talking' || !radio) {
+      setBurstSeconds(0);
+      return;
+    }
+    const timer = window.setInterval(() => {
+      setBurstSeconds(radio.burstElapsedSeconds());
+    }, 250);
+    return () => window.clearInterval(timer);
+  }, [pttState, radio]);
   if (!radio) return null;
   const talking = pttState === 'talking';
   const dims = size === 'large' ? 'h-16 w-16 text-[26px]' : 'h-12 w-12 text-[20px]';

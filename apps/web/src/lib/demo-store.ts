@@ -1024,6 +1024,59 @@ export function hostCheckin(demo: DemoRoom, playerId: string, text: string): voi
  * room or null. Callers navigate to /play when `phase` leaves LOBBY —
  * guarded to fire once (see `watchDemoPhase`).
  */
+/**
+ * Cheap change key for a demo room (B13/B14): a small string built from
+ * the fields the UI actually reads, WITHOUT stringifying the whole room
+ * (whose zone boundary alone is a long coordinate list). `room.version`
+ * only bumps on a few mutations (config save, phase set, shrink, end),
+ * so the key also covers every field other mutations touch without a
+ * version bump: ready/connection/fix/left/ejected per player, catch
+ * states, ping ids, announcements, and the team-pick fields
+ * `setTeamAssignment` / `setSelectedHunters` change without bumping the
+ * version. Two polls with the same key mean nothing the UI reads
+ * changed, so the caller can skip its re-render outright; a different
+ * key means "maybe changed" and the caller falls back to the full
+ * JSON comparison before applying.
+ */
+export function demoRoomChangeKey(demo: DemoRoom | null): string {
+  if (!demo) return 'null';
+  const { room } = demo;
+  const players = demo.players
+    .map(
+      (p) =>
+        `${p.playerId}|${p.displayName}|${p.team ?? ''}|${p.matchRole ?? ''}|${p.isReady ? 1 : 0}|${p.connectionState}|${p.lastFixAt ?? ''}|${p.leftAt ?? ''}|${p.ejectedAt ?? ''}|${p.isHost ? 1 : 0}`,
+    )
+    .join(';');
+  const catches = demo.catches
+    .map((c) => `${c.catchId}:${c.state}:${c.confirmedAt ?? ''}:${c.disputedAt ?? ''}`)
+    .join(';');
+  const pings = demo.pings.map((p) => `${p.pingId}:${p.createdAt}`).join(';');
+  const announcements = demo.announcements
+    .map((a) => `${a.sentAt}:${a.byPlayerId}:${a.text}`)
+    .join(';');
+  return [
+    room.version,
+    room.phase,
+    room.roomCode,
+    room.hostPlayerId,
+    room.startedAt ?? '',
+    room.endsAt ?? '',
+    room.pausedAt ?? '',
+    room.result ? JSON.stringify(room.result) : '',
+    room.config.teamAssignment,
+    room.config.selectedHunterIds.join(','),
+    room.config.hunterCount,
+    demo.sosActive ? 1 : 0,
+    demo.pausedFrom ?? '',
+    demo.appliedShrinks,
+    JSON.stringify(demo.lastPingAtMs),
+    players,
+    catches,
+    pings,
+    announcements,
+  ].join('~');
+}
+
 export function pollDemoRoom(roomId: string): DemoRoom | null {
   return getRoom(roomId);
 }

@@ -18,7 +18,7 @@ import {
   type RoomConfig,
 } from '@pakdam/shared';
 import { getWorkerUrl, isLiveTransportEnabled } from './websocket';
-import { getSessionForRoom, storeLiveSeat, type PakdamSession } from './session-credentials';
+import { clearHostToken, getSessionForRoom, storeLiveSeat, type PakdamSession } from './session-credentials';
 
 export { isLiveTransportEnabled, getWorkerUrl };
 export { DEFAULT_ROOM_CONFIG };
@@ -191,6 +191,72 @@ export async function joinLiveRoom(
     roomCode: roomCode.trim().toUpperCase(),
   };
   storeLiveSeat(session);
+  // A2: join never returns a host token, so a host who rejoined in a
+  // fresh tab used to pay a second round-trip (POST /host/token) on
+  // every host action — including START. Mint it here, in the
+  // background, so by the time the host taps START the token is already
+  // cached and START is a single POST. Non-blocking: a mint failure
+  // just leaves the lazy path (`getHostTokenLive`) to run at START.
+  // `storeLiveSeat` keeps a good stored reconnect token when the join
+  // returned an empty one, so the stored seat is read back for the mint.
+  if (data.player.isHost) {
+    const stored = getSessionForRoom(roomId);
+    if (stored && !stored.hostToken && stored.reconnectToken) {
+      void fetchHostToken(roomId, stored.playerId, stored.reconnectToken)
+        .then((hostToken) => storeLiveSeat({ ...stored, hostToken }))
+        .catch(() => undefined);
+    }
+  }
+  return session;
+}
+
+/**
+ * POST /v1/rooms/join-by-code — join by code in ONE call (Phase 3 #9):
+ * the server resolves the code to a roomId itself, so the client no
+ * longer does GET by-code THEN POST join. `reconnectToken` is forwarded
+ * only when this tab already holds a live session for this code under
+ * the same display name (seat restore — look it up with
+ * getSessionForRoomCode first). A restored seat returns an EMPTY
+ * reconnect token — `storeLiveSeat` keeps the good stored one.
+ */
+export async function joinLiveRoomByCode(
+  displayName: string,
+  roomCode: string,
+  reconnectToken?: string,
+): Promise<PakdamSession> {
+  if (!isValidDisplayName(displayName)) {
+    throw new Error('Enter a name between 1 and 30 characters.');
+  }
+  const code = roomCode.trim().toUpperCase();
+  const data = await postJson<JoinRoomResponse & { roomId: string }>('/v1/rooms/join-by-code', {
+    displayName: displayName.trim(),
+    kind: 'guest',
+    roomCode: code,
+    ...(reconnectToken ? { reconnectToken } : {}),
+  });
+  const session: PakdamSession = {
+    mode: 'live',
+    roomId: data.roomId,
+    playerId: data.player.playerId,
+    displayName: displayName.trim(),
+    reconnectToken: data.reconnectToken,
+    isHost: data.player.isHost,
+    roomCode: code,
+  };
+  storeLiveSeat(session);
+  // A2 (same background mint as joinLiveRoom — this is the join path
+  // both join pages actually use): a host who joined in a fresh tab
+  // mints the host token now, so START is a single POST by the time
+  // the host taps it. Non-blocking; a mint failure just leaves the
+  // lazy path (`getHostTokenLive`) to run at START.
+  if (data.player.isHost) {
+    const stored = getSessionForRoom(data.roomId);
+    if (stored && !stored.hostToken && stored.reconnectToken) {
+      void fetchHostToken(data.roomId, stored.playerId, stored.reconnectToken)
+        .then((hostToken) => storeLiveSeat({ ...stored, hostToken }))
+        .catch(() => undefined);
+    }
+  }
   return session;
 }
 
@@ -273,12 +339,30 @@ async function getHostTokenForRoom(roomId: string): Promise<{ playerId: string; 
  * redirects to results.
  */
 export async function endLiveMatch(roomId: string): Promise<{ ok: boolean }> {
-  const { playerId, hostToken } = await getHostTokenForRoom(roomId);
-  return postJson<{ ok: boolean }>(`/v1/rooms/${roomId}/lifecycle`, {
-    action: 'end',
-    playerId,
-    hostToken,
-  });
+  const send = async (): Promise<{ ok: boolean }> => {
+    const { playerId, hostToken } = await getHostTokenForRoom(roomId);
+    return postJson<{ ok: boolean }>(`/v1/rooms/${roomId}/lifecycle`, {
+      action: 'end',
+      playerId,
+      hostToken,
+    });
+  };
+  try {
+    return await send();
+  } catch (err) {
+    // Stale host token (rotated by the background mint): drop the dead
+    // token, mint once, retry once. A failed re-mint surfaces the
+    // original error, not the mint error.
+    if (err instanceof LiveHttpError && err.status === 403) {
+      try {
+        clearHostToken(roomId);
+        return await send();
+      } catch {
+        throw err;
+      }
+    }
+    throw err;
+  }
 }
 
 /**

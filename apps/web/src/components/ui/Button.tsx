@@ -15,7 +15,7 @@ export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
 }
 
 const base =
-  'inline-flex w-full items-center justify-center gap-2 rounded-[14px] px-4 text-[17px] font-bold leading-none transition-colors select-none';
+  'inline-flex w-full items-center justify-center gap-2 rounded-[14px] px-4 text-[17px] font-bold leading-none transition-colors select-none active:scale-95';
 
 const variants: Record<ButtonVariant, string> = {
   primary:

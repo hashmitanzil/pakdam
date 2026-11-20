@@ -5,7 +5,7 @@
  * with at most one short hint. No presets, no extra blocks.
  * All number settings are ShadowHunt-style − / + steppers — no sliders.
  */
-import type { ReactNode } from 'react';
+import { memo, type ReactNode } from 'react';
 import {
   SHRINK_INTERVAL_MINUTES_GRID,
   balancedHunterCount,
@@ -44,7 +44,8 @@ function row(label: string, value: string, control: ReactNode, hint?: string) {
 }
 
 /** Rules steppers + shrink + play-zone toggle (SCRAM-SPEC §5d–§5e). */
-export function RulesControls({ config, isHost, onChange }: SetupControlsProps) {
+/** Memoized (B14): setup re-renders on every poll tick — the controls only re-render when the config or host state changes. */
+export const RulesControls = memo(function RulesControls({ config, isHost, onChange }: SetupControlsProps) {
   const set = (patch: Partial<RoomConfig>): void => onChange({ ...config, ...patch });
   const pingsOff = config.pingIntervalSeconds === 0;
   const zoneOff = config.playZoneEnabled === false;
@@ -148,10 +149,10 @@ export function RulesControls({ config, isHost, onChange }: SetupControlsProps) 
       </div>
     </section>
   );
-}
+});
 
 /** Team toggles — host-controlled teams only (SCRAM-SPEC §1, §5f). */
-export function TeamControls({
+export const TeamControls = memo(function TeamControls({
   config,
   activePlayerCount,
   isHost,
@@ -242,4 +243,4 @@ export function TeamControls({
       */}
     </section>
   );
-}
+});

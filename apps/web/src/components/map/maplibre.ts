@@ -309,6 +309,31 @@ export async function createOlaMap(
 }
 
 /**
+ * Prefetch the map assets at idle time (B21): the lazy `maplibre-gl`
+ * chunk (~1 MB) and the cleaned Ola style JSON, so the first map paint
+ * on setup / play does not pay the serial style-fetch → chunk → tiles
+ * wait. Warms the browser cache only — constructing the map still goes
+ * through `createOlaMap`. Runs once per page load, only when an Ola key
+ * is configured; failures are swallowed (the map path retries on its own).
+ */
+let mapAssetsPrefetched = false;
+export function prefetchMapAssets(): void {
+  if (mapAssetsPrefetched || typeof window === 'undefined' || !isOlaConfigured()) return;
+  mapAssetsPrefetched = true;
+  const run = (): void => {
+    void import('maplibre-gl').catch(() => undefined);
+    void fetchCleanedOlaStyle().catch(() => undefined);
+  };
+  const idle = (
+    window as unknown as {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
+    }
+  ).requestIdleCallback;
+  if (typeof idle === 'function') idle(run, { timeout: 3000 });
+  else window.setTimeout(run, 500);
+}
+
+/**
  * Re-centre only when the fix moved > 25 m or accuracy at least halved —
  * otherwise the camera stays put so the player can pan freely.
  */

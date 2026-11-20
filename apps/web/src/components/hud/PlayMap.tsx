@@ -375,11 +375,33 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, nextZoneBoundary, n
       }),
     [pings],
   );
-  // Live reveals only — expiry filtering is the one thing the 1 s clock
-  // drives here, so it lives in its own memo, not in the overlay effects.
+  // Live reveals only — B17: the features rebuild ONLY when the SET
+  // of reveals changes, never on the 1 s clock. Expiry is handled by
+  // one timeout per nearest expiry (below), not by re-filtering every
+  // tick; the "X revealed" label on the play page still drops at the
+  // exact second, since that is render-only text.
+  const [revealEpoch, setRevealEpoch] = useState(0);
+  useEffect(() => {
+    const now = Date.now();
+    const nextExpiry = Math.min(
+      ...reveals
+        .map((r) => r.expiresAtMs)
+        .filter((t) => t > now),
+    );
+    if (!Number.isFinite(nextExpiry)) return;
+    const timer = setTimeout(
+      () => setRevealEpoch((n) => n + 1),
+      Math.max(0, nextExpiry - now),
+    );
+    return () => clearTimeout(timer);
+    // Re-arms when the set changes or an expiry fires.
+  }, [reveals, revealEpoch]);
   const liveReveals = useMemo(
-    () => reveals.filter((r) => nowMs === undefined || r.expiresAtMs > nowMs),
-    [reveals, nowMs],
+    () => reveals.filter((r) => r.expiresAtMs > Date.now()),
+    // revealEpoch is intentionally a dep: it re-runs this memo when an
+    // expiry fires, even though the body reads the clock directly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [reveals, revealEpoch],
   );
   const revealFeatures = useMemo(
     () =>

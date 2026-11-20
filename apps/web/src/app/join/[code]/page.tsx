@@ -3,15 +3,15 @@
 /**
  * Deep-link join — the code comes from the URL (`/join/<CODE>`), the
  * player only enters a codename, JOIN → the lobby. Guest-only, no login.
- * Same join path as /join (PROTOCOL-MAP §1.2–1.3).
+ * Same one-call join path as /join (PROTOCOL-MAP §1.2–1.3).
  */
 import { useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import { isValidDisplayName, isValidRoomCode } from '@pakdam/shared';
 import { isLiveTransportEnabled } from '../../../lib/websocket';
-import { joinLiveRoom, resolveRoomByCode } from '../../../lib/live-client';
+import { joinLiveRoomByCode } from '../../../lib/live-client';
 import { getRoomByCode, joinRoom as joinDemoRoom } from '../../../lib/demo-store';
-import { getSessionForRoom, storeDemoSeat } from '../../../lib/session-credentials';
+import { getSessionForRoomCode, storeDemoSeat } from '../../../lib/session-credentials';
 
 export default function JoinByCodePage() {
   const router = useRouter();
@@ -36,13 +36,12 @@ export default function JoinByCodePage() {
     setJoining(true);
     try {
       if (isLiveTransportEnabled()) {
-        const { roomId } = await resolveRoomByCode(code);
-        const existing = getSessionForRoom(roomId);
+        const existing = getSessionForRoomCode(code);
         const restoreToken =
           existing?.displayName?.toLowerCase() === name.toLowerCase()
             ? existing.reconnectToken
             : undefined;
-        const session = await joinLiveRoom(roomId, name, code, restoreToken);
+        const session = await joinLiveRoomByCode(name, code, restoreToken);
         router.push(`/room/${session.roomId}`);
       } else {
         const demo = getRoomByCode(code);

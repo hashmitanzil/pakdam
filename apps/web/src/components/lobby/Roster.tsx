@@ -10,7 +10,7 @@
  * card is empty dark space (ShadowHunt form — the emptiness is the
  * design, so this component renders no empty-state copy).
  */
-import { useState } from 'react';
+import { memo, useState } from 'react';
 import type { PlayerView } from '@pakdam/shared';
 import { Pill } from '../ui/Pill';
 import { initialsForName } from '../../lib/utils';
@@ -36,7 +36,8 @@ function freshnessLabel(player: PlayerView): string {
   return locationFreshnessLabel(new Date(player.lastFixAt).getTime());
 }
 
-export function Roster({
+/** Memoized (B14): the lobby re-renders on every poll tick — the roster only re-renders when its players or handlers change. */
+export const Roster = memo(function Roster({
   players,
   hostPlayerId,
   myPlayerId,
@@ -189,4 +190,4 @@ export function Roster({
       ) : null}
     </ul>
   );
-}
+});

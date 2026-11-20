@@ -9,25 +9,42 @@ visual assertions** anywhere in the suite.
 
 ```bash
 cd apps/web
-npm run test:e2e            # runs `playwright test` (starts `next dev` if needed)
+pnpm run build             # build first — the suite runs against the PRODUCTION server
+pnpm run test:e2e          # runs `playwright test` (starts `next start` if needed)
 npx playwright test e2e/smoke.spec.ts
 ```
 
-The config (`../playwright.config.ts`) starts `npm run dev` on port 3000
+The config (`../playwright.config.ts`) starts `next start` on port 3000
 unless a server is already running there (`reuseExistingServer: true`).
-Set `PLAYWRIGHT_BASE_URL` to point at a different server.
+It builds first only when no `.next` exists yet, so a clean checkout
+still runs with one command. Set `PLAYWRIGHT_BASE_URL` to point at a
+different server.
+
+> **Delete `.next` after any env change.** A stale build silently bakes
+> the old `NEXT_PUBLIC_*` values (`NEXT_PUBLIC_WORKER_URL`, the Ola key)
+> into the bundle, while the helpers' `LIVE` / `OLA_KEY_SET` flags are
+> read from the test process env at run time — the two disagree and the
+> specs fail confusingly. CI is safe (it builds fresh with explicit env
+> before the tests run).
+
+Why production, not `next dev`: dev mode uses eval() for source maps /
+fast refresh, which violates this app's CSP (`script-src 'self'
+'unsafe-inline'`, no `'unsafe-eval'`) and floods every page with page
+errors. Production Next.js never evals, so the violation disappears with
+NO CSP weakening — the production CSP is untouched. Do NOT "fix" a
+reappearing eval error by adding `'unsafe-eval'` to the production CSP.
 
 ## Demo vs live
 
-The app is demo or live depending on `NEXT_PUBLIC_WORKER_URL` **at the
-time the dev server starts** — it is baked into the client bundle, so the
-variable must be set before the server starts, and the test process must
-see the same value.
+The app is demo or live depending on `NEXT_PUBLIC_WORKER_URL` **at BUILD
+time** — it is baked into the client bundle, so the variable must be set
+before `pnpm run build`, and the test process must see the same value
+(the helpers' `LIVE` flag reads the test process's environment).
 
 | Run | Command | What runs |
 | --- | --- | --- |
-| Demo (default) | `npm run test:e2e` with no Worker URL set | All demo specs. Live specs skip. |
-| Live | `NEXT_PUBLIC_WORKER_URL=https://<worker> npm run test:e2e` (server started with the same variable) | The live specs in `join-lobby.spec.ts` and `session-restore.spec.ts`. Demo specs skip. |
+| Demo (default) | `pnpm run test:e2e` with no Worker URL set | All demo specs. Live specs skip. |
+| Live | `NEXT_PUBLIC_WORKER_URL=https://<worker> pnpm run build` then `pnpm run test:e2e` with the same variable set | The live specs in `join-lobby.spec.ts` and `session-restore.spec.ts`. Demo specs skip. |
 
 The two modes are mutually exclusive in one run because the mode is
 app-global: a demo spec cannot run against a live server and vice versa.
@@ -41,19 +58,19 @@ Map specs skip cleanly when no key is configured — the VM has none:
 
 | Run | What runs |
 | --- | --- |
-| No key (default) | `map-tiles.spec.ts` "no Ola key" tests: the one-line missing-key banners in the lobby (`Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.`) and on play (`Map needs an Ola key — the game still works without it.`). The with-key tests skip. |
-| Key set | `NEXT_PUBLIC_OLA_MAPS_API_KEY=<key> npm run test:e2e` (server started with the same variable): canvas-mount, Draw tap-to-place, and no-go tests run; the no-key tests skip. These need network access to `api.olamaps.io`. |
+| No key (default) | `map-tiles.spec.ts` "no Ola key" tests: the one-line missing-key banner on the **setup screen** (`Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.` — the lobby has no map) and on play (`Map needs an Ola key — the game still works without it.`). The with-key tests skip. |
+| Key set | `NEXT_PUBLIC_OLA_MAPS_API_KEY=<key> pnpm run build` then `pnpm run test:e2e` with the same variable set: canvas-mount, Draw tap-to-place, and no-go tests run; the no-key tests skip. These need network access to `api.olamaps.io`. The key is baked at build time — setting it only for the test run does nothing. CI builds with NO key (see `.github/workflows/ci.yml`), so the no-key specs are the CI default; never bake a placeholder key — the app treats any non-empty value as configured. |
 
 ## Spec inventory
 
 | File | Tests | Covers |
 | --- | --- | --- |
 | `helpers.ts` | — | Room create/join, 3-player lobby, ready + start, role reveal, demo-store reads, force-end, overflow / target / no-Forge checks |
-| `smoke.spec.ts` | 6 | Home, HOST A GAME → mode select, codename required, code errors, no console errors |
+| `smoke.spec.ts` | 9 | Home, HOST A GAME → mode select, /join screen, codename required, code errors, no console errors |
 | `join-lobby.spec.ts` | 12 | Join by code, lobby-is-setup, COPY, I'm ready, start gate (<3 / not-all-ready / all-ready), F2 guest auto-navigate, remove, Leave; + 2 live |
-| `host-setup.spec.ts` | 11 | Mode change, steppers, shrink toggle/stepper, Play zone OFF, Balance/Random/ping-history, guest cannot edit |
-| `live-hud.spec.ts` | 10 | Role reveal, status strip, head start lines, bottom tabs, radio, PTT (absent in demo), SOS, safety pause, suspended banner, per-role catch buttons |
-| `catch-nav.spec.ts` | 13 | Name-only picker, claim card, scanner, manual fallback, no catch code, `?runner=` auto-select, `?scan=1` shows the picker, runner confirm/dispute, host resolve (ALLOW + REJECT in demo), P0-1 resume |
+| `host-setup.spec.ts` | 11 | Mode change, steppers, shrink toggle/stepper, Play zone OFF, Balance/Random/ping-history, guest read-only sheet (v15) |
+| `live-hud.spec.ts` | 10 | Role reveal, status strip, head start lines, bottom tabs, radio, PTT (absent in demo), safety pause, suspended banner, per-role catch buttons |
+| `catch-nav.spec.ts` | 13 | Name-only picker, claim card, scanner, manual fallback, no catch code, `?runner=` auto-select, `?scan=1` shows the picker, runner confirm, no dispute, P0-1 resume |
 | `catch-results.spec.ts` | 4 | Runners Win / Hunters Win, one-line stats, max-6 timeline, START A FRESH GAME, new code |
 | `session-restore.spec.ts` | 6 | Reload in lobby/play, guest reload, sessionStorage key, no-seat state; + 1 live |
 | `outside-zone.spec.ts` | 4 | Banner + countdown, back-inside clears, poor GPS freezes, 30 s ejection (demo) |
@@ -61,10 +78,10 @@ Map specs skip cleanly when no key is configured — the VM has none:
 | `responsive.spec.ts` | 6 | 320 / 360 / 768 / 1280px, no overflow, tabs reachable |
 | `brutal-phone.spec.ts` | 2 | Full phone-viewport E2E (create → results), phone HUD basics |
 | `map-tiles.spec.ts` | 6 | No-key banners (3) + with-key canvas / Draw taps (3) |
-| `map-accuracy.spec.ts` | 6 | 500 m → 125 m default, 100 m minimum, no 1 km cap, always-Auto final size, next zone hidden, ±50 m GPS rule |
+| `map-accuracy.spec.ts` | 6 | 500 m → 211 m default (~42% Auto final size), 100 m minimum, no 1 km cap, always-Auto final size, next zone hidden, ±50 m GPS rule |
 | `no-forge-office.spec.ts` | 3 | No Forge/Hermes/office text on any screen |
 
-Total: **94 tests** (88 demo + 3 live + 3 with-key; the live and with-key
+Total: **99 tests** (93 demo + 3 live + 3 with-key; the live and with-key
 tests skip unless their environment is configured).
 
 ## Notes for the verifier
@@ -107,3 +124,19 @@ tests skip unless their environment is configured).
   span, so exact-text name assertions must include the suffix.
 - Outside-zone banner waits are 45 s: the emulated FAR fix lands in ~2 s
   unloaded but the 15 s bound timed out under 4-worker parallel load.
+- Countdown minutes are NOT zero-padded anywhere (`formatAgeLabel` in
+  `@pakdam/shared` renders "0:30", "9:59" — never "00:30" / "09:59"), so
+  countdown assertions use `\d+:\d\d`, and the outside-zone banner reads
+  "Return in 0:30". (The `formatOutsideCountdown` doc comment still says
+  `00:26` — the comment is wrong, the code is right.)
+- Home takes no room code: the code input lives only on `/join` (and the
+  `/join/<CODE>` deep link). The lobby has no map: the zone map, its
+  missing-key banner and Circle / Draw live on the setup screen.
+- The runner's play-screen button is "Got Tagged" — there is no "SHOW MY
+  QR" button in the app; the QR itself is shown on `/catch`.
+- Since v15 a joiner tapping the summary strip opens the Settings sheet
+  read-only ("View only — only the host can change settings.", every
+  control disabled); the RoomCodeCard SETTINGS button still answers a
+  joiner with the one-line notice instead. Do not confuse the two.
+- The lobby auto-navigates to `/play` once the phase leaves LOBBY, so a
+  lobby assertion must run before the match starts, never after.

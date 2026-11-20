@@ -3,17 +3,17 @@
 /**
  * Join by code — guest-only, no login (SCRAM-SPEC §3, PROTOCOL-MAP §1.2–1.3).
  *
- * Code + codename, JOIN → the lobby. Live: resolve the code, then join
- * (a stored reconnect token is forwarded only to restore a seat under
- * the same codename). Demo: join the local room by code.
+ * Code + codename, JOIN → the lobby. Live: one join-by-code call (the
+ * server resolves the code; a stored reconnect token is forwarded only
+ * to restore a seat under the same codename). Demo: join the local room by code.
  */
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { isValidDisplayName, isValidRoomCode } from '@pakdam/shared';
 import { isLiveTransportEnabled } from '../../lib/websocket';
-import { joinLiveRoom, resolveRoomByCode } from '../../lib/live-client';
+import { joinLiveRoomByCode } from '../../lib/live-client';
 import { getRoomByCode, joinRoom as joinDemoRoom } from '../../lib/demo-store';
-import { getSessionForRoom, storeDemoSeat } from '../../lib/session-credentials';
+import { getSessionForRoomCode, storeDemoSeat } from '../../lib/session-credentials';
 
 export default function JoinPage() {
   const router = useRouter();
@@ -37,13 +37,12 @@ export default function JoinPage() {
     setJoining(true);
     try {
       if (isLiveTransportEnabled()) {
-        const { roomId } = await resolveRoomByCode(normalizedCode);
-        const existing = getSessionForRoom(roomId);
+        const existing = getSessionForRoomCode(normalizedCode);
         const restoreToken =
           existing?.displayName?.toLowerCase() === name.toLowerCase()
             ? existing.reconnectToken
             : undefined;
-        const session = await joinLiveRoom(roomId, name, normalizedCode, restoreToken);
+        const session = await joinLiveRoomByCode(name, normalizedCode, restoreToken);
         router.push(`/room/${session.roomId}`);
       } else {
         const demo = getRoomByCode(normalizedCode);

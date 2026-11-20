@@ -72,6 +72,22 @@ const EMPTY_POLYGONS: GeoPolygon[] = [];
 const EMPTY_FIXES: Record<string, LocationFix> = {};
 const EMPTY_TEAMMATES: PlayerView[] = [];
 
+/**
+ * B12: return the previous identity when the new value is deeply equal
+ * (by JSON — these values are small: a zone boundary, a few no-go
+ * polygons, a handful of teammate fixes). Snapshots hand out fresh
+ * objects every time, which used to bust every memo downstream even
+ * when nothing had changed.
+ */
+function useStableByJson<T>(value: T): T {
+  const ref = useRef<{ json: string; value: T } | null>(null);
+  const json = JSON.stringify(value);
+  if (ref.current === null || ref.current.json !== json) {
+    ref.current = { json, value };
+  }
+  return ref.current.value;
+}
+
 export default function PlayPage({
   params,
   searchParams,
@@ -105,6 +121,7 @@ export default function PlayPage({
     socket,
     socketState,
     socketError,
+    lastSocketError,
     demo,
     myPlayerId,
     myPlayer,
@@ -136,6 +153,10 @@ export default function PlayPage({
 
   const [tab, setTab] = useState<BottomTabId>('map');
   const [nowMs, setNowMs] = useState(() => Date.now());
+  // B11: the 1 s clock above is for the countdown TEXT only
+  // (StatusStrip). The map and the dots get a coarse 5 s clock, so a
+  // tick does not rebuild map overlays or dot labels every second.
+  const mapNowMs = useMemo(() => Math.floor(nowMs / 5000) * 5000, [nowMs]);
   const [myFix, setMyFix] = useState<LocationFix | null>(null);
   const [fixNotice, setFixNotice] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -143,6 +164,10 @@ export default function PlayPage({
   // Bumped when the role-reveal overlay dismisses — PlayMap resizes
   // explicitly then, so a canvas measured while covered never stays blank.
   const [mapResizeNonce, setMapResizeNonce] = useState(0);
+  // A6: optimistic pause / end-round — the tap shows at once, the
+  // server snapshot reconciles; a failed send rolls back (see below).
+  const [pausedOverride, setPausedOverride] = useState<boolean | null>(null);
+  const [phaseOverride, setPhaseOverride] = useState<MatchPhase | null>(null);
   const [outsideSecondsLeft, setOutsideSecondsLeft] = useState<number | null>(null);
   const [radioUnread, setRadioUnread] = useState(0);
   const [leaveArmed, setLeaveArmed] = useState(false);
@@ -155,7 +180,6 @@ export default function PlayPage({
   const [voiceStatus, setVoiceStatus] = useState<VoiceRadioStatus>('off');
   const [voiceDetail, setVoiceDetail] = useState<string | undefined>(undefined);
   const [pttState, setPttState] = useState<PttState>('idle');
-  const [burstSeconds, setBurstSeconds] = useState(0);
   const [muted, setMuted] = useState(false);
 
   const myRole = myPlayer?.matchRole ?? null;
@@ -167,22 +191,62 @@ export default function PlayPage({
   const myFixRef = useRef<LocationFix | null>(null);
   // Last fix actually shown on screen — the display throttle below.
   const lastShownFixRef = useRef<{ fix: LocationFix; atMs: number } | null>(null);
-  const outsideAccumRef = useRef(0);
+  // B20: when the current outside-zone spell started (ms epoch) — the
+  // countdown is computed from the wall clock, never accumulated.
+  const outsideSinceRef = useRef<number | null>(null);
+  // Wall-clock time of the last outside-zone tick — the poor-GPS freeze
+  // slides the spell start by the ELAPSED time, not a flat 1 s per
+  // tick, so a throttled/backgrounded tick cannot under-count.
+  const lastOutsideTickMsRef = useRef<number | null>(null);
   const outsideEjectedRef = useRef(false);
   const seenRadioRef = useRef(0);
+
+  // A6: an optimistic pause/resume stands only until the server
+  // snapshot agrees with it — then it is the truth, not an override.
+  useEffect(() => {
+    if (pausedOverride !== null && safetyState.paused === pausedOverride) {
+      setPausedOverride(null);
+    }
+  }, [pausedOverride, safetyState.paused]);
+  // (d) A server rejection of a pause/resume (including a 429) arrives
+  // only as an error envelope — without this, a non-host tapping
+  // "Resume the match" (or any rejected pause) would flip their client
+  // to live while the match stays paused server-side, indefinitely.
+  // The override clears and the server's reason is shown. Tied to the
+  // pending safety action by receipt time so an unrelated error never
+  // clears a pause the player is waiting on.
+  const pendingSafetyAtMsRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!lastSocketError || pausedOverride === null) return;
+    const at = pendingSafetyAtMsRef.current;
+    if (at !== null && lastSocketError.atMs >= at && lastSocketError.atMs - at < 15_000) {
+      pendingSafetyAtMsRef.current = null;
+      setPausedOverride(null);
+      setNotice(lastSocketError.message);
+    }
+  }, [lastSocketError, pausedOverride]);
+  // A6: same for the optimistic end-round phase.
+  useEffect(() => {
+    if (phaseOverride !== null && phase === phaseOverride) {
+      setPhaseOverride(null);
+    }
+  }, [phaseOverride, phase]);
+
+  // B10: the map is kept mounted (hidden) across tabs, but a canvas
+  // hidden with display:none reports zero size — resize explicitly
+  // when the map tab comes back so it paints correctly.
+  useEffect(() => {
+    if (tab === 'map') setMapResizeNonce((n) => n + 1);
+  }, [tab]);
 
   // Stable derived identities, defined early: the outside-zone effect
   // below depends on the boundary, not on the whole room object (fresh
   // per snapshot), and a fresh `[]` fallback each render would bust
-  // every memo downstream.
-  const zoneBoundary = useMemo(
-    () => room?.config.zone.boundary ?? EMPTY_POLYGON,
-    [room],
-  );
-  const noGoAreas = useMemo(
-    () => room?.config.noGoAreas ?? EMPTY_POLYGONS,
-    [room],
-  );
+  // every memo downstream. B12: deep-compared, so the identity holds
+  // when the data did not actually change.
+  const zoneBoundary = useStableByJson(room?.config.zone.boundary ?? EMPTY_POLYGON);
+  const noGoAreas = useStableByJson(room?.config.noGoAreas ?? EMPTY_POLYGONS);
+  const stableTeammateFixes = useStableByJson(teammateFixes);
 
   useEffect(() => {
     socketRef.current = socket;
@@ -290,9 +354,21 @@ export default function PlayPage({
   }, [roomId, myPlayerId, mode]);
 
   // Outside-zone countdown (display; demo enforces at 0, live is server-enforced).
+  // B20: computed from the wall clock (Date.now() - outsideSinceMs),
+  // never accumulated with a flat += 1000 per tick — a throttled or
+  // delayed tick used to over-count, and the state was set on every
+  // tick even when the displayed second had not changed.
   useEffect(() => {
+    const now = Date.now();
+    // Elapsed wall-clock since the last tick — the poor-GPS freeze
+    // below slides the spell start by exactly this, so a throttled or
+    // backgrounded tick freezes the full time that passed, not 1 s.
+    const lastTick = lastOutsideTickMsRef.current;
+    const elapsedMs = lastTick === null ? 1000 : Math.max(now - lastTick, 0);
+    lastOutsideTickMsRef.current = now;
     if (phase !== 'ACTIVE' && phase !== 'HEAD_START') {
-      outsideAccumRef.current = 0;
+      outsideSinceRef.current = null;
+      lastOutsideTickMsRef.current = null;
       outsideEjectedRef.current = false;
       if (outsideSecondsLeft !== null) setOutsideSecondsLeft(null);
       return;
@@ -301,20 +377,40 @@ export default function PlayPage({
     const boundary = zoneBoundary;
     if (!fix || boundary.length < 3) return;
     if (isPointInZone(fix, boundary)) {
-      outsideAccumRef.current = 0;
+      outsideSinceRef.current = null;
+      lastOutsideTickMsRef.current = null;
       outsideEjectedRef.current = false;
       if (outsideSecondsLeft !== null) setOutsideSecondsLeft(null);
       return;
     }
-    // Poor GPS freezes the countdown — seconds already counted stay.
-    if (fix.accuracyMeters <= ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
-      outsideAccumRef.current += 1000;
+    // (l-ii) A fix older than ~10 s is missing, not outside: the GPS
+    // stream stopped (tunnel, permission revoked, backgrounded
+    // watcher) and the countdown must freeze on minutes-old data,
+    // never keep decrementing — in demo it used to eject at 0.
+    if (now - fix.timestampMs > 10_000) return;
+    // (l-i) The spell starts on the FIRST outside tick, BEFORE the
+    // poor-GPS branch: if the first outside fix is the poor one, the
+    // old code returned before ever setting outsideSinceRef, so the
+    // banner could never appear. The banner shows 0:30 from this tick.
+    if (outsideSinceRef.current === null) outsideSinceRef.current = now;
+    // Poor GPS freezes the countdown — the spell's start slides
+    // forward by the ELAPSED wall-clock time (l-iii), not a flat
+    // 1 s per tick, so a throttled/backgrounded tick cannot under-count
+    // the freeze. Falls through to the countdown below, so the banner
+    // renders at 0:30 while frozen.
+    if (fix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
+      outsideSinceRef.current += elapsedMs;
     }
-    const left = Math.max(
-      0,
-      OUTSIDE_ZONE_RETURN_SECONDS - Math.floor(outsideAccumRef.current / 1000),
+    const left = Math.min(
+      OUTSIDE_ZONE_RETURN_SECONDS,
+      Math.max(
+        0,
+        OUTSIDE_ZONE_RETURN_SECONDS -
+          Math.floor((now - outsideSinceRef.current) / 1000),
+      ),
     );
-    setOutsideSecondsLeft(left);
+    // Only setState when the displayed second actually changes.
+    setOutsideSecondsLeft((prev) => (prev === left ? prev : left));
     if (left <= 0 && !outsideEjectedRef.current) {
       outsideEjectedRef.current = true;
       if (mode === 'demo') {
@@ -366,18 +462,6 @@ export default function PlayPage({
     );
   }, [players, myPlayerId]);
 
-  // Burst elapsed while talking.
-  useEffect(() => {
-    if (pttState !== 'talking') {
-      setBurstSeconds(0);
-      return;
-    }
-    const timer = window.setInterval(() => {
-      setBurstSeconds(voiceRadioRef.current?.burstElapsedSeconds() ?? 0);
-    }, 250);
-    return () => window.clearInterval(timer);
-  }, [pttState]);
-
   // Radio unread badge.
   useEffect(() => {
     if (tab === 'radio') {
@@ -389,6 +473,10 @@ export default function PlayPage({
   }, [radioMessages.length, tab]);
 
   // -- Derived values ---------------------------------------------------------
+  // A6: the displayed pause / phase is the optimistic override while
+  // one stands, the server truth otherwise.
+  const effectivePaused = pausedOverride ?? safetyState.paused;
+  const displayPhase = phaseOverride ?? phase;
   const activePlayers = useMemo(
     () => players.filter((p) => p.leftAt === null),
     [players],
@@ -505,11 +593,11 @@ export default function PlayPage({
             room.config.durationSeconds,
             room.config.zoneShrinkIntervalSeconds,
             room.config.zoneShrinkEnabled,
-            safetyState.paused && safetyState.pausedAt
+            effectivePaused && safetyState.pausedAt
               ? new Date(safetyState.pausedAt).getTime()
               : nowMs,
           ),
-    [startedAtMs, room, safetyState.paused, safetyState.pausedAt, nowMs],
+    [startedAtMs, room, effectivePaused, safetyState.pausedAt, nowMs],
   );
 
   // Pings are mutual and role-scoped: the server only delivers pings
@@ -554,7 +642,7 @@ export default function PlayPage({
             ? 'Suspended'
             : myLastFixMs === null
               ? 'Location never reported'
-              : ageLabelFromTimestamp(myLastFixMs, nowMs),
+              : ageLabelFromTimestamp(myLastFixMs, mapNowMs),
         suspended: myPlayer?.connectionState === 'suspended',
       });
       // Live teammates — never when I am caught (a tagged Runner loses
@@ -571,7 +659,7 @@ export default function PlayPage({
             label:
               lastFixMs === null
                 ? 'Location never reported'
-                : ageLabelFromTimestamp(lastFixMs, nowMs),
+                : ageLabelFromTimestamp(lastFixMs, mapNowMs),
             suspended: p.connectionState === 'suspended',
           });
         }
@@ -587,12 +675,12 @@ export default function PlayPage({
         // Demo pings are simulated (fired by the local store, not the
         // server) — labelled so, wherever they are shown.
         label:
-          ageLabelFromTimestamp(new Date(ping.createdAt).getTime(), nowMs) +
+          ageLabelFromTimestamp(new Date(ping.createdAt).getTime(), mapNowMs) +
           (mode === 'demo' ? ' · (simulated)' : ''),
       });
     }
     return out;
-  }, [playerById, myPlayer, myPlayerId, teammateIds, visiblePings, nowMs, amCaught, isSpectator, mode]);
+  }, [playerById, myPlayer, myPlayerId, teammateIds, visiblePings, mapNowMs, amCaught, isSpectator, mode]);
 
   const myLastFixMs = myPlayer?.lastFixAt ? new Date(myPlayer.lastFixAt).getTime() : null;
   const isSuspended = myPlayer?.connectionState === 'suspended';
@@ -639,6 +727,8 @@ export default function PlayPage({
   );
 
   // -- Safety actions ---------------------------------------------------------
+  // A6: pause / resume show at once (local override) and reconcile on
+  // the next snapshot; a failed send rolls straight back and says so.
   // Stable callbacks (useCallback): an inline handler is a new function
   // every render, which re-renders every memoized child that receives it
   // — and a tap landing mid-render waits for that render to finish.
@@ -646,7 +736,10 @@ export default function PlayPage({
     if (mode === 'live') {
       if (!socketRef.current?.safetyPause()) {
         setNotice('Not connected — pause was not sent. Wait for the reconnect, then tap again.');
+        return;
       }
+      pendingSafetyAtMsRef.current = Date.now();
+      setPausedOverride(true);
     } else {
       const current = getRoom(roomId);
       if (current) {
@@ -659,7 +752,10 @@ export default function PlayPage({
     if (mode === 'live') {
       if (!socketRef.current?.safetyResume()) {
         setNotice('Not connected — resume was not sent. Wait for the reconnect, then tap again.');
+        return;
       }
+      pendingSafetyAtMsRef.current = Date.now();
+      setPausedOverride(false);
     } else {
       const current = getRoom(roomId);
       if (current) {
@@ -687,7 +783,12 @@ export default function PlayPage({
   const handleEndRound = useCallback(() => {
     if (!isHost) return;
     if (mode === 'live') {
+      // A6: the round shows as ended at once (display phase override);
+      // the server snapshot reconciles, and the terminal redirect
+      // follows the real room phase. A failed POST rolls back.
+      setPhaseOverride('COMPLETED');
       void endLiveMatch(roomId).catch(() => {
+        setPhaseOverride(null);
         setNotice('Could not end the round — check your connection and try again.');
       });
       return;
@@ -751,7 +852,9 @@ export default function PlayPage({
     setMuted(next);
   }, [muted, voiceRadio]);
   const handleEnableVoice = useCallback(() => {
-    void voiceRadio?.enable();
+    // B18: returns the real promise so the radio tab can show
+    // "Enabling…" while getUserMedia resolves.
+    return voiceRadio?.enable() ?? Promise.resolve(false);
   }, [voiceRadio]);
   const handleSendRadio = useCallback(
     (text: string, kind?: 'quick' | 'text') => sendRadio(text, kind),
@@ -787,11 +890,11 @@ export default function PlayPage({
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pb-24 pt-3">
       <StatusStrip
-        phase={phase}
+        phase={displayPhase}
         config={room.config}
         startedAt={room.startedAt}
         endsAt={room.endsAt}
-        paused={safetyState.paused}
+        paused={effectivePaused}
         pausedAt={safetyState.pausedAt}
         runnersLeft={runnersLeft}
         runnersTotal={runnersTotal}
@@ -875,66 +978,60 @@ export default function PlayPage({
         </p>
       ) : null}
 
-      {tab === 'map' ? (
-        // Definite height (420 px), NOT min-h + flex-1: the play map's
-        // container used to be `h-full` against a flex item whose height
-        // came only from min-h/flex distribution, so MapLibre could
-        // initialise against a zero-height canvas on a real phone and
-        // stay blank. The setup map works because its container has an
-        // explicit fixed height (280 px) — the play map now does too.
-        <div className="relative h-[420px] shrink-0">
-          <PlayMap
-            zoneBoundary={zoneBoundary}
-            // Next-zone preview (P1-18): the DO's `zone.preview`, 30 s
-            // before the shrink — dashed ring + "Next zone in MM:SS".
-            // Null outside the preview window; the next zone is never guessed.
-            nextZoneBoundary={nextZonePreview?.boundary ?? null}
-            nextZoneFiresAtMs={nextZonePreview?.firesAtMs ?? null}
-            pings={visiblePings}
-            noGoAreas={noGoAreas}
-            myFix={myFix}
-            // Teammates' live positions (green dots). A spectator sees no
-            // live dots, so nothing is passed while spectating.
-            teammateFixes={isSpectator ? EMPTY_FIXES : teammateFixes}
-            reveals={reveals}
-            nowMs={nowMs}
-            resizeNonce={mapResizeNonce}
-          />
-          <PlayerDots dots={dots} />
-          <div className="absolute bottom-3 right-3 z-10 flex flex-col items-center gap-3">
-            <PTTButton
-              radio={mode === 'live' ? voiceRadio : null}
-              pttState={pttState}
-              burstSeconds={burstSeconds}
-              size="large"
-              disabled={!canSendRadio}
-            />
-          </div>
-        </div>
-      ) : null}
-
-      {tab === 'radio' ? (
-        <div className="min-h-[420px] flex-1">
-          <RadioStrip
-            team={myTeam}
-            channelLine={channelLine}
-            messages={radioMessages}
-            notices={radioNotices}
-            myPlayerId={myPlayerId}
-            canSend={canSendRadio}
-            voiceRadio={mode === 'live' ? voiceRadio : null}
-            voiceStatus={voiceStatus}
-            voiceDetail={voiceDetail}
-            voiceSummary={voiceRadio?.connectionSummary ?? ''}
+      {/* B10: the map stays MOUNTED across tabs and is only hidden
+          with CSS — Map → Radio → Map used to tear the whole map down
+          (style fetch + ~1 MB chunk + tiles + fitBounds from scratch).
+          A resize fires when the tab comes back (see the tab effect). */}
+      <div className={`relative h-[420px] shrink-0 ${tab === 'map' ? '' : 'hidden'}`}>
+        <PlayMap
+          zoneBoundary={zoneBoundary}
+          // Next-zone preview (P1-18): the DO's `zone.preview`, 30 s
+          // before the shrink — dashed ring + "Next zone in MM:SS".
+          // Null outside the preview window; the next zone is never guessed.
+          nextZoneBoundary={nextZonePreview?.boundary ?? null}
+          nextZoneFiresAtMs={nextZonePreview?.firesAtMs ?? null}
+          pings={visiblePings}
+          noGoAreas={noGoAreas}
+          myFix={myFix}
+          // Teammates' live positions (green dots). A spectator sees no
+          // live dots, so nothing is passed while spectating.
+          teammateFixes={isSpectator ? EMPTY_FIXES : stableTeammateFixes}
+          reveals={reveals}
+          nowMs={mapNowMs}
+          resizeNonce={mapResizeNonce}
+        />
+        <PlayerDots dots={dots} />
+        <div className="absolute bottom-3 right-3 z-10 flex flex-col items-center gap-3">
+          <PTTButton
+            radio={mode === 'live' ? voiceRadio : null}
             pttState={pttState}
-            burstSeconds={burstSeconds}
-            muted={muted}
-            onToggleMute={handleToggleMute}
-            onEnableVoice={handleEnableVoice}
-            onSendRadio={handleSendRadio}
+            size="large"
+            disabled={!canSendRadio}
           />
         </div>
-      ) : null}
+      </div>
+
+      {/* B10: the radio tab stays mounted too — switching tabs used to
+          unmount RadioStrip and drop the in-progress draft. */}
+      <div className={`min-h-[420px] flex-1 ${tab === 'radio' ? '' : 'hidden'}`}>
+        <RadioStrip
+          team={myTeam}
+          channelLine={channelLine}
+          messages={radioMessages}
+          notices={radioNotices}
+          myPlayerId={myPlayerId}
+          canSend={canSendRadio}
+          voiceRadio={mode === 'live' ? voiceRadio : null}
+          voiceStatus={voiceStatus}
+          voiceDetail={voiceDetail}
+          voiceSummary={voiceRadio?.connectionSummary ?? ''}
+          pttState={pttState}
+          muted={muted}
+          onToggleMute={handleToggleMute}
+          onEnableVoice={handleEnableVoice}
+          onSendRadio={handleSendRadio}
+        />
+      </div>
 
       {tab === 'map' && isHunter && !isSpectator ? (
         <Button variant="primary" onClick={goCatchQr}>
@@ -1001,7 +1098,7 @@ export default function PlayPage({
           {/* Host only: end the round early (POST …/lifecycle, host-only).
               The match completes with the mode-aware outcome and the play
               screen redirects to results. */}
-          {isHost && (phase === 'HEAD_START' || phase === 'ACTIVE' || phase === 'SAFETY_PAUSED') ? (
+          {isHost && (displayPhase === 'HEAD_START' || displayPhase === 'ACTIVE' || displayPhase === 'SAFETY_PAUSED') ? (
             <button
               type="button"
               onClick={handleEndRoundFromSheet}
@@ -1046,11 +1143,12 @@ export default function PlayPage({
             </ul>
           </div>
           <SafetyControls
-            phase={phase}
-            paused={safetyState.paused}
+            phase={displayPhase}
+            paused={effectivePaused}
             pausedByName={pausedByName}
             pausedFrom={demo?.pausedFrom ?? null}
-            canPause={phase === 'HEAD_START' || phase === 'ACTIVE' || phase === 'SAFETY_PAUSED'}
+            canPause={displayPhase === 'HEAD_START' || displayPhase === 'ACTIVE' || displayPhase === 'SAFETY_PAUSED'}
+            isHost={isHost}
             onPause={handlePause}
             onResume={handleResume}
           />

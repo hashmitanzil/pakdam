@@ -125,6 +125,27 @@ export class RoomDO implements DurableObject {
   private store: RoomStore | null = null;
   private loaded = false;
   private readonly sessions = new Map<string, SessionRecord>();
+  /**
+   * Phase 3 #1/#5 — alarm dedup: the last delay `armAlarm()` actually
+   * set (or `null` after deleteAlarm, `undefined` before the first arm
+   * / after an alarm fires). Re-setting the same delay only re-arms the
+   * same tick, so it is skipped.
+   */
+  private lastAlarmDelayMs: number | null | undefined = undefined;
+  /** Phase 3 #4 — next epoch ms the idempotency table may sync to storage. */
+  private idempotencyPersistDueMs = 0;
+  /**
+   * Phase 4 (s) — first-tick-after-wake grace: true until the first
+   * alarm() tick of this DO instance runs. Heartbeats move
+   * lastHeartbeatAtMs in memory only (Phase 3 #1), so the stored copy
+   * can be minutes stale after a DO eviction; without grace the first
+   * tick computes missed >= HEARTBEAT_MISSED_LIMIT and closes 1011 +
+   * suspends a live seat. A fresh instance starts true (an eviction
+   * always creates a new instance), and alarm() consumes it — a wake
+   * via a message does not, so the grace is still there when the tick
+   * finally runs.
+   */
+  private firstAlarmTickAfterWake = true;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -151,8 +172,16 @@ export class RoomDO implements DurableObject {
   private async save(): Promise<void> {
     if (!this.store) return;
     // P1-5: sync the durable-backed memory maps into the state first,
-    // so the ticket registry / idempotency / pending pings persist.
+    // so the ticket registry / pending pings persist.
     this.store.syncDurableMemory();
+    // Phase 3 #4: the idempotency table syncs at most once a minute, not
+    // on every save — rebuilding those arrays on every save is O(n) on
+    // the hot path. The first save after a load always syncs (due = 0).
+    const nowMs = Date.now();
+    if (nowMs >= this.idempotencyPersistDueMs) {
+      this.store.syncIdempotencyMemory();
+      this.idempotencyPersistDueMs = nowMs + 60_000;
+    }
     await this.ctx.storage.put(STATE_KEY, durableSnapshot(this.store.state));
   }
 
@@ -181,11 +210,16 @@ export class RoomDO implements DurableObject {
 
   private async armAlarm(): Promise<void> {
     const delay = this.alarmDelayMs();
+    // Phase 3 #1/#5: skip re-arming when the delay is unchanged — the
+    // already-set alarm fires at the same time anyway. Only a phase
+    // change (1 s live <-> 30 s lobby) or a terminal phase re-arms.
+    if (delay === this.lastAlarmDelayMs) return;
     if (delay === null) {
       await this.ctx.storage.deleteAlarm();
-      return;
+    } else {
+      await this.ctx.storage.setAlarm(Date.now() + delay);
     }
-    await this.ctx.storage.setAlarm(Date.now() + delay);
+    this.lastAlarmDelayMs = delay;
   }
 
   private async afterMutation(
@@ -277,10 +311,34 @@ export class RoomDO implements DurableObject {
     const out: SessionRecord[] = [];
     for (const rec of map.values()) {
       if (!rec.sessionId) rec.sessionId = 'legacy';
-      this.sessions.set(this.sessionCacheKey(rec.playerId, rec.sessionId), rec);
+      const key = this.sessionCacheKey(rec.playerId, rec.sessionId);
+      // Phase 3 #1: the in-memory record is NEWER than the durable one
+      // (heartbeat timers move in memory only now) — never clobber it
+      // with the stale storage copy.
+      const cached = this.sessions.get(key);
+      if (cached) {
+        out.push(cached);
+        continue;
+      }
+      this.sessions.set(key, rec);
       out.push(rec);
     }
+    // Sessions only in memory (created since the last list) are live too.
+    for (const rec of this.sessions.values()) {
+      if (!out.includes(rec)) out.push(rec);
+    }
     return out;
+  }
+
+  /**
+   * Sessions for the alarm's heartbeat check (Phase 3 #5): the in-memory
+   * cache is the live source while the DO is awake, so a storage
+   * `list()` on every 1 s tick is a wasted read. Storage is listed only
+   * when the cache is empty — a fresh wake with live sockets.
+   */
+  private async sessionsForHeartbeatCheck(): Promise<SessionRecord[]> {
+    if (this.sessions.size > 0) return [...this.sessions.values()];
+    return this.listSessions();
   }
 
   /**
@@ -574,6 +632,11 @@ export class RoomDO implements DurableObject {
           }
           return json({ ok: false, error: r.error, code: r.code }, r.status);
         }
+        if (r.events.length === 0 && r.persist.length === 0) {
+          // Cheap re-fetch (Phase 3 #10): a valid token already existed,
+          // nothing mutated — answer without a full save + re-arm.
+          return json({ ok: true, ...r.value });
+        }
         await this.afterMutation(r.events, r.persist);
         return json({ ok: true, ...r.value });
       }
@@ -805,6 +868,10 @@ export class RoomDO implements DurableObject {
     // Heartbeat liveness (P2): only an actual `heartbeat` message — or a
     // location update, which proves the same thing — resets the timer.
     // Any other inbound traffic does NOT prove the socket is alive.
+    // The timer moves in memory only (Phase 3 #1) — the stored copy
+    // goes stale across a DO eviction, and the alarm's
+    // first-tick-after-wake grace (Phase 4 (s)) is what keeps that
+    // staleness from suspending a live seat.
     if (type === 'heartbeat' || type === 'location.update') {
       session.lastHeartbeatAtMs = nowMs;
       session.missedHeartbeats = 0;
@@ -850,8 +917,11 @@ export class RoomDO implements DurableObject {
       }
       if (resumed.persist.length > 0) {
         this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, resumed.persist));
+        // Only a resume mutates durable state on hello; the welcome +
+        // snapshot themselves are transient (Phase 3 #1).
+        await this.save();
       }
-      await this.save();
+      // armAlarm is a no-op when the delay is unchanged (dedup inside).
       await this.armAlarm();
       return;
     }
@@ -897,7 +967,13 @@ export class RoomDO implements DurableObject {
       },
       nowMs,
     );
-    await this.putSession(session);
+    // Phase 3 #1 — skip the durable path for non-durable messages: the
+    // session record is written only when the message changed durable
+    // state (a heartbeat / GPS fix / snapshot only moves in-memory
+    // timers). Writing the session + full state blob + re-arming the
+    // alarm on every message is what queued taps behind GPS fixes.
+    // Game mutations (ready, catch, pause, leave, ...) still save.
+    if (result.durable) await this.putSession(session);
     await this.deliver(result.events, nowMs);
     if (result.persist.length > 0) {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, result.persist));
@@ -910,9 +986,12 @@ export class RoomDO implements DurableObject {
       closeSocket(result.close.code, result.close.reason);
     }
     await this.maybeWarnRenewal(session, nowMs);
-    await this.save();
+    if (result.durable) {
+      await this.save();
+      await this.maybeUnregisterCode();
+    }
+    // armAlarm is a no-op when the delay is unchanged (dedup inside).
     await this.armAlarm();
-    await this.maybeUnregisterCode();
   }
 
   /** Warn once when the socket's ticket expires within 30 s. */
@@ -977,7 +1056,8 @@ export class RoomDO implements DurableObject {
     if (persist.length > 0) {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, persist));
     }
-    await this.save();
+    // Phase 3 #1: a close that suspended nothing writes nothing.
+    if (events.length > 0 || persist.length > 0) await this.save();
     await this.armAlarm();
   }
 
@@ -986,6 +1066,14 @@ export class RoomDO implements DurableObject {
   async alarm(): Promise<void> {
     await this.load();
     if (!this.store) return;
+    // The alarm fired, so nothing is pending: force the re-arm at the end
+    // (armAlarm dedups on the delay, so this reset is what re-arms).
+    this.lastAlarmDelayMs = undefined;
+    // Phase 4 (s) — consume the first-tick-after-wake grace (see the
+    // field): a live socket at tick time proves the seat is alive far
+    // better than the stale stored heartbeat timestamp does.
+    const firstTickAfterWake = this.firstAlarmTickAfterWake;
+    this.firstAlarmTickAfterWake = false;
     const nowMs = Date.now();
     const tick = this.store.alarmTick(nowMs);
     await this.deliver(tick.events, nowMs);
@@ -993,12 +1081,31 @@ export class RoomDO implements DurableObject {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, tick.persist));
     }
 
-    // Heartbeat + renewal checks for every live session.
-    const sessions = await this.listSessions();
+    // Heartbeat + renewal checks for every live session. The storage
+    // list() runs only when the in-memory cache is empty (a fresh wake);
+    // while awake the cache IS the live session set (Phase 3 #5).
+    const sessions = await this.sessionsForHeartbeatCheck();
+    let sessionDirty = false;
     for (const session of sessions) {
       if (!session.helloDone) continue;
       const missed = Math.floor((nowMs - session.lastHeartbeatAtMs) / HEARTBEAT_INTERVAL_MS);
       if (missed >= HEARTBEAT_MISSED_LIMIT) {
+        // Phase 4 (s) — first-tick-after-wake grace: the stored
+        // lastHeartbeatAtMs can be minutes stale after a DO eviction
+        // (heartbeats move it in memory only), so a live seat would
+        // otherwise be closed 1011 + suspended on the first tick even
+        // though its client is alive and heartbeating. A socket still
+        // attached for this seat proves it is alive: reset its clock
+        // (and persist the fresh timestamp) instead of suspending.
+        // A seat with NO socket attached gets no grace — a genuinely
+        // dead seat still suspends on the first tick.
+        if (firstTickAfterWake && this.ctx.getWebSockets(session.playerId).length > 0) {
+          session.lastHeartbeatAtMs = nowMs;
+          session.missedHeartbeats = 0;
+          await this.putSession(session);
+          sessionDirty = true;
+          continue;
+        }
         // Dead socket: close it (1011, 'heartbeat timeout') so the client
         // reconnect path re-syncs via snapshot; the seat is suspended.
         // 1006 is reserved (RFC 6455 §7.4) and must never be sent. Only
@@ -1018,16 +1125,28 @@ export class RoomDO implements DurableObject {
         if (r.persist.length > 0) {
           this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, r.persist));
         }
+        sessionDirty = true;
         continue;
       }
-      session.missedHeartbeats = missed;
-      await this.putSession(session);
+      // Only write the session when the missed count actually changed —
+      // not on every 1 s tick (Phase 3 #5).
+      if (session.missedHeartbeats !== missed) {
+        session.missedHeartbeats = missed;
+        await this.putSession(session);
+        sessionDirty = true;
+      }
       await this.maybeWarnRenewal(session, nowMs);
     }
 
-    await this.save();
+    // Skip the save when the tick produced nothing durable: no events, no
+    // persist, no session change. A quiet 1 s tick is then deliver-
+    // nothing, write-nothing (Phase 3 #5).
+    const changed = tick.events.length > 0 || tick.persist.length > 0 || sessionDirty;
+    if (changed) {
+      await this.save();
+      await this.maybeUnregisterCode();
+    }
     await this.armAlarm();
-    await this.maybeUnregisterCode();
   }
 }
 

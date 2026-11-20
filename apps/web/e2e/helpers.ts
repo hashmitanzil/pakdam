@@ -117,17 +117,20 @@ export async function createHostRoom(
   return { roomId, code };
 }
 
-/** Guest flow: Home → code + JOIN → codename + JOIN → lobby. New page, same context. */
+/**
+ * Guest flow: /join → code + codename + JOIN → lobby. New page, same
+ * context. The code lives ONLY on the /join screen — Home has no code
+ * input (it only routes to /join), so filling a code on Home was stale.
+ */
 export async function joinRoomAsGuest(
   context: BrowserContext,
   code: string,
   name: string,
 ): Promise<Page> {
   const page = await context.newPage();
-  await page.goto('/');
-  await page.getByLabel('Room code').fill(code);
-  await page.getByRole('button', { name: 'JOIN', exact: true }).click();
+  await page.goto('/join');
   await expect(page.getByRole('heading', { name: 'Join a game' })).toBeVisible();
+  await page.getByLabel('Room code').fill(code);
   await page.getByLabel('Your codename').fill(name);
   await page.getByRole('button', { name: 'JOIN', exact: true }).click();
   await expect(page.getByRole('heading', { name: 'Lobby' })).toBeVisible();

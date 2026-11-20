@@ -38,6 +38,11 @@ export function CatchQR({
 }: CatchQRProps) {
   const [qrDataUrl, setQrDataUrl] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
+  // (m) The scanner used to run silently forever at ≤640 px, every 3rd
+  // frame — a QR held far, small or blurry never decoded and nothing
+  // said so. After ~5 s without a decode it escalates to full
+  // resolution, every frame, and says so.
+  const [notDetecting, setNotDetecting] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -73,35 +78,60 @@ export function CatchQR({
   }, [mode, token]);
 
   // CATCH BY QR — camera + jsQR frame decoding.
+  // B19: full-resolution frames every animation frame were the most
+  // expensive per-frame work on the catch screen. Frames start
+  // downscaled to ~640 px wide and decoded only every 3rd frame — jsQR
+  // still reads a 220 px QR comfortably at that size, at a third of
+  // the cost. (m) After ~5 s without a decode, the loop escalates to
+  // full resolution every frame until a read succeeds — a far, small
+  // or blurry QR gets a real second chance instead of failing silently.
   useEffect(() => {
     if (mode !== 'scan') return;
     let raf = 0;
     let stopped = false;
+    let frame = 0;
+    let startedAtMs = 0;
+    let decoded = false;
+    let hintShown = false;
     lastScannedRef.current = null;
+    setNotDetecting(false);
 
     const decodeLoop = () => {
       if (stopped) return;
+      frame += 1;
       const video = videoRef.current;
       const canvas = canvasRef.current;
-      if (video && canvas && video.readyState === video.HAVE_ENOUGH_DATA) {
-        const width = video.videoWidth;
-        const height = video.videoHeight;
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(video, 0, 0, width, height);
-          const imageData = ctx.getImageData(0, 0, width, height);
-          const result = jsQR(imageData.data, width, height);
-          if (result?.data) {
-            const value = result.data.trim();
-            const last = lastScannedRef.current;
-            // Same QR within 3 s = the same frame re-read: ignore it.
-            // A different QR, or the same one after a wrong scan cooled
-            // off, is reported — the loop keeps running either way.
-            if (!last || last.value !== value || Date.now() - last.atMs > 3000) {
-              lastScannedRef.current = { value, atMs: Date.now() };
-              onScanRef.current(value);
+      if (video && video.readyState === video.HAVE_ENOUGH_DATA) {
+        if (startedAtMs === 0) startedAtMs = Date.now();
+        // Escalated once no decode has landed in ~5 s: full resolution,
+        // every frame, until a read succeeds.
+        const escalated = !decoded && Date.now() - startedAtMs > 5_000;
+        if (escalated && !hintShown) {
+          hintShown = true;
+          setNotDetecting(true);
+        }
+        if ((escalated || frame % 3 === 0) && canvas) {
+          const scale = escalated ? 1 : Math.min(1, 640 / video.videoWidth);
+          const width = Math.max(1, Math.round(video.videoWidth * scale));
+          const height = Math.max(1, Math.round(video.videoHeight * scale));
+          canvas.width = width;
+          canvas.height = height;
+          const ctx = canvas.getContext('2d');
+          if (ctx) {
+            ctx.drawImage(video, 0, 0, width, height);
+            const imageData = ctx.getImageData(0, 0, width, height);
+            const result = jsQR(imageData.data, width, height);
+            if (result?.data) {
+              decoded = true;
+              const value = result.data.trim();
+              const last = lastScannedRef.current;
+              // Same QR within 3 s = the same frame re-read: ignore it.
+              // A different QR, or the same one after a wrong scan cooled
+              // off, is reported — the loop keeps running either way.
+              if (!last || last.value !== value || Date.now() - last.atMs > 3000) {
+                lastScannedRef.current = { value, atMs: Date.now() };
+                onScanRef.current(value);
+              }
             }
           }
         }
@@ -175,6 +205,11 @@ export function CatchQR({
         />
       </div>
       <p className="text-center text-[14px] text-[#A1A1AA]">Point at the runner&apos;s QR</p>
+      {notDetecting ? (
+        <p className="text-center text-[14px] text-[#F59E0B]">
+          Not detecting a QR — move closer, hold steady, and make sure the whole QR is inside the frame.
+        </p>
+      ) : null}
       {cameraError ? (
         <p className="text-center text-[14px] text-[#EF4444]">{cameraError}</p>
       ) : null}

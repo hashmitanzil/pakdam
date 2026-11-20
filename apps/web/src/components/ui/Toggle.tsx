@@ -7,7 +7,8 @@
  * The track is a CAPSULE / pill, ~48 × 24 px, fully rounded — the SCRAM
  * toggle from the video frames, shorter than the 30 px v11 version. The
  * white circular knob is ~22 px diameter (nearly the track height, ~1 px
- * margin top/bottom) and slides end to end on a smooth 200 ms transition.
+ * margin top/bottom) and slides end to end on a smooth 120 ms transition
+ * (B25: was 200 ms — the knob lagged the tap).
  * Knob offsets: OFF left-[1px], ON left-[25px] (48 − 22 − 1 = 25).
  * The pill alone carries the state (colour + knob position) — no
  * separate On/Off word beside it, which made the row read cluttered.
@@ -31,12 +32,12 @@ export function Toggle({ checked, onChange, label, disabled = false }: TogglePro
       aria-label={label}
       disabled={disabled}
       onClick={() => onChange(!checked)}
-      className={`relative h-[24px] w-[48px] shrink-0 rounded-full transition-colors duration-200 ${
+      className={`relative h-[24px] w-[48px] shrink-0 rounded-full transition-colors duration-120 ${
         checked ? 'bg-[#EF4444]' : 'bg-[#3F3F46]'
       } ${disabled ? 'opacity-50' : ''}`}
     >
       <span
-        className={`absolute top-1/2 h-[22px] w-[22px] -translate-y-1/2 rounded-full bg-white shadow-md transition-all duration-200 ease-in-out ${
+        className={`absolute top-1/2 h-[22px] w-[22px] -translate-y-1/2 rounded-full bg-white shadow-md transition-all duration-120 ease-in-out ${
           checked ? 'left-[25px]' : 'left-[1px]'
         }`}
       />

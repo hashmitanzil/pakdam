@@ -20,7 +20,10 @@ test.describe('responsive widths (demo)', () => {
       await page.goto('/');
       await expectNoHorizontalOverflow(page);
       await expect(page.getByRole('button', { name: /HOST A GAME/ })).toBeVisible();
+      // The code input lives on /join, not Home.
+      await page.goto('/join');
       await expect(page.getByPlaceholder('ABC123')).toBeVisible();
+      await expectNoHorizontalOverflow(page);
     });
   }
 

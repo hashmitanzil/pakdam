@@ -22,13 +22,16 @@ test.use({ viewport: { width: 360, height: 800 } });
 test.describe('mobile layout — 360px (demo)', () => {
   test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
 
-  test('home at 360px: no overflow, HOST A GAME and JOIN are thumb targets', async ({
+  test('home at 360px: no overflow, HOST A GAME and JOIN A GAME are thumb targets', async ({
     page,
   }) => {
     await page.goto('/');
     await expectNoHorizontalOverflow(page);
     await expectButtonHeight(page, /HOST A GAME/);
-    await expectButtonHeight(page, 'JOIN', 48);
+    await expectButtonHeight(page, /JOIN A GAME/, 48);
+    // Home takes no code — the code input lives on /join, and it is a
+    // thumb target there too.
+    await page.goto('/join');
     const codeInput = page.getByLabel('Room code');
     const box = await codeInput.boundingBox();
     expect(box!.height).toBeGreaterThanOrEqual(48);
@@ -62,9 +65,9 @@ test.describe('mobile layout — 360px (demo)', () => {
     expect(box).not.toBeNull();
     expect(box!.y + box!.height).toBeLessThanOrEqual(800);
     expect(box!.height).toBeGreaterThanOrEqual(48);
-    const catchButton = hostPage.getByRole('button', { name: /CATCH BY QR|SHOW MY QR/ });
+    const catchButton = hostPage.getByRole('button', { name: /CATCH BY QR|Got Tagged/ });
     await expect(catchButton).toBeVisible();
-    await expectButtonHeight(hostPage, /CATCH BY QR|SHOW MY QR/, 48);
+    await expectButtonHeight(hostPage, /CATCH BY QR|Got Tagged/, 48);
   });
 
   test('130% zoom proxy (277px CSS width): home and lobby do not overflow', async ({

@@ -49,10 +49,15 @@ test.describe('join + lobby (demo)', () => {
   }) => {
     const hostPage = await context.newPage();
     await createHostSetupRoom(hostPage);
-    // Map on top (Circle | Draw above it).
-    await expect(hostPage.getByRole('region', { name: 'Play area map' })).toBeVisible();
-    await expect(hostPage.getByRole('button', { name: 'Circle', exact: true })).toBeVisible();
-    await expect(hostPage.getByRole('button', { name: 'Draw', exact: true })).toBeVisible();
+    // Map on top (Circle | Draw above it) — the map lives in the
+    // <section aria-label="Play zone"> on this screen, not a region
+    // called "Play area map" (no such element exists).
+    await expect(hostPage.getByRole('region', { name: 'Play zone' })).toBeVisible();
+    // Shape labels are lowercase DOM text ('circle'/'draw') with CSS-only
+    // capitalisation — exact: true is case-sensitive, so 'Circle'/'Draw'
+    // can never match.
+    await expect(hostPage.getByRole('button', { name: 'circle', exact: true })).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: 'draw', exact: true })).toBeVisible();
     // No room code on the create screen — the room does not exist yet.
     await expect(hostPage.getByText('Game code')).toBeHidden();
     // Mode card.
@@ -157,10 +162,14 @@ test.describe('join + lobby (demo)', () => {
     await expect(
       hostPage.getByRole('button', { name: /I'm ready — tap to change/ }),
     ).toBeVisible();
+    // The blocked host start button renders "▶ START GAME" (the label is
+    // 'START GAME' once ≥2 players; there is no 'WAITING FOR EVERYONE TO
+    // BE READY' button anywhere in the app — the waiting line is the
+    // notice shown after tapping, from the gate reason).
     await expect(
-      hostPage.getByRole('button', { name: 'WAITING FOR EVERYONE TO BE READY' }),
+      hostPage.getByRole('button', { name: '▶ START GAME' }),
     ).toBeVisible();
-    await hostPage.getByRole('button', { name: 'WAITING FOR EVERYONE TO BE READY' }).click();
+    await hostPage.getByRole('button', { name: '▶ START GAME' }).click();
     await expect(hostPage.getByText(`Waiting for: ${GUEST_NAMES[0]}, ${GUEST_NAMES[1]}.`)).toBeVisible();
     // A guest sees the host-only bar instead of a start button.
     await expect(
@@ -189,11 +198,14 @@ test.describe('join + lobby (demo)', () => {
   test('host can remove a guest from the roster (confirm dialog)', async ({ context }) => {
     const { hostPage } = await setupThreePlayerLobby(context);
     await expect(hostPage.getByText(GUEST_NAMES[0], { exact: true })).toBeVisible();
-    hostPage.on('dialog', (dialog) => void dialog.accept());
     await hostPage
       .getByRole('button', { name: `Options for ${GUEST_NAMES[0]}`, exact: true })
       .click();
     await hostPage.getByRole('button', { name: 'Remove', exact: true }).click();
+    // Leave / Remove confirm in-app (Sheet), not window.confirm.
+    const dialog = hostPage.getByRole('dialog', { name: 'Remove player?' });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole('button', { name: 'Remove', exact: true }).click();
     await expect(hostPage.getByText(GUEST_NAMES[0], { exact: true })).toBeHidden({ timeout: 10000 });
     await expect(hostPage.getByText('2 joined')).toBeVisible();
   });
@@ -201,8 +213,11 @@ test.describe('join + lobby (demo)', () => {
   test('Leave asks for confirmation and returns Home', async ({ context }) => {
     const hostPage = await context.newPage();
     await createHostRoom(hostPage);
-    hostPage.on('dialog', (dialog) => void dialog.accept());
     await hostPage.getByRole('button', { name: 'Leave', exact: true }).click();
+    // Leave confirms in-app (Sheet), not window.confirm.
+    const dialog = hostPage.getByRole('dialog', { name: 'Leave room?' });
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole('button', { name: 'Leave room', exact: true }).click();
     await expect(hostPage).toHaveURL(/\/$/);
     await expect(hostPage.getByRole('button', { name: /HOST A GAME/ })).toBeVisible();
   });

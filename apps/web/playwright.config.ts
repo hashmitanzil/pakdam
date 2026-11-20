@@ -4,10 +4,22 @@ import { defineConfig } from '@playwright/test';
  * Playwright config for the Pakdam PWA (pakdam-fresh).
  *
  * The suite is text-only: no screenshots, no video, no trace (see
- * e2e/README.md). The dev server is started automatically unless one is
- * already running on port 3000; it inherits the shell environment, so
- * NEXT_PUBLIC_WORKER_URL / NEXT_PUBLIC_OLA_MAPS_API_KEY must be set
- * before the server starts for the live / with-key specs.
+ * e2e/README.md).
+ *
+ * The suite runs against the PRODUCTION build (`next start`), NOT the dev
+ * server. Next.js dev mode uses eval() for source maps / fast refresh,
+ * which violates this app's CSP (`script-src 'self' 'unsafe-inline'`, no
+ * 'unsafe-eval') and floods every page with page errors — that was the
+ * smoke.spec.ts:86/:90 failure, a dev-mode artifact, not an app bug.
+ * Production Next.js never evals, so the violation disappears with NO CSP
+ * weakening (the production CSP is untouched).
+ *
+ * The server command builds first only when no `.next` exists yet, so a
+ * clean checkout still runs with one command; CI builds explicitly before
+ * the test leg (see .github/workflows/ci.yml) and the existing build is
+ * reused. NEXT_PUBLIC_* values are baked at BUILD time, so demo/live mode
+ * and the Ola key are decided by the build's environment, not the test
+ * process's — keep them in sync (see e2e/README.md).
  */
 export default defineConfig({
   testDir: './e2e',
@@ -23,9 +35,9 @@ export default defineConfig({
     screenshot: 'off',
   },
   webServer: {
-    command: 'pnpm run dev',
+    command: 'sh -c \'test -d .next || pnpm run build; exec pnpm run start\'',
     url: 'http://localhost:3000',
     reuseExistingServer: true,
-    timeout: 120000,
+    timeout: 180000,
   },
 });

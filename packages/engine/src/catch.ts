@@ -106,16 +106,20 @@ export function isDuplicateCommand(
   return nowMs - record.seenAtMs < IDEMPOTENCY_TTL_MS;
 }
 
-/** Record a (seat, commandId) as seen. Returns a new map (input untouched). */
+/**
+ * Record a (seat, commandId) as seen. Mutates the map IN PLACE (the old
+ * version copied the whole map — `new Map(seen)` — on every message
+ * carrying a commandId). Callers must not reassign from the return value;
+ * there is none. Exactly-once semantics are unchanged: a repeat inside
+ * the TTL is still a duplicate (see `isDuplicateCommand`).
+ */
 export function rememberCommand(
-  seen: ReadonlyMap<string, IdempotencyRecord>,
+  seen: Map<string, IdempotencyRecord>,
   seatPlayerId: string,
   commandId: string,
   nowMs: number,
-): Map<string, IdempotencyRecord> {
-  const next = new Map(seen);
-  next.set(`${seatPlayerId}:${commandId}`, { commandId, seenAtMs: nowMs });
-  return next;
+): void {
+  seen.set(`${seatPlayerId}:${commandId}`, { commandId, seenAtMs: nowMs });
 }
 
 /** Drop idempotency records older than the 10-min TTL. */

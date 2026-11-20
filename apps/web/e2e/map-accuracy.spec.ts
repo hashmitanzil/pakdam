@@ -1,6 +1,6 @@
 /**
  * map-accuracy.spec.ts — zone accuracy rules (BEHAVIOUR.md §2): radius
- * min 100 m, no maximum, Auto final size ≈ 25%, next zone hidden until
+ * min 100 m, no maximum, Auto final size ≈ 42%, next zone hidden until
  * the shrink preview, and the ±50 m GPS rule. Demo-only. Text-only.
  * The zone is edited inline on the create screen (Zone size stepper
  * below the map); the summary strip that reflects it lives on the
@@ -46,7 +46,7 @@ test.describe('zone accuracy (demo)', () => {
     const hostPage = await context.newPage();
     await createHostSetupRoom(hostPage);
     const increase = hostPage.getByRole('button', { name: 'Increase Zone size' });
-    for (let i = 0; i < 12; i++) await increase.click(); // 500 → 1100 m
+    for (let i = 0; i < 6; i++) await increase.click(); // 500 → 1100 m (+100 m per tap above 500 m)
     await expect(
       hostPage.getByRole('group', { name: 'Zone size' }).getByText('1.1 km'),
     ).toBeVisible();
@@ -75,7 +75,7 @@ test.describe('zone accuracy (demo)', () => {
     // and the HUD correctly shows "no shrink left" instead.
     const { hostPage } = await startDemoMatch(context, { roundShort: false });
     await expect(hostPage.getByText(/Next zone/i)).toBeHidden();
-    await expect(hostPage.getByText(/Zone 500 m shrinks in \d\d:\d\d/)).toBeVisible();
+    await expect(hostPage.getByText(/Zone 500 m shrinks in \d+:\d\d/)).toBeVisible();
   });
 
   test('a fix worse than ±50 m is never auto-centred: the GPS-rough line appears', async ({

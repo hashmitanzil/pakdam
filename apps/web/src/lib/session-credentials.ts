@@ -51,6 +51,15 @@ export function getSessionForRoom(roomId: string): PakdamSession | null {
   return found ?? null;
 }
 
+/** The live session for a room code, or null (join-by-code restore lookup, Phase 3 #9). */
+export function getSessionForRoomCode(roomCode: string): PakdamSession | null {
+  const normalized = roomCode.trim().toUpperCase();
+  const found = readAll().find(
+    (s) => s.mode === 'live' && (s.roomCode ?? '').toUpperCase() === normalized,
+  );
+  return found ?? null;
+}
+
 /**
  * Save (or replace) the session for its room. Saving a session for a room
  * replaces whatever that tab held before; live and demo sessions are never
@@ -87,6 +96,22 @@ export function storeDemoSeat(session: PakdamSession): void {
 /** Drop the seat for a room (leave / switch player). The room itself is untouched. */
 export function clearSession(roomId: string): void {
   writeAll(readAll().filter((s) => s.roomId !== roomId));
+}
+
+/**
+ * Drop ONLY the cached host token for a room (the seat + reconnect
+ * token stay). The background mint rotates the host token, so a cached
+ * token can go stale (two tabs, a rejoin) — a 403 from a host-token
+ * POST drops it here and re-mints once. This writes directly instead
+ * of going through `saveSession`: saving a session with an empty
+ * hostToken would merge the old token straight back in.
+ */
+export function clearHostToken(roomId: string): void {
+  writeAll(
+    readAll().map((s) =>
+      s.roomId === roomId ? { ...s, hostToken: undefined } : s,
+    ),
+  );
 }
 
 /** True only with a live session + isHost + a non-empty hostToken. Display name alone is never proof of host. */

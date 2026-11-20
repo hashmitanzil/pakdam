@@ -22,6 +22,7 @@ import {
   handleHostToken,
   handleHostTransfer,
   handleJoin,
+  handleJoinByCode,
   handleLifecycle,
   handleLookupByCode,
   handleRegenerateCode,
@@ -168,6 +169,12 @@ const ROUTES: Route[] = [
     rateKey: 'POST /v1/rooms/:id/join',
     match: seg('/v1/rooms/:id/join'),
     handler: (req, ctx, p) => handleJoin(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/rooms/join-by-code',
+    match: seg('/v1/rooms/join-by-code'),
+    handler: (req, ctx) => handleJoinByCode(req, ctx),
   },
   {
     method: 'POST',
@@ -329,12 +336,13 @@ export default {
           route.rateKey === 'GET /v1/rooms/:id';
         const isWsRoute = route.rateKey === 'WS /v1/rooms/:id/ws';
         const isJoinRoute = route.rateKey === 'POST /v1/rooms/:id/join';
+        const isJoinByCodeRoute = route.rateKey === 'POST /v1/rooms/join-by-code';
         const isByCodeRoute = route.rateKey === 'GET /v1/rooms/by-code/:code';
         if (!isSeatRoute) {
           let key = clientIp(req);
           if (isWsRoute) {
             key = `ws:${params['id'] ?? 'unknown'}`;
-          } else if (isJoinRoute) {
+          } else if (isJoinRoute || isJoinByCodeRoute) {
             let roomCode: string | null = null;
             if (req.method === 'POST') {
               // Peek at the body once for the rate-limit key; the handler
@@ -349,7 +357,9 @@ export default {
             }
             // Room + code bucket (35/min in the table): a full roster on
             // one NAT IP joins inside a minute without a 429.
-            key = `join:${params['id'] ?? 'unknown'}:${roomCode ?? ''}`;
+            key = isJoinByCodeRoute
+              ? `join-by-code:${roomCode ?? ''}`
+              : `join:${params['id'] ?? 'unknown'}:${roomCode ?? ''}`;
           } else if (isByCodeRoute) {
             // The code itself is the bucket (35/min in the table).
             key = `by-code:${params['code'] ?? ''}`;

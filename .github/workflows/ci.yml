@@ -41,12 +41,17 @@ jobs:
       - name: Install Playwright browsers
         run: pnpm --filter pakdam-web exec playwright install --with-deps chromium
 
-      # Runs the real test suite and FAILS if any workspace has no test
-      # script or no tests — `pnpm -r run test` used to exit 0 with zero
-      # tests executed, which hid the gap. See root package.json `test`.
-      - name: Unit tests
-        run: pnpm test
-
+      # Production build BEFORE the tests: the e2e leg runs against the
+      # production server (`next start`, see apps/web/playwright.config.ts)
+      # because Next.js dev mode eval()s for source maps and violates the
+      # app's CSP (no 'unsafe-eval'), which flooded every page with page
+      # errors. The build must exist before `pnpm test` starts the e2e leg.
+      # NEXT_PUBLIC_* values are baked into the client bundle at build
+      # time: WORKER_URL "" keeps the build in demo mode for the demo
+      # specs, and NO Ola key is set on purpose — a baked placeholder key
+      # would make the app treat Ola as configured and the no-key map
+      # specs (the CI default) would fail instead of showing the
+      # missing-key banner.
       - name: Production build
         run: pnpm build
         env:
@@ -54,4 +59,9 @@ jobs:
           NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
           NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder
           NEXT_PUBLIC_SITE_URL: http://localhost:3000
-          NEXT_PUBLIC_OLA_MAPS_API_KEY: placeholder
+
+      # Runs the real test suite and FAILS if any workspace has no test
+      # script or no tests — `pnpm -r run test` used to exit 0 with zero
+      # tests executed, which hid the gap. See root package.json `test`.
+      - name: Unit tests
+        run: pnpm test

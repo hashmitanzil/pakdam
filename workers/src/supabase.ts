@@ -290,16 +290,27 @@ export async function executePersistIntent(
   }
 }
 
-/** Best-effort, in order; a failure in one intent never fails the others. */
+/**
+ * Best-effort, CONCURRENT (Phase 3 #8): every intent is an independent
+ * PostgREST call on a different row/table (or the same room row carrying
+ * the same snapshot values), so they run via Promise.allSettled instead
+ * of sequentially — a catch confirm's catch-update + player-upsert +
+ * room-event (+ match-result + room-upsert on a win) and a start's N+1
+ * player-upserts no longer pay N round trips in series. A failure in
+ * one intent never fails the others, as before. Hashes are untouched
+ * (SHA-256 is sub-ms; caching them would save nothing and risk reuse).
+ */
 export async function executePersistIntents(
   env: SupabaseEnv,
   intents: readonly PersistIntent[],
 ): Promise<void> {
-  for (const intent of intents) {
-    try {
-      await executePersistIntent(env, intent);
-    } catch {
-      // Best-effort by design — the DO is the authority.
-    }
-  }
+  await Promise.allSettled(
+    intents.map(async (intent) => {
+      try {
+        await executePersistIntent(env, intent);
+      } catch {
+        // Best-effort by design — the DO is the authority.
+      }
+    }),
+  );
 }

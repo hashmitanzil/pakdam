@@ -9,6 +9,7 @@
 import { test, expect } from '@playwright/test';
 import {
   LIVE,
+  createHostRoom,
   expectNoForgeOfficeText,
   startDemoMatch,
 } from './helpers';
@@ -27,10 +28,15 @@ test.describe('no Forge office in the PWA (demo)', () => {
   test('lobby, play, catch and results have no Forge-office references', async ({
     context,
   }) => {
+    // The lobby can only be checked BEFORE the match starts: once the
+    // phase leaves LOBBY the lobby page auto-navigates to /play, so a
+    // post-start visit to /room/[id] never shows the Lobby heading.
+    const lobbyPage = await context.newPage();
+    await createHostRoom(lobbyPage);
+    await expect(lobbyPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
+    await expectNoForgeOfficeText(lobbyPage);
+    await lobbyPage.close();
     const { hostPage, roomId } = await startDemoMatch(context);
-    await expectNoForgeOfficeText(hostPage);
-    await hostPage.goto(`/room/${roomId}`);
-    await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
     await expectNoForgeOfficeText(hostPage);
     await hostPage.goto(`/room/${roomId}/catch`);
     await expect(hostPage.getByRole('heading', { name: 'Catch' })).toBeVisible();

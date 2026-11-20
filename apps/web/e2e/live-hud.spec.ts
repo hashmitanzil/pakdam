@@ -61,7 +61,9 @@ test.describe('live HUD (demo)', () => {
     await expect(page.getByText('Time left')).toBeVisible();
     await expect(page.getByText('Next ping')).toBeVisible();
     await expect(page.getByText(/Runners left 2 of 2/)).toBeVisible();
-    await expect(page.getByText(/Zone 500 m shrinks in \d\d:\d\d/)).toBeVisible();
+    // Countdown minutes are NOT zero-padded (formatAgeLabel: "9:59", not
+    // "09:59"), so the minutes half is \d+, not \d\d.
+    await expect(page.getByText(/Zone 500 m shrinks in \d+:\d\d/)).toBeVisible();
     await expect(page.getByRole('progressbar', { name: 'Runners left' })).toBeVisible();
     // No fix has ever arrived in a headless context without geolocation.
     await expect(page.getByText('Location never reported')).toBeVisible();
@@ -194,7 +196,7 @@ test.describe('live HUD (demo)', () => {
     await expect(hostPage.getByText(/Suspended — location unknown/)).toBeHidden();
   });
 
-  test('catch buttons are one per role: hunter gets CATCH BY QR, runner gets SHOW MY QR', async ({
+  test('catch buttons are one per role: hunter gets CATCH BY QR, runner gets Got Tagged', async ({
     context,
   }) => {
     const { hostPage, guestPages, roles } = await startDemoMatch(context);
@@ -205,10 +207,12 @@ test.describe('live HUD (demo)', () => {
       const role = roles.get(names[i]!);
       if (role === 'hunter') {
         await expect(page.getByRole('button', { name: 'CATCH BY QR' })).toBeVisible();
-        await expect(page.getByRole('button', { name: 'SHOW MY QR' })).toBeHidden();
+        await expect(page.getByRole('button', { name: 'Got Tagged' })).toBeHidden();
       } else {
-        await expect(page.getByRole('button', { name: 'SHOW MY QR' })).toBeVisible();
-        await expect(page.getByRole('button', { name: 'Got tagged' })).toBeVisible();
+        // No "SHOW MY QR" button exists on the play screen — the
+        // runner's button is "Got Tagged", which opens /catch where the
+        // QR itself is shown.
+        await expect(page.getByRole('button', { name: 'Got Tagged' })).toBeVisible();
         await expect(page.getByRole('button', { name: 'CATCH BY QR' })).toBeHidden();
       }
     }

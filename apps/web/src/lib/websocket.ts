@@ -252,11 +252,13 @@ export class PakdamSocket {
     return this.sendCommand('reveal.send', { fix });
   }
 
-  /** "I'm ready" — one tap sends ready AND confirms the briefing together. */
+  /**
+   * "I'm ready" — one tap, one message. The server folds
+   * briefing.confirm into ready.set (Phase 3 #6), so no second message
+   * (and no second save + broadcast + Supabase upsert) is sent.
+   */
   setReady(isReady: boolean): boolean {
-    const sent = this.sendCommand('ready.set', { isReady });
-    if (sent && isReady) this.sendCommand('briefing.confirm', {});
-    return sent;
+    return this.sendCommand('ready.set', { isReady });
   }
 
   sendRadio(text: string, kind: 'quick' | 'text' = 'text'): boolean {

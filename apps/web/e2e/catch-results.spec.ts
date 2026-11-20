@@ -121,6 +121,8 @@ test.describe('catch → results (demo)', () => {
     await hostPage.getByRole('button', { name: 'START A FRESH GAME' }).click();
     await hostPage.getByRole('button', { name: /HOST A GAME/ }).click();
     await hostPage.getByLabel('Your codename').fill('Teo');
+    // The mode card does nothing until the on-site box is ticked.
+    await hostPage.getByRole('checkbox', { name: /I'm at the play location/ }).click();
     await hostPage.getByRole('button', { name: /Classic/ }).click();
     await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
     const newCode = (await hostPage.locator('section[aria-label="Game code"] .pakdam-code').innerText()).trim();

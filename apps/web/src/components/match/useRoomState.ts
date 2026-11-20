@@ -30,6 +30,7 @@ import type {
   RadioMessage,
   Room,
   SafetyState,
+  WsErrorCode,
   WsErrorPayload,
   WsSnapshotPayload,
   WsConnectionState,
@@ -40,6 +41,7 @@ import { fetchLiveRoomState } from '@/lib/live-room-client';
 import { getSessionForRoom, type PakdamSession } from '@/lib/session-credentials';
 import {
   getRoom,
+  demoRoomChangeKey,
   pollDemoRoom,
   recordPlayerSuspension,
   resumePlayer,
@@ -82,6 +84,14 @@ export interface RoomStateData {
   socket: PakdamSocket | null;
   socketState: WsConnectionState;
   socketError: string | null;
+  /**
+   * The most recent server error envelope, with its code and receipt
+   * time — pages with a pending action (catch confirm, pause/resume)
+   * watch this to clear the pending state and show the server's reason
+   * instead of wedging. `socketError` (the plain string) stays for the
+   * generic banners; this is the structured, per-envelope companion.
+   */
+  lastSocketError: { code: WsErrorCode; message: string; atMs: number } | null;
   /** Demo room (null in live mode). */
   demo: DemoRoom | null;
   myPlayerId: string;
@@ -177,6 +187,11 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   >([]);
   const [socketState, setSocketState] = useState<WsConnectionState>('idle');
   const [socketError, setSocketError] = useState<string | null>(null);
+  const [lastSocketError, setLastSocketError] = useState<{
+    code: WsErrorCode;
+    message: string;
+    atMs: number;
+  } | null>(null);
   const [demo, setDemo] = useState<DemoRoom | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -191,6 +206,23 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   // change produces different JSON and applies normally.
   const lastSnapshotJsonRef = useRef<string | null>(null);
   const lastDemoJsonRef = useRef<string | null>(null);
+  // Cheap first gate (B13): (version, serverSeq) of the last applied
+  // snapshot — the same pair means the same server state, so the
+  // JSON.stringify below is skipped entirely. A different pair falls
+  // through to the stringify comparison as before.
+  const lastSnapshotKeyRef = useRef<string | null>(null);
+  // Cheap first gate for demo polls (B13): see `demoRoomChangeKey`.
+  const lastDemoKeyRef = useRef<string | null>(null);
+  // Optimistic live radio messages awaiting their server echo (A5):
+  // the server mints a NEW messageId, so the echo can only be matched
+  // by content + time, never by id.
+  const pendingRadioRef = useRef<
+    Array<{ messageId: string; playerId: string; text: string; kind: 'quick' | 'text'; sentAtMs: number }>
+  >([]);
+  // When the last radio message was sent (epoch ms) — an error envelope
+  // is tied to that send only while it is recent, so an unrelated error
+  // (e.g. a safety 403) never pulls back a radio message.
+  const lastRadioSendAtMsRef = useRef<number>(0);
   // Player list for resolving a reveal sender's display name inside the
   // socket callback (created once per room/session, so state would be stale).
   const playersRef = useRef<PlayerView[]>([]);
@@ -201,6 +233,11 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   myPlayerIdRef.current = myPlayerId;
 
   const applySnapshot = useCallback((snapshot: WsSnapshotPayload) => {
+    // Cheap gate first (B13): same (version, serverSeq) = same server
+    // state — skip the stringify + whole fan-out outright.
+    const key = `${snapshot.version}:${snapshot.serverSeq}`;
+    if (key === lastSnapshotKeyRef.current) return;
+    lastSnapshotKeyRef.current = key;
     // Duplicate snapshot (welcome → re-request, reconnect re-fetch):
     // same content, nothing to apply — skip the whole fan-out.
     const json = JSON.stringify(snapshot);
@@ -279,7 +316,11 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     // The demo poll runs every 1 s and re-parses localStorage, so `next`
     // is a fresh object every time even when nothing changed — without
     // this guard the poll re-rendered the whole play page (and rebuilt
-    // the map overlays) every second of an idle game.
+    // the map overlays) every second of an idle game. Cheap key first
+    // (B13): an unchanged key skips the stringify outright.
+    const demoKey = demoRoomChangeKey(next);
+    if (demoKey === lastDemoKeyRef.current) return;
+    lastDemoKeyRef.current = demoKey;
     const json = JSON.stringify(next);
     if (json === lastDemoJsonRef.current) return;
     lastDemoJsonRef.current = json;
@@ -394,6 +435,43 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
           case 'radio': {
             const radio = payload['radio'] as RadioMessage | undefined;
             if (!radio) break;
+            // A5: the server echo carries a NEW messageId, so an
+            // optimistic message is matched by content + time (same
+            // sender, same text/kind) and replaced by the server copy —
+            // never shown twice. The window is 60 s, not 10 s: a client
+            // clock >10 s off the server used to miss the echo entirely
+            // and render every message twice. Pending entries older
+            // than 60 s expire here too — an echo that late can never
+            // match, so the unconfirmed optimistic copy is pulled back
+            // rather than lingering as if it had been sent.
+            const pending = pendingRadioRef.current;
+            const nowMs = Date.now();
+            const stale = pending.filter((p) => nowMs - p.sentAtMs > 60_000);
+            if (stale.length > 0) {
+              const staleIds = new Set(stale.map((p) => p.messageId));
+              pendingRadioRef.current = pending.filter((p) => !staleIds.has(p.messageId));
+              setRadioMessages((prev) => prev.filter((m) => !staleIds.has(m.messageId)));
+            }
+            const matchIndex = pendingRadioRef.current.findIndex(
+              (p) =>
+                p.playerId === radio.playerId &&
+                p.text === radio.text &&
+                p.kind === radio.kind &&
+                Math.abs(Date.parse(radio.sentAt) - p.sentAtMs) < 60_000,
+            );
+            if (matchIndex >= 0) {
+              const optimisticId = pendingRadioRef.current[matchIndex]?.messageId;
+              pendingRadioRef.current.splice(matchIndex, 1);
+              setRadioMessages((prev) =>
+                prev.some((m) => m.messageId === radio.messageId)
+                  ? prev
+                  : [
+                      ...prev.filter((m) => m.messageId !== optimisticId).slice(-49),
+                      radio,
+                    ],
+              );
+              break;
+            }
             setRadioMessages((prev) =>
               prev.some((m) => m.messageId === radio.messageId)
                 ? prev
@@ -504,7 +582,31 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         }
       },
       onError: (err: WsErrorPayload) => {
-        if (!cancelled) setSocketError(err.message);
+        if (!cancelled) {
+          setSocketError(err.message);
+          setLastSocketError({ code: err.code, message: err.message, atMs: Date.now() });
+          // A5 rollback, by error CODE — not by message-text regex. The
+          // old `/radio/i` test missed the two rejections that matter
+          // most: the rate limit ("Too many messages — slow down.",
+          // RATE_LIMITED) and the caught-spectator block ("You are out
+          // — spectating players cannot message the live team.",
+          // FORBIDDEN) — both left the optimistic message on screen as
+          // delivered when it was never sent. Tied to the last radio
+          // send (recent only): an unrelated error never pulls back a
+          // radio message. VALIDATION_FAILED covers the remaining radio
+          // rejections ("Radio text must be…").
+          if (
+            (err.code === 'RATE_LIMITED' ||
+              err.code === 'FORBIDDEN' ||
+              err.code === 'VALIDATION_FAILED') &&
+            pendingRadioRef.current.length > 0 &&
+            Date.now() - lastRadioSendAtMsRef.current < 10_000
+          ) {
+            const dropped = new Set(pendingRadioRef.current.map((p) => p.messageId));
+            pendingRadioRef.current = [];
+            setRadioMessages((prev) => prev.filter((m) => !dropped.has(m.messageId)));
+          }
+        }
       },
     });
     socketRef.current = socket;
@@ -571,7 +673,32 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         setRadioMessages((prev) => [...prev.slice(-49), message]);
         return true;
       }
-      return socketRef.current?.sendRadio(text, kind) ?? false;
+      // A5: live radio is optimistic too — the message appears at once
+      // (pending), the server echo replaces it by content match (the
+      // server mints its own messageId), and a send failure pulls it
+      // straight back. The demo branch below already did this locally.
+      const me = playersRef.current.find((p) => p.playerId === myPlayerIdRef.current);
+      const message: RadioMessage = {
+        messageId: crypto.randomUUID(),
+        roomId,
+        playerId: myPlayerIdRef.current,
+        senderName: me?.displayName ?? 'You',
+        text,
+        kind,
+        sentAt: new Date().toISOString(),
+      };
+      const sent = socketRef.current?.sendRadio(text, kind) ?? false;
+      if (!sent) return false;
+      lastRadioSendAtMsRef.current = Date.parse(message.sentAt);
+      pendingRadioRef.current.push({
+        messageId: message.messageId,
+        playerId: message.playerId,
+        text,
+        kind,
+        sentAtMs: Date.parse(message.sentAt),
+      });
+      setRadioMessages((prev) => [...prev.slice(-49), message]);
+      return true;
     },
     [mode, roomId],
   );
@@ -614,6 +741,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     socket,
     socketState,
     socketError,
+    lastSocketError,
     demo,
     myPlayerId,
     myPlayer,

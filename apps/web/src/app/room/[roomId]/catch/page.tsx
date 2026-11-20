@@ -19,7 +19,7 @@
  */
 'use client';
 
-import { use, useEffect, useState } from 'react';
+import { use, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useRoomState } from '@/components/match/useRoomState';
 import { CatchQR } from '@/components/catch/CatchQR';
@@ -60,6 +60,7 @@ export default function CatchPage({
     activeCatches,
     sessionCatches,
     socket,
+    lastSocketError,
     demo,
     myPlayerId,
     myPlayer,
@@ -74,6 +75,26 @@ export default function CatchPage({
   const [manualMode, setManualMode] = useState(false);
   const [qrToken, setQrToken] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // A4: "Confirming…" shows the instant Self confirm is tapped — the
+  // done card renders on the server echo (live) or the store write
+  // (demo); a failed confirm clears it and says so.
+  const [confirming, setConfirming] = useState(false);
+  // (b) A live confirm/scan that the server REJECTS (stale GPS, >100 m,
+  // already decided, expired) arrives only as an error envelope — the
+  // page used to never read it, so the Runner wedged on "Confirming…"
+  // with the button disabled and no message. These refs tie a fresh
+  // error envelope to the pending catch action that caused it; the
+  // timeout is the fallback if no envelope ever arrives.
+  const pendingConfirmAtMsRef = useRef<number | null>(null);
+  const pendingScanAtMsRef = useRef<number | null>(null);
+  const confirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const clearConfirmTimeout = () => {
+    if (confirmTimeoutRef.current) {
+      clearTimeout(confirmTimeoutRef.current);
+      confirmTimeoutRef.current = null;
+    }
+    pendingConfirmAtMsRef.current = null;
+  };
   const [doneCatchId, setDoneCatchId] = useState<string | null>(null);
   // The done card falls back to the latest confirmed catch (so it survives
   // the claim leaving the pending set) — but "Tag someone else" must be
@@ -222,6 +243,10 @@ export default function CatchPage({
         return;
       }
       // Confirmed state arrives over the socket; the done card renders from it.
+      // A server rejection arrives only as an error envelope — the effect
+      // on lastSocketError below shows the server's reason instead of
+      // leaving the scanner running silently with no feedback.
+      pendingScanAtMsRef.current = Date.now();
       return;
     }
     // No client-side wrong-scan lockout: the WS `catch.confirm` 5/min/seat
@@ -259,25 +284,85 @@ export default function CatchPage({
       setNotice("You're suspended — reconnect to confirm.");
       return;
     }
+    if (confirming) return;
+    setConfirming(true);
     if (mode === 'live') {
       if (!socket?.sendCatchConfirm(openClaim.catchId, '', true)) {
+        setConfirming(false);
         setNotice('Not connected — the confirmation was not sent. Wait for the reconnect, then tap again.');
         return;
       }
       // Confirmed state arrives over the socket; the done card renders from it.
+      // A server rejection arrives only as an error envelope (the effect
+      // on lastSocketError below clears this and shows the reason); the
+      // 10 s timeout is the fallback if no envelope ever arrives, so a
+      // Runner can never wedge on "Confirming…" with a disabled button.
+      clearConfirmTimeout();
+      pendingConfirmAtMsRef.current = Date.now();
+      confirmTimeoutRef.current = setTimeout(() => {
+        confirmTimeoutRef.current = null;
+        pendingConfirmAtMsRef.current = null;
+        setConfirming(false);
+        setNotice('Confirmation timed out — the server did not answer. Tap Self confirm again.');
+      }, 10_000);
       return;
     }
     const current = getRoom(roomId);
-    if (!current) return;
+    if (!current) {
+      setConfirming(false);
+      return;
+    }
     try {
       const confirmed = confirmCatch(current, openClaim.catchId, myPlayerId, 'manual-confirm');
       setDoneCatchId(confirmed.catchId);
       setDismissedDoneCatchId(null);
       refreshDemo();
     } catch (err) {
+      setConfirming(false);
       setNotice(err instanceof Error ? err.message : 'Could not confirm the tag.');
     }
   };
+
+  // The pending state clears the moment the done card can render (the
+  // server echo / store write landed) or the claim goes away.
+  useEffect(() => {
+    if (confirming && (doneCatch || !openClaim)) {
+      clearConfirmTimeout();
+      setConfirming(false);
+    }
+    // A decided catch answers any pending scan too — a later error is
+    // unrelated to it.
+    if (doneCatch) pendingScanAtMsRef.current = null;
+  }, [confirming, doneCatch, openClaim]);
+
+  // (b) A server rejection of the pending confirm/scan arrives only as
+  // an error envelope: clear the pending state and show the server's
+  // reason. Tied to the pending action by receipt time (within 15 s of
+  // the send) so an unrelated error never surfaces as a catch failure.
+  useEffect(() => {
+    if (!lastSocketError) return;
+    const { atMs, message } = lastSocketError;
+    const confirmAt = pendingConfirmAtMsRef.current;
+    if (confirmAt !== null && atMs >= confirmAt && atMs - confirmAt < 15_000) {
+      clearConfirmTimeout();
+      setConfirming(false);
+      setNotice(message);
+      return;
+    }
+    const scanAt = pendingScanAtMsRef.current;
+    if (scanAt !== null && atMs >= scanAt && atMs - scanAt < 15_000) {
+      pendingScanAtMsRef.current = null;
+      setNotice(message);
+    }
+  }, [lastSocketError]);
+
+  // Never leave the confirm timeout running after unmount.
+  useEffect(
+    () => () => {
+      if (confirmTimeoutRef.current) clearTimeout(confirmTimeoutRef.current);
+    },
+    [],
+  );
 
   // -- Host: resolve a disputed catch ------------------------------------------
   const handleHostResolve = async (catchId: string, decision: 'confirmed' | 'rejected') => {
@@ -495,10 +580,10 @@ export default function CatchPage({
           <button
             type="button"
             onClick={handleRunnerConfirm}
-            disabled={isSuspended}
+            disabled={isSuspended || confirming}
             className="self-center text-[15px] font-semibold text-[#EF4444] disabled:opacity-40"
           >
-            Self confirm
+            {confirming ? 'Confirming…' : 'Self confirm'}
           </button>
         </div>
       ) : isHunter && openClaim && scanOpen && !manualMode ? (

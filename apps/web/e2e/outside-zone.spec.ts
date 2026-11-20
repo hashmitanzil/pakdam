@@ -46,7 +46,9 @@ test.describe('outside zone (demo)', () => {
     // run (probe 2026-11-19), but the 15 s bound timed out under the
     // 4-worker parallel load (run 2) while the 60 s eject test passed —
     // the bound was the emulation, not the app.
-    await expect(hostPage.getByText(/OUTSIDE ZONE — Return in 00:\d\d or ejected/)).toBeVisible({
+    // Countdown minutes are NOT zero-padded (formatAgeLabel: "0:30",
+    // not "00:30").
+    await expect(hostPage.getByText(/OUTSIDE ZONE — Return in 0:\d\d or ejected/)).toBeVisible({
       timeout: 45000,
     });
     await expect(hostPage.getByText('30s', { exact: true })).toBeVisible();
@@ -56,24 +58,26 @@ test.describe('outside zone (demo)', () => {
   test('back inside clears the banner', async ({ browser }) => {
     const { context, hostPage } = await startAtCentre(browser);
     await context.setGeolocation(FAR);
-    await expect(hostPage.getByText(/OUTSIDE ZONE — Return in 00:\d\d or ejected/)).toBeVisible({
+    await expect(hostPage.getByText(/OUTSIDE ZONE — Return in 0:\d\d or ejected/)).toBeVisible({
       timeout: 45000,
     });
     await context.setGeolocation(CENTRE);
-    await expect(hostPage.getByText(/OUTSIDE ZONE — Return in 00:\d\d or ejected/)).toBeHidden({
+    await expect(hostPage.getByText(/OUTSIDE ZONE — Return in 0:\d\d or ejected/)).toBeHidden({
       timeout: 15000,
     });
     await context.close();
   });
 
-  test('poor GPS freezes the countdown at 00:30', async ({ browser }) => {
+  test('poor GPS freezes the countdown at 0:30', async ({ browser }) => {
     const { context, hostPage } = await startAtCentre(browser);
     await context.setGeolocation(FAR_ROUGH);
-    await expect(hostPage.getByText('OUTSIDE ZONE — Return in 00:30 or ejected')).toBeVisible({
+    // Frozen at the full 30 s while the fix is too rough to trust —
+    // "0:30", not "00:30" (minutes are not zero-padded).
+    await expect(hostPage.getByText('OUTSIDE ZONE — Return in 0:30 or ejected')).toBeVisible({
       timeout: 45000,
     });
     await hostPage.waitForTimeout(5000);
-    await expect(hostPage.getByText('OUTSIDE ZONE — Return in 00:30 or ejected')).toBeVisible();
+    await expect(hostPage.getByText('OUTSIDE ZONE — Return in 0:30 or ejected')).toBeVisible();
     await context.close();
   });
 

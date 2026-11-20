@@ -20,6 +20,8 @@ export interface SafetyControlsProps {
   /** The phase to return to on resume (demo knows it; live keeps it server-side). */
   pausedFrom: MatchPhase | null;
   canPause: boolean;
+  /** Resume is host-only on the server — a non-host never sees the button. */
+  isHost: boolean;
   onPause: () => void;
   onResume: () => void;
 }
@@ -32,6 +34,7 @@ export const SafetyControls = memo(function SafetyControls({
   pausedByName,
   pausedFrom,
   canPause,
+  isHost,
   onPause,
   onResume,
 }: SafetyControlsProps) {
@@ -51,9 +54,15 @@ export const SafetyControls = memo(function SafetyControls({
                 Resume returns to {pausedFrom === 'HEAD_START' ? 'the head start' : 'live play'}.
               </p>
             ) : null}
-            <Button variant="outline" onClick={onResume} className="mt-3">
-              Resume the match
-            </Button>
+            {isHost ? (
+              <Button variant="outline" onClick={onResume} className="mt-3">
+                Resume the match
+              </Button>
+            ) : (
+              <p className="mt-2 text-[13px] text-[#A1A1AA]">
+                Only the host can resume the match.
+              </p>
+            )}
           </>
         ) : (
           <>

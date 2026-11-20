@@ -358,6 +358,61 @@ export async function handleJoin(
 }
 
 /**
+ * POST /v1/rooms/join-by-code — join by code in ONE call (Phase 3 #9).
+ * The client used to do GET by-code (registry hop) THEN POST join; this
+ * folds the lookup into the join on the server side, so the client makes
+ * a single request. Same validation, same DO op, same response shape as
+ * handleJoin plus the roomId. The two-call path stays for back-compat.
+ */
+export async function handleJoinByCode(
+  req: Request,
+  ctx: HttpContext,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const displayName = asString(body['displayName']);
+  if (!displayName || !isValidDisplayName(displayName)) {
+    return err('Display name must be 1–30 characters.', 400);
+  }
+  if (body['kind'] !== 'guest') {
+    return err("kind must be 'guest'.", 400);
+  }
+  const roomCode = asString(body['roomCode']);
+  if (!roomCode || !isValidRoomCode(roomCode)) {
+    return err('roomCode must be 6 characters A–Z0–9.', 400);
+  }
+  const found = await callRegistry(ctx.env, 'lookup', { code: roomCode.trim().toUpperCase() });
+  if (!found.ok) {
+    return err('No live room for that code.', 404);
+  }
+  const roomId = found['roomId'] as string;
+  const rawReconnect = asString(body['reconnectToken']);
+  const joined = await callDo(ctx.env, roomId, 'add-player', {
+    displayName: displayName.trim(),
+    roomCode: roomCode.trim().toUpperCase(),
+    reconnectTokenHash: rawReconnect ? await hashReconnectToken(rawReconnect) : null,
+  });
+  if (!joined.ok) return doError(joined);
+  const joinedPlayer = joined['player'];
+  const player =
+    joinedPlayer !== null && typeof joinedPlayer === 'object'
+      ? (({ reconnectTokenHash: _hash, ...rest }) => rest)(
+          joinedPlayer as Record<string, unknown>,
+        )
+      : joinedPlayer;
+  recordTelemetry('player_games', 1);
+  return json({
+    ok: true,
+    roomId,
+    roomCode: roomCode.trim().toUpperCase(),
+    player,
+    reconnectToken: joined['reconnectToken'],
+    restored: joined['restored'],
+  });
+}
+
+/**
  * POST /v1/rooms/:id/ws-ticket — single-use WS ticket (60 s TTL).
  * ISSUANCE-SIDE ONLY: the Worker mints the value and registers its HASH
  * with the DO. The Worker never validates a ticket against its own store.
@@ -493,10 +548,11 @@ export async function handleUpdateConfig(
   if (typeof body['config'] !== 'object' || body['config'] === null) {
     return err('config is required.', 400);
   }
-  const issues = validateRoomConfig(body['config']);
-  if (issues.length > 0) {
-    return err('Room config is not valid.', 400, issues);
-  }
+  // Phase 3 #7: validate ONCE, in the DO (updateConfig ->
+  // validateRoomConfig). The Worker used to validate here too, so every
+  // debounced keystroke paid for validation twice; the DO's check is
+  // unchanged and still rejects a bad config with 400. (Create keeps its
+  // Worker-side check: createRoom has no DO yet to validate in.)
   const hostTokenHash = await hashHostToken(rawHost);
   const limited = await checkSeatLimit('POST /v1/rooms/:id/config', roomId, hostTokenHash);
   if (limited) return limited;

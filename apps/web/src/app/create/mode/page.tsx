@@ -10,7 +10,7 @@
  * comes only after the host taps CREATE LOBBY — the code appears there,
  * never here or on the create screen.
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   DEFAULT_ROOM_CONFIG,
@@ -22,6 +22,7 @@ import { isLiveTransportEnabled } from '../../../lib/websocket';
 import { createLiveRoom } from '../../../lib/live-client';
 import { createRoom as createDemoRoom } from '../../../lib/demo-store';
 import { storeDemoSeat } from '../../../lib/session-credentials';
+import { prefetchMapAssets } from '../../../components/map/maplibre';
 
 const MODES: { mode: MatchMode; title: string; line: string }[] = [
   { mode: 'classic', title: 'Classic', line: "Tagged? You're out. Watch live." },
@@ -33,6 +34,11 @@ export default function ModeSelectPage() {
   const [codename, setCodename] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState<MatchMode | null>(null);
+  // B21: the setup map is one tap away — warm its chunk + style now,
+  // at idle, so first paint does not pay the serial fetch wait.
+  useEffect(() => {
+    prefetchMapAssets();
+  }, []);
   // The host MUST confirm they are at the play location — the server
   // rejects configs without `hostOnSiteConfirmed`, so this is a real
   // gate, never silently set true.

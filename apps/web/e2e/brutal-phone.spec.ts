@@ -32,9 +32,11 @@ test.describe('brutal phone end-to-end (demo)', () => {
     const runnerName = names[runnerIdx]!;
 
     // Play HUD on the phone: status strip + per-role catch button.
+    // (The runner's button is "Got Tagged" — there is no "SHOW MY QR"
+    // button on the play screen; the QR itself is shown on /catch.)
     await expect(hunterPage.getByText('Time left')).toBeVisible();
     await expect(hunterPage.getByRole('button', { name: 'CATCH BY QR' })).toBeVisible();
-    await expect(runnerPage.getByRole('button', { name: 'SHOW MY QR' })).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Got Tagged' })).toBeVisible();
 
     // Catch via the working path: /catch (no query) → pick a name → claim.
     // Claiming opens the QR scanner first (claim → scan); Cancel it to

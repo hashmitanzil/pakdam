@@ -8,13 +8,15 @@
  * invite link. Copy covers sharing; the invite link is the URL form of
  * the same code (`/join/<CODE>`).
  */
-import { useEffect, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 
 export interface RoomCodeCardProps {
   code: string;
   isHost: boolean;
   /** Live rooms can regenerate; demo rooms cannot (local-only code). */
   canChangeCode: boolean;
+  /** A code change is in flight — the button shows it instead of sitting dead. */
+  changingCode?: boolean;
   onOpenSettings: () => void;
   onChangeCode: () => void;
   /** One-line answers (e.g. demo code-change) surface in the lobby notice. */
@@ -40,10 +42,13 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-export function RoomCodeCard({
+/** Memoized (B14): the lobby re-renders on every poll tick — the code
+ *  card only re-renders when the code, host state or a handler changes. */
+export const RoomCodeCard = memo(function RoomCodeCard({
   code,
   isHost,
   canChangeCode,
+  changingCode = false,
   onOpenSettings,
   onChangeCode,
   onNotice,
@@ -124,6 +129,7 @@ export function RoomCodeCard({
         {isHost ? (
           <button
             type="button"
+            disabled={changingCode}
             onClick={() => {
               if (!canChangeCode) {
                 onNotice?.('Changing the code needs a live room — this is a demo room.');
@@ -131,9 +137,9 @@ export function RoomCodeCard({
               }
               onChangeCode();
             }}
-            className="text-[15px] font-semibold text-[#EF4444]"
+            className="text-[15px] font-semibold text-[#EF4444] disabled:opacity-40"
           >
-            Change code
+            {changingCode ? 'Changing…' : 'Change code'}
           </button>
         ) : null}
       </div>
@@ -150,4 +156,4 @@ export function RoomCodeCard({
       ) : null}
     </section>
   );
-}
+});

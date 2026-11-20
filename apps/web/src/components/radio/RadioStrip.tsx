@@ -35,10 +35,10 @@ export interface RadioStripProps {
   /** e.g. `Connected: 2 of 3 teammates.` — empty when nothing is connected. */
   voiceSummary: string;
   pttState: PttState;
-  burstSeconds: number;
   muted: boolean;
   onToggleMute: () => void;
-  onEnableVoice: () => void;
+  /** Returns the enable promise so the button can show "Enabling…" while getUserMedia resolves. */
+  onEnableVoice: () => Promise<boolean> | void;
   onSendRadio: (text: string, kind?: 'quick' | 'text') => void;
 }
 
@@ -57,13 +57,15 @@ export const RadioStrip = memo(function RadioStrip({
   voiceDetail,
   voiceSummary,
   pttState,
-  burstSeconds,
   muted,
   onToggleMute,
   onEnableVoice,
   onSendRadio,
 }: RadioStripProps) {
   const [draft, setDraft] = useState('');
+  // B18: "Enabling…" while getUserMedia resolves — the tap used to
+  // sit dead until the mic permission prompt answered.
+  const [enablingVoice, setEnablingVoice] = useState(false);
   const quick = team === 'hunters' ? QUICK_SIGNALS.hunters : QUICK_SIGNALS.runners;
 
   const sendDraft = () => {
@@ -71,6 +73,17 @@ export const RadioStrip = memo(function RadioStrip({
     if (!text || !canSend) return;
     onSendRadio(text.slice(0, RADIO_MAX_CHARS), 'text');
     setDraft('');
+  };
+
+  const enableVoice = () => {
+    if (enablingVoice) return;
+    setEnablingVoice(true);
+    void Promise.resolve()
+      .then(async () => {
+        await onEnableVoice();
+      })
+      .catch(() => undefined)
+      .finally(() => setEnablingVoice(false));
   };
 
   return (
@@ -98,10 +111,11 @@ export const RadioStrip = memo(function RadioStrip({
       ) : voiceStatus === 'off' ? (
         <button
           type="button"
-          onClick={onEnableVoice}
-          className="self-start rounded-full border border-[#EF4444] px-3 py-1 text-[13px] font-semibold text-[#EF4444]"
+          onClick={enableVoice}
+          disabled={enablingVoice}
+          className="self-start rounded-full border border-[#EF4444] px-3 py-1 text-[13px] font-semibold text-[#EF4444] disabled:opacity-60"
         >
-          Turn on voice
+          {enablingVoice ? 'Enabling…' : 'Turn on voice'}
         </button>
       ) : voiceStatus === 'failed' || voiceStatus === 'unavailable' ? (
         <p className="text-[13px] text-[#A1A1AA]">{voiceDetail ?? VOICE_FAILURE_COPY}</p>
@@ -180,7 +194,6 @@ export const RadioStrip = memo(function RadioStrip({
         <PTTButton
           radio={voiceRadio}
           pttState={pttState}
-          burstSeconds={burstSeconds}
           size="small"
           disabled={!canSend}
         />

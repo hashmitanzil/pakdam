@@ -88,7 +88,7 @@ test.describe('host setup (demo)', () => {
     await expect(hostPage.getByLabel('Game summary')).toContainText('no pings');
     await hostPage.getByRole('button', { name: 'Settings', exact: true }).click();
     await setStepper(hostPage, 'Pings every', 4); // 3 min
-    await expect(hostPage.getByText('How often hunters see where runners are.')).toBeVisible();
+    await expect(hostPage.getByText('How often both sides see where the other team is.')).toBeVisible();
     await hostPage.getByRole('button', { name: 'Done' }).click();
   });
 
@@ -96,7 +96,9 @@ test.describe('host setup (demo)', () => {
     const hostPage = await context.newPage();
     await createHostSetupRoom(hostPage);
     await expect(hostPage.getByText('Shrinks every')).toBeVisible();
-    await expect(hostPage.getByText('How long players get between each shrink.')).toBeVisible();
+    await expect(
+      hostPage.getByText('Auto from the round length — 3 shrinks per game. You can still change it below.'),
+    ).toBeVisible();
     await hostPage.getByRole('switch', { name: 'Zone shrinks' }).click();
     await expect(hostPage.getByText('Shrinks every')).toBeHidden();
     await hostPage.getByRole('switch', { name: 'Zone shrinks' }).click();
@@ -189,19 +191,34 @@ test.describe('host setup (demo)', () => {
     ).toBeHidden();
   });
 
-  test('guest cannot change settings: Settings opens a notice, not the sheet', async ({ context }) => {
+  test('guest cannot change settings: summary strip opens the sheet read-only (v15), Settings shows a notice', async ({ context }) => {
     const { hostPage, guestPages } = await setupThreePlayerLobby(context);
     const guest = guestPages[0]!;
-    // A guest tapping the summary gets the one-line answer.
+    // v15: a joiner tapping the summary strip OPENS the sheet read-only —
+    // the settings are visible, every control is disabled, the "View
+    // only" line shows, and there is no Change button and no save path.
     await guest.getByLabel('Game summary').click();
-    await expect(guest.getByText('Only the host can change the game settings.')).toBeVisible();
-    // A guest tapping Settings gets the same notice — the sheet never opens.
+    const sheet = guest.getByRole('dialog', { name: 'Settings' });
+    await expect(sheet).toBeVisible();
+    await expect(
+      guest.getByText('View only — only the host can change settings.'),
+    ).toBeVisible();
+    await expect(guest.getByText('Round length')).toBeVisible();
+    await expect(guest.getByRole('button', { name: 'Decrease Round length' })).toBeDisabled();
+    await expect(guest.getByRole('button', { name: 'Increase Round length' })).toBeDisabled();
+    await expect(guest.getByRole('switch', { name: 'Zone shrinks' })).toBeDisabled();
+    await expect(guest.getByRole('button', { name: 'Change', exact: true })).toBeHidden();
+    await guest.getByRole('button', { name: 'Done' }).click();
+    await expect(guest.getByRole('dialog', { name: 'Settings' })).toBeHidden();
+    // The RoomCodeCard SETTINGS button is a DIFFERENT control: a joiner
+    // tapping it still gets the one-line notice and the sheet never opens.
     await guest.getByRole('button', { name: 'Settings', exact: true }).click();
     await expect(guest.getByText('Only the host can change the game settings.')).toBeVisible();
-    await expect(guest.getByText('Game settings')).toBeHidden();
+    await expect(guest.getByRole('dialog', { name: 'Settings' })).toBeHidden();
     // The host CAN open it, and the steppers there are enabled.
     await hostPage.getByRole('button', { name: 'Settings', exact: true }).click();
-    await expect(hostPage.getByText('Game settings')).toBeVisible();
+    await expect(hostPage.getByRole('dialog', { name: 'Settings' })).toBeVisible();
+    await expect(hostPage.getByRole('heading', { name: 'Settings' })).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Decrease Round length' })).toBeEnabled();
     await hostPage.getByRole('button', { name: 'Done' }).click();
   });

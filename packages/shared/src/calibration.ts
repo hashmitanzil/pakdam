@@ -60,6 +60,9 @@ export const FIX_TTL_MS = 120_000;
 /** Redacted game-event log cap in the DO. */
 export const GAME_EVENT_LOG_CAP = 500;
 
+/** Lightweight event log cap in the DO (same 500 — it grows with every save). */
+export const EVENT_LOG_CAP = 500;
+
 /** Text radio: keep the last 50 messages per client, ephemeral, no backfill. */
 export const RADIO_KEEP_LAST = 50;
 
@@ -353,6 +356,10 @@ export const HTTP_RATE_LIMITS: Readonly<Record<string, { readonly limit: number;
     // inside a minute — so a crowded join never 429s the 6th player.
     'GET /v1/rooms/by-code/:code': { limit: 35, windowSeconds: 60, key: 'room' },
     'POST /v1/rooms/:id/join': { limit: 35, windowSeconds: 60, key: 'room' },
+    // Join-by-code (single call: registry lookup folded into the join).
+    // Same 35/min/code bucket as the two-call join path — a full roster
+    // on one venue WiFi joins inside a minute without a 429.
+    'POST /v1/rooms/join-by-code': { limit: 35, windowSeconds: 60, key: 'room' },
     'POST /v1/rooms/:id/ws-ticket': { limit: 10, windowSeconds: 60, key: 'seat' },
     'POST /v1/rooms/:id/ws-ticket/revoke': { limit: 10, windowSeconds: 60, key: 'seat' },
     'POST /v1/rooms/:id/start': { limit: 5, windowSeconds: 60, key: 'seat' },
@@ -361,7 +368,14 @@ export const HTTP_RATE_LIMITS: Readonly<Record<string, { readonly limit: number;
     'POST /v1/support/grievances': { limit: 5, windowSeconds: 60, key: 'ip' },
     // Routes the old build left un-limited — fresh build MUST limit them:
     'GET /v1/rooms/:id': { limit: 60, windowSeconds: 60, key: 'seat' },
-    'POST /v1/rooms/:id/config': { limit: 10, windowSeconds: 60, key: 'seat' },
+    // Config: the host client debounces at 500 ms while dragging steppers,
+    // so sustained editing legitimately sends up to 120/min/seat. The
+    // limit matches that debounce exactly (120/min/seat) — a host-only,
+    // host-token-authed, lobby-only full replace, still bounded, still
+    // validated in the DO. Raising the number to match the client is the
+    // consistency fix; the protection (per-seat bucket + DO validation)
+    // is unchanged.
+    'POST /v1/rooms/:id/config': { limit: 120, windowSeconds: 60, key: 'seat' },
     'POST /v1/rooms/:id/remove-player': { limit: 10, windowSeconds: 60, key: 'seat' },
     'POST /v1/rooms/:id/regenerate-code': { limit: 5, windowSeconds: 60, key: 'seat' },
     'POST /v1/rooms/:id/catch-token': { limit: 10, windowSeconds: 60, key: 'seat' },

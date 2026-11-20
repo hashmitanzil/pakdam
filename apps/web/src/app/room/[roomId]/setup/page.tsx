@@ -28,19 +28,20 @@ import {
   updateLiveRoomConfig,
 } from '../../../../lib/live-room-client';
 import {
+  demoRoomChangeKey,
   getRoom,
   pollDemoRoom,
   setSelectedHunters,
   setTeamAssignment,
   updateRoomConfig,
-  watchDemoPhase,
 } from '../../../../lib/demo-store';
 import {
   getSessionForRoom,
   type PakdamSession,
 } from '../../../../lib/session-credentials';
 import { canZoneAutoCentreOn, getCurrentFix, watchLocation } from '../../../../lib/geolocation';
-import { distanceMeters, formatDistance } from '../../../../lib/utils';
+import { distanceMeters, formatDistance, haversineMeters } from '../../../../lib/utils';
+import { prefetchMapAssets } from '../../../../components/map/maplibre';
 import { circlePolygon } from '@pakdam/engine';
 import { Button } from '../../../../components/ui/Button';
 import { Stepper } from '../../../../components/ui/Stepper';
@@ -110,9 +111,16 @@ export default function SetupPage() {
   zoneRef.current = zone;
   const pushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pendingPushRef = useRef(false);
+  // A7: the latest config awaiting its debounced push, for flushing.
+  const pendingConfigRef = useRef<RoomConfig | null>(null);
   const noticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const gpsAttemptedRef = useRef(false);
   const navigatedRef = useRef(false);
+  // B14: identical-skip refs for the demo poll / live snapshots.
+  const lastDemoKeyRef = useRef<string | null>(null);
+  const lastSnapshotKeyRef = useRef<string | null>(null);
+  // B15: last fix actually shown on screen — the GPS display throttle.
+  const lastShownFixRef = useRef<{ fix: { lat: number; lng: number }; atMs: number } | null>(null);
 
   const showNotice = useCallback((message: string): void => {
     setNotice(message);
@@ -144,6 +152,69 @@ export default function SetupPage() {
       )
     : null;
 
+  // B21: warm the map chunk + Ola style at idle — the setup map is
+  // the first thing on this screen, so prefetch on mount.
+  useEffect(() => {
+    prefetchMapAssets();
+  }, []);
+
+  // A7: roll the visible config back to the server's saved truth.
+  const rollbackConfig = useCallback((): void => {
+    if (session?.mode !== 'live') {
+      const saved = getRoom(roomId);
+      if (saved) setLobby({ room: saved.room, players: saved.players });
+      return;
+    }
+    const currentSession = session;
+    if (!currentSession) return;
+    void fetchLiveRoomState(roomId, currentSession.playerId, currentSession.reconnectToken ?? '')
+      .then((state) => setLobby({ room: state.room, players: state.players }))
+      .catch(() => undefined);
+  }, [roomId, session]);
+
+  // A7: flush the pending debounced config push right now (CREATE
+  // LOBBY, unmount) instead of letting the 500 ms timer fire after
+  // the user has moved on. Returns false when the save failed (the UI
+  // is already rolled back by then).
+  const flushConfigPush = useCallback(async (): Promise<boolean> => {
+    if (pushTimerRef.current) {
+      clearTimeout(pushTimerRef.current);
+      pushTimerRef.current = null;
+    }
+    const pending = pendingConfigRef.current;
+    if (!pendingPushRef.current || !pending) return true;
+    pendingConfigRef.current = null;
+    try {
+      await updateLiveRoomConfig(roomId, pending);
+      pendingPushRef.current = false;
+      return true;
+    } catch (err: unknown) {
+      pendingPushRef.current = false;
+      showNotice(
+        err instanceof Error && 'status' in err
+          ? liveErrorMessage((err as { status: number }).status)
+          : 'Settings were not saved — try again.',
+      );
+      rollbackConfig();
+      return false;
+    }
+  }, [roomId, rollbackConfig, showNotice]);
+
+  // A7: never leave a pending push behind on unmount (best-effort).
+  useEffect(
+    () => () => {
+      if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
+      if (pendingPushRef.current && pendingConfigRef.current) {
+        const pending = pendingConfigRef.current;
+        pendingPushRef.current = false;
+        void updateLiveRoomConfig(roomId, pending).catch(() => undefined);
+      }
+    },
+    // Runs once, on unmount, with the refs as they stand then.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
   // -- Load the seat, then live state / socket or demo polling. -----------
   useEffect(() => {
     const found = getSessionForRoom(roomId);
@@ -170,6 +241,11 @@ export default function SetupPage() {
             goPlay();
             return;
           }
+          // B14: identical-skip — same (version, serverSeq) = same
+          // server state; a re-delivered snapshot changes nothing.
+          const key = `${snapshot.version}:${snapshot.serverSeq}`;
+          if (key === lastSnapshotKeyRef.current) return;
+          lastSnapshotKeyRef.current = key;
           const state = snapshotToLiveRoomState(snapshot);
           // Don't let a stale server echo clobber a config push in flight.
           if (pendingPushRef.current && lobbyRef.current) {
@@ -189,18 +265,28 @@ export default function SetupPage() {
         socketRef.current = null;
       };
     }
-    // Demo: 1 s poll + phase watch (auto-navigate to /play).
+    // Demo: ONE 1 s timer (B14) — the poll AND the phase watch used to
+    // be two separate 1 s timers. The poll skips identical states via
+    // the cheap change key, so an idle setup stops re-rendering.
     const demo = getRoom(roomId);
-    if (demo) setLobby({ room: demo.room, players: demo.players });
-    else setLoadError('Game not found or ended.');
+    if (demo) {
+      lastDemoKeyRef.current = demoRoomChangeKey(demo);
+      setLobby({ room: demo.room, players: demo.players });
+    } else setLoadError('Game not found or ended.');
     const timer = setInterval(() => {
       const current = pollDemoRoom(roomId);
-      if (current) setLobby({ room: current.room, players: current.players });
+      if (!current) return;
+      if (current.room.phase !== 'LOBBY') {
+        goPlay();
+        return;
+      }
+      const key = demoRoomChangeKey(current);
+      if (key === lastDemoKeyRef.current) return;
+      lastDemoKeyRef.current = key;
+      setLobby({ room: current.room, players: current.players });
     }, 1000);
-    const watch = watchDemoPhase(roomId, () => goPlay());
     return () => {
       clearInterval(timer);
-      watch.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, loadNonce]);
@@ -269,21 +355,26 @@ export default function SetupPage() {
           } else {
             updateRoomConfig(demo, next);
           }
-          const saved = getRoom(roomId);
-          if (saved) setLobby({ room: saved.room, players: saved.players });
+          // B25: ONE setLobby per config tap — the optimistic setLobby
+          // above already shows the saved value, so no re-read +
+          // second setLobby on success. Only a failed save rolls back.
         } catch (err) {
           showNotice(err instanceof Error ? err.message : 'Setup not accepted.');
-          const saved = getRoom(roomId);
-          if (saved) setLobby({ room: saved.room, players: saved.players });
+          rollbackConfig();
         }
         return;
       }
       // Live: debounce pushes while the host drags steppers.
       pendingPushRef.current = true;
+      pendingConfigRef.current = next;
       if (pushTimerRef.current) clearTimeout(pushTimerRef.current);
       pushTimerRef.current = setTimeout(() => {
+        pushTimerRef.current = null;
         void updateLiveRoomConfig(roomId, next)
           .catch((err: unknown) => {
+            // A7: the screen must not keep showing a value the server
+            // rejected — roll back to the saved config, then say so.
+            rollbackConfig();
             showNotice(
               err instanceof Error && 'status' in err
                 ? liveErrorMessage((err as { status: number }).status)
@@ -292,10 +383,11 @@ export default function SetupPage() {
           })
           .finally(() => {
             pendingPushRef.current = false;
+            pendingConfigRef.current = null;
           });
       }, 500);
     },
-    [config, isLive, normaliseConfig, roomId, showNotice],
+    [config, isLive, normaliseConfig, roomId, rollbackConfig, showNotice],
   );
   const applyConfigRef = useRef(applyConfig);
   applyConfigRef.current = applyConfig;
@@ -361,9 +453,24 @@ export default function SetupPage() {
   // -- Live location dot: foreground watch, updates the orange dot on the
   //    map. Starts once on mount; stops on unmount. Only permission-denied
   //    is surfaced; transient errors are swallowed by the watch.
+  //    B15: the dot only moves when the fix actually moved (≥ 5 m) or
+  //    5 s passed — the same display gate as the play page — instead of
+  //    re-rendering (and re-drawing the map) on every raw GPS fix.
   useEffect(() => {
     const handle = watchLocation(
-      (fix) => setUserLocation({ lat: fix.lat, lng: fix.lng }),
+      (fix) => {
+        const lastShown = lastShownFixRef.current;
+        const movedM = lastShown
+          ? haversineMeters(lastShown.fix, { lat: fix.lat, lng: fix.lng })
+          : Infinity;
+        if (movedM >= 5 || !lastShown || fix.timestampMs - lastShown.atMs >= 5000) {
+          lastShownFixRef.current = {
+            fix: { lat: fix.lat, lng: fix.lng },
+            atMs: fix.timestampMs,
+          };
+          setUserLocation({ lat: fix.lat, lng: fix.lng });
+        }
+      },
       (err) => {
         if (err.kind === 'permission-denied') setGpsNote(err.message);
       },
@@ -372,13 +479,18 @@ export default function SetupPage() {
   }, []);
 
   // -- Zone draft handlers (map + inline controls). ----------------------
-  const onZoneChange = (draft: ZoneDraft): void => {
-    setZone(draft);
-    // Always push: a Draw with < 3 corners clears the server zone to an
-    // empty boundary (see applyZoneToConfig) instead of leaving the old
-    // circle active while the host draws.
-    applyZoneToConfig(draft);
-  };
+  // Stable (B14): PlayAreaMap is memoised — a fresh onZoneChange every
+  // render would bust it on every poll tick.
+  const onZoneChange = useCallback(
+    (draft: ZoneDraft): void => {
+      setZone(draft);
+      // Always push: a Draw with < 3 corners clears the server zone to an
+      // empty boundary (see applyZoneToConfig) instead of leaving the old
+      // circle active while the host draws.
+      applyZoneToConfig(draft);
+    },
+    [applyZoneToConfig],
+  );
 
   // -- Inline zone controls (Circle | Draw lives on the create screen).
   const switchShape = (next: 'circle' | 'draw'): void => {
@@ -467,7 +579,7 @@ export default function SetupPage() {
     onZoneChange({ ...zone, drawPoints: [] });
   };
 
-  const onLocate = (): void => {
+  const onLocate = useCallback((): void => {
     if (userLocation) {
       // Already have a fix — just re-centre the map on it.
       setLocateNonce((n) => n + 1);
@@ -485,7 +597,16 @@ export default function SetupPage() {
         );
       })
       .finally(() => setLocating(false));
-  };
+  }, [userLocation, showNotice]);
+
+  // A7: CREATE LOBBY flushes any debounced config push first, so the
+  // lobby opens on the saved config — a failed save stops here with
+  // the rollback already applied, instead of navigating on stale data.
+  const handleCreateLobby = useCallback((): void => {
+    void flushConfigPush().then((flushed) => {
+      if (flushed) goLobby();
+    });
+  }, [flushConfigPush, goLobby]);
 
   // -- Render states. ------------------------------------------------------
   if (session === undefined) {
@@ -722,7 +843,7 @@ export default function SetupPage() {
       </div>
 
       <div className="sticky bottom-0 mt-4 bg-[#0A0A0B] pb-[env(safe-area-inset-bottom,0px)] pt-2">
-        <Button variant="primary" onClick={goLobby}>
+        <Button variant="primary" onClick={handleCreateLobby}>
           CREATE LOBBY
         </Button>
       </div>

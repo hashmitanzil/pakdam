@@ -8,7 +8,7 @@ import { test, expect } from '@playwright/test';
 import {
   LIVE,
   OLA_KEY_SET,
-  createHostRoom,
+  createHostSetupRoom,
   startDemoMatch,
 } from './helpers';
 
@@ -16,11 +16,13 @@ test.describe('map tiles — no Ola key', () => {
   test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
   test.skip(OLA_KEY_SET, 'no-key spec — skip when NEXT_PUBLIC_OLA_MAPS_API_KEY is set');
 
-  test('lobby zone map shows the missing-key banner, not a blank canvas', async ({
+  test('setup zone map shows the missing-key banner, not a blank canvas', async ({
     context,
   }) => {
+    // The lobby has NO map — the zone map (and its missing-key banner)
+    // lives on the create screen (/room/[id]/setup).
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     await expect(
       hostPage.getByText('Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.'),
     ).toBeVisible();
@@ -38,9 +40,11 @@ test.describe('map tiles — no Ola key', () => {
     await expect(hostPage.getByText('Time left')).toBeVisible();
   });
 
-  test('lobby zone section without a key offers Circle / Draw inline', async ({ context }) => {
+  test('setup zone section without a key offers Circle / Draw inline', async ({ context }) => {
+    // Again the setup screen, not the lobby: the lobby has no map and no
+    // shape toggle at all.
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     // Shape toggle labels are lowercase DOM text ("circle"/"draw", CSS
     // capitalised).
     await expect(hostPage.getByRole('button', { name: 'circle', exact: true })).toBeVisible();
@@ -55,9 +59,9 @@ test.describe('map tiles — Ola key configured', () => {
   test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
   test.skip(!OLA_KEY_SET, 'with-key spec — skip when NEXT_PUBLIC_OLA_MAPS_API_KEY is not set');
 
-  test('lobby zone map mounts a canvas', async ({ context }) => {
+  test('setup zone map mounts a canvas', async ({ context }) => {
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     await expect(hostPage.locator('[aria-label="Play zone map"] canvas')).toBeVisible({
       timeout: 30000,
     });
@@ -74,7 +78,7 @@ test.describe('map tiles — Ola key configured', () => {
     context,
   }) => {
     const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
+    await createHostSetupRoom(hostPage);
     await expect(hostPage.locator('[aria-label="Play zone map"] canvas')).toBeVisible({
       timeout: 30000,
     });

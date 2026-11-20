@@ -18,6 +18,7 @@
  * non-host); demo mode has no server, so the client-side guard is what
  * keeps a joiner read-only there.
  */
+import { memo } from 'react';
 import type { RoomConfig } from '@pakdam/shared';
 import { Sheet } from '../ui/Sheet';
 import { Button } from '../ui/Button';
@@ -33,7 +34,8 @@ export interface HostSettingsSheetProps {
   onClose: () => void;
 }
 
-export function HostSettingsSheet({
+/** Memoized (B14): the lobby re-renders on every poll tick — the sheet only re-renders when its config or handlers change. */
+export const HostSettingsSheet = memo(function HostSettingsSheet({
   open,
   config,
   activePlayerCount,
@@ -91,4 +93,4 @@ export function HostSettingsSheet({
       </div>
     </Sheet>
   );
-}
+});

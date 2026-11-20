@@ -48,6 +48,7 @@
 import {
   CATCH_MAX_DISTANCE_METERS,
   CATCH_TOKEN_TTL_SECONDS,
+  EVENT_LOG_CAP,
   GAME_EVENT_LOG_CAP,
   HEARTBEAT_INTERVAL_MS,
   HTTP_RATE_LIMITS,
@@ -243,14 +244,58 @@ export interface RoomMemory {
   /** commandId -> direct reply events, so a retry gets the original reply. */
   idempotentReplies: Map<string, OutboundEvent[]>;
   /**
+   * Per-seat Supabase player-row persist throttle (Phase 3 #2): the last
+   * epoch ms a player-upsert intent was emitted for a location.update.
+   * The durable player row is refreshed at most every
+   * PLAYER_PERSIST_INTERVAL_MS per seat, not on every GPS fix.
+   */
+  lastPlayerPersistAtMs: Record<string, number>;
+  /**
+   * Per-seat GPS fix throttle (Phase 3 #2): the last epoch ms a fix was
+   * accepted for this seat. Fixes arriving sooner than
+   * GPS_FIX_MIN_INTERVAL_MS after the previous accepted fix are dropped
+   * (coalesced), so the DO queue is bounded at ~1 fix/s/seat by design.
+   */
+  lastFixAcceptedAtMs: Record<string, number>;
+  /**
    * Per-ping recipients still awaiting delivery: pingId -> playerIds not
    * yet delivered to. Mirrors the durable `pendingPingRecipients`.
    */
   pendingPingRecipients: Map<string, Set<string>>;
+  /**
+   * Radio content-dedupe (Phase 4 (r)): `${playerId}:${kind}:${text}` ->
+   * epoch ms of the last SENT radio message with that content. Memory
+   * only, pruned to the dedupe window on every radio.send — a retry that
+   * minted a new commandId cannot be caught by commandId idempotency,
+   * so identical content inside the window is dropped as a duplicate.
+   */
+  recentRadio: Map<string, number>;
 }
 
 /** Start gate: a fix counts as fresh for 120 s at start time (P1-7). */
 export const START_GPS_FRESHNESS_MS = 120_000;
+
+/**
+ * Player-row persist throttle (Phase 3 #2): a location.update emits a
+ * Supabase player-upsert at most once per 30 s per seat (or sooner when
+ * something durable actually changed — quality, role, connection). 30 s
+ * is far inside the 120 s start-gate window, and the live in-memory fix
+ * is the gate's primary source anyway; the durable lastFixAt is only
+ * the hibernate/wake fallback.
+ */
+export const PLAYER_PERSIST_INTERVAL_MS = 30_000;
+
+/** GPS fix throttle (Phase 3 #2): at most ~1 accepted fix/s/seat. */
+export const GPS_FIX_MIN_INTERVAL_MS = 1_000;
+
+/**
+ * Radio content-dedupe window (Phase 4 (r)): same sender + same kind +
+ * same text inside this window is dropped as a double-delivery. 5 s is
+ * short enough that a genuinely repeated message still goes through,
+ * long enough to catch a double-tap / retry that minted a new commandId
+ * (which the commandId idempotency above cannot catch).
+ */
+export const RADIO_DEDUPE_WINDOW_MS = 5_000;
 
 /** Idle-lobby expiry: a LOBBY older than 24 h transitions to EXPIRED. */
 export const LOBBY_EXPIRY_MS = 24 * 60 * 60 * 1000;
@@ -336,6 +381,9 @@ export function emptyMemory(): RoomMemory {
     lastDisconnectAtMs: {},
     idempotentReplies: new Map(),
     pendingPingRecipients: new Map(),
+    lastPlayerPersistAtMs: {},
+    lastFixAcceptedAtMs: {},
+    recentRadio: new Map(),
   };
 }
 
@@ -442,20 +490,39 @@ export class RoomStore {
   /**
    * Copy the durable-backed memory maps into `state` before a
    * `storage.put` (P1-5). The class calls this inside `save()`; every
-   * mutation therefore persists the ticket registry, idempotency, and
-   * pending pings together with the game state.
+   * mutation therefore persists the ticket registry and pending pings
+   * together with the game state. The idempotency table is deliberately
+   * NOT synced here: rebuilding those arrays on every save is O(n) on
+   * the hot path (Phase 3 #4). It syncs on a slow cadence instead via
+   * `syncIdempotencyMemory()` — a wake inside that window loses at most
+   * 60 s of idempotency records. Same-commandId retries stay safe
+   * (the cached reply is what a retry gets), and the state-changing
+   * commands are additionally guarded against double-apply by the
+   * engine (re-confirm → CONFLICT, re-request → open claim, ready.set
+   * → idempotent assignment, pause/resume/leave/dispute/
+   * briefing.confirm likewise). That guard does NOT cover the relay
+   * commands (radio.send, signal.send, pin.place, announcement.send,
+   * safety.sos, reveal.send): they carry no server state to conflict
+   * on, so a retry that mints a NEW commandId re-applies them.
+   * radio.send has a content-dedupe window instead (Phase 4 (r)); the
+   * others are deliberately unguarded — see the note at the radio.send
+   * dedupe for why.
    */
   syncDurableMemory(): void {
     this.state.tickets = [...this.mem.tickets];
+    this.state.pendingPings = [...this.mem.pendingPings];
+    this.state.pendingPingRecipients = Object.fromEntries(
+      [...this.mem.pendingPingRecipients.entries()].map(([k, v]) => [k, [...v]]),
+    );
+  }
+
+  /** Slow-cadence sync of the idempotency table + cached replies (Phase 3 #4). */
+  syncIdempotencyMemory(): void {
     this.state.idempotency = [...this.mem.idempotency.entries()].map(
       ([key, record]) => ({ key, record }),
     );
     this.state.idempotentReplies = [...this.mem.idempotentReplies.entries()].map(
       ([key, events]) => ({ key, events }),
-    );
-    this.state.pendingPings = [...this.mem.pendingPings];
-    this.state.pendingPingRecipients = Object.fromEntries(
-      [...this.mem.pendingPingRecipients.entries()].map(([k, v]) => [k, [...v]]),
     );
   }
 
@@ -763,6 +830,12 @@ export class RoomStore {
       this.state.gameEventLog.splice(0, this.state.gameEventLog.length - GAME_EVENT_LOG_CAP);
     }
     this.state.eventLog.push({ seq, type, actorId, at: event.timestamp });
+    // Phase 3 #4: the lightweight log was uncapped, so the persisted
+    // blob grew monotonically for the whole match and every save()
+    // rewrote more. Same 500 cap as the game-event log.
+    if (this.state.eventLog.length > EVENT_LOG_CAP) {
+      this.state.eventLog.splice(0, this.state.eventLog.length - EVENT_LOG_CAP);
+    }
     return {
       kind: 'room-event',
       roomId: this.room.roomId,
@@ -989,15 +1062,27 @@ export class RoomStore {
    * own matchRole/team). A single broadcast view would leak the subject's
    * role to every other seat — live during play on restore (no phase gate)
    * and on leave. The reconnect-token hash is stripped for every viewer.
+   *
+   * Phase 3 #9: there are only TWO distinct views — the subject's own
+   * and everyone else's redacted one — so this builds TWO events, not
+   * N: one broadcast carrying the redacted view to the whole room, plus
+   * one direct event carrying the subject's own view to the subject
+   * (delivered second, so the subject's last-applied view is their own).
+   * The client only re-fetches a snapshot on these events, so the
+   * subject receiving both is harmless. Role secrecy is unchanged.
    */
   private emitPlayerEvent(
     type: 'player.joined' | 'player.removed' | 'player.left',
     player: Player,
     nowMs: number,
   ): OutboundEvent[] {
-    return this.allPlayerIds().map((viewerId) =>
-      this.emit(type, { player: this.playerViewFor(viewerId, player) }, [viewerId], nowMs),
-    );
+    // A viewer id that can never be a real seat (UUIDs only): the
+    // redacted view for "everyone else".
+    const redacted = this.playerViewFor('00000000-0000-0000-0000-000000000000', player);
+    return [
+      this.emit(type, { player: redacted }, this.allPlayerIds(), nowMs),
+      this.emit(type, { player: this.playerViewFor(player.playerId, player) }, [player.playerId], nowMs),
+    ];
   }
 
   // -- host token -----------------------------------------------------------
@@ -1488,20 +1573,17 @@ export class RoomStore {
     ).toISOString();
     const held = this.mem.rawCatchTokens.get(c.catchId);
     if (held && input.nowMs < held.expiresAtMs) {
-      // P2 (re-fetchable token): a second fetch ROTATES the token — mint
-      // a fresh one and invalidate the photographed old QR. The catch
-      // page always displays the latest fetched token, so the runner's
-      // on-screen QR stays valid; only a stale photograph dies.
-      const { token, tokenHash } = await issueCatchToken(c.catchId);
-      c.qrTokenHash = tokenHash;
-      this.mem.rawCatchTokens.set(c.catchId, {
-        token,
-        expiresAtMs: Date.parse(expiresAt),
-      });
+      // Phase 3 #10 (cheap re-fetch): a valid token already exists, so
+      // return it WITHOUT rotating — no new hash, no catch-update, no
+      // full afterMutation save. Rotation on every re-fetch made each QR
+      // refresh a full-cost mutation. Trade-off, stated plainly: a QR
+      // photographed before this re-fetch stays valid until the 120 s
+      // TTL expires (the old P2 rotation killed it at once); the token
+      // is still single-use + TTL-bound and QR-only.
       return okResult(
-        { token, catchId: c.catchId, expiresAt },
+        { token: held.token, catchId: c.catchId, expiresAt },
         sweep.events,
-        [...sweep.persist, { kind: 'catch-update', catch: c }],
+        sweep.persist,
       );
     }
     // Raw token lost (e.g. DO hibernated — raw tokens are memory-only):
@@ -2484,10 +2566,34 @@ export class RoomStore {
   }
 
   /**
+   * Message types that change nothing durable and are relay/read-only, so
+   * they skip idempotency entirely (Phase 3 #1/#3): a retry of one of
+   * these re-runs the same cheap read/relay instead of replaying a cached
+   * reply, and no (seat, commandId) record is ever written for them.
+   * Everything else keeps exactly-once via `rememberCommand`.
+   */
+  private static readonly NON_MUTATING_TYPES: ReadonlySet<string> = new Set([
+    'heartbeat',
+    'location.update',
+    'snapshot.request',
+    'resync.request',
+    'voice.signal',
+  ]);
+
+  /**
    * Dispatch one client message (hello already validated by the caller).
    * Returns outbound events, persist intents, and optionally a socket close.
    * The caller (DO class) delivers events, owns the socket, and executes
    * the persist intents via ctx.waitUntil().
+   *
+   * `durable` (Phase 3 #1) tells the caller whether this message changed
+   * durable state: only then must it `save()` (and `putSession`). Relay /
+   * read-only traffic (heartbeat, GPS fix, snapshot, voice signal) returns
+   * `durable: false`, so a tap never queues behind a full state rewrite.
+   * Game mutations (ready, catch, config, pause, start, leave, join)
+   * always return `durable: true` — via a non-empty `persist`, or via
+   * `durableChanged` for the rare mutation with no Supabase intent
+   * (reveal.send's `lastFixAt`).
    */
   async handleWsMessage(
     session: WsSessionRef,
@@ -2496,6 +2602,7 @@ export class RoomStore {
   ): Promise<{
     events: OutboundEvent[];
     persist: PersistIntent[];
+    durable: boolean;
     close?: { code: number; reason: string };
   }> {
     const playerId = session.playerId;
@@ -2504,54 +2611,11 @@ export class RoomStore {
     const persist: PersistIntent[] = [];
     const type = envelope.type;
     const payload = (envelope.payload ?? {}) as Record<string, unknown>;
+    // Set by cases that mutate durable state without emitting a persist
+    // intent (reveal.send's lastFixAt). Anything with a persist intent is
+    // durable by construction.
+    let durableChanged = false;
 
-    if (!me) {
-      return {
-        events: [this.errorEvent(playerId, 'ROOM_NOT_FOUND', 'Seat not found in this room.', false, undefined, nowMs)],
-        persist,
-        close: { code: 4403, reason: 'Seat not found.' },
-      };
-    }
-    // A seat that left the room has no socket business left; its socket
-    // should already be closed, so a message from it is a protocol error.
-    if (me.leftAt !== null) {
-      return {
-        events: [this.errorEvent(playerId, 'FORBIDDEN', 'That seat has left the room.', false, undefined, nowMs)],
-        persist,
-        close: { code: 4403, reason: 'Seat has left the room.' },
-      };
-    }
-    // A socket past its ticket expiry is closed 4401. (The class checks
-    // this on every message too; this is the store-side guard.)
-    // NOTE: the class passes the session ticket expiry separately.
-
-    // Idempotency: a retry reuses the same commandId; replays get the
-    // original reply without re-applying or burning rate budget. The
-    // cached reply is delivered ONLY to the replaying player (recipients
-    // narrowed below) so a broadcast op is never re-broadcast to the
-    // whole room on a retry.
-    if (typeof envelope.commandId === 'string' && envelope.commandId.length > 0) {
-      if (isDuplicateCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs)) {
-        const cached = this.mem.idempotentReplies.get(`${playerId}:${envelope.commandId}`) ?? [];
-        const narrowed = cached.map((e) => ({ ...e, recipients: [playerId] }));
-        return { events: narrowed, persist };
-      }
-      this.mem.idempotency = rememberCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs);
-    }
-
-    // Per-message rate limit (player.suspended is exempt).
-    const rl = this.checkWsRateLimit(playerId, type, nowMs);
-    if (!rl.allowed) {
-      return {
-        events: [
-          this.errorEvent(playerId, 'RATE_LIMITED', 'Too many messages — slow down.', true, rl.retryAfterSeconds, nowMs),
-        ],
-        persist,
-      };
-    }
-
-    const direct = (t: WsServerMessageType, p: Record<string, unknown>): OutboundEvent =>
-      this.emit(t, p, [playerId], nowMs);
     // P1-9: cache the ACTUAL reply — broadcast events included, not an
     // empty list. A genuine same-commandId replay gets the original
     // reply (narrowed to the replier at the top of this function), never
@@ -2561,7 +2625,14 @@ export class RoomStore {
     // every recipient). Per-viewer events (emitPlayerEvent's role-filtered
     // copies for OTHER seats) are never cached — replaying one to the
     // wrong viewer would hand them another seat's view.
+    // Hoisted above the early returns (Phase 4 (q)): the !me / leftAt /
+    // rate-limit / leave returns below must cache their error reply too
+    // — previously they returned without caching, so a same-commandId
+    // retry got an empty [] that looked like success.
     const rememberReply = (evts: OutboundEvent[]): void => {
+      // Non-mutating messages never recorded a commandId (see above), so
+      // there is nothing to cache for them.
+      if (RoomStore.NON_MUTATING_TYPES.has(type)) return;
       if (typeof envelope.commandId === 'string' && envelope.commandId.length > 0) {
         this.mem.idempotentReplies.set(
           `${playerId}:${envelope.commandId}`,
@@ -2573,6 +2644,86 @@ export class RoomStore {
         );
       }
     };
+
+    // Phase 4 (q) — cache an early return's error as its reply. The
+    // idempotency block below has not run yet for the !me / leftAt
+    // returns, so the commandId is recorded here as well (calling
+    // rememberCommand twice — rate-limit / leave — only refreshes
+    // seenAtMs, which is harmless). A retry then reaches the cached
+    // error instead of an empty [].
+    const cacheEarlyReply = (evts: OutboundEvent[]): void => {
+      if (RoomStore.NON_MUTATING_TYPES.has(type)) return;
+      if (typeof envelope.commandId === 'string' && envelope.commandId.length > 0) {
+        rememberCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs);
+        rememberReply(evts);
+      }
+    };
+
+    if (!me) {
+      const errorEvents = [this.errorEvent(playerId, 'ROOM_NOT_FOUND', 'Seat not found in this room.', false, undefined, nowMs)];
+      cacheEarlyReply(errorEvents);
+      return {
+        events: errorEvents,
+        persist,
+        durable: false,
+        close: { code: 4403, reason: 'Seat not found.' },
+      };
+    }
+    // A seat that left the room has no socket business left; its socket
+    // should already be closed, so a message from it is a protocol error.
+    if (me.leftAt !== null) {
+      const errorEvents = [this.errorEvent(playerId, 'FORBIDDEN', 'That seat has left the room.', false, undefined, nowMs)];
+      cacheEarlyReply(errorEvents);
+      return {
+        events: errorEvents,
+        persist,
+        durable: false,
+        close: { code: 4403, reason: 'Seat has left the room.' },
+      };
+    }
+    // A socket past its ticket expiry is closed 4401. (The class checks
+    // this on every message too; this is the store-side guard.)
+    // NOTE: the class passes the session ticket expiry separately.
+
+    // Idempotency: a retry reuses the same commandId; replays get the
+    // original reply without re-applying or burning rate budget. The
+    // cached reply is delivered ONLY to the replaying player (recipients
+    // narrowed below) so a broadcast op is never re-broadcast to the
+    // whole room on a retry. SKIPPED for non-mutating messages (Phase 3
+    // #3): location.update / heartbeat / snapshot / resync / voice.signal
+    // carry no mutation to dedupe, and recording them only grew the map.
+    if (
+      !RoomStore.NON_MUTATING_TYPES.has(type) &&
+      typeof envelope.commandId === 'string' &&
+      envelope.commandId.length > 0
+    ) {
+      if (isDuplicateCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs)) {
+        const cached = this.mem.idempotentReplies.get(`${playerId}:${envelope.commandId}`) ?? [];
+        const narrowed = cached.map((e) => ({ ...e, recipients: [playerId] }));
+        return { events: narrowed, persist, durable: false };
+      }
+      // In-place (Phase 3 #3): no `new Map(seen)` copy per message.
+      rememberCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs);
+    }
+
+    // Per-message rate limit (player.suspended is exempt).
+    const rl = this.checkWsRateLimit(playerId, type, nowMs);
+    if (!rl.allowed) {
+      const errorEvents = [
+        this.errorEvent(playerId, 'RATE_LIMITED', 'Too many messages — slow down.', true, rl.retryAfterSeconds, nowMs),
+      ];
+      // Phase 4 (q): cache the rate-limit error — a retry gets the
+      // error, not an empty [] that looks like success.
+      cacheEarlyReply(errorEvents);
+      return {
+        events: errorEvents,
+        persist,
+        durable: false,
+      };
+    }
+
+    const direct = (t: WsServerMessageType, p: Record<string, unknown>): OutboundEvent =>
+      this.emit(t, p, [playerId], nowMs);
 
     // Caught-Runner (spectator) comms block (P2): a caught Runner cannot
     // send radio / quick signals / voice signals / pins / announcements
@@ -2598,7 +2749,7 @@ export class RoomStore {
         ),
       );
       rememberReply(events);
-      return { events, persist };
+      return { events, persist, durable: false };
     }
 
     switch (type) {
@@ -2617,6 +2768,12 @@ export class RoomStore {
           break;
         }
         me.isReady = payload['isReady'] as boolean;
+        // Phase 3 #6: "I'm ready" folds briefing.confirm in — one tap,
+        // one message, one save, one broadcast. A ready tap also
+        // confirms the briefing (un-readying does not un-confirm it).
+        // The standalone briefing.confirm case below stays for old
+        // clients that still send it.
+        if (me.isReady) me.briefingConfirmed = true;
         this.bumpVersion();
         if (me.isReady) {
           persist.push(this.logGameEvent('PLAYER_READY', playerId, { playerId, isReady: true }, nowMs));
@@ -2653,18 +2810,46 @@ export class RoomStore {
           break;
         }
         const goodFix = fix as LocationFix;
+        // Phase 3 #2 — server-side fix throttle: at most ~1 accepted
+        // fix/s/seat. A fix arriving sooner is dropped (coalesced), not
+        // errored: the client streams ~1/s, so this only bites on
+        // bursts, and the live fix stays at most 1 s stale.
+        const lastAccepted = this.mem.lastFixAcceptedAtMs[playerId] ?? 0;
+        if (nowMs - lastAccepted < GPS_FIX_MIN_INTERVAL_MS) {
+          // Coalesced fix: no reply is cached here on purpose —
+          // location.update is NON_MUTATING, so no commandId was ever
+          // recorded for it and there is no retry to serve (Phase 4 (q)
+          // does not apply to this return).
+          return { events, persist, durable: false };
+        }
+        this.mem.lastFixAcceptedAtMs[playerId] = nowMs;
         this.mem.latestFix[playerId] = goodFix;
+        // Phase 4 (i) — snapshot-key fix: an accepted fix mutates
+        // snapshot content (players[].lastFixAt, teammateFixes, and the
+        // time-derived locationStatus) without any emit, so the
+        // (version, serverSeq) key the client gates HTTP snapshots on
+        // would not move and a re-fetch could be skipped as identical
+        // while fixes aged in between. Advance serverSeq (in-memory
+        // only — this case still returns durable:false unless a persist
+        // is due, so no save is written per fix; the bump persists with
+        // the next durable save). reveal.send needs no bump here: it
+        // always emits, which advances the sequence itself.
+        this.nextSeq();
         me.lastFixAt = new Date(nowMs).toISOString();
         const quality: LocationQuality = check.quality ?? classifyAccuracy(goodFix.accuracyMeters);
         const qualityChanged = me.locationQuality !== quality;
         me.locationQuality = quality;
+        const prevConnection = me.connectionState;
+        let resumed = false;
         if (me.connectionState === 'suspended') {
           const r = resumeSuspendedPlayer(me, nowMs);
           Object.assign(me, r.player);
+          resumed = true;
           events.push(this.emit('player.resumed', { playerId }, this.allPlayerIds(), nowMs));
         } else {
           me.connectionState = 'connected';
         }
+        const connectionChanged = resumed || prevConnection !== me.connectionState;
         // Outside-zone countdown (live phases, play zone on, boundary set,
         // seat still in play — an ejected seat never re-accrues).
         if (
@@ -2718,7 +2903,20 @@ export class RoomStore {
             ),
           );
         }
-        persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: me });
+        // Phase 3 #2 — stop the per-fix Supabase write: the player row
+        // persists only when something durable changed (quality, role
+        // via resume, connection) or at most once every 30 s
+        // (PLAYER_PERSIST_INTERVAL_MS). The live in-memory fix is the
+        // start gate's primary source; the durable lastFixAt is only
+        // the hibernate/wake fallback, and 30 s is far inside its
+        // 120 s freshness window. A fix with no durable change returns
+        // durable:false, so the caller skips the save entirely.
+        const lastPlayerPersist = this.mem.lastPlayerPersistAtMs[playerId] ?? 0;
+        const persistDue = nowMs - lastPlayerPersist >= PLAYER_PERSIST_INTERVAL_MS;
+        if (qualityChanged || connectionChanged || persistDue) {
+          persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: me });
+          this.mem.lastPlayerPersistAtMs[playerId] = nowMs;
+        }
         break;
       }
       case 'reveal.send': {
@@ -2744,6 +2942,9 @@ export class RoomStore {
         }
         this.mem.latestFix[playerId] = fix;
         me.lastFixAt = new Date(nowMs).toISOString();
+        // No Supabase intent here (as before), but the lastFixAt change
+        // IS durable state — flag it so the caller saves.
+        durableChanged = true;
         const centre: GeoPoint = { lat: fix.lat, lng: fix.lng };
         const reveal: RevealArea = {
           revealId: newId(),
@@ -2988,7 +3189,11 @@ export class RoomStore {
         const r = this.leaveSeat(playerId, reason, nowMs);
         events.push(...r.events);
         persist.push(...r.persist);
-        return { events, persist, close: { code: 1000, reason: 'Left the room.' } };
+        // Phase 4 (q): this early return used to bypass rememberReply —
+        // a same-commandId retry got an empty [] that looked like
+        // success. Cache the leave reply first.
+        rememberReply(events);
+        return { events, persist, durable: persist.length > 0, close: { code: 1000, reason: 'Left the room.' } };
       }
       case 'player.suspended': {
         const reason = payload['reason'];
@@ -3028,6 +3233,39 @@ export class RoomStore {
             break;
           }
         }
+        // Phase 4 (r) — content dedupe for radio.send: same sender +
+        // same kind + same text inside RADIO_DEDUPE_WINDOW_MS is a
+        // double-delivery (a double-tap / retry that minted a NEW
+        // commandId, so the commandId idempotency above cannot catch
+        // it) — drop it silently. The original send's reply stays
+        // cached under ITS commandId, so a same-commandId retry still
+        // gets the original radio event. The drop itself caches NO
+        // reply: caching [] here would be the exact false-success the
+        // Phase 4 (q) fix removes elsewhere. A retry of the dropped
+        // attempt hits the duplicate check at the top and gets the
+        // (empty) cached reply — which is honest here, not a false
+        // success: nothing was sent, so there is nothing to replay.
+        // Why radio only: the other relay commands are deliberately
+        // unguarded. safety.sos must NEVER be dropped — a second SOS
+        // is a second distress call, and raiseSos is already
+        // state-idempotent (sosActive stays true); only its audit row
+        // would double-log, which is intended. pin.place / reveal.send
+        // are deliberate re-assertions (a re-placed pin or a fresh
+        // reveal is a new marker / a new position broadcast, each with
+        // a fresh id). signal.send is a transient toast with no server
+        // state — a duplicate only re-flashes it, and suppressing a
+        // quick signal the sender deliberately re-tapped would hide a
+        // live "I need help" repeat. Radio is the one where a duplicate
+        // is both likely (chat send double-tap) and pure noise.
+        const radioKey = `${playerId}:${kind}:${text}`;
+        const lastRadioAtMs = this.mem.recentRadio.get(radioKey) ?? 0;
+        for (const [k, atMs] of this.mem.recentRadio) {
+          if (nowMs - atMs >= RADIO_DEDUPE_WINDOW_MS) this.mem.recentRadio.delete(k);
+        }
+        if (nowMs - lastRadioAtMs < RADIO_DEDUPE_WINDOW_MS) {
+          return { events, persist, durable: false };
+        }
+        this.mem.recentRadio.set(radioKey, nowMs);
         const msg: RadioMessage = {
           messageId: newId(),
           roomId: this.room.roomId,
@@ -3200,7 +3438,11 @@ export class RoomStore {
     }
 
     rememberReply(events);
-    return { events, persist };
+    // Durable iff a persist intent was produced or a case flagged a
+    // durable change with no intent (reveal.send). Everything else —
+    // heartbeat ack, snapshot, GPS fix, radio/signal/voice/pin relay —
+    // is transient: the caller skips putSession + save + re-arm for it.
+    return { events, persist, durable: persist.length > 0 || durableChanged };
   }
 }
 
