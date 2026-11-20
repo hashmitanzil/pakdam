@@ -29,7 +29,6 @@ import { MIN_PLAYERS } from '@pakdam/shared';
 import { PakdamSocket } from '../../../lib/websocket';
 import type { WsSnapshotPayload } from '../../../lib/websocket';
 import { isFixSendableToServer, watchLocation } from '../../../lib/geolocation';
-import { liveErrorMessage } from '../../../lib/live-client';
 import {
   canStartLiveMatch,
   fetchLiveRoomState,
@@ -233,6 +232,11 @@ export default function LobbyPage() {
 
   const applyConfig = useCallback(
     (nextRaw: RoomConfig): void => {
+      // Defense in depth: only the host may change config. The sheet is
+      // read-only for a joiner (no-op onChange), and live mode is also
+      // server-guarded (403) — but demo mode has no server, so this
+      // guard is what keeps a joiner from mutating demo config.
+      if (!isHost) return;
       const current = lobbyRef.current;
       if (!current || !config) return;
       const next = normaliseConfig(nextRaw);
@@ -273,8 +277,8 @@ export default function LobbyPage() {
         void updateLiveRoomConfig(roomId, next)
           .catch((err: unknown) => {
             showNotice(
-              err instanceof Error && 'status' in err
-                ? liveErrorMessage((err as { status: number }).status)
+              err instanceof Error && err.message
+                ? err.message
                 : 'Settings were not saved — try again.',
             );
           })
@@ -283,7 +287,7 @@ export default function LobbyPage() {
           });
       }, 500);
     },
-    [config, isLive, normaliseConfig, roomId, showNotice],
+    [config, isHost, isLive, normaliseConfig, roomId, showNotice],
   );
 
   // -- Readiness (one tap = ready + briefing confirmed). -----------------
@@ -544,10 +548,8 @@ export default function LobbyPage() {
         <button
           type="button"
           onClick={() => {
-            if (!isHost) {
-              showNotice('Only the host can change the game settings.');
-              return;
-            }
+            // Both roles open the sheet: the host edits, a joiner sees
+            // the same settings read-only (HostSettingsSheet handles it).
             setSettingsOpen(true);
           }}
           className="flex items-center justify-between rounded-[16px] border border-[#26262B] bg-[#141416] px-4 py-3 text-left"
@@ -632,6 +634,7 @@ export default function LobbyPage() {
         open={settingsOpen}
         config={config}
         activePlayerCount={activePlayers.length}
+        isHost={isHost}
         onChange={applyConfig}
         onClose={() => setSettingsOpen(false)}
       />

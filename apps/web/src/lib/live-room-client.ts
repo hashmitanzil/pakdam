@@ -21,7 +21,7 @@ import {
 } from '@pakdam/shared';
 import { getWorkerUrl } from './websocket';
 import { getSessionForRoom, storeLiveSeat } from './session-credentials';
-import { fetchHostToken, LiveHttpError, liveErrorMessage } from './live-client';
+import { fetchHostToken, LiveHttpError, liveErrorMessage, readLiveErrorMessage } from './live-client';
 import type { PakdamSocket } from './websocket';
 
 export { MIN_PLAYERS, liveErrorMessage, LiveHttpError };
@@ -71,7 +71,9 @@ async function postHost<T>(
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
-  if (!response.ok) throw new LiveHttpError(response.status);
+  if (!response.ok) {
+    throw new LiveHttpError(response.status, await readLiveErrorMessage(response));
+  }
   return (await response.json()) as T;
 }
 

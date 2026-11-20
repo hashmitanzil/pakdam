@@ -34,13 +34,16 @@ export default tseslint.config(
   {
     // Node.js test hooks + unit tests are plain `.mjs` run by `node --test`.
     // They use Node globals (`URL` in the resolve hooks, `Request` in the
-    // workers rate-limit test) that the default recommended config does
-    // not declare — declare them here so `no-undef` does not flag them.
+    // workers rate-limit test, `Response`/`process` in the start-error
+    // tests) that the default recommended config does not declare —
+    // declare them here so `no-undef` does not flag them.
     files: ["**/resolve-hooks.mjs", "**/test/**/*.mjs"],
     languageOptions: {
       globals: {
         URL: "readonly",
         Request: "readonly",
+        Response: "readonly",
+        process: "readonly",
       },
     },
   },

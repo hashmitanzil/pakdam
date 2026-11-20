@@ -50,6 +50,24 @@ export class LiveHttpError extends Error {
   }
 }
 
+/**
+ * Read the server's plain-words reason out of an error response body
+ * (`{ error: '…' }`). Returns `undefined` when the body is missing, not
+ * JSON, or carries no `error` string — the caller then falls back to the
+ * generic status mapping in `LiveHttpError`. Every POST helper must use
+ * this: a 409 from /start carries the gate reason (e.g. "Waiting for X
+ * to tap \"I'm ready\"."), and throwing without it shows the wrong
+ * generic "Full, or no longer open." instead.
+ */
+export async function readLiveErrorMessage(response: Response): Promise<string | undefined> {
+  try {
+    const data = (await response.json()) as { error?: string };
+    return typeof data.error === 'string' && data.error.length > 0 ? data.error : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 async function postJson<T>(
   path: string,
   body: Record<string, unknown>,
@@ -64,14 +82,7 @@ async function postJson<T>(
     ...init,
   });
   if (!response.ok) {
-    let message: string | undefined;
-    try {
-      const data = (await response.json()) as { error?: string };
-      message = data.error;
-    } catch {
-      message = undefined;
-    }
-    throw new LiveHttpError(response.status, message);
+    throw new LiveHttpError(response.status, await readLiveErrorMessage(response));
   }
   return (await response.json()) as T;
 }
