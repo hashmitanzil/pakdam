@@ -43,6 +43,7 @@ import {
   type CatchView,
   type LocationFix,
   type MatchPhase,
+  type MatchTag,
 } from '@pakdam/shared';
 
 export { CATCH_CONFIRMATION_REQUIRED, CATCH_TOKEN_TTL_SECONDS, isValidCatchToken };
@@ -214,6 +215,22 @@ export function openCatchForRunner(
 }
 
 /**
+ * Confirmed tags for the match result, oldest first. Only catches in
+ * `confirmed` state with a confirmation time are listed — a pending,
+ * disputed, expired or rejected catch is never a tag.
+ */
+export function confirmedTags(catches: readonly CatchEvent[]): MatchTag[] {
+  return catches
+    .filter((c) => c.state === 'confirmed' && c.confirmedAt !== null)
+    .map((c) => ({
+      hunterPlayerId: c.hunterPlayerId,
+      runnerPlayerId: c.runnerPlayerId,
+      confirmedAt: c.confirmedAt as string,
+    }))
+    .sort((a, b) => Date.parse(a.confirmedAt) - Date.parse(b.confirmedAt));
+}
+
+/**
  * Request a catch. Hunter only, ACTIVE only, target a free, present,
  * non-suspended Runner. One pending catch per Runner: a re-request by the
  * SAME Hunter returns the open claim (idempotent); a different Hunter gets
@@ -294,11 +311,19 @@ export function confirmCatch(input: {
   if (input.phase !== 'ACTIVE') {
     return { ok: false, code: 'INVALID_STATE', reason: 'The match is not live.' };
   }
+  // Expiry BEFORE the decided check: a claim already flipped to 'expired'
+  // by the lazy sweep must answer CATCH_EXPIRED ("QR expired — ask the
+  // Hunter to re-claim"), not CONFLICT. A genuinely decided catch
+  // (confirmed / disputed / rejected) is not expired, so a second confirm
+  // still answers CONFLICT below.
+  if (
+    c.state === 'expired' ||
+    (isPendingCatch(c) && isCatchExpired(c, input.nowMs, input.ttlSeconds))
+  ) {
+    return { ok: false, code: 'CATCH_EXPIRED', reason: 'This catch expired — tag the Runner again.' };
+  }
   if (!isPendingCatch(c)) {
     return { ok: false, code: 'CONFLICT', reason: 'This catch has already been decided.' };
-  }
-  if (isCatchExpired(c, input.nowMs, input.ttlSeconds)) {
-    return { ok: false, code: 'CATCH_EXPIRED', reason: 'This catch expired — tag the Runner again.' };
   }
   if (input.runner.connectionState === 'suspended') {
     return {
@@ -349,11 +374,16 @@ export function disputeCatch(input: {
   if (input.disputerId !== c.runnerPlayerId) {
     return { ok: false, code: 'FORBIDDEN', reason: 'Only the Runner can dispute this catch.' };
   }
+  // Expiry BEFORE the decided check (same reason as confirmCatch): an
+  // already-expired claim answers CATCH_EXPIRED, not CONFLICT.
+  if (
+    c.state === 'expired' ||
+    (isPendingCatch(c) && isCatchExpired(c, input.nowMs, input.ttlSeconds))
+  ) {
+    return { ok: false, code: 'CATCH_EXPIRED', reason: 'This catch expired — tag the Runner again.' };
+  }
   if (!isPendingCatch(c)) {
     return { ok: false, code: 'CONFLICT', reason: 'This catch has already been decided.' };
-  }
-  if (isCatchExpired(c, input.nowMs, input.ttlSeconds)) {
-    return { ok: false, code: 'CATCH_EXPIRED', reason: 'This catch expired — tag the Runner again.' };
   }
   return {
     ok: true,

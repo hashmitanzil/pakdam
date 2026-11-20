@@ -5,9 +5,8 @@
  * rematch, no share cards, no leaderboards, no per-player stats grid.
  *
  * Honesty rule: caught / surviving membership comes from `room.result`
- * only, never from roles. Per-tag times exist in demo (the store keeps
- * them); live results have none — the snapshot never carries confirmed
- * catches — so a live timeline is short rather than invented.
+ * only, never from roles. Per-tag entries come from `result.tags` (live
+ * and demo) — each confirmed tag carries who tagged whom and when.
  */
 'use client';
 
@@ -83,24 +82,44 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
   const survivors = result.survivingRunnerIds.length;
   const stats = `${formatDurationShort(result.durationSeconds)} · ${tags} tag${tags === 1 ? '' : 's'}${survivors > 0 ? ` · ${survivors} runner${survivors === 1 ? '' : 's'} never caught` : ''}`;
 
-  // Timeline: start + per-tag times (demo only — live has none) + end.
+  // Timeline: start + one entry per confirmed tag + end. Tag entries come
+  // from `result.tags` (live and demo). A result saved before tags existed
+  // has an empty list — demo falls back to its own catch records so an old
+  // persisted demo room still shows its tags.
+  const tagEntries: Array<{ hunterPlayerId: string; runnerPlayerId: string; confirmedAt: string }> =
+    result.tags.length > 0
+      ? result.tags
+      : mode === 'demo' && demo
+        ? demo.catches
+            .filter((c) => c.state === 'confirmed' && c.confirmedAt)
+            .map((c) => ({
+              hunterPlayerId: c.hunterPlayerId,
+              runnerPlayerId: c.runnerPlayerId,
+              confirmedAt: c.confirmedAt as string,
+            }))
+        : [];
   const events: TimelineEvent[] = [];
   events.push({
     atSeconds: 0,
     text: `Match started — ${players.filter((p) => p.leftAt === null).length} players`,
   });
-  if (mode === 'demo' && demo && startedAtMs !== null) {
-    for (const c of demo.catches.filter((x) => x.state === 'confirmed' && x.confirmedAt)) {
-      const hunter = players.find((p) => p.playerId === c.hunterPlayerId)?.displayName ?? 'A Hunter';
-      const runner = players.find((p) => p.playerId === c.runnerPlayerId)?.displayName ?? 'a Runner';
-      events.push({
-        atSeconds: Math.max(
-          0,
-          Math.floor((new Date(c.confirmedAt as string).getTime() - startedAtMs) / 1000),
-        ),
-        text: `${hunter} tagged ${runner}`,
-      });
-    }
+  // Tag entries are added even when `startedAt` is unknown: a result
+  // implies the match started, but a null `startedAt` must never silently
+  // drop the tags. Without a start time the offset is unknowable, so those
+  // tags sit at 0 s (right after "Match started") instead of vanishing.
+  for (const tag of tagEntries) {
+    const hunter = players.find((p) => p.playerId === tag.hunterPlayerId)?.displayName ?? 'A Hunter';
+    const runner = players.find((p) => p.playerId === tag.runnerPlayerId)?.displayName ?? 'a Runner';
+    events.push({
+      atSeconds:
+        startedAtMs !== null
+          ? Math.max(
+              0,
+              Math.floor((new Date(tag.confirmedAt).getTime() - startedAtMs) / 1000),
+            )
+          : 0,
+      text: `${hunter} tagged ${runner}`,
+    });
   }
   events.push({
     atSeconds: result.durationSeconds,
@@ -129,11 +148,6 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
       <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
         <h2 className="mb-3 text-[18px] font-bold text-white">What happened</h2>
         <ResultsTimeline events={events} />
-        {mode === 'live' ? (
-          <p className="mt-3 text-[13px] text-[#A1A1AA]">
-            Tag times aren&apos;t kept after the match.
-          </p>
-        ) : null}
       </div>
 
       <Button variant="primary" onClick={() => router.push('/')}>

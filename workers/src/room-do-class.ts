@@ -467,7 +467,14 @@ export class RoomDO implements DurableObject {
           expiresAtMs: num(body['expiresAtMs']),
           nowMs,
         });
-        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        if (!r.ok) {
+          // Carry `retryAfterSeconds` through so the Worker can set the
+          // `Retry-After` header on a DO-enforced rate limit.
+          return json(
+            { ok: false, error: r.error, code: r.code, retryAfterSeconds: r.retryAfterSeconds },
+            r.status,
+          );
+        }
         return json({ ok: true, ...r.value });
       }
       case 'revoke-tickets': {

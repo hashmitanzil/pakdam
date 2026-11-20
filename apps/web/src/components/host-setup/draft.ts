@@ -17,7 +17,17 @@ function shortMinutes(totalSeconds: number): string {
   return Number.isInteger(minutes) ? `${minutes}m` : `${minutes.toFixed(1)}m`;
 }
 
-function hunterCountFor(config: RoomConfig, activePlayerCount: number): number {
+/**
+ * Effective Hunter count for this roster: Balance OFF honours the host's
+ * stepper value; Balance ON reads the balance table from the roster size,
+ * and the stepper value is only a stored preference for if Balance is
+ * later turned OFF — it never decides the draw while Balance is ON.
+ * Every UI surface that counts Hunters (summary strip, Teams picker,
+ * start gate) must use this, never `config.hunterCount` directly, or the
+ * host is asked to pick a count the server will not draw (D-1 follow-up:
+ * Balance ON + hunterCount 2 on 4 players draws 1 Hunter).
+ */
+export function effectiveHunterCount(config: RoomConfig, activePlayerCount: number): number {
   if (config.balanceHunters === false) return config.hunterCount;
   return balancedHunterCount(Math.max(3, activePlayerCount));
 }
@@ -31,7 +41,7 @@ export function formatRoomSummary(
   activePlayerCount: number,
 ): string {
   const radius = boundaryRadiusMeters(config.zone.boundary);
-  const hunters = hunterCountFor(config, activePlayerCount);
+  const hunters = effectiveHunterCount(config, activePlayerCount);
   const ping =
     config.playZoneEnabled === false || config.pingIntervalSeconds === 0
       ? 'no pings'

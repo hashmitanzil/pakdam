@@ -131,10 +131,10 @@ export async function setupThreePlayerLobby(
   const hostPage = await context.newPage();
   const { roomId, code } = await createHostRoom(hostPage, HOST_NAME, opts.mode ?? 'Classic');
   if (opts.roundShort !== false) {
-    await setSlider(hostPage, 'Round length', 0); // index 0 = 10 min
+    await setStepper(hostPage, 'Round length', 0); // index 0 = 10 min
   }
   if (opts.headStartNone !== false) {
-    await setSlider(hostPage, 'Head start', 0); // index 0 = None
+    await setStepper(hostPage, 'Head start', 0); // index 0 = None
   }
   const guestPages = [
     await joinRoomAsGuest(context, code, GUEST_NAMES[0]),
@@ -143,10 +143,17 @@ export async function setupThreePlayerLobby(
   return { hostPage, guestPages, code, roomId };
 }
 
-/** Set a discrete slider (range input) by step index, then check its value label. */
-export async function setSlider(page: Page, label: string, index: number): Promise<void> {
-  const slider = page.getByLabel(label, { exact: true });
-  await slider.fill(String(index));
+/** Set a discrete stepper (− / +) by grid index: drive down to the first grid entry (Decrease disables at index 0), then step up `index` times. */
+export async function setStepper(page: Page, label: string, index: number): Promise<void> {
+  const decrease = page.getByRole('button', { name: `Decrease ${label}`, exact: true });
+  const increase = page.getByRole('button', { name: `Increase ${label}`, exact: true });
+  for (let i = 0; i < 10; i++) {
+    if (await decrease.isDisabled()) break;
+    await decrease.click();
+  }
+  for (let i = 0; i < index; i++) {
+    await increase.click();
+  }
 }
 
 /**

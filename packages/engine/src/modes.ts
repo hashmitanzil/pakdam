@@ -7,7 +7,7 @@
  * in either mode — ejection removes a Runner exactly like a catch for win
  * purposes, but the record keeps them "ejected", not "caught".
  */
-import type { MatchMode, MatchResult, MatchRole } from '@pakdam/shared';
+import type { MatchMode, MatchResult, MatchRole, MatchTag } from '@pakdam/shared';
 
 /** Minimal seat shape the mode rules need (no coordinates, no tokens). */
 export interface ModePlayer {
@@ -65,17 +65,26 @@ export function resolveModeOutcome(input: {
   caughtRunnerIds: readonly string[];
   /** Duration in seconds; 0 when the caller has not measured it yet. */
   durationSeconds?: number;
+  /** Confirmed tags, oldest first; [] when the caller has none. */
+  tags?: MatchTag[];
 }): MatchResult {
   const caught = new Set(input.caughtRunnerIds);
   const free = freeRunnerIds(input.players, caught);
-  const allRunners = runnerIds(input.players);
   const surviving = free;
-  const caughtList = allRunners.filter((id) => caught.has(id));
+  // The caught list IS the confirmed-catch set — do NOT filter it through
+  // current-role runnerIds(). In Infection a tagged Runner flips to
+  // Hunter (applyConfirmedTag), so filtering by "still a Runner" drops
+  // every flipped Runner and a full sweep reports zero caught (D-1).
+  // The input set is authoritative by construction at every call site
+  // (confirmed catches only — ejected Runners are never in it, so they
+  // still appear in neither list, as documented above).
+  const caughtList = [...caught];
   return {
     outcome: free.length === 0 ? 'hunters-win' : 'runners-win',
     durationSeconds: input.durationSeconds ?? 0,
     caughtRunnerIds: caughtList,
     survivingRunnerIds: surviving,
+    tags: input.tags ?? [],
   };
 }
 
@@ -111,6 +120,8 @@ export function maybeCompleteOnWin(input: {
   players: readonly ModePlayer[];
   caughtRunnerIds: readonly string[];
   durationSeconds?: number;
+  /** Confirmed tags, oldest first; [] when the caller has none. */
+  tags?: MatchTag[];
 }): MatchResult | null {
   const outcome = resolveModeOutcome(input);
   return outcome.outcome === 'hunters-win' ? outcome : null;

@@ -5,8 +5,10 @@
  * `GET /v1/rooms/:id`, then a `PakdamSocket` — the snapshot is the whole
  * truth; most events just trigger a fresh snapshot. Pings, radio and voice
  * signals are handled from the socket directly because snapshots never
- * carry them. Confirmed catches are session-only (the snapshot never
- * carries them either), so the hook keeps the ones it saw arrive.
+ * carry them. Decided catches (confirmed / disputed) ARE carried in the
+ * snapshot (`decidedCatches`), so `applySnapshot` merges them into the
+ * session catches — that is what restores the after-tagged screen and
+ * auto-spectator state after a reload, when no `catch.*` event will arrive.
  *
  * Demo mode (no Worker URL): poll the demo store every 1 s. Demo pings
  * auto-fire and the shrink uses the random-offset draw inside the store —
@@ -60,7 +62,7 @@ export interface RoomStateData {
   safetyState: SafetyState;
   /** Pending catches only (recipient-filtered, from the snapshot / demo). */
   activeCatches: CatchView[];
-  /** Confirmed / disputed catches this tab saw arrive (session-only). */
+  /** Confirmed / disputed catches: from live `catch.*` events, and rebuilt from the snapshot's `decidedCatches` on every snapshot (incl. first paint) so they survive a reload. */
   sessionCatches: CatchView[];
   locationStatus: Record<string, 'known' | 'unknown'>;
   /** Delivered pings, kept until the next ping replaces them — never timer-removed. */
@@ -154,6 +156,23 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     setActiveCatches(snapshot.activeCatches);
     setLocationStatus(snapshot.locationStatus);
     setAnnouncements(snapshot.missedAnnouncements);
+    // Decided catches (confirmed / disputed) are carried in the snapshot so
+    // the after-tagged screen and auto-spectator state survive a reload:
+    // merge them into the session catches (upsert by catchId — a later live
+    // event for the same catch replaces the snapshot copy, never duplicates
+    // it). `?? []` tolerates a server that predates `decidedCatches`.
+    const decided = snapshot.decidedCatches ?? [];
+    if (decided.length > 0) {
+      setSessionCatches((prev) => {
+        const next = [...prev];
+        for (const c of decided) {
+          const i = next.findIndex((p) => p.catchId === c.catchId);
+          if (i >= 0) next[i] = c;
+          else next.push(c);
+        }
+        return next;
+      });
+    }
     setLoading(false);
   }, []);
 
@@ -215,10 +234,10 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     fetchLiveRoomState(roomId, session.playerId, session.reconnectToken)
       .then((state) => {
         if (cancelled) return;
-        setRoom(state.room);
-        setPlayers(state.players);
-        setPhase(state.room.phase);
-        setLoading(false);
+        // First paint IS a full snapshot (room/players/phase plus the
+        // decided catches that restore the after-tagged / spectator state),
+        // so apply it the same way as a socket snapshot.
+        applySnapshot(state);
       })
       .catch(() => {
         if (!cancelled) {

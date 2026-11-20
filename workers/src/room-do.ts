@@ -35,6 +35,7 @@ import {
   FIX_TTL_MS,
   GAME_EVENT_LOG_CAP,
   HEARTBEAT_INTERVAL_MS,
+  HTTP_RATE_LIMITS,
   MAX_PLAYERS,
   MIN_PLAYERS,
   OUTSIDE_ZONE_RETURN_SECONDS,
@@ -83,8 +84,8 @@ import {
   assignRoles,
   buildPing,
   buildSnapshot,
-  clearSelectedHunters,
   confirmCatch,
+  confirmedTags,
   disputeCatch,
   dueRunnerIds,
   emptyOutsideZoneState,
@@ -163,6 +164,16 @@ export interface RoomMemory {
   outsideZone: Record<string, OutsideZoneState>;
   pendingPings: Ping[];
   tickets: WsTicketRecord[];
+  /**
+   * Per-seat WS-ticket issue timestamps: key `playerId` -> issue times.
+   * The DO-owned ticket-issue limit (same table as the Worker's HTTP
+   * limiter). The Worker limiter is per-isolate best-effort, so a burst
+   * spread across isolates could mint an 11th ticket inside a minute;
+   * the DO is the single instance per room, so its window cannot be
+   * bypassed that way. Same durability class as the ticket registry
+   * itself (DO memory, not `storage.put`).
+   */
+  ticketIssues: Map<string, number[]>;
   /** Per-seat WS rate-limit windows: key `${playerId}:${type}` -> timestamps. */
   wsRate: Map<string, number[]>;
   /** (seat, commandId) idempotency records, 10 min TTL. */
@@ -201,6 +212,8 @@ export type OpResult<T> =
       error: string;
       code: string;
       status: number;
+      /** Seconds to wait before retrying (rate limits only). */
+      retryAfterSeconds?: number;
       /**
        * Side effects that already happened before the failure (e.g. the
        * overdue-catch sweep in getCatchToken): the caller must still
@@ -225,8 +238,9 @@ export function errResult(
   status: number,
   events: OutboundEvent[] = [],
   persist: PersistIntent[] = [],
+  retryAfterSeconds?: number,
 ): OpResult<never> {
-  return { ok: false, error, code, status, events, persist };
+  return { ok: false, error, code, status, events, persist, retryAfterSeconds };
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +255,7 @@ export function emptyMemory(): RoomMemory {
     outsideZone: {},
     pendingPings: [],
     tickets: [],
+    ticketIssues: new Map(),
     wsRate: new Map(),
     idempotency: new Map(),
     rawCatchTokens: new Map(),
@@ -870,13 +885,15 @@ export class RoomStore {
       return { ok: false, error: issues.join(' '), code: 'VALIDATION_FAILED', status: 400 };
     }
     const next = input.config as RoomConfig;
-    const old = this.room.config;
-    if (
-      next.hunterCount !== old.hunterCount ||
-      next.teamAssignment !== old.teamAssignment
-    ) {
-      next.selectedHunterIds = clearSelectedHunters();
-    }
+    // NOTE: no clearing of `selectedHunterIds` here. An earlier version
+    // wiped the pick whenever hunterCount or teamAssignment changed — but
+    // the incoming config already carries the pick the host just made
+    // against the NEW values (the lobby's normaliseConfig fills/trims it
+    // on every edit), so wiping it made 'selected' unstartable: the host
+    // picked 1 Hunter (the effective count), the DO stored 0, and start
+    // failed with "Pick exactly 1 Hunter." A stale pick cannot survive
+    // a UI-driven change (normaliseConfig trims it first); an API-driven
+    // stale pick is caught at start by assignRoles, in plain words.
     this.room.config = next;
     this.bumpVersion();
     const events = [this.roomStateEvent('config-updated', input.nowMs)];
@@ -952,6 +969,13 @@ export class RoomStore {
    * Register a ticket hash minted by the Worker. Issuing a new ticket
    * revokes any other unredeemed ticket for the same seat. The ticket VALUE
    * never arrives here — only its hash.
+   *
+   * DO-ENFORCED ISSUE LIMIT: the per-seat ticket-issue window from the
+   * shared HTTP rate-limit table (10/min/seat) is enforced HERE, in the
+   * room's DO — not only in the Worker, whose limiter is in-memory per
+   * isolate and can be bypassed by a burst landing on different isolates.
+   * Every ticket issue goes through this one op on the single DO instance
+   * per room, so the window is shared across isolates by construction.
    */
   registerTicket(input: {
     playerId: string;
@@ -968,6 +992,17 @@ export class RoomStore {
     }
     if (seat.leftAt !== null) {
       return errResult('That seat has left the room.', 'CONFLICT', 409);
+    }
+    const issueCheck = this.checkTicketIssueRateLimit(input.playerId, input.nowMs);
+    if (!issueCheck.allowed) {
+      return errResult(
+        'Too many tries — slow down.',
+        'RATE_LIMITED',
+        429,
+        [],
+        [],
+        issueCheck.retryAfterSeconds,
+      );
     }
     this.mem.tickets = this.mem.tickets.filter(
       (t) => !(t.playerId === input.playerId && !t.redeemed),
@@ -1097,6 +1132,7 @@ export class RoomStore {
       players: this.state.players,
       caughtRunnerIds: this.caughtRunnerIds(),
       durationSeconds,
+      tags: confirmedTags(this.state.catches),
     });
     if (win) {
       const done = this.completeMatch(win, nowMs);
@@ -1323,6 +1359,7 @@ export class RoomStore {
       durationSeconds,
       caughtRunnerIds: this.caughtRunnerIds(),
       survivingRunnerIds: freeRunnerIds(this.state.players, this.caughtRunnerIds()),
+      tags: confirmedTags(this.state.catches),
     };
     try {
       this.room.phase = transitionOrThrow(this.room.phase, 'CANCELLED');
@@ -1582,6 +1619,7 @@ export class RoomStore {
         durationSeconds,
         caughtRunnerIds: this.caughtRunnerIds(),
         survivingRunnerIds: freeRunnerIds(this.state.players, this.caughtRunnerIds()),
+        tags: confirmedTags(this.state.catches),
       };
       try {
         this.room.phase = transitionOrThrow(this.room.phase, 'ABANDONED');
@@ -1708,6 +1746,7 @@ export class RoomStore {
         players: this.state.players,
         caughtRunnerIds: this.caughtRunnerIds(),
         durationSeconds: this.room.config.durationSeconds,
+        tags: confirmedTags(this.state.catches),
       });
       const done = this.completeMatch(result, nowMs);
       events.push(...done.events);
@@ -1738,6 +1777,7 @@ export class RoomStore {
             players: this.state.players,
             caughtRunnerIds: this.caughtRunnerIds(),
             durationSeconds,
+            tags: confirmedTags(this.state.catches),
           });
           if (win) {
             const done = this.completeMatch(win, nowMs);
@@ -1836,6 +1876,36 @@ export class RoomStore {
       return { ok: false, error: 'hello must not carry a credential.', closeCode: 4400 };
     }
     return { ok: true };
+  }
+
+  /**
+   * Per-seat WS-ticket issue limit, enforced in the DO (durable across
+   * isolates). Same table entry as the Worker's HTTP limiter
+   * (`POST /v1/rooms/:id/ws-ticket`, 10/min/seat) — one source of truth,
+   * two enforcement points: the Worker limiter is the cheap first line,
+   * this one is authoritative. Applies to both `connect` and `renew`
+   * tickets: a renew storm mints tickets too.
+   */
+  private checkTicketIssueRateLimit(
+    playerId: string,
+    nowMs: number,
+  ): { allowed: boolean; retryAfterSeconds: number } {
+    const entry = HTTP_RATE_LIMITS['POST /v1/rooms/:id/ws-ticket'];
+    const limit = entry?.limit ?? 10;
+    const windowSeconds = entry?.windowSeconds ?? 60;
+    const cutoff = nowMs - windowSeconds * 1000;
+    const seen = (this.mem.ticketIssues.get(playerId) ?? []).filter((t) => t > cutoff);
+    if (seen.length >= limit) {
+      const oldest = seen[0] ?? nowMs;
+      this.mem.ticketIssues.set(playerId, seen);
+      return {
+        allowed: false,
+        retryAfterSeconds: Math.max(1, Math.ceil((oldest + windowSeconds * 1000 - nowMs) / 1000)),
+      };
+    }
+    seen.push(nowMs);
+    this.mem.ticketIssues.set(playerId, seen);
+    return { allowed: true, retryAfterSeconds: 0 };
   }
 
   /** Per-seat per-message WS rate limit (OPEN values from shared). */
@@ -1972,10 +2042,20 @@ export class RoomStore {
       case 'location.update': {
         const fix = payload['fix'] as LocationFix | undefined;
         const prev = this.mem.latestFix[playerId] ?? null;
+        // NOTE (deliberate, not an oversight): a caught Runner's fixes are
+        // still accepted. They are out of play, but they are still a real
+        // person in the field — their location stays visible for safety,
+        // and the spectator's own map dot needs it. It cannot affect the
+        // outcome: caught status comes only from confirmed catches, a
+        // caught Runner cannot be re-tagged (CONFLICT), and `ready.set`
+        // mid-game is display-only (the start gate already passed).
         const check = validateFix(fix, prev, nowMs);
         if (!check.ok) {
+          // The code comes from the validator: malformed fixes are
+          // VALIDATION_FAILED, only a fix that arrived too old is
+          // STALE_LOCATION. Clients branch on the code.
           events.push(
-            this.errorEvent(playerId, 'STALE_LOCATION', check.errors.join(' ') || 'Fix rejected.', false, undefined, nowMs),
+            this.errorEvent(playerId, check.code ?? 'VALIDATION_FAILED', check.errors.join(' ') || 'Fix rejected.', false, undefined, nowMs),
           );
           break;
         }
@@ -2024,6 +2104,7 @@ export class RoomStore {
               players: this.state.players,
               caughtRunnerIds: this.caughtRunnerIds(),
               durationSeconds,
+              tags: confirmedTags(this.state.catches),
             });
             if (win) {
               const done = this.completeMatch(win, nowMs);
@@ -2048,8 +2129,14 @@ export class RoomStore {
       case 'reveal.send': {
         const fix = payload['fix'] as LocationFix | undefined;
         const check = validateFix(fix, this.mem.latestFix[playerId] ?? null, nowMs);
-        if (!check.ok || !fix) {
-          events.push(this.errorEvent(playerId, 'STALE_LOCATION', 'Reveal needs a fresh fix.', false, undefined, nowMs));
+        if (!fix) {
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Reveal needs a fresh fix.', false, undefined, nowMs));
+          break;
+        }
+        if (!check.ok) {
+          // Same code mapping as location.update: malformed is
+          // VALIDATION_FAILED, only too-old is STALE_LOCATION.
+          events.push(this.errorEvent(playerId, check.code ?? 'VALIDATION_FAILED', check.errors.join(' ') || 'Reveal needs a fresh fix.', false, undefined, nowMs));
           break;
         }
         if (this.room.phase !== 'HEAD_START' && this.room.phase !== 'ACTIVE') {

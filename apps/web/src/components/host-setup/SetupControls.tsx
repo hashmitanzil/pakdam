@@ -1,12 +1,12 @@
 /**
  * SetupControls — the lobby-is-setup controls (SCRAM-SPEC §5d + §5f),
  * shared by the lobby page and the HostSettingsSheet (same controls, no
- * map). Every decided setting stays, as one slider / stepper / toggle
+ * map). Every decided setting stays, as one stepper / toggle
  * with at most one short hint. No presets, no extra blocks.
+ * All number settings are ShadowHunt-style − / + steppers — no sliders.
  */
 import type { ReactNode } from 'react';
-import type { RoomConfig } from '@pakdam/shared';
-import { Slider } from '../ui/Slider';
+import { balancedHunterCount, type RoomConfig } from '@pakdam/shared';
 import { Stepper } from '../ui/Stepper';
 import { Toggle } from '../ui/Toggle';
 import { formatDurationShort } from '../../lib/utils';
@@ -37,7 +37,7 @@ function row(label: string, value: string, control: ReactNode, hint?: string) {
   );
 }
 
-/** Rules sliders + shrink + play-zone toggle (SCRAM-SPEC §5d–§5e). */
+/** Rules steppers + shrink + play-zone toggle (SCRAM-SPEC §5d–§5e). */
 export function RulesControls({ config, isHost, onChange }: SetupControlsProps) {
   const set = (patch: Partial<RoomConfig>): void => onChange({ ...config, ...patch });
   const pingsOff = config.pingIntervalSeconds === 0;
@@ -47,7 +47,7 @@ export function RulesControls({ config, isHost, onChange }: SetupControlsProps) 
       {row(
         'Round length',
         formatDurationShort(config.durationSeconds),
-        <Slider
+        <Stepper
           steps={DURATION_STEPS}
           value={config.durationSeconds}
           label="Round length"
@@ -60,7 +60,7 @@ export function RulesControls({ config, isHost, onChange }: SetupControlsProps) 
       {row(
         'Head start',
         config.headStartSeconds === 0 ? 'None' : formatDurationShort(config.headStartSeconds),
-        <Slider
+        <Stepper
           steps={HEAD_START_STEPS}
           value={config.headStartSeconds}
           label="Head start"
@@ -73,7 +73,7 @@ export function RulesControls({ config, isHost, onChange }: SetupControlsProps) 
       {row(
         'Pings every',
         zoneOff || pingsOff ? 'Off' : formatDurationShort(config.pingIntervalSeconds),
-        <Slider
+        <Stepper
           steps={PING_STEPS}
           value={zoneOff ? 0 : config.pingIntervalSeconds}
           label="Pings every"
@@ -165,8 +165,19 @@ export function TeamControls({
           onChange={(v) => set({ balanceHunters: v })}
         />
       </div>
-      {!balance
-        ? row(
+      {balance
+        ? // Balance ON: the stepper is hidden (it would be silently
+          // discarded — the table decides the draw), but the effective
+          // count is shown so the host sees what will actually be drawn.
+          row(
+            'Hunters',
+            String(balancedHunterCount(Math.max(3, activePlayerCount))),
+            <p className="text-[13px] text-[#A1A1AA]">
+              Set by balance for {activePlayerCount} player{activePlayerCount === 1 ? '' : 's'}.
+              Turn balance off to choose yourself.
+            </p>,
+          )
+        : row(
             'Hunters',
             String(config.hunterCount),
             <Stepper
@@ -179,8 +190,7 @@ export function TeamControls({
               format={(v) => String(v)}
               onChange={(v) => set({ hunterCount: Math.max(1, Math.min(maxHunters, v)) })}
             />,
-          )
-        : null}
+          )}
       <div className="mt-4 flex items-center justify-between gap-3">
         <div>
           <p className="text-[15px] font-semibold text-white">Random hunters</p>

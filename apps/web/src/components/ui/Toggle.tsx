@@ -13,22 +13,30 @@ export interface ToggleProps {
 
 export function Toggle({ checked, onChange, label, disabled = false }: ToggleProps) {
   return (
-    <button
-      type="button"
-      role="switch"
-      aria-checked={checked}
-      aria-label={label}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
-      className={`relative h-8 w-[52px] shrink-0 rounded-full transition-colors ${
-        checked ? 'bg-[#EF4444]' : 'bg-[#3F3F46]'
-      } ${disabled ? 'opacity-50' : ''}`}
-    >
+    <span className="inline-flex shrink-0 items-center gap-2">
       <span
-        className={`absolute top-[3px] h-[26px] w-[26px] rounded-full bg-white shadow transition-all ${
-          checked ? 'left-[23px]' : 'left-[3px]'
-        }`}
-      />
-    </button>
+        className={`text-[13px] font-bold ${checked ? 'text-white' : 'text-[#A1A1AA]'}`}
+        aria-hidden
+      >
+        {checked ? 'On' : 'Off'}
+      </span>
+      <button
+        type="button"
+        role="switch"
+        aria-checked={checked}
+        aria-label={label}
+        disabled={disabled}
+        onClick={() => onChange(!checked)}
+        className={`relative h-8 w-[52px] shrink-0 rounded-full transition-colors ${
+          checked ? 'bg-[#EF4444]' : 'bg-[#3F3F46]'
+        } ${disabled ? 'opacity-50' : ''}`}
+      >
+        <span
+          className={`absolute top-[3px] h-[26px] w-[26px] rounded-full bg-white shadow transition-all ${
+            checked ? 'left-[23px]' : 'left-[3px]'
+          }`}
+        />
+      </button>
+    </span>
   );
 }

@@ -112,8 +112,10 @@ export function validateZoneBoundary(boundary: unknown): string[] {
  * hunterCount 1..maxPlayers−1, zone radius ≥ 100 m with no maximum,
  * finalSizePercent null (Auto) or 0–100, hostOnSiteConfirmed required,
  * catchConfirmationRequired forced true, and the pick invariant
- * (teamAssignment 'selected' ⇒ exactly hunterCount picked ids;
- * 'random' ⇒ no picked ids — switching to Random clears the pick).
+ * (teamAssignment 'selected' ⇒ at least 1 and at most maxPlayers − 1
+ * picked ids — the exact count is decided at start from the roster, so
+ * this validator cannot demand it; 'random' ⇒ no picked ids —
+ * switching to Random clears the pick).
  */
 export function validateRoomConfig(config: unknown): string[] {
   const issues: string[] = [];
@@ -242,8 +244,21 @@ export function validateRoomConfig(config: unknown): string[] {
       }
       seen.add(id);
     }
-    if (c.teamAssignment === 'selected' && c.selectedHunterIds.length !== c.hunterCount) {
-      issues.push('with teamAssignment selected, exactly hunterCount Hunters must be picked');
+    // 'selected' needs a pick the roster COULD satisfy — but the exact
+    // count is decided at start from the roster (balance table when
+    // Balance is ON), which this roster-blind validator cannot know. So
+    // it enforces only the knowable bounds (≥ 1 pick, ≤ maxPlayers − 1);
+    // demanding exactly `hunterCount` here made Balance-ON configs
+    // unstartable: the validator wanted the stored stepper value while
+    // the draw wanted the table value. The exact count is enforced at
+    // start (assignRoles, plain-words error) and by the lobby gate.
+    if (c.teamAssignment === 'selected') {
+      const maxPick = typeof c.maxPlayers === 'number' ? c.maxPlayers - 1 : 29;
+      if (c.selectedHunterIds.length < 1 || c.selectedHunterIds.length > maxPick) {
+        issues.push(
+          'with teamAssignment selected, pick at least 1 Hunter and at most maxPlayers − 1',
+        );
+      }
     }
     if (c.teamAssignment === 'random' && c.selectedHunterIds.length !== 0) {
       issues.push('with teamAssignment random, no Hunters may be picked (Random clears the pick)');

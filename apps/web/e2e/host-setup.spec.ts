@@ -1,16 +1,17 @@
 /**
- * host-setup.spec.ts — mode select, rules sliders, zone editor, team
+ * host-setup.spec.ts — mode select, rules steppers, inline zone, team
  * controls. Demo-only. Text-only: DOM text and roles, no screenshots.
  *
- * Grounded in the built UI: slider labels are the range inputs' aria-labels
- * ("Round length", "Head start", "Pings every"); steppers are the
- * "Increase/Decrease <label>" buttons; toggles are switches by aria-label.
+ * Grounded in the built UI: steppers are the "Increase/Decrease <label>"
+ * buttons inside the group labelled <label>; toggles are switches by
+ * aria-label; the zone is edited inline on the lobby (Circle | Draw
+ * toggle above the map, Zone size / Corners steppers below it).
  */
 import { test, expect } from '@playwright/test';
 import {
   LIVE,
   createHostRoom,
-  setSlider,
+  setStepper,
   setupThreePlayerLobby,
 } from './helpers';
 
@@ -34,39 +35,37 @@ test.describe('host setup (demo)', () => {
     await expect(hostPage.getByText("Tagged? You're out. Watch live.")).toBeVisible();
   });
 
-  test('Round length slider changes the value and the summary strip', async ({ context }) => {
+  test('Round length stepper changes the value and the summary strip', async ({ context }) => {
     const hostPage = await context.newPage();
     await createHostRoom(hostPage);
-    const roundLength = hostPage.getByLabel('Round length', { exact: true });
-    await expect(roundLength).toHaveAttribute('aria-valuetext', '30 min');
-    await setSlider(hostPage, 'Round length', 0); // 10 min
-    await expect(roundLength).toHaveAttribute('aria-valuetext', '10 min');
+    const roundLength = hostPage.getByRole('group', { name: 'Round length' });
+    await expect(roundLength.getByText('30 min')).toBeVisible();
+    await setStepper(hostPage, 'Round length', 0); // 10 min
+    await expect(roundLength.getByText('10 min')).toBeVisible();
     await expect(hostPage.getByLabel('Game summary')).toContainText('· 10m');
-    await setSlider(hostPage, 'Round length', 5); // 60 min
-    await expect(roundLength).toHaveAttribute('aria-valuetext', '60 min');
+    await setStepper(hostPage, 'Round length', 5); // 60 min
+    await expect(roundLength.getByText('60 min')).toBeVisible();
     await expect(hostPage.getByLabel('Game summary')).toContainText('· 60m');
   });
 
-  test('Head start slider reaches None; Pings slider reaches Off with its hint', async ({
+  test('Head start stepper reaches None; Pings stepper reaches Off with its hint', async ({
     context,
   }) => {
     const hostPage = await context.newPage();
     await createHostRoom(hostPage);
-    await setSlider(hostPage, 'Head start', 0);
-    await expect(hostPage.getByLabel('Head start', { exact: true })).toHaveAttribute(
-      'aria-valuetext',
-      'None',
-    );
-    await setSlider(hostPage, 'Pings every', 0);
-    await expect(hostPage.getByLabel('Pings every', { exact: true })).toHaveAttribute(
-      'aria-valuetext',
-      'Off',
-    );
+    await setStepper(hostPage, 'Head start', 0);
+    await expect(
+      hostPage.getByRole('group', { name: 'Head start' }).getByText('None'),
+    ).toBeVisible();
+    await setStepper(hostPage, 'Pings every', 0);
+    await expect(
+      hostPage.getByRole('group', { name: 'Pings every' }).getByText('Off'),
+    ).toBeVisible();
     await expect(
       hostPage.getByText('No pings. Hunters only see runners who leave the zone.'),
     ).toBeVisible();
     await expect(hostPage.getByLabel('Game summary')).toContainText('no pings');
-    await setSlider(hostPage, 'Pings every', 4); // 3 min
+    await setStepper(hostPage, 'Pings every', 4); // 3 min
     await expect(hostPage.getByText('How often hunters see where runners are.')).toBeVisible();
   });
 
@@ -111,16 +110,16 @@ test.describe('host setup (demo)', () => {
     ).toBeDisabled();
   });
 
-  test('Play zone OFF hides the map row and shows the no-zone line', async ({ context }) => {
+  test('Play zone OFF hides the map and zone controls, shows the no-zone line', async ({ context }) => {
     const hostPage = await context.newPage();
     await createHostRoom(hostPage);
     await hostPage.getByRole('switch', { name: 'Play zone' }).click();
     await expect(
       hostPage.getByText('No zone and no pings. Classic hide and seek — hunters get no locations at all.'),
     ).toBeVisible();
-    await expect(hostPage.getByRole('button', { name: /Zone size/ })).toBeHidden();
+    await expect(hostPage.getByRole('group', { name: 'Zone size' })).toBeHidden();
     await hostPage.getByRole('switch', { name: 'Play zone' }).click();
-    await expect(hostPage.getByRole('button', { name: /Zone size/ })).toBeVisible();
+    await expect(hostPage.getByRole('group', { name: 'Zone size' })).toBeVisible();
   });
 
   test('Balance OFF shows the Hunters stepper; Random OFF shows the pick hint', async ({
@@ -162,8 +161,8 @@ test.describe('host setup (demo)', () => {
     const guest = guestPages[0]!;
     await guest.getByLabel('Game summary').click();
     await expect(guest.getByText('Only the host can change the game settings.')).toBeVisible();
-    // Guest sliders are disabled.
-    await expect(guest.getByLabel('Round length', { exact: true })).toBeDisabled();
-    await expect(hostPage.getByLabel('Round length', { exact: true })).toBeEnabled();
+    // Guest steppers are disabled.
+    await expect(guest.getByRole('button', { name: 'Decrease Round length' })).toBeDisabled();
+    await expect(hostPage.getByRole('button', { name: 'Decrease Round length' })).toBeEnabled();
   });
 });

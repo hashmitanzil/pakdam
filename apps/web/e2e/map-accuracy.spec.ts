@@ -2,6 +2,8 @@
  * map-accuracy.spec.ts — zone accuracy rules (BEHAVIOUR.md §2): radius
  * min 100 m, no maximum, Auto final size ≈ 25%, next zone hidden until
  * the shrink preview, and the ±50 m GPS rule. Demo-only. Text-only.
+ * The zone is edited inline on the lobby (Zone size stepper below the
+ * map); there is no separate editor dialog.
  */
 import { test, expect } from '@playwright/test';
 import {
@@ -13,81 +15,50 @@ import {
 test.describe('zone accuracy (demo)', () => {
   test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
 
-  async function openZoneEditor(context: import('@playwright/test').BrowserContext) {
-    const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
-    await hostPage.getByRole('button', { name: /Zone size/ }).click();
-    const dialog = hostPage.getByRole('dialog', { name: 'Play zone' });
-    await expect(dialog).toBeVisible();
-    return { hostPage, dialog };
-  }
-
   test('default zone is 500 m → 125 m (Auto final size is 25%)', async ({ context }) => {
     const hostPage = await context.newPage();
     await createHostRoom(hostPage);
-    await expect(hostPage.getByRole('button', { name: /Zone size 500 m → 125 m/ })).toBeVisible();
+    await expect(
+      hostPage.getByRole('group', { name: 'Zone size' }).getByText('500 m'),
+    ).toBeVisible();
+    await expect(hostPage.getByText('Final size Auto · 125 m')).toBeVisible();
     await expect(hostPage.getByLabel('Game summary')).toContainText('500m zone');
   });
 
   test('Zone size stepper stops at the 100 m minimum', async ({ context }) => {
-    const { dialog } = await openZoneEditor(context);
-    const decrease = dialog.getByRole('button', { name: 'Decrease Zone size' });
+    const hostPage = await context.newPage();
+    await createHostRoom(hostPage);
+    const decrease = hostPage.getByRole('button', { name: 'Decrease Zone size' });
     for (let i = 0; i < 8; i++) await decrease.click(); // 500 → 100 m
-    await expect(dialog.getByText('100 m').first()).toBeVisible();
-    await expect(dialog.getByText('200 m across')).toBeVisible();
+    await expect(
+      hostPage.getByRole('group', { name: 'Zone size' }).getByText('100 m'),
+    ).toBeVisible();
+    await expect(hostPage.getByText('200 m across')).toBeVisible();
     await expect(decrease).toBeDisabled();
   });
 
-  test('Zone size has no 1 km cap: 1.1 km sticks and the summary updates on Done', async ({
+  test('Zone size has no 1 km cap: 1.1 km sticks and the summary updates', async ({
     context,
   }) => {
-    const { hostPage, dialog } = await openZoneEditor(context);
-    const increase = dialog.getByRole('button', { name: 'Increase Zone size' });
+    const hostPage = await context.newPage();
+    await createHostRoom(hostPage);
+    const increase = hostPage.getByRole('button', { name: 'Increase Zone size' });
     for (let i = 0; i < 12; i++) await increase.click(); // 500 → 1100 m
-    await expect(dialog.getByText('1.1 km').first()).toBeVisible();
-    await dialog.getByRole('button', { name: 'Done' }).click();
-    await expect(hostPage.getByRole('dialog', { name: 'Play zone' })).toBeHidden();
+    await expect(
+      hostPage.getByRole('group', { name: 'Zone size' }).getByText('1.1 km'),
+    ).toBeVisible();
+    // Inline editing applies live — no Done step.
     await expect(hostPage.getByLabel('Game summary')).toContainText('1100m zone');
-    await expect(hostPage.getByRole('button', { name: /Zone size 1.1 km → 275 m/ })).toBeVisible();
   });
 
-  test('Final size defaults to Auto · 125 m; Fixed 250 m updates the lobby row', async ({
+  test('Final size is always Auto · 125 m — no manual final-size control', async ({
     context,
   }) => {
-    const { hostPage, dialog } = await openZoneEditor(context);
-    await expect(dialog.getByText('Auto · 125 m')).toBeVisible();
-    await dialog.getByRole('button', { name: 'Auto', exact: true }).click();
-    await expect(dialog.getByRole('button', { name: 'Fixed — tap for Auto' })).toBeVisible();
-    const increaseFinal = dialog.getByRole('button', { name: 'Increase Final size' });
-    for (let i = 0; i < 5; i++) await increaseFinal.click(); // 125 → 250 m
-    await expect(dialog.getByText('250 m').first()).toBeVisible();
-    await dialog.getByRole('button', { name: 'Done' }).click();
-    await expect(hostPage.getByRole('button', { name: /Zone size 500 m → 250 m/ })).toBeVisible();
-  });
-
-  test('Cancel discards zone edits; Done applies them', async ({ context }) => {
-    const { hostPage, dialog } = await openZoneEditor(context);
-    await dialog.getByRole('button', { name: 'Increase Zone size' }).click();
-    await expect(dialog.getByText('550 m').first()).toBeVisible();
-    await dialog.getByRole('button', { name: 'Cancel' }).click();
-    await expect(hostPage.getByRole('button', { name: /Zone size 500 m → 125 m/ })).toBeVisible();
-    await hostPage.getByRole('button', { name: /Zone size/ }).click();
-    const dialog2 = hostPage.getByRole('dialog', { name: 'Play zone' });
-    await dialog2.getByRole('button', { name: 'Increase Zone size' }).click();
-    await dialog2.getByRole('button', { name: 'Done' }).click();
-    await expect(hostPage.getByRole('button', { name: /Zone size 550 m → 138 m/ })).toBeVisible();
-  });
-
-  test('Draw needs at least 3 corners: Done with none answers in one line', async ({
-    context,
-  }) => {
-    const { dialog } = await openZoneEditor(context);
-    await dialog.getByRole('button', { name: 'Draw' }).click();
-    // No corners placed: there is no "Start again" to click (it only
-    // renders once corners exist) — Done straight away is the test.
-    await dialog.getByRole('button', { name: 'Done' }).click();
-    await expect(dialog.getByText('Place at least 3 corners to make a zone.')).toBeVisible();
-    await expect(dialog).toBeVisible();
+    const hostPage = await context.newPage();
+    await createHostRoom(hostPage);
+    await expect(hostPage.getByText('Final size Auto · 125 m')).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: 'Increase Final size' })).toBeHidden();
+    await expect(hostPage.getByText('Fixed — tap for Auto')).toBeHidden();
   });
 
   test('the play HUD never shows the next zone (hidden until the shrink preview)', async ({

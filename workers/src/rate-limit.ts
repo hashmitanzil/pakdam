@@ -14,6 +14,17 @@
  * registry DO), which is the single owner. If a limit ever needs to survive
  * isolate eviction, move that route's state into the DO.
  *
+ * EXCEPTION — WS tickets are DO-enforced: `POST /v1/rooms/:id/ws-ticket`
+ * mints credentials, so its 10/min/seat window is ALSO enforced in the
+ * room's DO (`RoomStore.registerTicket` → `checkTicketIssueRateLimit`),
+ * which every ticket issue passes through on the single DO instance per
+ * room. A burst spread across isolates can 429 at the Worker on one
+ * isolate and still be stopped by the DO on the next. The Worker limiter
+ * stays as the cheap first line. Other seat routes keep Worker-only
+ * limits (accepted: they all require a valid seat credential, and the DO
+ * already enforces per-message WS limits + idempotency; moving each
+ * route's window into its DO op is a wider refactor).
+ *
  * NAT-JOIN (fixed): a 30-player roster joining inside a minute from one NAT
  * IP is legitimate, so join + by-code are keyed by room/code at 35/min in
  * the shared table — never per-IP. The old per-IP 5/min join limit 429'd

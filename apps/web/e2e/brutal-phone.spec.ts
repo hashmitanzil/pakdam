@@ -52,8 +52,10 @@ test.describe('brutal phone end-to-end (demo)', () => {
     // Runner confirms on their phone.
     await runnerPage.goto(`/room/${roomId}/catch`);
     await expect(runnerPage.getByText(`You were tagged by ${hunterName}?`)).toBeVisible();
-    await runnerPage.getByRole('button', { name: 'YES, I WAS TAGGED' }).click();
-    await expect(runnerPage.getByText('✓ Catch confirmed')).toBeVisible();
+    await runnerPage.getByRole('button', { name: 'Self confirm' }).click();
+    // Classic: the tagged Runner is out — after-tagged screen.
+    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
 
     // Back to the map, end the match, results, fresh game.

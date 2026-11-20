@@ -21,11 +21,15 @@ export default tseslint.config(
   {
     // Generated, not source: `next build` writes next-env.d.ts, and the
     // Serwist build writes public/sw.js (the bundled service worker).
+    // `wrangler dev` writes bundled output under workers/.wrangler/tmp —
+    // linting it fails on Worker globals and must not fail `pnpm lint`
+    // while a dev server runs.
     ignores: [
       "**/node_modules/**",
       "**/dist/**",
       "**/.next/**",
       "**/build/**",
+      "**/.wrangler/**",
       "**/next-env.d.ts",
       "**/public/sw.js",
     ],

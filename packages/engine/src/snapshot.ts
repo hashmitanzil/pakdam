@@ -11,7 +11,10 @@
  * hash is stripped for every seat, including the viewer's own.
  *
  * `activeCatches` holds pending catches only, recipient-filtered to the
- * parties + the host; a confirmed catch never appears in it.
+ * parties + the host. Decided catches (confirmed / disputed) appear in
+ * `decidedCatches` instead, so the after-tagged screen and auto-spectator
+ * state survive a reload — a snapshot is the whole truth, and a decided
+ * catch must be rebuildable from it, not only from live `catch.*` events.
  */
 import type {
   CatchEvent,
@@ -62,6 +65,30 @@ export function activeCatchesFor(
 }
 
 /**
+ * Decided catches this viewer may see (confirmed or disputed): the parties
+ * to the catch, plus the host. Same recipient filter as `activeCatchesFor`,
+ * so role secrecy is unchanged — a seat only ever learns about catches it
+ * took part in (or the host sees all). The client merges these into its
+ * session catches on every snapshot, which is what restores the
+ * after-tagged screen and auto-spectator state after a reload.
+ */
+export function decidedCatchesFor(
+  viewerPlayerId: string,
+  viewerIsHost: boolean,
+  catches: readonly CatchEvent[],
+): CatchView[] {
+  return catches
+    .filter(
+      (c) =>
+        (c.state === 'confirmed' || c.state === 'disputed') &&
+        (viewerIsHost ||
+          c.hunterPlayerId === viewerPlayerId ||
+          c.runnerPlayerId === viewerPlayerId),
+    )
+    .map(toCatchView);
+}
+
+/**
  * Build the authorised snapshot for one viewer. The caller supplies the
  * server-held state; this function applies the privacy rules and nothing
  * else. No coordinates, no pending pings, no token hashes — ever.
@@ -85,6 +112,11 @@ export function buildSnapshot(input: {
     serverSeq: input.serverSeq,
     locationStatus: input.locationStatus,
     activeCatches: activeCatchesFor(
+      input.viewerPlayerId,
+      input.viewerIsHost,
+      input.catches,
+    ),
+    decidedCatches: decidedCatchesFor(
       input.viewerPlayerId,
       input.viewerIsHost,
       input.catches,

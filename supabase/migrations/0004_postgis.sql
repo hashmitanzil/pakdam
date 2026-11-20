@@ -1,11 +1,18 @@
 -- Pakdam — 0004_postgis
--- Fresh PostGIS layer for the Pakdam rebuild.
+-- Fresh PostGIS layer for the Pakdam rebuild (written from PROTOCOL-MAP §7.2).
 -- Apply after 0001_init + 0003_indexes.
 --
 -- Uses ST_Covers, NOT ST_Contains: ST_Contains is geometry-only and the first
 -- live run failed with ERROR 42883; ST_Covers works on geography and also
 -- counts a point exactly ON the boundary as inside, which is the right call
 -- for a game zone.
+--
+-- What PostGIS does NOT do: it can test whether a point is inside a boundary.
+-- It CANNOT judge whether a place is DANGEROUS. The real safety layer is the
+-- host's venue choice + the pre-match warning. A restricted area is a
+-- host-drawn polygon, not a safety verdict.
+--
+-- Points are passed as ARGUMENTS and never stored.
 
 CREATE EXTENSION IF NOT EXISTS postgis;
 

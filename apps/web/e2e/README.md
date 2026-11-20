@@ -51,7 +51,7 @@ Map specs skip cleanly when no key is configured — the VM has none:
 | `helpers.ts` | — | Room create/join, 3-player lobby, ready + start, role reveal, demo-store reads, force-end, overflow / target / no-Forge checks |
 | `smoke.spec.ts` | 6 | Home, HOST A GAME → mode select, codename required, code errors, no console errors |
 | `join-lobby.spec.ts` | 12 | Join by code, lobby-is-setup, COPY, I'm ready, start gate (<3 / not-all-ready / all-ready), F2 guest auto-navigate, remove, Leave; + 2 live |
-| `host-setup.spec.ts` | 11 | Mode change, sliders, shrink toggle/stepper, Play zone OFF, Balance/Random/ping-history, guest cannot edit |
+| `host-setup.spec.ts` | 11 | Mode change, steppers, shrink toggle/stepper, Play zone OFF, Balance/Random/ping-history, guest cannot edit |
 | `live-hud.spec.ts` | 10 | Role reveal, status strip, head start lines, bottom tabs, radio, PTT (absent in demo), SOS, safety pause, suspended banner, per-role catch buttons |
 | `catch-nav.spec.ts` | 13 | Name-only picker, claim card, scanner, manual fallback, no catch code, `?runner=` auto-select, `?scan=1` shows the picker, runner confirm/dispute, host resolve (ALLOW + REJECT in demo), P0-1 resume |
 | `catch-results.spec.ts` | 4 | Runners Win / Hunters Win, one-line stats, max-6 timeline, START A FRESH GAME, new code |
@@ -60,11 +60,11 @@ Map specs skip cleanly when no key is configured — the VM has none:
 | `mobile-layout.spec.ts` | 5 | 360px baseline, ≥48px targets, bottom tabs reachable, 130% zoom proxy (277px) |
 | `responsive.spec.ts` | 6 | 320 / 360 / 768 / 1280px, no overflow, tabs reachable |
 | `brutal-phone.spec.ts` | 2 | Full phone-viewport E2E (create → results), phone HUD basics |
-| `map-tiles.spec.ts` | 7 | No-key banners (3) + with-key canvas / Draw taps / no-go (4) |
-| `map-accuracy.spec.ts` | 8 | 500 m → 125 m default, 100 m minimum, no 1 km cap, Auto/ Fixed final size, Cancel vs Done, 3-corner rule, next zone hidden, ±50 m GPS rule |
+| `map-tiles.spec.ts` | 6 | No-key banners (3) + with-key canvas / Draw taps (3) |
+| `map-accuracy.spec.ts` | 6 | 500 m → 125 m default, 100 m minimum, no 1 km cap, always-Auto final size, next zone hidden, ±50 m GPS rule |
 | `no-forge-office.spec.ts` | 3 | No Forge/Hermes/office text on any screen |
 
-Total: **97 tests** (90 demo + 3 live + 4 with-key; the live and with-key
+Total: **94 tests** (88 demo + 3 live + 3 with-key; the live and with-key
 tests skip unless their environment is configured).
 
 ## Notes for the verifier

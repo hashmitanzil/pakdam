@@ -141,7 +141,9 @@ async function callRegistry(
   }
 }
 
-/** Turn a DO failure into an HTTP error response. */
+/** Turn a DO failure into an HTTP error response. A DO rate limit carries
+ * `Retry-After` (seconds) so the client backs off the same way it does for
+ * the Worker-side limiter. */
 function doError(r: DoResponse): Response {
   const status =
     typeof r.status === 'number'
@@ -155,7 +157,13 @@ function doError(r: DoResponse): Response {
             : r.code === 'VALIDATION_FAILED'
               ? 400
               : 400;
-  return err(r.error ?? 'Room operation failed.', status);
+  const res = err(r.error ?? 'Room operation failed.', status);
+  if (r.code === 'RATE_LIMITED' && typeof r['retryAfterSeconds'] === 'number') {
+    const headers = new Headers(res.headers);
+    headers.set('Retry-After', String(r['retryAfterSeconds']));
+    return new Response(res.body, { status, headers });
+  }
+  return res;
 }
 
 function stripDoEnvelope(r: DoResponse): Record<string, unknown> {

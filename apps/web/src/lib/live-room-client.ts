@@ -37,12 +37,18 @@ export interface LiveRoomState {
  * GET /v1/rooms/:id?playerId=… — recipient-filtered room state (first paint
  * / results). Bearer reconnect token in the header — the client never puts
  * the token in the query string (tokens must not land in edge access logs).
+ *
+ * The server answers with the FULL snapshot (`WsSnapshotPayload`), not just
+ * room/players — including `decidedCatches`, which is what restores the
+ * after-tagged screen and auto-spectator state on a reload before the
+ * socket's first snapshot lands. Callers that only need room/players use
+ * `snapshotToLiveRoomState`.
  */
 export async function fetchLiveRoomState(
   roomId: string,
   playerId: string,
   reconnectToken: string,
-): Promise<LiveRoomState> {
+): Promise<WsSnapshotPayload> {
   const workerUrl = getWorkerUrl();
   if (!workerUrl) throw new Error('Live transport is not configured.');
   const response = await fetch(
@@ -50,7 +56,7 @@ export async function fetchLiveRoomState(
     { headers: { Authorization: `Bearer ${reconnectToken}` } },
   );
   if (!response.ok) throw new LiveHttpError(response.status);
-  return (await response.json()) as LiveRoomState;
+  return (await response.json()) as WsSnapshotPayload;
 }
 
 async function postHost<T>(

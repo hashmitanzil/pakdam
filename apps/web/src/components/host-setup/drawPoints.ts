@@ -1,9 +1,8 @@
 /**
  * Pure point / zone math for the host-setup map (SCRAM-SPEC §5e–§6).
  *
- * No I/O, no React, no map instance — the PlayAreaMap and ZoneEditor
- * components own the map; this module only turns tap points into zone
- * geometry. Canonical circle/polygon helpers come from @pakdam/engine.
+ * No I/O, no React, no map instance — the PlayAreaMap component owns the
+ * map; this module only turns tap points into zone geometry. Canonical circle/polygon helpers come from @pakdam/engine.
  */
 import {
   circlePolygon,

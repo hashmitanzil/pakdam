@@ -288,12 +288,26 @@ export interface Player {
  */
 export type PlayerView = Omit<Player, 'reconnectTokenHash'>;
 
+/**
+ * One confirmed tag: who tagged whom, and when. Carried on the match
+ * result so the results page can list tags in live games (previously the
+ * timeline only had per-tag entries in demo mode).
+ */
+export interface MatchTag {
+  hunterPlayerId: string;
+  runnerPlayerId: string;
+  /** ISO timestamp of the confirmation. */
+  confirmedAt: string;
+}
+
 /** The match result — no routes, no coordinate trails. */
 export interface MatchResult {
   outcome: 'hunters-win' | 'runners-win' | 'cancelled' | 'abandoned';
   durationSeconds: number;
   caughtRunnerIds: string[];
   survivingRunnerIds: string[];
+  /** Confirmed tags, oldest first. Empty when nobody was tagged. */
+  tags: MatchTag[];
 }
 
 /** A room. `result` is null until the match completes. */
@@ -462,7 +476,10 @@ export interface Announcement {
 /**
  * Snapshot payload — the whole truth the UI renders. It NEVER carries raw
  * coordinates, pending pings, or token hashes. Pings arrive only as `ping`
- * events after connect; a reconnect loses earlier pings.
+ * events after connect; a reconnect loses earlier pings. Decided catches
+ * (confirmed / disputed) ARE carried, so the after-tagged screen and
+ * auto-spectator state survive a reload — a snapshot must rebuild them,
+ * not just the live `catch.*` events.
  */
 export interface WsSnapshotPayload {
   room: Room;
@@ -471,8 +488,15 @@ export interface WsSnapshotPayload {
   version: number;
   serverSeq: number;
   locationStatus: Record<string, 'known' | 'unknown'>;
-  /** Pending catches only (recipient-filtered: parties + host). Confirmed ones never appear. */
+  /** Pending catches only (recipient-filtered: parties + host). */
   activeCatches: CatchView[];
+  /**
+   * Decided catches this viewer may see (confirmed or disputed,
+   * recipient-filtered: parties + host). The client merges these into its
+   * session catches on every snapshot, so a tagged Runner who reloads
+   * still sees "You were tagged by X" and stays a spectator.
+   */
+  decidedCatches: CatchView[];
   safetyState: SafetyState;
   missedAnnouncements: Announcement[];
 }

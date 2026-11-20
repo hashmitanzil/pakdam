@@ -38,24 +38,16 @@ test.describe('map tiles — no Ola key', () => {
     await expect(hostPage.getByText('Time left')).toBeVisible();
   });
 
-  test('zone editor without a key still opens and offers Circle / Draw', async ({ context }) => {
+  test('lobby zone section without a key offers Circle / Draw inline', async ({ context }) => {
     const hostPage = await context.newPage();
     await createHostRoom(hostPage);
-    await hostPage.getByRole('button', { name: /Zone size/ }).click();
-    const dialog = hostPage.getByRole('dialog', { name: 'Play zone' });
-    await expect(dialog).toBeVisible();
-    await expect(dialog.getByRole('button', { name: 'Cancel' })).toBeVisible();
-    await expect(dialog.getByRole('button', { name: 'Done' })).toBeVisible();
     // Shape toggle labels are lowercase DOM text ("circle"/"draw", CSS
-    // capitalised) — exact match, or "Drop a no-go circle" / "Redraw"
-    // also match a substring search for Circle / Draw.
-    await expect(dialog.getByRole('button', { name: 'circle', exact: true })).toBeVisible();
-    await expect(dialog.getByRole('button', { name: 'draw', exact: true })).toBeVisible();
+    // capitalised).
+    await expect(hostPage.getByRole('button', { name: 'circle', exact: true })).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: 'draw', exact: true })).toBeVisible();
     await expect(
-      dialog.getByText('Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.'),
+      hostPage.getByText('Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.'),
     ).toBeVisible();
-    await dialog.getByRole('button', { name: 'Cancel' }).click();
-    await expect(dialog).toBeHidden();
   });
 });
 
@@ -83,36 +75,19 @@ test.describe('map tiles — Ola key configured', () => {
   }) => {
     const hostPage = await context.newPage();
     await createHostRoom(hostPage);
-    await hostPage.getByRole('button', { name: /Zone size/ }).click();
-    const dialog = hostPage.getByRole('dialog', { name: 'Play zone' });
-    await expect(dialog.locator('[aria-label="Play zone map"] canvas')).toBeVisible({
+    await expect(hostPage.locator('[aria-label="Play zone map"] canvas')).toBeVisible({
       timeout: 30000,
     });
-    await dialog.getByRole('button', { name: 'Draw' }).click();
+    await hostPage.getByRole('button', { name: 'Draw' }).click();
     // Switching to Draw seeds 6 corners from the circle; clear them first.
-    await expect(dialog.getByText('(6 placed)')).toBeVisible();
-    await dialog.getByRole('button', { name: 'Start again' }).click();
-    await expect(dialog.getByText('(0 placed)')).toBeVisible();
-    const map = dialog.locator('[aria-label="Play zone map"]');
+    await expect(hostPage.getByText('(6 placed)')).toBeVisible();
+    await hostPage.getByRole('button', { name: 'Start again' }).click();
+    await expect(hostPage.getByText('(0 placed)')).toBeVisible();
+    const map = hostPage.locator('[aria-label="Play zone map"]');
     await map.click({ position: { x: 120, y: 80 } });
     await map.click({ position: { x: 200, y: 140 } });
     await map.click({ position: { x: 90, y: 160 } });
-    await expect(dialog.getByText('(3 placed)')).toBeVisible();
-    await expect(dialog.getByText('Tap the map to place numbered corners — 3 taps make a triangle. (3 placed)')).toBeVisible();
-  });
-
-  test('no-go: Drop a no-go circle then tap the map lists No-go 1', async ({ context }) => {
-    const hostPage = await context.newPage();
-    await createHostRoom(hostPage);
-    await hostPage.getByRole('button', { name: /Zone size/ }).click();
-    const dialog = hostPage.getByRole('dialog', { name: 'Play zone' });
-    await expect(dialog.locator('[aria-label="Play zone map"] canvas')).toBeVisible({
-      timeout: 30000,
-    });
-    await dialog.getByRole('button', { name: 'Drop a no-go circle' }).click();
-    await expect(dialog.getByRole('button', { name: 'Done placing' })).toBeVisible();
-    await dialog.locator('[aria-label="Play zone map"]').click({ position: { x: 150, y: 120 } });
-    await expect(dialog.getByText('No-go 1')).toBeVisible();
-    await expect(dialog.getByRole('button', { name: 'Remove' })).toBeVisible();
+    await expect(hostPage.getByText('(3 placed)')).toBeVisible();
+    await expect(hostPage.getByText('Tap the map to place numbered corners — 3 taps make a triangle. (3 placed)')).toBeVisible();
   });
 });

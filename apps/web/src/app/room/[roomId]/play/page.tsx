@@ -60,8 +60,15 @@ import type { PakdamSocket } from '@/lib/websocket';
 
 const TERMINAL: MatchPhase[] = ['COMPLETED', 'CANCELLED', 'ABANDONED', 'EXPIRED'];
 
-export default function PlayPage({ params }: { params: Promise<{ roomId: string }> }) {
+export default function PlayPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ roomId: string }>;
+  searchParams: Promise<{ spectate?: string }>;
+}) {
   const { roomId } = use(params);
+  const spectateParam = use(searchParams)?.spectate === '1';
   const router = useRouter();
 
   const voiceRadioRef = useRef<VoiceRadio | null>(null);
@@ -330,6 +337,16 @@ export default function PlayPage({ params }: { params: Promise<{ roomId: string 
       : 0;
   const runnersLeft = Math.max(0, runnersTotal - caughtIds.size - ejectedRunnerCount);
 
+  // Spectator mode: a Classic Runner who has been tagged is out and can
+  // only watch. Triggered by the catch page's "Spectate match" (?spectate=1)
+  // or by the confirmed catch itself, so a tagged Runner can never act
+  // again even if they reach the play page another way. (Infection flips a
+  // tagged Runner to Hunter, so `isRunner` is false there and this never
+  // applies.) Radio and SOS stay available — they are safety/communication,
+  // not playing actions.
+  const amCaught = isRunner && myPlayerId !== null && caughtIds.has(myPlayerId);
+  const isSpectator = spectateParam || amCaught;
+
   const startedAtMs = room?.startedAt ? new Date(room.startedAt).getTime() : null;
   const zoneBoundary = room?.config.zone.boundary ?? [];
   const zoneRadiusM =
@@ -555,6 +572,15 @@ export default function PlayPage({ params }: { params: Promise<{ roomId: string 
         isRunner={isRunner}
       />
 
+      {isSpectator ? (
+        <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3">
+          <p className="text-[14px] font-semibold text-white">You&apos;re out — spectating the match.</p>
+          <p className="mt-1 text-[13px] text-[#A1A1AA]">
+            You can watch the map, but you can&apos;t tag or be tagged.
+          </p>
+        </div>
+      ) : null}
+
       {isSuspended ? (
         <div className="rounded-2xl border border-[#F59E0B] bg-[#141416] p-3">
           <p className="text-[14px] font-semibold text-white">
@@ -677,12 +703,12 @@ export default function PlayPage({ params }: { params: Promise<{ roomId: string 
         </div>
       ) : null}
 
-      {tab === 'map' && isHunter ? (
+      {tab === 'map' && isHunter && !isSpectator ? (
         <Button variant="primary" onClick={() => router.push(`/room/${roomId}/catch?scan=1`)}>
           CATCH BY QR
         </Button>
       ) : null}
-      {tab === 'map' && isRunner ? (
+      {tab === 'map' && isRunner && !isSpectator ? (
         <Button variant="primary" onClick={() => router.push(`/room/${roomId}/catch`)}>
           Got Tagged
         </Button>

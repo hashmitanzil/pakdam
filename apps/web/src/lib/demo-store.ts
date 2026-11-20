@@ -44,6 +44,7 @@ import {
   type Room,
   type RoomConfig,
 } from '@pakdam/shared';
+import { confirmedTags } from '@pakdam/engine';
 
 export type { CatchEvent, CatchView, GeoPoint, GeoPolygon, LocationFix, MatchPhase, MatchResult, Ping, Player, Room, RoomConfig };
 
@@ -553,13 +554,20 @@ export function canStartDemoMatch(demo: DemoRoom): { canStart: boolean; reason: 
     };
   }
   const config = demo.room.config;
+  // Teams-ready uses the EFFECTIVE Hunter count (balance table when
+  // Balance is ON), never the stored stepper value — the draw uses the
+  // effective count, so the gate must agree with it.
+  const hunterCount =
+    config.balanceHunters === true
+      ? balancedHunterCount(active.length)
+      : config.hunterCount;
   const teamsReady =
     config.teamAssignment === 'random' ||
-    config.selectedHunterIds.length === config.hunterCount;
+    config.selectedHunterIds.length === hunterCount;
   if (!teamsReady) {
     return {
       canStart: false,
-      reason: `Pick ${config.hunterCount} ${config.hunterCount === 1 ? 'Hunter' : 'Hunters'} first.`,
+      reason: `Pick ${hunterCount} ${hunterCount === 1 ? 'Hunter' : 'Hunters'} first.`,
     };
   }
   return { canStart: true, reason: null };
@@ -868,7 +876,13 @@ function completeMatch(demo: DemoRoom, nowMs: number): void {
   const durationSeconds = demo.room.startedAt
     ? Math.max(0, Math.floor((nowMs - new Date(demo.room.startedAt).getTime()) / 1000))
     : 0;
-  demo.room.result = { outcome, durationSeconds, caughtRunnerIds, survivingRunnerIds };
+  demo.room.result = {
+    outcome,
+    durationSeconds,
+    caughtRunnerIds,
+    survivingRunnerIds,
+    tags: confirmedTags(demo.catches),
+  };
   demo.room.phase = 'COMPLETED';
   demo.room.version += 1;
   latestFixes.clear();

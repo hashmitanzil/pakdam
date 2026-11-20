@@ -40,8 +40,10 @@ test.describe('catch → results (demo)', () => {
       .getByRole('button', { name: `I TAGGED ${runnerName.toUpperCase()}` })
       .click();
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await runnerPage.getByRole('button', { name: 'YES, I WAS TAGGED' }).click();
-    await expect(runnerPage.getByText('✓ Catch confirmed')).toBeVisible();
+    await runnerPage.getByRole('button', { name: 'Self confirm' }).click();
+    // Classic: the tagged Runner is out — after-tagged screen.
+    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
   }
 
@@ -85,12 +87,12 @@ test.describe('catch → results (demo)', () => {
       .getByRole('button', { name: `I TAGGED ${runnerNames[1]!.toUpperCase()}` })
       .click();
     await runnerPages[1]!.goto(`/room/${roomId}/catch`);
-    await runnerPages[1]!.getByRole('button', { name: 'YES, I WAS TAGGED' }).click();
+    await runnerPages[1]!.getByRole('button', { name: 'Self confirm' }).click();
     // Catching the last free runner completes the match at once, so the
     // catch page may show the done card or the match-over card — either
     // proves the confirm landed.
     await expect(
-      runnerPages[1]!.getByText(/✓ Catch confirmed|Match over — see the results page/),
+      runnerPages[1]!.getByText(/You were tagged|Match over — see the results page/),
     ).toBeVisible();
     // Catching the last free runner completes the match at once.
     await goToResults(hostPage, roomId);

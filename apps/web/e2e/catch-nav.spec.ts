@@ -6,7 +6,10 @@
  * Grounded in the built catch page (apps/web/src/app/room/[roomId]/catch):
  * - Hunter with no claim sees "Who did you tag?" + name buttons + the
  *   "I TAGGED <NAME>" action; there is no "No Runner selected" dead end.
- * - The runner confirms with "YES, I WAS TAGGED" / "NO — DISPUTE".
+ * - The runner confirms with "Self confirm" (no dispute — paused for now).
+ * - A Classic tagged Runner is out and gets the after-tagged screen
+ *   ("You were tagged" + Spectate match / Return to lobby); the Hunter
+ *   keeps the "✓ Catch confirmed" card.
  * - No catch code anywhere: the token lives only inside the QR.
  */
 import { test, expect } from '@playwright/test';
@@ -149,20 +152,25 @@ test.describe('catch flow (demo)', () => {
     const { runnerPage, roomId } = await setupCatch(context);
     await runnerPage.goto(`/room/${roomId}/catch`);
     await expect(runnerPage.getByText('No one has claimed a tag on you yet.')).toBeVisible();
-    await expect(runnerPage.getByRole('button', { name: 'YES, I WAS TAGGED' })).toBeHidden();
+    await expect(runnerPage.getByRole('button', { name: 'Self confirm' })).toBeHidden();
   });
 
-  test('runner confirms a claim: YES → Catch confirmed on both phones', async ({ context }) => {
+  test('runner confirms a claim: Self confirm → after-tagged screen on the runner, Catch confirmed on the hunter', async ({ context }) => {
     const { hunterPage, runnerPage, roomId, hunterName, runnerName } = await setupCatch(context);
     await claimRunner(hunterPage, roomId, runnerName);
     await runnerPage.goto(`/room/${roomId}/catch`);
     await expect(runnerPage.getByText(`You were tagged by ${hunterName}?`)).toBeVisible();
-    await expect(runnerPage.getByRole('button', { name: 'YES, I WAS TAGGED' })).toBeVisible();
-    await expect(runnerPage.getByRole('button', { name: 'NO — DISPUTE' })).toBeVisible();
-    await runnerPage.getByRole('button', { name: 'YES, I WAS TAGGED' }).click();
-    await expect(runnerPage.getByText('✓ Catch confirmed')).toBeVisible();
-    await expect(runnerPage.getByText(`${runnerName} was tagged by ${hunterName}.`)).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Self confirm' })).toBeVisible();
+    await runnerPage.getByRole('button', { name: 'Self confirm' }).click();
+    // Classic: the tagged Runner is out — they get the after-tagged screen,
+    // not the hunter's "Catch confirmed" card.
+    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByText(`You were tagged by ${hunterName}.`)).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Return to lobby' })).toBeVisible();
+    await expect(runnerPage.getByText('✓ Catch confirmed')).toBeHidden();
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
+    await expect(hunterPage.getByText(`${runnerName} was tagged by ${hunterName}.`)).toBeVisible();
     await expect(hunterPage.getByRole('button', { name: 'Tag someone else' })).toBeVisible();
   });
 
@@ -226,9 +234,12 @@ test.describe('catch flow (demo)', () => {
       timeout: 10000,
     });
     await expect(runnerPage.getByText("You're suspended — reconnect to confirm.")).toBeHidden();
-    await expect(runnerPage.getByRole('button', { name: 'YES, I WAS TAGGED' })).toBeEnabled();
-    await runnerPage.getByRole('button', { name: 'YES, I WAS TAGGED' }).click();
-    await expect(runnerPage.getByText('✓ Catch confirmed')).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Self confirm' })).toBeEnabled();
+    await runnerPage.getByRole('button', { name: 'Self confirm' }).click();
+    // Classic: the tagged Runner is out — after-tagged screen, not the
+    // hunter's "Catch confirmed" card.
+    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
   });
 
   test('catch page before the match is live says catches count once live', async ({

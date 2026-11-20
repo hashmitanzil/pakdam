@@ -2,18 +2,18 @@
 
 /**
  * PlayAreaMap — Ola dark map + zone overlay + Draw interaction
- * (SCRAM-SPEC §5e–§6).
+ * (SCRAM-SPEC §5e–§6), ShadowHunt layout on the lobby.
  *
  * - Circle mode: tap the map to move the centre; drag the red centre
- *   handle; radius changes only via the steppers (Circle untouched by
- *   tap-to-place).
+ *   handle; radius changes only via the Radius stepper below the map.
  * - Draw mode: tap the map to place numbered corner points (3 taps =
- *   triangle); corners are draggable markers; Undo removes the last
- *   point, Start again clears all points.
- * - Done commits the draft — the caller applies it to the room config,
- *   which is what updates the summary strip (SCRAM's bug, where Done
- *   left the lobby summary unchanged, is not reproduced here: Done does
- *   nothing on its own, the caller writes the zone on Done).
+ *   triangle); corners are draggable markers; the Corners stepper,
+ *   Undo and Start again live in the lobby under the map.
+ * - The orange dot is the player's live location; the target button on
+ *   the map's top-right re-centres on it. Zoom is pinch-only — there are
+ *   no zoom buttons on the map.
+ * - Radius auto-zoom: whenever the radius changes, the map zooms to fit
+ *   the whole zone in view. Free panning is never fought otherwise.
  * - The map never auto-centres on a fix worse than ±50 m; centring is
  *   the caller's job (it passes `centre` in).
  */
@@ -54,12 +54,15 @@ export interface PlayAreaMapProps {
   noGoAreas: GeoPolygon[];
   /** False for guests: the map renders read-only. */
   editable?: boolean;
-  /** When true, the next map tap drops a no-go circle instead of editing the zone. */
-  placingNoGo?: boolean;
   onZoneChange: (draft: ZoneDraft) => void;
-  onNoGoAdd?: (point: GeoPoint) => void;
-  /** Shown when set; the caller applies the draft on Done. */
-  onDone?: () => void;
+  /** The player's live location — rendered as the orange dot. */
+  userLocation?: GeoPoint | null;
+  /** Bumped by the caller when the target button is tapped: fly to the dot. */
+  locateNonce?: number;
+  /** True while a fresh fix is being fetched for the target button. */
+  locating?: boolean;
+  /** Called when the target button is tapped. */
+  onLocate?: () => void;
   height?: number;
 }
 
@@ -86,6 +89,24 @@ function toGeoJsonCollection(polygons: GeoPolygon[]): {
   features: GeoJsonPolygon[];
 } {
   return { type: 'FeatureCollection', features: polygons.map(toGeoJson) };
+}
+
+/** [[minLng, minLat], [maxLng, maxLat]] of a boundary, for fitBounds. */
+function boundaryBBox(polygon: GeoPolygon): [[number, number], [number, number]] {
+  let minLng = Infinity;
+  let minLat = Infinity;
+  let maxLng = -Infinity;
+  let maxLat = -Infinity;
+  for (const p of polygon) {
+    minLng = Math.min(minLng, p.lng);
+    maxLng = Math.max(maxLng, p.lng);
+    minLat = Math.min(minLat, p.lat);
+    maxLat = Math.max(maxLat, p.lat);
+  }
+  return [
+    [minLng, minLat],
+    [maxLng, maxLat],
+  ];
 }
 
 function ensureZoneLayers(map: MapLibreMapLike): void {
@@ -147,19 +168,23 @@ export function PlayAreaMap({
   finalRadiusMeters,
   noGoAreas,
   editable = false,
-  placingNoGo = false,
   onZoneChange,
-  onNoGoAdd,
-  onDone,
+  userLocation = null,
+  locateNonce = 0,
+  locating = false,
+  onLocate,
   height = 220,
 }: PlayAreaMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMapLike | null>(null);
   const markersRef = useRef<{ remove: () => void }[]>([]);
+  const dotMarkerRef = useRef<{ remove: () => void } | null>(null);
   const maplibreRef = useRef<typeof import('maplibre-gl') | null>(null);
-  const propsRef = useRef({ centre, radiusMeters, shape, drawPoints, editable, placingNoGo, onZoneChange, onNoGoAdd });
-  propsRef.current = { centre, radiusMeters, shape, drawPoints, editable, placingNoGo, onZoneChange, onNoGoAdd };
+  const propsRef = useRef({ centre, radiusMeters, shape, drawPoints, editable, onZoneChange });
+  propsRef.current = { centre, radiusMeters, shape, drawPoints, editable, onZoneChange };
   const lastFlownRef = useRef<{ lng: number; lat: number } | null>(null);
+  const lastFittedRadiusRef = useRef<number | null>(null);
+  const lastLocateNonceRef = useRef(0);
   const [loaded, setLoaded] = useState(false);
   const [mapReady, setMapReady] = useState(isOlaConfigured());
 
@@ -191,10 +216,6 @@ export function PlayAreaMap({
         const p = propsRef.current;
         if (!p.editable) return;
         const point: GeoPoint = { lat: e.lngLat.lat, lng: e.lngLat.lng };
-        if (p.placingNoGo) {
-          p.onNoGoAdd?.(point);
-          return;
-        }
         if (p.shape === 'draw') {
           if (p.drawPoints.length >= DRAW_MAX_POINTS) return;
           p.onZoneChange({
@@ -221,13 +242,15 @@ export function PlayAreaMap({
       cancelled = true;
       for (const m of markersRef.current) m.remove();
       markersRef.current = [];
+      dotMarkerRef.current?.remove();
+      dotMarkerRef.current = null;
       map?.remove();
       mapRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Zone / final-ring / no-go overlays.
+  // Zone / final-ring / no-go overlays + radius auto-zoom.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !loaded) return;
@@ -254,9 +277,14 @@ export function PlayAreaMap({
     );
     const nogoSource = map.getSource(NOGO_FILL_ID);
     nogoSource?.setData(toGeoJsonCollection(noGoAreas));
-    // Re-centre only when the caller's centre moved (> 25 m) — free panning
-    // is never fought.
-    if (
+    // Radius changed (or first load): zoom to fit the whole zone in view.
+    // Otherwise re-centre only when the caller's centre moved (> 25 m) —
+    // free panning is never fought.
+    if (radiusMeters !== lastFittedRadiusRef.current && boundary.length >= 3) {
+      map.fitBounds(boundaryBBox(boundary), { padding: 40, duration: 500 });
+      lastFittedRadiusRef.current = radiusMeters;
+      lastFlownRef.current = { lng: centre.lng, lat: centre.lat };
+    } else if (
       shouldRefly(lastFlownRef.current, { ...centre, accuracyMeters: 0 }, null)
     ) {
       lastFlownRef.current = { lng: centre.lng, lat: centre.lat };
@@ -368,19 +396,46 @@ export function PlayAreaMap({
     };
   }, [loaded, editable, shape, drawPoints, centre]);
 
-  const undo = (): void => {
-    if (shape !== 'draw' || drawPoints.length === 0) return;
-    onZoneChange({
-      centre,
-      radiusMeters,
-      shape: 'draw',
-      drawPoints: drawPoints.slice(0, -1),
+  // Live location dot (orange, ShadowHunt style) — follows the fix, never
+  // moves the camera on its own; only a target-button tap flies to it.
+  useEffect(() => {
+    const map = mapRef.current;
+    const maplibre = maplibreRef.current;
+    if (!map || !loaded || !maplibre || !userLocation) {
+      dotMarkerRef.current?.remove();
+      dotMarkerRef.current = null;
+      return;
+    }
+    dotMarkerRef.current?.remove();
+    const el = document.createElement('div');
+    el.setAttribute('aria-label', 'Your location');
+    Object.assign(el.style, {
+      width: '18px',
+      height: '18px',
+      borderRadius: '999px',
+      background: '#F97316',
+      border: '3px solid #fff',
+      boxShadow: '0 0 0 6px rgba(249, 115, 22, 0.25)',
     });
-  };
-  const startAgain = (): void => {
-    if (shape !== 'draw') return;
-    onZoneChange({ centre, radiusMeters, shape: 'draw', drawPoints: [] });
-  };
+    const marker = new maplibre.Marker({ element: el })
+      .setLngLat([userLocation.lng, userLocation.lat])
+      .addTo(map as unknown as import('maplibre-gl').Map);
+    dotMarkerRef.current = marker;
+    return () => {
+      marker.remove();
+      dotMarkerRef.current = null;
+    };
+  }, [loaded, userLocation]);
+
+  // Target-button tap: fly to the live location dot. The nonce guard keeps
+  // the continuous watch updates from re-flying the camera.
+  useEffect(() => {
+    if (!locateNonce || locateNonce === lastLocateNonceRef.current || !userLocation) return;
+    const map = mapRef.current;
+    if (!map || !loaded) return;
+    lastLocateNonceRef.current = locateNonce;
+    map.flyTo({ center: [userLocation.lng, userLocation.lat], duration: 500 });
+  }, [locateNonce, loaded, userLocation]);
 
   if (!mapReady) {
     return (
@@ -396,48 +451,44 @@ export function PlayAreaMap({
 
   return (
     <div>
-      <div
-        ref={containerRef}
-        className="w-full overflow-hidden rounded-[16px] border border-[#26262B] bg-[#141416]"
-        style={{ height }}
-        aria-label="Play zone map"
-      />
+      <div className="relative">
+        <div
+          ref={containerRef}
+          className="w-full overflow-hidden rounded-[16px] border border-[#26262B] bg-[#141416]"
+          style={{ height }}
+          aria-label="Play zone map"
+        />
+        <button
+          type="button"
+          onClick={() => onLocate?.()}
+          disabled={!onLocate || locating}
+          aria-label={locating ? 'Finding your location…' : 'Centre on my location'}
+          className="absolute right-3 top-3 flex h-10 w-10 items-center justify-center rounded-full border border-[#26262B] bg-[#1E1E22] text-white shadow-lg disabled:opacity-50"
+        >
+          <svg
+            width="20"
+            height="20"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            aria-hidden
+          >
+            <circle cx="12" cy="12" r="7" />
+            <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none" />
+            <line x1="12" y1="2" x2="12" y2="5" />
+            <line x1="12" y1="19" x2="12" y2="22" />
+            <line x1="2" y1="12" x2="5" y2="12" />
+            <line x1="19" y1="12" x2="22" y2="12" />
+          </svg>
+        </button>
+      </div>
       <p className="mt-2 text-[13px] text-[#A1A1AA]">
-        {placingNoGo
-          ? 'Tap the map to drop a no-go circle.'
-          : shape === 'draw'
-            ? `Tap the map to place numbered corners — 3 taps make a triangle. (${drawPoints.length} placed)`
-            : 'Tap the map to move the zone centre.'}
+        {shape === 'draw'
+          ? `Tap the map to place numbered corners — 3 taps make a triangle. (${drawPoints.length} placed)`
+          : 'Tap the map to move the zone centre.'}
       </p>
-      {editable ? (
-        <div className="mt-1 flex items-center gap-4">
-          <button
-            type="button"
-            onClick={undo}
-            disabled={shape !== 'draw' || drawPoints.length === 0}
-            className="text-[15px] font-semibold text-[#A1A1AA] disabled:opacity-40"
-          >
-            Undo
-          </button>
-          <button
-            type="button"
-            onClick={startAgain}
-            disabled={shape !== 'draw' || drawPoints.length === 0}
-            className="text-[15px] font-semibold text-[#EF4444] disabled:opacity-40"
-          >
-            Start again
-          </button>
-          {onDone ? (
-            <button
-              type="button"
-              onClick={onDone}
-              className="ml-auto text-[15px] font-semibold text-[#EF4444]"
-            >
-              Done
-            </button>
-          ) : null}
-        </div>
-      ) : null}
     </div>
   );
 }

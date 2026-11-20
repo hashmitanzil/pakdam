@@ -2,9 +2,9 @@
  * ResultsTimeline — "What happened" (SCRAM-SPEC §10).
  *
  * One line per event, mm:ss only, newest last, max 6. The caller builds
- * the events from what the match actually recorded — live results have no
- * per-tag times (the snapshot never carries them), so a live timeline is
- * short rather than invented.
+ * the events from what the match actually recorded — `result.tags` carries
+ * one entry per confirmed tag (live and demo), so a live timeline lists
+ * who tagged whom instead of only the start and the end.
  */
 'use client';
 

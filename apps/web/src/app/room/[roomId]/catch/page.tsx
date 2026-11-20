@@ -337,6 +337,17 @@ export default function CatchPage({
       ? (players.find((p) => p.playerId === openClaim.hunterPlayerId)?.displayName ?? 'The Hunter')
       : null;
 
+  // The Hunter who tagged me (confirmed catch). Only in Classic is a
+  // tagged Runner OUT — in Infection they flip to Hunter and keep playing,
+  // so the after-tagged screen is Classic-only.
+  const doneHunterName = doneCatch
+    ? (players.find((p) => p.playerId === doneCatch.hunterPlayerId)?.displayName ?? 'the Hunter')
+    : null;
+  const isMyConfirmedTag =
+    doneCatch !== null &&
+    doneCatch.runnerPlayerId === myPlayerId &&
+    room?.config.mode === 'classic';
+
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-4 px-4 pb-8 pt-3">
       <div className="flex items-center justify-between">
@@ -369,8 +380,30 @@ export default function CatchPage({
         <p className="text-[15px] text-[#A1A1AA]">
           Catches count once the match is live.
         </p>
+      ) : doneCatch && isMyConfirmedTag ? (
+        // After-tagged (Classic Runner, out): "You were tagged by X" with
+        // Spectate match / Return to lobby. The claim/QR screen never shows
+        // again for this catch — it is decided, and a second confirm is
+        // rejected server-side (CONFLICT).
+        <div className="flex flex-col gap-3 rounded-2xl border border-[#EF4444] bg-[#141416] p-5 text-center">
+          <p className="text-[28px] font-bold text-white">You were tagged</p>
+          <p className="text-[15px] text-[#A1A1AA]">
+            You were tagged by {doneHunterName}.
+          </p>
+          <Button variant="primary" onClick={() => router.push(`/room/${roomId}/play?spectate=1`)}>
+            Spectate match
+          </Button>
+          <button
+            type="button"
+            onClick={() => router.push('/')}
+            className="self-center text-[15px] font-semibold text-[#EF4444]"
+          >
+            Return to lobby
+          </button>
+        </div>
       ) : doneCatch ? (
         // ✓ Catch confirmed — survives the claim leaving the pending set.
+        // Hunter keeps this card (and the Infection flip keeps playing).
         <div className="flex flex-col gap-3 rounded-2xl border border-[#22C55E] bg-[#141416] p-5 text-center">
           <p className="text-[28px] font-bold text-white">✓ Catch confirmed</p>
           <p className="text-[15px] text-[#A1A1AA]">

@@ -33,6 +33,14 @@ export interface FixValidationResult {
   warnings: string[];
   /** Quality tier of the fix (null when the fix is rejected). */
   quality: LocationQuality | null;
+  /**
+   * Error code for a rejection (null when `ok`): malformed shape/range,
+   * bad timestamp, clock skew and exact duplicates are VALIDATION_FAILED;
+   * only a fix that arrived too old is STALE_LOCATION. Callers must use
+   * this, never hard-code one code for every failure — a malformed fix
+   * is not a stale one, and clients branch on the code.
+   */
+  code: 'VALIDATION_FAILED' | 'STALE_LOCATION' | null;
 }
 
 /**
@@ -52,7 +60,7 @@ export function validateFix(
   const warnings: string[] = [];
 
   if (typeof fix !== 'object' || fix === null) {
-    return { ok: false, errors: ['fix must be an object'], warnings, quality: null };
+    return { ok: false, errors: ['fix must be an object'], warnings, quality: null, code: 'VALIDATION_FAILED' };
   }
   const f = fix as Partial<LocationFix>;
   if (
@@ -74,18 +82,29 @@ export function validateFix(
     errors.push('fix timestampMs must be a finite epoch-milliseconds number');
   }
   if (errors.length > 0) {
-    return { ok: false, errors, warnings, quality: null };
+    return { ok: false, errors, warnings, quality: null, code: 'VALIDATION_FAILED' };
   }
 
   const timestampMs = f.timestampMs as number;
+  // A timestamp too far in the future is a validity problem (clock skew /
+  // replay), not staleness; only a fix that arrived too old is stale.
   if (timestampMs - nowMs > CLOCK_SKEW_MS) {
-    errors.push('fix timestamp is too far in the future (clock skew or replay)');
+    return {
+      ok: false,
+      errors: ['fix timestamp is too far in the future (clock skew or replay)'],
+      warnings,
+      quality: null,
+      code: 'VALIDATION_FAILED',
+    };
   }
   if (nowMs - timestampMs > STALE_FIX_MS) {
-    errors.push('fix is too old on arrival');
-  }
-  if (errors.length > 0) {
-    return { ok: false, errors, warnings, quality: null };
+    return {
+      ok: false,
+      errors: ['fix is too old on arrival'],
+      warnings,
+      quality: null,
+      code: 'STALE_LOCATION',
+    };
   }
 
   if (
@@ -97,7 +116,7 @@ export function validateFix(
     timestampMs === previousFix.timestampMs
   ) {
     errors.push('fix is an exact duplicate of the previous accepted fix');
-    return { ok: false, errors, warnings, quality: null };
+    return { ok: false, errors, warnings, quality: null, code: 'VALIDATION_FAILED' };
   }
 
   const accuracyMeters = f.accuracyMeters as number;
@@ -114,7 +133,7 @@ export function validateFix(
       }
     }
   }
-  return { ok: true, errors, warnings, quality };
+  return { ok: true, errors, warnings, quality, code: null };
 }
 
 // ---------------------------------------------------------------------------

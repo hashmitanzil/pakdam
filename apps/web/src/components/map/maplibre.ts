@@ -77,6 +77,10 @@ export interface MapLibreMapLike {
   getZoom(): number;
   flyTo(options: { center: [number, number]; zoom?: number; duration?: number }): void;
   easeTo(options: { center?: [number, number]; zoom?: number; duration?: number }): void;
+  fitBounds(
+    bounds: [[number, number], [number, number]],
+    options?: { padding?: number; duration?: number },
+  ): void;
   addSource(id: string, source: Record<string, unknown>): void;
   getSource(id: string): { setData(data: unknown): void } | undefined;
   addLayer(layer: Record<string, unknown>): void;
