@@ -1,14 +1,17 @@
 /**
  * catch-nav.spec.ts — the catch flow: auto-select, name-only picker, QR
- * show/scan, manual fallback, runner confirm/dispute, host resolve, and
+ * show/scan, manual fallback, runner confirm, host resolve, and
  * the no-catch-code rule. Demo-only. Text-only, no screenshots.
  *
  * Grounded in the built catch page (apps/web/src/app/room/[roomId]/catch):
  * - Hunter with no claim sees "Who did you tag?" + name buttons + the
  *   "I TAGGED <NAME>" action; there is no "No Runner selected" dead end.
- * - The runner confirms with "Self confirm" (no dispute — paused for now).
+ * - The runner confirms with "Self confirm" — there is NO dispute button
+ *   (founder decision 2026-11-19); the host's dispute review stays in
+ *   place only for server-side disputed catches, which this client can
+ *   never create.
  * - A Classic tagged Runner is out and gets the after-tagged screen
- *   ("You were tagged" + Spectate match / Return to lobby); the Hunter
+ *   ("You were tagged" + Spectate match / Back to home); the Hunter
  *   keeps the "✓ Catch confirmed" card.
  * - No catch code anywhere: the token lives only inside the QR.
  */
@@ -146,13 +149,19 @@ test.describe('catch flow (demo)', () => {
     await expect(hunterPage.getByRole('button', { name: runnerName })).toBeVisible();
   });
 
-  test('runner with no claim sees the empty state, not a confirm screen', async ({
+  test('runner with no claim sees their QR note + Self confirm, not a dead end', async ({
     context,
   }) => {
+    // P1-20: "Got Tagged" opens the runner's own QR directly even with no
+    // open claim — the note + Self confirm render, and the QR appears the
+    // moment the hunter claims the tag.
     const { runnerPage, roomId } = await setupCatch(context);
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await expect(runnerPage.getByText('No one has claimed a tag on you yet.')).toBeVisible();
-    await expect(runnerPage.getByRole('button', { name: 'Self confirm' })).toBeHidden();
+    await expect(
+      runnerPage.getByText("Show this to the hunter — they'll scan it to claim the tag."),
+    ).toBeVisible();
+    await expect(runnerPage.getByText("No one has claimed a tag on you yet.")).toBeHidden();
+    await expect(runnerPage.getByRole('button', { name: 'Self confirm' })).toBeVisible();
   });
 
   test('runner confirms a claim: Self confirm → after-tagged screen on the runner, Catch confirmed on the hunter', async ({ context }) => {
@@ -167,52 +176,43 @@ test.describe('catch flow (demo)', () => {
     await expect(runnerPage.getByText('You were tagged')).toBeVisible();
     await expect(runnerPage.getByText(`You were tagged by ${hunterName}.`)).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
-    await expect(runnerPage.getByRole('button', { name: 'Return to lobby' })).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Back to home' })).toBeVisible();
     await expect(runnerPage.getByText('✓ Catch confirmed')).toBeHidden();
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
     await expect(hunterPage.getByText(`${runnerName} was tagged by ${hunterName}.`)).toBeVisible();
     await expect(hunterPage.getByRole('button', { name: 'Tag someone else' })).toBeVisible();
   });
 
-  test('runner disputes: host sees the dispute and ALLOW TAG resolves it', async ({
+  test('P1-17: no dispute button — the runner only ever sees Self confirm', async ({
+    context,
+  }) => {
+    // Founder decision (2026-11-19): NO dispute. The runner confirms with
+    // Self confirm; there is no 'NO — DISPUTE' button anywhere on the
+    // catch screen, and the host sees no Disputes section unless a catch
+    // is already disputed server-side (this client can never create one).
+    const { hostPage, hunterPage, runnerPage, roomId, runnerName } =
+      await setupCatch(context);
+    await claimRunner(hunterPage, roomId, runnerName);
+    await runnerPage.goto(`/room/${roomId}/catch`);
+    await expect(runnerPage.getByRole('button', { name: 'NO — DISPUTE' })).toBeHidden();
+    await expect(runnerPage.getByRole('button', { name: 'Self confirm' })).toBeVisible();
+    await hostPage.goto(`/room/${roomId}/catch`);
+    await expect(hostPage.getByText('Disputes')).toBeHidden();
+  });
+
+  test('P1-17: runner confirms instead of disputing — after-tagged screen, no Disputes section', async ({
     context,
   }) => {
     const { hostPage, hunterPage, runnerPage, roomId, hunterName, runnerName } =
       await setupCatch(context);
     await claimRunner(hunterPage, roomId, runnerName);
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await runnerPage.getByRole('button', { name: 'NO — DISPUTE' }).click();
-    await expect(runnerPage.getByText('Dispute sent — the host reviews it in person.')).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'NO — DISPUTE' })).toBeHidden();
+    await runnerPage.getByRole('button', { name: 'Self confirm' }).click();
+    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByText(`You were tagged by ${hunterName}.`)).toBeVisible();
     await hostPage.goto(`/room/${roomId}/catch`);
-    await expect(hostPage.getByText('Disputes')).toBeVisible();
-    await expect(
-      hostPage.getByText(`Dispute: ${hunterName} says they tagged ${runnerName}`),
-    ).toBeVisible();
-    await expect(hostPage.getByRole('button', { name: 'ALLOW TAG' })).toBeVisible();
-    // Demo has REJECT too (demo-store `rejectCatch`, parity with live resolve).
-    await expect(hostPage.getByRole('button', { name: 'REJECT TAG' })).toBeVisible();
-    await hostPage.getByRole('button', { name: 'ALLOW TAG' }).click();
-    await expect(hostPage.getByText('Tag allowed.')).toBeVisible();
-  });
-
-  test('runner disputes: host REJECT TAG voids the tag (demo)', async ({ context }) => {
-    const { hostPage, hunterPage, runnerPage, roomId, hunterName, runnerName } =
-      await setupCatch(context);
-    await claimRunner(hunterPage, roomId, runnerName);
-    await runnerPage.goto(`/room/${roomId}/catch`);
-    await runnerPage.getByRole('button', { name: 'NO — DISPUTE' }).click();
-    await expect(runnerPage.getByText('Dispute sent — the host reviews it in person.')).toBeVisible();
-    await hostPage.goto(`/room/${roomId}/catch`);
-    await expect(
-      hostPage.getByText(`Dispute: ${hunterName} says they tagged ${runnerName}`),
-    ).toBeVisible();
-    await hostPage.getByRole('button', { name: 'REJECT TAG' }).click();
-    await expect(hostPage.getByText('Tag rejected by the host.')).toBeVisible();
     await expect(hostPage.getByText('Disputes')).toBeHidden();
-    // The runner stays free: no open claim, no confirmed tag.
-    await runnerPage.goto(`/room/${roomId}/catch`);
-    await expect(runnerPage.getByText('No one has claimed a tag on you yet.')).toBeVisible();
-    await expect(runnerPage.getByText('✓ Catch confirmed')).toBeHidden();
   });
 
   test('P0-1: a suspended runner is resumed on catch-page arrival and can confirm', async ({

@@ -73,6 +73,13 @@ const nextConfig: NextConfig = {
         source: '/(.*)',
         headers: [
           { key: 'Content-Security-Policy', value: csp },
+          {
+            key: 'Strict-Transport-Security',
+            // HSTS: the web origin is HTTPS-only in production; force it
+            // for a year, including subdomains. No preload (deliberate —
+            // preload is a one-way commitment for a personal project).
+            value: 'max-age=31536000; includeSubDomains',
+          },
           { key: 'X-Content-Type-Options', value: 'nosniff' },
           { key: 'X-Frame-Options', value: 'DENY' },
           {
@@ -101,7 +108,7 @@ const nextConfig: NextConfig = {
   // The web app never reads Supabase directly — all durable reads go through
   // the Worker (BEHAVIOUR.md §3.1). No Supabase client is bundled here.
   experimental: {
-    optimizePackageImports: ['@pakdam/shared'],
+    optimizePackageImports: ['@pakdam/shared', '@pakdam/engine'],
   },
   // @pakdam/shared and @pakdam/engine import each other with Node-style
   // `.js` specifiers (`./calibration.js` for `./calibration.ts`). tsc and

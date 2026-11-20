@@ -34,7 +34,7 @@ export function formatDistance(meters: number): string {
   return `${(meters / 1000).toFixed(1)} km`;
 }
 
-/** `500 m` zone size as `500 m → 125 m` (start → final). */
+/** `500 m` zone size as `500 m → 211 m` (start → final; ~42% when Auto). */
 export function formatZoneSize(startRadiusM: number, finalRadiusM: number | null): string {
   const finalLabel = finalRadiusM === null ? 'Auto' : formatDistance(finalRadiusM);
   return `${formatDistance(startRadiusM)} → ${finalLabel}`;

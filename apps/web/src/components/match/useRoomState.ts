@@ -94,6 +94,21 @@ export interface RoomStateData {
   refreshDemo: () => void;
   /** Send a team-radio text (live: over the socket; demo: local only). */
   sendRadio: (text: string, kind?: 'quick' | 'text') => boolean;
+  /**
+   * Live reveal areas (from `reveal` events): who revealed, where, the
+   * radius, and when the display expires. Rendered by the play page.
+   */
+  reveals: Array<{
+    playerId: string;
+    displayName: string;
+    centre: { lat: number; lng: number };
+    radiusMeters: number;
+    expiresAtMs: number;
+  }>;
+  /** Send a reveal of my current position (live only; needs a fresh fix). */
+  sendReveal: (fix?: LocationFix) => boolean;
+  /** Leave the room: sends `leave` over the socket, then closes it. */
+  leave: () => void;
 }
 
 const IDLE_SAFETY: SafetyState = {
@@ -146,6 +161,15 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   const [pings, setPings] = useState<Ping[]>([]);
   const [radioMessages, setRadioMessages] = useState<RadioMessage[]>([]);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  const [reveals, setReveals] = useState<
+    Array<{
+      playerId: string;
+      displayName: string;
+      centre: { lat: number; lng: number };
+      radiusMeters: number;
+      expiresAtMs: number;
+    }>
+  >([]);
   const [socketState, setSocketState] = useState<WsConnectionState>('idle');
   const [socketError, setSocketError] = useState<string | null>(null);
   const [demo, setDemo] = useState<DemoRoom | null>(null);
@@ -154,6 +178,10 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
 
   const [socket, setSocket] = useState<PakdamSocket | null>(null);
   const socketRef = useRef<PakdamSocket | null>(null);
+  // Player list for resolving a reveal sender's display name inside the
+  // socket callback (created once per room/session, so state would be stale).
+  const playersRef = useRef<PlayerView[]>([]);
+  playersRef.current = players;
   const voiceSignalRef = useRef(options?.onVoiceSignal);
   voiceSignalRef.current = options?.onVoiceSignal;
   const myPlayerIdRef = useRef(myPlayerId);
@@ -170,7 +198,25 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     // a caught Runner). `??` tolerates a server that predates these fields.
     setTeammateIds(snapshot.teammateIds ?? []);
     setTeammateFixes(snapshot.teammateFixes ?? {});
-    setAnnouncements(snapshot.missedAnnouncements);
+    // A snapshot rescues a transient first-paint GET failure (P1-23):
+    // the error clears as soon as live truth lands.
+    setError(null);
+    // Missed announcements MERGE into the existing list (P1-22) — a
+    // snapshot only carries the ones missed since the last disconnect,
+    // so replacing the whole list would drop announcements already shown.
+    // Dedupe by announcementId; a later live event replaces, never duplicates.
+    const missed = snapshot.missedAnnouncements ?? [];
+    if (missed.length > 0) {
+      setAnnouncements((prev) => {
+        const next = [...prev];
+        for (const a of missed) {
+          const i = next.findIndex((p) => p.announcementId === a.announcementId);
+          if (i >= 0) next[i] = a;
+          else next.push(a);
+        }
+        return next;
+      });
+    }
     // Decided catches (confirmed / disputed) are carried in the snapshot so
     // the after-tagged screen and auto-spectator state survive a reload:
     // merge them into the session catches (upsert by catchId — a later live
@@ -187,6 +233,21 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         }
         return next;
       });
+      // P1-1: merge the decided catches into activeCatches as well — a
+      // disputed catch still needs host resolution, so it stays visible
+      // in the host UI. Confirmed catches are NOT pending and stay out.
+      const disputed = decided.filter((c) => c.state === 'disputed');
+      if (disputed.length > 0) {
+        setActiveCatches((prev) => {
+          const next = [...prev];
+          for (const c of disputed) {
+            const i = next.findIndex((p) => p.catchId === c.catchId);
+            if (i >= 0) next[i] = c;
+            else next.push(c);
+          }
+          return next;
+        });
+      }
     }
     setLoading(false);
   }, []);
@@ -324,6 +385,39 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
             if (announcement) setAnnouncements((prev) => [...prev, announcement]);
             break;
           }
+          case 'reveal': {
+            // P1-19: a teammate's reveal — store it for the play page to
+            // render (centre + radius + display expiry). The sender's name
+            // is resolved from the roster at receipt time.
+            const reveal = payload['reveal'] as
+              | { revealId?: string; byPlayerId?: string; centre?: { lat: number; lng: number }; radiusMeters?: number; sentAt?: string }
+              | undefined;
+            if (!reveal || !reveal.byPlayerId || !reveal.centre) break;
+            // Extracted before the setState closure: narrowing does not
+            // survive into the updater function.
+            const revealerId = reveal.byPlayerId;
+            const revealCentre = reveal.centre;
+            const revealRadius = reveal.radiusMeters ?? 150;
+            const sender =
+              playersRef.current.find((p) => p.playerId === revealerId);
+            const sentAtMs = reveal.sentAt ? Date.parse(reveal.sentAt) : Date.now();
+            setReveals((prev) => [
+              // One live reveal per player; expired rings drop out.
+              ...prev.filter(
+                (r) => r.playerId !== revealerId && Date.now() < r.expiresAtMs,
+              ),
+              {
+                playerId: revealerId,
+                displayName: sender?.displayName ?? '',
+                centre: { lat: revealCentre.lat, lng: revealCentre.lng },
+                radiusMeters: revealRadius,
+                // Display TTL (60 s): the server defines no reveal TTL,
+                // so the client retires the ring after a minute.
+                expiresAtMs: sentAtMs + 60_000,
+              },
+            ]);
+            break;
+          }
           case 'catch.requested':
           case 'catch.confirmed':
           case 'catch.disputed':
@@ -373,8 +467,9 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       onStateChange: (state, detail) => {
         if (cancelled) return;
         setSocketState(state);
-        // A reconnect loses earlier pings — they arrive again as fresh `ping` events.
-        if (state === 'reconnecting') setPings([]);
+        // Pings are NOT wiped on reconnecting: the existing pings stay
+        // until the next interval replaces them — a reconnect must not
+        // blank the map. Fresh `ping` events re-deliver what is still live.
         if (state === 'reconnect-failed') {
           setSocketError(detail ?? 'reconnect failed — Retry');
         } else if (state === 'closed') {
@@ -453,6 +548,20 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     [mode, players, roomId],
   );
 
+  const sendReveal = useCallback(
+    (fix?: LocationFix): boolean => {
+      if (mode === 'demo') return false;
+      if (!fix) return false;
+      return socketRef.current?.sendReveal(fix) ?? false;
+    },
+    [mode],
+  );
+
+  /** Leave the room (P0-1): the socket sends `leave`, then closes. */
+  const leave = useCallback((): void => {
+    socketRef.current?.leave();
+  }, []);
+
   const myPlayer = players.find((p) => p.playerId === myPlayerId);
 
   return {
@@ -470,6 +579,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     pings,
     radioMessages,
     announcements,
+    reveals,
     socket,
     socketState,
     socketError,
@@ -481,6 +591,8 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     retryConnection,
     refreshDemo,
     sendRadio,
+    sendReveal,
+    leave,
   };
 }
 

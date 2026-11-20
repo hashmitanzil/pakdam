@@ -18,7 +18,7 @@ import {
   type RoomConfig,
 } from '@pakdam/shared';
 import { getWorkerUrl, isLiveTransportEnabled } from './websocket';
-import { storeLiveSeat, type PakdamSession } from './session-credentials';
+import { getSessionForRoom, storeLiveSeat, type PakdamSession } from './session-credentials';
 
 export { isLiveTransportEnabled, getWorkerUrl };
 export { DEFAULT_ROOM_CONFIG };
@@ -207,4 +207,85 @@ export async function fetchLiveCatchToken(
     `/v1/rooms/${roomId}/catch-token`,
     { playerId, reconnectToken, catchId },
   );
+}
+
+export interface LiveResultsResponse {
+  ok: boolean;
+  roomId: string;
+  phase: string;
+  result: {
+    outcome: 'hunters-win' | 'runners-win' | 'cancelled' | 'abandoned';
+    durationSeconds: number;
+    caughtRunnerIds: string[];
+    survivingRunnerIds: string[];
+    tags: { hunterPlayerId: string; runnerPlayerId: string; confirmedAt: string }[];
+  };
+  /** Points per playerId (server-computed, completed matches only). */
+  scores: Record<string, number>;
+}
+
+/**
+ * GET /v1/rooms/:id/results — match result + server-computed scores,
+ * participant-only; 404 until a result exists. Bearer reconnect token in
+ * the header — the client never puts the token in the query string.
+ */
+export async function fetchLiveResults(
+  roomId: string,
+  playerId: string,
+  reconnectToken: string,
+): Promise<LiveResultsResponse> {
+  const workerUrl = getWorkerUrl();
+  if (!workerUrl) throw new Error('Live transport is not configured.');
+  const response = await fetch(
+    `${workerUrl}/v1/rooms/${roomId}/results?playerId=${encodeURIComponent(playerId)}`,
+    { headers: { Authorization: `Bearer ${reconnectToken}` } },
+  );
+  if (!response.ok) throw new LiveHttpError(response.status);
+  return (await response.json()) as LiveResultsResponse;
+}
+
+/** Recover the host token when the stored one is missing (join never returns one). */
+async function getHostTokenForRoom(roomId: string): Promise<{ playerId: string; hostToken: string }> {
+  const session = getSessionForRoom(roomId);
+  if (!session) throw new Error('No live seat saved on this device for this room.');
+  if (session.hostToken) return { playerId: session.playerId, hostToken: session.hostToken };
+  if (!session.reconnectToken) throw new Error('No live seat saved on this device for this room.');
+  const hostToken = await fetchHostToken(roomId, session.playerId, session.reconnectToken);
+  storeLiveSeat({ ...session, hostToken });
+  return { playerId: session.playerId, hostToken };
+}
+
+/**
+ * POST /v1/rooms/:id/lifecycle { action: 'end' } — host ends the round
+ * early (server-only REST lifecycle; pause/resume go over WS instead).
+ * The match completes with the mode-aware outcome and the play screen
+ * redirects to results.
+ */
+export async function endLiveMatch(roomId: string): Promise<{ ok: boolean }> {
+  const { playerId, hostToken } = await getHostTokenForRoom(roomId);
+  return postJson<{ ok: boolean }>(`/v1/rooms/${roomId}/lifecycle`, {
+    action: 'end',
+    playerId,
+    hostToken,
+  });
+}
+
+/**
+ * POST /v1/reports — report / block intake (audit record ONLY, 202). A
+ * 'block' does NOT remove or silence anyone — it is only recorded for
+ * the host's later review. No location is ever attached.
+ */
+export async function submitReport(
+  roomId: string,
+  targetPlayerId: string,
+  kind: 'report' | 'block',
+): Promise<void> {
+  const session = getSessionForRoom(roomId);
+  if (!session) throw new Error('No live seat saved on this device for this room.');
+  await postJson<{ ok: boolean }>('/v1/reports', {
+    roomId,
+    playerId: session.playerId,
+    targetPlayerId,
+    kind,
+  });
 }

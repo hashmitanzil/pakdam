@@ -1,16 +1,13 @@
 /**
  * Pakdam WS event catalogue — frozen contract v2.1.
  *
- * 22 client→server message types, 34 server→client types.
+ * 22 client→server message types, 35 server→client types.
  *
  * NOTE — server count: the protocol map's header states 35 server→client
- * types but its own §2.4 table enumerates 34 distinct type names (7
- * connection + 7 roster + 9 play + 5 catch + 3 safety + 3 match = 34).
- * This file implements the 34 enumerated types exactly; no 35th type
- * exists in the table, so 34 is the complete count. The protocol map's
- * header count (and BEHAVIOUR.md, which copied it) were wrong, not the
- * enumeration. If a 35th type is ever identified, add it here and bump
- * the protocol version. Do not invent one to make the count match.
+ * types and its §2.4 table enumerates 34 named types plus `zone.preview`
+ * (added by the shrink-preview fix, P1-18) = 35. This file implements
+ * all 35 exactly. If another type is ever identified, add it here and
+ * bump the protocol version. Do not invent one to make the count match.
  *
  * Broadcast scoping (server-side, must be preserved): direct messages
  * (`welcome`, `snapshot`, `error`, `heartbeat.ack`, `auth.refreshed`,
@@ -18,11 +15,13 @@
  * `radio` are team-only (lobby = whole lobby); `ping` is role-scoped — it
  * goes only to the ping's recipient role (a Runner ping to Hunters, a
  * Hunter ping to Runners), so each side sees only the opposing team;
- * `reveal` goes to the whole room; everything else broadcasts to the room.
+ * `reveal` goes to the whole room; `zone.preview` broadcasts to the room;
+ * everything else broadcasts to the room.
  */
 import type {
   Announcement,
   CatchView,
+  GeoPoint,
   LocationFix,
   MapPin,
   MatchPhase,
@@ -196,7 +195,7 @@ export function isWsClientMessageType(value: string): value is WsClientMessageTy
 }
 
 // ---------------------------------------------------------------------------
-// Server → client (34 enumerated types; see note at the top of this file)
+// Server → client (35 enumerated types; see note at the top of this file)
 // ---------------------------------------------------------------------------
 
 export interface WelcomePayload {
@@ -251,6 +250,21 @@ export interface ZoneUpdatePayload {
   zone: ZoneConfig;
   phase: MatchPhase;
   serverSeq: number;
+}
+
+/**
+ * Shrink preview, broadcast 30 s before a shrink (PREVIEW_LEAD_SECONDS).
+ * `boundary` is the next zone boundary the DO computed (the same boundary
+ * it will apply when the shrink fires — the preview is the real next
+ * zone, not a second draw); `firesAtMs` is the epoch ms the shrink
+ * fires; `shrinkIndex` is 1-based (1, 2 or 3). The client draws the
+ * dashed preview ring + "Next zone in MM:SS" and never guesses a
+ * boundary of its own.
+ */
+export interface ZonePreviewPayload {
+  boundary: GeoPoint[];
+  firesAtMs: number;
+  shrinkIndex: number;
 }
 
 export interface CatchEventPayload {
@@ -366,6 +380,7 @@ export interface WsServerPayloads {
   ping: PingEventPayload;
   'ping.expired': PingExpiredPayload;
   'zone.update': ZoneUpdatePayload;
+  'zone.preview': ZonePreviewPayload;
   reveal: RevealEventPayload;
   pin: PinEventPayload;
   signal: SignalEventPayload;
@@ -405,6 +420,7 @@ export const WS_SERVER_TYPES: readonly WsServerMessageType[] = [
   'ping',
   'ping.expired',
   'zone.update',
+  'zone.preview',
   'reveal',
   'pin',
   'signal',

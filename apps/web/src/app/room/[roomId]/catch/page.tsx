@@ -21,7 +21,6 @@
 
 import { use, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { WRONG_SCAN_LOCK_SECONDS, WRONG_SCAN_MAX } from '@pakdam/shared';
 import { useRoomState } from '@/components/match/useRoomState';
 import { CatchQR } from '@/components/catch/CatchQR';
 import { ClaimPicker } from '@/components/catch/ClaimPicker';
@@ -29,6 +28,7 @@ import { Button } from '@/components/ui/Button';
 import { fetchLiveCatchToken } from '@/lib/live-client';
 import { resolveLiveCatch } from '@/lib/live-room-client';
 import { getSessionForRoom } from '@/lib/session-credentials';
+import { formatClock } from '@/lib/utils';
 import {
   confirmCatch,
   getCatchRaw,
@@ -65,6 +65,7 @@ export default function CatchPage({
     myPlayer,
     loading,
     error,
+    retryConnection,
     refreshDemo,
   } = useRoomState(roomId);
 
@@ -73,8 +74,6 @@ export default function CatchPage({
   const [manualMode, setManualMode] = useState(false);
   const [qrToken, setQrToken] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
-  const [wrongScans, setWrongScans] = useState(0);
-  const [lockedUntilMs, setLockedUntilMs] = useState<number | null>(null);
   const [doneCatchId, setDoneCatchId] = useState<string | null>(null);
   // The done card falls back to the latest confirmed catch (so it survives
   // the claim leaving the pending set) — but "Tag someone else" must be
@@ -225,21 +224,14 @@ export default function CatchPage({
       // Confirmed state arrives over the socket; the done card renders from it.
       return;
     }
-    if (lockedUntilMs !== null && Date.now() < lockedUntilMs) {
-      setNotice('Too many wrong scans — wait 30 s.');
-      return;
-    }
+    // No client-side wrong-scan lockout: the WS `catch.confirm` 5/min/seat
+    // rate limit already bounds failed confirms (the old WRONG_SCAN_*
+    // calibration was deleted as dead). A wrong scan just says so and the
+    // scanner keeps running — re-scan in place (P1-28).
     const current = getRoom(roomId);
     if (!current) return;
     if (!verifyCatchScan(openClaim.catchId, rawToken)) {
-      const wrong = wrongScans + 1;
-      setWrongScans(wrong);
-      if (wrong >= WRONG_SCAN_MAX) {
-        setLockedUntilMs(Date.now() + WRONG_SCAN_LOCK_SECONDS * 1000);
-        setNotice('Too many wrong scans — wait 30 s.');
-      } else {
-        setNotice("That QR didn't match — try again.");
-      }
+      setNotice("That QR didn't match — try again.");
       return;
     }
     try {
@@ -253,8 +245,16 @@ export default function CatchPage({
   };
 
   // -- Runner: confirm / dispute ----------------------------------------------
+  // NO dispute button here on purpose (founder decision, 2026-11-19):
+  // the Runner confirms with Self confirm; there is no "NO — DISPUTE"
+  // action in the client. The server-side dispute handler stays
+  // intentionally dormant — a disputed catch can still only arrive via
+  // the host's resolve path, never from this screen.
   const handleRunnerConfirm = () => {
-    if (!openClaim) return;
+    if (!openClaim) {
+      setNotice('No open claim yet — ask the hunter to claim the tag first, then confirm here.');
+      return;
+    }
     if (isSuspended) {
       setNotice("You're suspended — reconnect to confirm.");
       return;
@@ -325,7 +325,12 @@ export default function CatchPage({
         <p className="py-6 text-center text-[15px] text-white">
           {error ?? 'No live seat saved on this device for this room.'}
         </p>
-        <Button variant="primary" onClick={() => router.push('/')}>
+        {/* A transient first-paint GET failure must not dead-end the
+            screen — Retry re-requests the snapshot (P1-23). */}
+        <Button variant="primary" onClick={retryConnection}>
+          Retry
+        </Button>
+        <Button variant="outline" onClick={() => router.push('/')}>
           Go home
         </Button>
       </main>
@@ -382,7 +387,7 @@ export default function CatchPage({
         </p>
       ) : doneCatch && isMyConfirmedTag ? (
         // After-tagged (Classic Runner, out): "You were tagged by X" with
-        // Spectate match / Return to lobby. The claim/QR screen never shows
+        // Spectate match / Back to home. The claim/QR screen never shows
         // again for this catch — it is decided, and a second confirm is
         // rejected server-side (CONFLICT).
         <div className="flex flex-col gap-3 rounded-2xl border border-[#EF4444] bg-[#141416] p-5 text-center">
@@ -390,6 +395,12 @@ export default function CatchPage({
           <p className="text-[15px] text-[#A1A1AA]">
             You were tagged by {doneHunterName}.
           </p>
+          {room.endsAt ? (
+            <p className="text-[14px] text-[#A1A1AA]">
+              Time left in the round:{' '}
+              {formatClock(Math.max(0, Date.parse(room.endsAt) - Date.now()))}
+            </p>
+          ) : null}
           <Button variant="primary" onClick={() => router.push(`/room/${roomId}/play?spectate=1`)}>
             Spectate match
           </Button>
@@ -398,7 +409,7 @@ export default function CatchPage({
             onClick={() => router.push('/')}
             className="self-center text-[15px] font-semibold text-[#EF4444]"
           >
-            Return to lobby
+            Back to home
           </button>
         </div>
       ) : doneCatch ? (
@@ -429,20 +440,53 @@ export default function CatchPage({
             </button>
           ) : null}
         </div>
-      ) : isRunner && openClaim ? (
-        // Runner side: my QR for the Hunter to scan + Self confirm
-        // (manual confirm). No dispute — not needed for now.
+      ) : isRunner ? (
+        // Runner side (P1-20): "Got Tagged" opens the runner's own QR
+        // directly — claim or not, never a "No one has claimed a tag on
+        // you yet" dead end. With an open claim the QR is the runner's
+        // own catch token (fetched via getCatchToken) and Self confirm
+        // settles the tag. With NO open claim yet, the note + Self
+        // confirm still render and the QR appears here the moment the
+        // hunter claims the tag (the snapshot re-renders this branch) —
+        // the live catch-token endpoint mints a token per pending catch
+        // only, so no token exists to show before a claim lands.
+        // No dispute button — founder decision, see handleRunnerConfirm.
         <div className="flex flex-col gap-4">
-          <p className="text-[15px] text-white">
-            You were tagged by {hunterName}?
-          </p>
-          <CatchQR
-            mode="show"
-            token={qrToken}
-            runnerName={myPlayer?.displayName ?? 'You'}
-            onScan={() => undefined}
-            onManualFallback={() => undefined}
-          />
+          {openClaim ? (
+            <p className="text-[15px] text-white">
+              You were tagged by {hunterName}?
+            </p>
+          ) : (
+            <p className="text-[15px] text-white">
+              Show this to the hunter — they&apos;ll scan it to claim the tag.
+            </p>
+          )}
+          {openClaim ? (
+            <CatchQR
+              mode="show"
+              token={qrToken}
+              runnerName={myPlayer?.displayName ?? 'You'}
+              onScan={() => undefined}
+              onManualFallback={() => undefined}
+            />
+          ) : (
+            <div className="flex flex-col items-center gap-3 rounded-2xl border border-[#26262B] bg-[#141416] p-6 text-center">
+              <p className="text-[15px] font-bold text-white">{myPlayer?.displayName ?? 'You'}</p>
+              <p className="text-[14px] text-[#A1A1AA]">
+                Waiting for the hunter&apos;s claim — your QR appears here as soon as they claim the tag.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  if (mode === 'live') socket?.requestSnapshot();
+                  else refreshDemo();
+                }}
+                className="text-[15px] font-semibold text-[#EF4444]"
+              >
+                Check again
+              </button>
+            </div>
+          )}
           {isSuspended ? (
             <p className="rounded-2xl border border-[#F59E0B] bg-[#141416] p-3 text-[14px] text-white">
               You&apos;re suspended — reconnect to confirm.
@@ -457,11 +501,6 @@ export default function CatchPage({
             Self confirm
           </button>
         </div>
-      ) : isRunner ? (
-        // Runner with no open claim — nothing to confirm yet.
-        <p className="rounded-2xl border border-[#26262B] bg-[#141416] p-4 text-[15px] text-[#A1A1AA]">
-          No one has claimed a tag on you yet.
-        </p>
       ) : isHunter && openClaim && scanOpen && !manualMode ? (
         // Hunter side: scan the Runner's QR.
         <div className="flex flex-col gap-3">
@@ -475,11 +514,6 @@ export default function CatchPage({
             onScan={handleScan}
             onManualFallback={() => setManualMode(true)}
           />
-          {lockedUntilMs !== null && Date.now() < lockedUntilMs ? (
-            <p className="text-center text-[14px] text-[#EF4444]">
-              Too many wrong scans — wait 30 s.
-            </p>
-          ) : null}
           <button
             type="button"
             onClick={() => setScanOpen(false)}

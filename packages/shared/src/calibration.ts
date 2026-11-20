@@ -94,6 +94,15 @@ export const ZONE_RADIUS_MIN_M = 100;
 /** Zone radius: default 500 m. */
 export const ZONE_RADIUS_DEFAULT_M = 500;
 
+/**
+ * Geometry bounds (validation): no zone / no-go / safe-area boundary may
+ * carry more than 64 points, and no zone boundary may span more than
+ * 100 km across (bounding-box diagonal) — a boundary spanning the planet
+ * is rejected, not stored.
+ */
+export const MAX_GEOMETRY_POINTS = 64;
+export const MAX_ZONE_DIAMETER_M = 100_000;
+
 /** Zone radius stepper step: 50 m. */
 export const ZONE_RADIUS_STEP_M = 50;
 
@@ -118,6 +127,12 @@ export const OUTSIDE_ZONE_RETURN_SECONDS = 30;
 /** Each shrink keeps 75% of the radius (−25% per shrink). */
 export const SHRINK_RADIUS_FACTOR = 0.75;
 
+/** Shrinks per round: exactly 3, at duration/3, 2·duration/3, duration. */
+export const SHRINK_COUNT_PER_ROUND = 3;
+
+/** Shrink preview lead: the DO broadcasts the next zone this far ahead. */
+export const PREVIEW_LEAD_SECONDS = 30;
+
 /** Next-zone draws within 10 m of the current centre are discarded and re-drawn. */
 export const MIN_NEXT_ZONE_OFFSET_M = 10;
 
@@ -135,6 +150,15 @@ export const CATCH_CONFIRMATION_REQUIRED = true;
  */
 export const CATCH_TOKEN_HEX_LENGTH = 32;
 export const CATCH_TOKEN_BITS = 128;
+
+/**
+ * Physical-tag rule (founder decision): a tag confirms ONLY when the
+ * Hunter and the Runner both have a recent fix and are within this
+ * distance of each other. A tag must not complete with both phones in
+ * different cities. Applies to the QR-token path AND the manual-confirm
+ * path — the engine gates both in `confirmCatch` (and `requestCatch`).
+ */
+export const CATCH_MAX_DISTANCE_METERS = 100;
 
 /** Scoring (completed matches only) — fixed founder rules, NOT calibration. */
 export const SCORING_RUNNER_PER_3_MIN_FREE = 1;
@@ -244,9 +268,11 @@ export const STALE_FIX_MS = 60_000;
 /** Impossible movement: > 30 m/s from the previous fix warns only, never rejects. OPEN. */
 export const MAX_PLAUSIBLE_SPEED_MPS = 30;
 
-/** Demo-only wrong-scan cooldown: 3 wrong scans → 30 s lock. OPEN. */
-export const WRONG_SCAN_MAX = 3;
-export const WRONG_SCAN_LOCK_SECONDS = 30;
+/** WRONG_SCAN_MAX / WRONG_SCAN_LOCK_SECONDS: DELETED — dead calibration
+ * with no engine/worker reference. Failed confirms are already limited
+ * by the WS `catch.confirm` 5/min/seat limit; do not re-add a separate
+ * lockout. NOTE: the web catch page still imports these names for its
+ * demo wrong-scan lockout — that usage must be removed there (Arjun). */
 
 /**
  * Hunter balance table (Balance ON sets the Hunter count from the roster at start).
@@ -326,9 +352,11 @@ export const HTTP_RATE_LIMITS: Readonly<Record<string, { readonly limit: number;
     'POST /v1/rooms/:id/host/transfer': { limit: 5, windowSeconds: 60, key: 'seat' },
     'POST /v1/rooms/:id/catches/:cid/resolve': { limit: 10, windowSeconds: 60, key: 'seat' },
     'GET /v1/rooms/:id/results': { limit: 30, windowSeconds: 60, key: 'seat' },
-    // The WS upgrade keys on client IP at the HTTP layer because the seat
-    // is unknown before ticket validation (the table says 'ip' for it).
-    'WS /v1/rooms/:id/ws': { limit: 10, windowSeconds: 60, key: 'ip' },
+    // The WS upgrade is keyed by ROOM, not client IP: 30 players on one
+    // venue WiFi share one IP, and a per-IP cap would 429 the 6th player.
+    // 60/min per room covers a full roster connecting + retries. The
+    // Worker builds the key from the roomId (see workers/src/index.ts).
+    'WS /v1/rooms/:id/ws': { limit: 60, windowSeconds: 60, key: 'room' },
   } as const;
 
 /**
@@ -356,8 +384,6 @@ export const CALIBRATION_OPEN = {
   clockSkewMs: CLOCK_SKEW_MS,
   staleFixMs: STALE_FIX_MS,
   maxPlausibleSpeedMps: MAX_PLAUSIBLE_SPEED_MPS,
-  wrongScanMax: WRONG_SCAN_MAX,
-  wrongScanLockSeconds: WRONG_SCAN_LOCK_SECONDS,
   wsTicketTtlMs: WS_TICKET_TTL_MS,
   reconnectMaxAttempts: RECONNECT_MAX_ATTEMPTS,
   reconnectBackoffBaseMs: RECONNECT_BACKOFF_BASE_MS,

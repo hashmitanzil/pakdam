@@ -7,6 +7,7 @@
  */
 import type { ReactNode } from 'react';
 import {
+  SHRINK_INTERVAL_MINUTES_GRID,
   balancedHunterCount,
   shrinkIntervalForDurationSeconds,
   type RoomConfig,
@@ -26,7 +27,8 @@ export interface SetupControlsProps {
 const DURATION_STEPS = [600, 900, 1200, 1800, 2700, 3600] as const;
 const HEAD_START_STEPS = [0, 60, 120, 180, 300] as const;
 const PING_STEPS = [0, 30, 60, 120, 180, 300] as const;
-const SHRINK_STEPS = [1, 3, 5, 10, 15, 20] as const;
+/** Shrink-interval grid (minutes) — the canonical grid from @pakdam/shared. */
+const SHRINK_STEPS = SHRINK_INTERVAL_MINUTES_GRID;
 
 function row(label: string, value: string, control: ReactNode, hint?: string) {
   return (
@@ -94,7 +96,7 @@ export function RulesControls({ config, isHost, onChange }: SetupControlsProps) 
           onChange={(v) => set({ pingIntervalSeconds: v })}
         />,
         zoneOff || pingsOff
-          ? 'No pings. Neither side sees the other — hunters only see runners who leave the zone.'
+          ? 'No pings. Neither side sees the other — hunters get no locations at all, including for runners who leave the zone (no code emits a reveal on zone exit).'
           : 'How often both sides see where the other team is.',
       )}
       <div className="mt-4 flex items-center justify-between gap-3">
@@ -231,20 +233,13 @@ export function TeamControls({
           }
         />
       </div>
-      <div className="mt-4 flex items-center justify-between gap-3">
-        <div>
-          <p className="text-[15px] font-semibold text-white">Show ping history</p>
-          <p className="text-[13px] text-[#A1A1AA]">
-            Hunters see each runner&apos;s earlier pings, not just the latest.
-          </p>
-        </div>
-        <Toggle
-          label="Show ping history"
-          checked={config.showPingHistory === true}
-          disabled={!isHost}
-          onChange={(v) => set({ showPingHistory: v })}
-        />
-      </div>
+      {/*
+        No "Show ping history" toggle here on purpose: the underlying
+        history was never implemented, so the toggle had zero effect and
+        a visible control must never promise a feature that does not
+        exist (P1-26). The `showPingHistory` config field itself is
+        removed from the shared types on the server side.
+      */}
     </section>
   );
 }

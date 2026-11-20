@@ -16,7 +16,7 @@ the demo store and the web app mirror them.
 - `TransitionResult` — `{ ok: true, phase }` or `{ ok: false, reason, code: 'INVALID_STATE' }`.
 - `isTerminalPhase(phase)` — is this phase terminal (no outgoing edge)?
 - `canTransition(from, to)` — is this edge allowed?
-- `transition(from, to)` — attempt a transition; same-phase is a no-op success, illegal edge rejects with reason.
+- `transition(from, to)` — attempt a transition; a same-phase transition is an ERROR (never a silent no-op success), illegal edge rejects with reason.
 - `transitionOrThrow(from, to)` — like `transition`, but throws an `INVALID_STATE` error on an illegal edge.
 - `MatchEvent` — named match events (`room-created`, `start-requested`, `countdown-complete`, `head-start-elapsed`, `match-end`, `resolve-complete`, `cancel`, `abandon`, `expire`, `pause`, `resume`).
 - `transitionForEvent(from, event, pausedFrom?)` — map a named event to its target phase, then apply `transition`; `resume` needs `pausedFrom`.
@@ -45,7 +45,7 @@ the demo store and the web app mirror them.
 - `resolveHunterCount({ balanceHunters, rosterSize, hostHunterCount })` — Balance ON reads the table; OFF uses the host stepper (clamped 1..n−1).
 - `validateSelectedHunters({ selectedHunterIds, hunterCount, joinedPlayerIds })` — pick problems in plain words, or null when valid.
 - `shuffled(items, random?)` — Fisher–Yates shuffle of a copy.
-- `assignRoles(players, options)` — draw roles once, at head start; ≥ 3 players, 1..n−1 Hunters; `selected` uses the host pick (stale-count pick falls back to a random draw), `random` shuffles.
+- `assignRoles(players, options)` — draw roles once, at head start; ≥ 2 players, 1..n−1 Hunters; `selected` uses the host pick (stale-count pick falls back to a random draw), `random` shuffles.
 - `clearSelectedHunters()` — switching to Random (or changing hunter count / assignment) clears the pick.
 
 ### `src/zone.ts` — zones, shrink, outside-zone
@@ -63,11 +63,13 @@ the demo store and the web app mirror them.
 - `offsetPolygon(polygon, dxMeters, dyMeters)` — offset every vertex by metres.
 - `polygonFullyInside(inner, outer)` — all vertices inside AND no edge crossing.
 - `isPointInZone(point, boundary)` — is this point inside the play zone?
-- `shrinkTimesSeconds(durationSeconds, intervalSeconds, shrinkEnabled)` — shrink times from match start.
-- `shrinkIndexAt(elapsedSeconds, intervalSeconds, shrinkEnabled)` — how many shrinks have fired.
+- `shrinkTimesSeconds(durationSeconds, intervalSeconds, shrinkEnabled)` — exactly 3 shrink times: [I, 2I, 3I].
+- `finalRadiusFactor(shrinkCount?)` — 0.75^shrinkCount (0.42 after 3 shrinks); `finalRadiusPercent(shrinkCount?)` — the same as a whole percent (42 after 3). Never hardcode 25%.
+- `shrinkIndexAt(elapsedSeconds, intervalSeconds, shrinkEnabled)` — how many shrinks have fired (max 3).
 - `nextShrinkAtMs(startedAtMs, durationSeconds, intervalSeconds, shrinkEnabled, nowMs)` — epoch ms of the next shrink, or null.
 - `ShrinkDrawResult` — `{ boundary, method, offsetMeters }`.
 - `randomOffsetShrinkBoundary(boundary, { factor?, random?, maxAttempts? })` — scale to 75%, move to a random position fully inside the old boundary, never concentric; fallbacks: compass → vertex → smaller concentric → concentric last resort.
+- `previewShrinkBoundary(boundary, options?)` — the next-zone preview boundary (same draw); the DO broadcasts it 30 s before the shrink as `zone.preview` and applies that same boundary when the shrink fires.
 - `OutsideZoneState` — per-player countdown state (`outsideSinceMs`, `outsideAccumMs`; DO memory only).
 - `emptyOutsideZoneState()` — fresh countdown state.
 - `OutsideZoneUpdate` — `{ state, remainingSeconds, shouldEject }`.
@@ -80,7 +82,7 @@ the demo store and the web app mirror them.
 - `PENDING_PING_TTL_SECONDS` — pending (undelivered) ping TTL 300 s (re-exported from shared).
 - `isPingDue(lastPingAtMs, startedAtMs, intervalSeconds, nowMs)` — is a ping due? First ping lands one interval after match start.
 - `nextPingAtMs(lastPingAtMs, startedAtMs, intervalSeconds)` — epoch ms of the next scheduled ping, or null.
-- `buildPing({ pingId, roomId, subjectPlayerId, fix, qualityAtPing, nowMs })` — one coarse 150 m ping area; null when there is no fix, never an invented position.
+- `buildPing({ pingId, roomId, subjectPlayerId, fix, qualityAtPing, nowMs })` — one coarse 150 m ping area centred on the subject's exact latest fix (the 150 m radius is the coarseness, not the centre); null when there is no fix, never an invented position.
 - `isPingDeliverable(ping, nowMs, ttlSeconds?)` — is an undelivered ping still within its TTL?
 - `purgeExpiredPings(pendingPings, nowMs, ttlSeconds?)` — drop undelivered pings past their TTL.
 - `replaceDeliveredPing(delivered, next)` — a delivered ping stays until the next ping replaces it.
@@ -104,14 +106,15 @@ the demo store and the web app mirror them.
 - `issueCatchToken(catchId)` — fresh 128-bit token (QR only) + its stored hash.
 - `verifyCatchToken(catchId, rawToken, storedHash)` — does this raw token match the stored hash?
 - `gpsEvidenceForCatch(hunterFix, runnerFix, nowMs)` — `present` / `absent` / `stale` (supporting evidence only, never proof).
+- `checkCatchProximity({ hunterFix, runnerFix, nowMs, maxDistanceMeters? })` — the ENFORCING physical-tag gate: both phones need a recent fix within 100 m (default `CATCH_MAX_DISTANCE_METERS`), else STALE_LOCATION / FORBIDDEN.
 - `CatchResult<T>` — `{ ok: true, value }` or `{ ok: false, reason, code }`.
 - `CatchPlayer` — minimal seat shape the catch rules need.
 - `isCatchableRunner(player, caughtRunnerIds)` — free, present, non-suspended Runner.
 - `openCatchForRunner(catches, runnerId)` — the open (pending) claim against a Runner, if any.
-- `requestCatch({ catches, hunter, runner, caughtRunnerIds, phase, catchId, roomId, nowMs, hunterFix, runnerFix })` — Hunter only, ACTIVE only, one pending catch per Runner; same-Hunter re-request returns the open claim, different Hunter gets CONFLICT.
-- `confirmCatch({ catchEvent, confirmerId, confirmerRole, manualConfirm, tokenValid, runner, caughtRunnerIds, phase, nowMs, ttlSeconds? })` — Runner (QR token or manual, no token) or claiming Hunter (valid QR token); suspended Runner blocks; second confirm is CONFLICT.
-- `disputeCatch({ catchEvent, disputerId, phase, nowMs, ttlSeconds? })` — Runner-only, on a pending claim; overdue claims expire instead.
-- `resolveCatch({ catchEvent, resolverIsHost, decision, nowMs })` — host resolves a disputed catch (`confirmed` / `rejected`); final.
+- `requestCatch({ catches, hunter, runner, caughtRunnerIds, phase, catchId, roomId, nowMs, hunterFix, runnerFix, positions?, maxDistanceMeters? })` — Hunter only, ACTIVE only, Hunter not suspended/disconnected, one pending catch per Runner; same-Hunter re-request returns the open claim, different Hunter gets CONFLICT. Physical-tag gate applies.
+- `confirmCatch({ catchEvent, confirmerId, confirmerRole, manualConfirm, tokenValid, runner, caughtRunnerIds, phase, nowMs, ttlSeconds?, positions, maxDistanceMeters? })` — Runner (QR token or manual, no token) or claiming Hunter (valid QR token); suspended Runner blocks; second confirm is CONFLICT. `positions` (required — the DO's latest fixes for both seats) must show both phones within 100 m with recent fixes, on BOTH the QR and the manual-confirm path.
+- `disputeCatch({ catchEvent, disputerId, phase, nowMs, ttlSeconds? })` — Runner-only, on a pending claim; overdue claims expire instead. Requires ACTIVE.
+- `resolveCatch({ catchEvent, resolverIsHost, decision, nowMs, phase? })` — host resolves a disputed catch (`confirmed` / `rejected`); final. Requires ACTIVE when `phase` is passed.
 - `expireCatchIfOverdue(catchEvent, nowMs, ttlSeconds?)` — lazily expire an overdue pending claim.
 - `selectEffectiveRunner({ urlRunnerId, myOpenClaim, myPlayerId, pickerChoiceId, myLatestConfirmedCatch })` — catch-page auto-select order: URL param → my open claim → picker choice → my latest confirmed catch; null means render the picker.
 - `pickerCandidates(players, selfId, caughtRunnerIds)` — name-only picker candidates (self, ejected/left, already-caught excluded).
@@ -122,12 +125,12 @@ the demo store and the web app mirror them.
 - `canSafetyPause(phase)` — pause allowed from HEAD_START / ACTIVE (already-paused is a harmless no-op).
 - `canStartSafetyPause(phase)` — a fresh pause may start here (HEAD_START / ACTIVE).
 - `PauseResult` — `{ ok: true, phase: 'SAFETY_PAUSED', pausedFrom, pausedAt }` or `{ ok: false, reason, code }`.
-- `pauseMatch(phase, byPlayerId, nowMs)` — start a safety pause; records `pausedAt` + `pausedFrom`.
+- `pauseMatch(phase, byPlayerId, nowMs, existing?)` — start a safety pause; records `pausedAt` + `pausedFrom`. Already paused + existing state passed = idempotent no-op returning the stored values unchanged (never hard-codes ACTIVE); already paused without it = INVALID_STATE.
 - `ResumeResult` — `{ ok: true, phase, startedAt, endsAt }` (deadlines shifted) or `{ ok: false, reason, code }`.
 - `shiftDeadlineForward(deadline, pauseDurationMs)` — shift an ISO deadline forward by the pause.
 - `resumeMatch({ phase, pausedFrom, pausedAt, startedAt, endsAt, nowMs })` — resume returns to the phase paused from, deadlines shifted; nothing completes while paused.
 - `safetyStateAfterPause(byPlayerId, nowMs, previous)` — snapshot safety state after a pause.
-- `safetyStateAfterResume(previous)` — snapshot safety state after a resume (SOS unchanged).
+- `safetyStateAfterResume(previous)` — snapshot safety state after a resume (SOS clears with the pause — the DO's `doSafetyResume` calls `clearSos` on this path).
 - `raiseSos(previous)` — raise an SOS (host-only recipients, not emergency dispatch).
 - `clearSos(previous)` — clear an SOS (host-acknowledged).
 - `sosRecipients(hostPlayerId)` — SOS recipients: the host only.
@@ -149,11 +152,11 @@ the demo store and the web app mirror them.
 
 - `SCORING_CLEAN_SWEEP`, `SCORING_HUNTER_PER_TAG`, `SCORING_RUNNER_NEVER_CAUGHT`, `SCORING_RUNNER_PER_3_MIN_FREE` — scoring constants (re-exported from shared).
 - `RUNNER_FREE_SECONDS_PER_POINT` — 180 s of free time earns one Runner point.
-- `ScoringPlayer` — minimal per-player scoring input (role at end, free seconds, caught, ejected, tags made).
-- `isCleanSweep({ result, ejectedRunnerIds })` — every Runner caught, none ejected, none surviving, Hunters won.
-- `runnerScore(player)` — +1 per whole 3 min free, +10 if never caught.
+- `ScoringPlayer` — minimal per-player scoring input (role at end, `wasRunner` when the player was a Runner at any point, free seconds, caught, ejected, tags made).
+- `isCleanSweep({ result, ejectedRunnerIds })` — every Runner caught, none ejected, none surviving, Hunters won. Caller contract: `ejectedRunnerIds` must contain ONLY ejected Runners (the DO filters at ejection).
+- `runnerScore(player)` — +1 per whole 3 min free, +10 if never caught. A flipped Runner still earns these (free time stops at the flip).
 - `hunterScore(player, cleanSweep, huntersWon)` — +3 per confirmed tag, +10 clean sweep when it applies.
-- `scorePlayer(player, { result, cleanSweep })` — points for one player (0 when the match never completed).
+- `scorePlayer(player, { result, cleanSweep })` — points for one player (0 when the match never completed). A flipped Runner earns BOTH parts: Runner free-time points + Hunter tag points.
 - `ScoreBreakdown` — per-player breakdown (points, free blocks, never-caught bonus, tags, clean-sweep bonus).
 - `scoreMatch({ players, result, ejectedRunnerIds })` — score a completed match; 0 for every player when there is no result.
 
@@ -161,5 +164,6 @@ the demo store and the web app mirror them.
 
 - `playerViewFor(viewerPlayerId, player)` — one seat as a viewer sees it: hash stripped, own role only, other seats' roles `null`.
 - `playersViewFor(viewerPlayerId, players)` — every seat as this viewer sees it.
-- `activeCatchesFor(viewerPlayerId, viewerIsHost, catches)` — pending catches only, to the parties + the host.
+- `activeCatchesFor(viewerPlayerId, viewerIsHost, catches)` — pending AND disputed catches, to the parties + the host (a disputed catch still needs resolution).
+- `decidedCatchesFor(viewerPlayerId, viewerIsHost, catches)` — confirmed/disputed catches, to the parties + the host.
 - `buildSnapshot({ room, players, viewerPlayerId, viewerIsHost, serverSeq, locationStatus, catches, safetyState, missedAnnouncements })` — the authorised snapshot: no raw coordinates, no pending pings, no token hashes, ever.

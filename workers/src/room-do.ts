@@ -12,12 +12,27 @@
  * - Durable (survives hibernation): room, players (incl. token hashes,
  *   never sent), catches (incl. qrTokenHash, server only), host-token
  *   hashes, serverSeq, redacted game-event log (cap 500), lastPingAtMs,
- *   pause/SOS state, lightweight event log, shrinkIndexApplied.
- * - Memory only (never persisted): latest fixes (purged after 120 s and at
- *   match end), pending pings, outside-zone countdowns, WS tickets, WS
- *   rate-limit windows, idempotency set, raw catch tokens, announcements.
- * Never persisted, ever: raw coordinates, raw tokens of any kind, WS
- * ticket values.
+ *   pause/SOS state, lightweight event log, shrinkIndexApplied, the WS
+ *   ticket registry (hashes only), idempotency records + cached replies,
+ *   pending pings (+ per-recipient delivery state), and the pending
+ *   shrink preview boundary. A wake must not invalidate a minted ticket,
+ *   lose a retry's reply, or drop a ping that was never delivered (P1-5).
+ * - Memory only (never persisted): latest fixes (purged after 30 s —
+ *   the LOCATION_FRESHNESS_SECONDS window — and at match end),
+ *   outside-zone countdowns, WS rate-limit windows, raw catch tokens,
+ *   announcements. Never persisted, ever: raw coordinates, raw tokens
+ *   of any kind, WS ticket values.
+ *
+ * Server caps (P2): safety pause / SOS / leave `reason` ≤ 500 chars;
+ * voice.signal `candidate` ≤ 8 KB (same as SDP); bug/grievance
+ * deviceInfo / appVersion / complainantRef ≤ 500 chars (enforced in
+ * http.ts); HTTP + DO /op bodies ≤ 1 MB (413 above).
+ *
+ * Physical tags (founder decision, P1-11): a tag confirms only when the
+ * Hunter and the Runner both have a recent fix within
+ * CATCH_MAX_DISTANCE_METERS (100 m) — enforced by the engine's
+ * checkCatchProximity; the DO passes `mem.latestFix` for both seats as
+ * `positions` (plus `maxDistanceMeters`) into requestCatch/confirmCatch.
  *
  * SUPABASE: this file never touches Supabase. Mutating ops return
  * `PersistIntent[]` (JSON-safe); the caller — the DO class for WS-driven
@@ -31,14 +46,16 @@
  * registry lives in the room's DO, not in Worker memory.
  */
 import {
+  CATCH_MAX_DISTANCE_METERS,
   CATCH_TOKEN_TTL_SECONDS,
-  FIX_TTL_MS,
   GAME_EVENT_LOG_CAP,
   HEARTBEAT_INTERVAL_MS,
   HTTP_RATE_LIMITS,
+  LOCATION_FRESHNESS_SECONDS,
   MAX_PLAYERS,
   MIN_PLAYERS,
   OUTSIDE_ZONE_RETURN_SECONDS,
+  PREVIEW_LEAD_SECONDS,
   QUICK_SIGNALS,
   RADIO_MAX_CHARS,
   RENEWAL_WARNING_MS,
@@ -53,7 +70,6 @@ import {
   isValidCatchToken,
   isValidDisplayName,
   isValidRoomCode,
-  locationStatusForPlayer,
   newId,
   randomHex,
   validateFix,
@@ -63,6 +79,7 @@ import {
   type CatchView,
   type GameEvent,
   type GeoPoint,
+  type GeoPolygon,
   type LocationFix,
   type LocationQuality,
   type MatchPhase,
@@ -84,6 +101,7 @@ import {
   assignRoles,
   buildPing,
   buildSnapshot,
+  canTransition,
   confirmCatch,
   confirmedTags,
   disputeCatch,
@@ -96,10 +114,12 @@ import {
   isCatchExpired,
   isDuplicateCommand,
   isPendingCatch,
+  isTerminalPhase,
   issueCatchToken,
   maybeCompleteOnWin,
   openCatchForRunner,
   pauseMatch,
+  previewShrinkBoundary,
   purgeIdempotency,
   purgeExpiredPings,
   raiseSos,
@@ -115,6 +135,7 @@ import {
   scoreMatch,
   shrinkIndexAt,
   toCatchView,
+  transitionForEvent,
   transitionOrThrow,
   updateOutsideZone,
   verifyCatchToken,
@@ -158,6 +179,39 @@ export interface RoomDoState {
   eventLog: Array<{ seq: number; type: string; actorId: string | null; at: string }>;
   /** How many scheduled shrinks have already been drawn. */
   shrinkIndexApplied: number;
+  /**
+   * WS ticket registry, durable (P1-5): hashes only, never values. A
+   * ticket minted before a hibernate must still redeem after the wake.
+   */
+  tickets: WsTicketRecord[];
+  /**
+   * (seat, commandId) idempotency records, durable (P1-5): serialised as
+   * { key, record } pairs; the live Map is rebuilt from these on load.
+   */
+  idempotency: Array<{ key: string; record: IdempotencyRecord }>;
+  /**
+   * Cached direct/broadcast replies per (seat, commandId), durable
+   * (P1-5 + P1-9): a retry after a wake gets the original reply.
+   */
+  idempotentReplies: Array<{ key: string; events: OutboundEvent[] }>;
+  /** Pending (undelivered) pings, durable (P1-5): re-delivered on hello. */
+  pendingPings: Ping[];
+  /**
+   * Per-ping recipients still awaiting delivery: pingId -> playerIds.
+   * A ping leaves `pendingPings` only when every recipient has received
+   * it (per-recipient ack); an offline Hunter still gets it on reconnect.
+   */
+  pendingPingRecipients: Record<string, string[]>;
+  /**
+   * The previewed next-zone boundary (P1-18): drawn PREVIEW_LEAD_SECONDS
+   * before the shrink and applied verbatim when the shrink fires, so the
+   * preview is the real next zone — never a second, different draw.
+   */
+  pendingShrink: {
+    boundary: GeoPolygon;
+    firesAtMs: number;
+    shrinkIndex: number;
+  } | null;
 }
 
 /** Memory-only state — rebuilt empty after hibernation, never persisted. */
@@ -188,7 +242,24 @@ export interface RoomMemory {
   lastDisconnectAtMs: Record<string, number>;
   /** commandId -> direct reply events, so a retry gets the original reply. */
   idempotentReplies: Map<string, OutboundEvent[]>;
+  /**
+   * Per-ping recipients still awaiting delivery: pingId -> playerIds not
+   * yet delivered to. Mirrors the durable `pendingPingRecipients`.
+   */
+  pendingPingRecipients: Map<string, Set<string>>;
 }
+
+/** Start gate: a fix counts as fresh for 120 s at start time (P1-7). */
+export const START_GPS_FRESHNESS_MS = 120_000;
+
+/** Idle-lobby expiry: a LOBBY older than 24 h transitions to EXPIRED. */
+export const LOBBY_EXPIRY_MS = 24 * 60 * 60 * 1000;
+
+/** Free-text caps (P2): safety pause / SOS / leave `reason`. */
+export const REASON_MAX_CHARS = 500;
+
+/** Voice ICE candidate cap (P2): 8 KB, same as the SDP cap. */
+export const VOICE_CANDIDATE_MAX_BYTES = 8_192;
 
 export interface OutboundEvent {
   type: WsServerMessageType;
@@ -264,6 +335,7 @@ export function emptyMemory(): RoomMemory {
     announcements: [],
     lastDisconnectAtMs: {},
     idempotentReplies: new Map(),
+    pendingPingRecipients: new Map(),
   };
 }
 
@@ -283,6 +355,12 @@ export function durableSnapshot(state: RoomDoState): RoomDoState {
     sosActive: state.sosActive,
     eventLog: state.eventLog,
     shrinkIndexApplied: state.shrinkIndexApplied,
+    tickets: state.tickets,
+    idempotency: state.idempotency,
+    idempotentReplies: state.idempotentReplies,
+    pendingPings: state.pendingPings,
+    pendingPingRecipients: state.pendingPingRecipients,
+    pendingShrink: state.pendingShrink,
   };
 }
 
@@ -305,6 +383,14 @@ export function restoreState(raw: unknown): RoomDoState | null {
     sosActive: s.sosActive ?? false,
     eventLog: s.eventLog ?? [],
     shrinkIndexApplied: s.shrinkIndexApplied ?? 0,
+    // P1-5 fields: older durable writes lack them — empty is the honest
+    // default (a pre-fix ticket simply does not survive the wake).
+    tickets: s.tickets ?? [],
+    idempotency: s.idempotency ?? [],
+    idempotentReplies: s.idempotentReplies ?? [],
+    pendingPings: s.pendingPings ?? [],
+    pendingPingRecipients: s.pendingPingRecipients ?? {},
+    pendingShrink: s.pendingShrink ?? null,
   };
 }
 
@@ -324,6 +410,53 @@ export class RoomStore {
   constructor(state: RoomDoState, mem: RoomMemory = emptyMemory()) {
     this.state = state;
     this.mem = mem;
+  }
+
+  /**
+   * Rebuild the durable-backed memory maps after a hibernate/wake (P1-5).
+   * The class calls this right after `restoreState`: tickets,
+   * idempotency records + cached replies, and pending pings (+ their
+   * per-recipient delivery state) come back; latest fixes deliberately
+   * do NOT — raw coordinates are never persisted, so a woken DO reports
+   * locations as unknown until each client sends a fresh fix (see
+   * `locationStatus`). Raw catch tokens are likewise memory-only and
+   * re-minted on re-fetch (see `getCatchToken`).
+   */
+  restoreDurableMemory(): void {
+    this.mem.tickets = [...(this.state.tickets ?? [])];
+    this.mem.idempotency = new Map(
+      (this.state.idempotency ?? []).map((e) => [e.key, e.record]),
+    );
+    this.mem.idempotentReplies = new Map(
+      (this.state.idempotentReplies ?? []).map((e) => [e.key, e.events]),
+    );
+    this.mem.pendingPings = [...(this.state.pendingPings ?? [])];
+    this.mem.pendingPingRecipients = new Map(
+      Object.entries(this.state.pendingPingRecipients ?? {}).map(([k, v]) => [
+        k,
+        new Set(v),
+      ]),
+    );
+  }
+
+  /**
+   * Copy the durable-backed memory maps into `state` before a
+   * `storage.put` (P1-5). The class calls this inside `save()`; every
+   * mutation therefore persists the ticket registry, idempotency, and
+   * pending pings together with the game state.
+   */
+  syncDurableMemory(): void {
+    this.state.tickets = [...this.mem.tickets];
+    this.state.idempotency = [...this.mem.idempotency.entries()].map(
+      ([key, record]) => ({ key, record }),
+    );
+    this.state.idempotentReplies = [...this.mem.idempotentReplies.entries()].map(
+      ([key, events]) => ({ key, events }),
+    );
+    this.state.pendingPings = [...this.mem.pendingPings];
+    this.state.pendingPingRecipients = Object.fromEntries(
+      [...this.mem.pendingPingRecipients.entries()].map(([k, v]) => [k, [...v]]),
+    );
   }
 
   // -- basics ---------------------------------------------------------------
@@ -430,6 +563,89 @@ export class RoomStore {
       .map((p) => p.playerId);
   }
 
+  /**
+   * Is this player a caught Runner spectating (Classic)? A confirmed
+   * catch against a seat that is still a Runner. Infection flips a
+   * tagged Runner to Hunter, so a flipped player is not a spectator.
+   * Caught spectators cannot send radio / voice / pins / announcements
+   * to their live team (P2) — the founder can override this rule.
+   */
+  isCaughtSpectator(playerId: string): boolean {
+    const me = this.player(playerId);
+    if (!me || me.matchRole !== 'runner') return false;
+    return this.state.catches.some(
+      (c) => c.state === 'confirmed' && c.runnerPlayerId === playerId,
+    );
+  }
+
+  /** Can the match complete from here (RESOLVING then COMPLETED)? */
+  canCompleteMatch(): boolean {
+    return (
+      canTransition(this.room.phase, 'RESOLVING') &&
+      canTransition('RESOLVING', 'COMPLETED')
+    );
+  }
+
+  /**
+   * Would confirming this catch (with the engine's decided value applied)
+   * complete the match? Pure simulation — nothing is mutated. Used by
+   * the confirm/resolve paths to validate the completion transition
+   * BEFORE marking the catch confirmed (P1-2).
+   */
+  wouldCompleteOnConfirm(
+    c: CatchEvent,
+    decided: CatchEvent,
+    nowMs: number,
+  ): boolean {
+    const nextCatches = this.state.catches.map((x) =>
+      x.catchId === c.catchId ? decided : x,
+    );
+    const caughtIds = nextCatches
+      .filter((x) => x.state === 'confirmed')
+      .map((x) => x.runnerPlayerId);
+    const durationSeconds =
+      this.room.startedAt === null
+        ? 0
+        : Math.max(0, Math.floor((nowMs - Date.parse(this.room.startedAt)) / 1000));
+    return (
+      maybeCompleteOnWin({
+        mode: this.room.config.mode,
+        players: this.state.players,
+        caughtRunnerIds: caughtIds,
+        durationSeconds,
+        tags: confirmedTags(nextCatches),
+      }) !== null
+    );
+  }
+
+  /** Record which seats a newly built ping still has to reach. */
+  notePingRecipients(pingId: string, recipientIds: string[]): void {
+    this.mem.pendingPingRecipients.set(pingId, new Set(recipientIds));
+  }
+
+  /**
+   * Per-recipient ping ack (P2): remove only the recipients that actually
+   * received this delivery from the ping's pending set. The ping leaves
+   * `pendingPings` (and `lastPingAtMs` advances) only when NO recipient
+   * is left waiting — an offline Hunter still gets it on reconnect.
+   */
+  acknowledgePingDeliveryFor(
+    pingId: string,
+    deliveredIds: string[],
+    nowMs: number,
+  ): void {
+    const waiting = this.mem.pendingPingRecipients.get(pingId);
+    if (waiting) {
+      for (const id of deliveredIds) waiting.delete(id);
+      if (waiting.size > 0) return;
+      this.mem.pendingPingRecipients.delete(pingId);
+    }
+    const idx = this.mem.pendingPings.findIndex((p) => p.pingId === pingId);
+    if (idx === -1) return;
+    const [ping] = this.mem.pendingPings.splice(idx, 1);
+    if (ping) this.state.lastPingAtMs[ping.subjectPlayerId] = nowMs;
+  }
+
   safetyState(): SafetyState {
     return {
       paused: this.state.paused,
@@ -439,13 +655,52 @@ export class RoomStore {
     };
   }
 
+  /**
+   * Per-viewer location status, teammates-only during play (P2 liveness
+   * leak): an opponent's freshness must not leak to the other team. The
+   * viewer always sees their own status; in the LOBBY there are no teams
+   * yet, so the whole lobby sees each other (the start gate needs it).
+   * Freshness needs a LIVE fix in memory, not just a durable `lastFixAt`:
+   * after a hibernate/wake the fixes are gone while `lastFixAt` still
+   * says "known" (P1-5) — reporting unknown until a fresh fix arrives
+   * is the honest answer, and lobby clients stream fixes continuously.
+   */
   locationStatus(nowMs: number): Record<string, 'known' | 'unknown'> {
     const out: Record<string, 'known' | 'unknown'> = {};
     for (const p of this.state.players) {
-      out[p.playerId] = locationStatusForPlayer(
-        p.lastFixAt === null ? null : Date.parse(p.lastFixAt),
-        nowMs,
-      );
+      const fix = this.mem.latestFix[p.playerId];
+      out[p.playerId] =
+        fix !== undefined && nowMs - fix.timestampMs <= LOCATION_FRESHNESS_SECONDS * 1000
+          ? 'known'
+          : 'unknown';
+    }
+    return out;
+  }
+
+  /**
+   * Location status for one viewer: teammates-only during play. The
+   * base `locationStatus` is the raw freshness map; this scopes it so a
+   * viewer sees real freshness for themself + their team, and 'unknown'
+   * for everyone else. In the LOBBY the whole lobby is one scope.
+   */
+  locationStatusFor(viewerId: string, nowMs: number): Record<string, 'known' | 'unknown'> {
+    const raw = this.locationStatus(nowMs);
+    if (this.room.phase === 'LOBBY') return raw;
+    const viewer = this.player(viewerId);
+    const team = viewer?.team ?? null;
+    if (team === null) {
+      const out: Record<string, 'known' | 'unknown'> = {};
+      for (const p of this.state.players) {
+        out[p.playerId] = p.playerId === viewerId ? raw[p.playerId] ?? 'unknown' : 'unknown';
+      }
+      return out;
+    }
+    const out: Record<string, 'known' | 'unknown'> = {};
+    for (const p of this.state.players) {
+      out[p.playerId] =
+        p.playerId === viewerId || p.team === team
+          ? raw[p.playerId] ?? 'unknown'
+          : 'unknown';
     }
     return out;
   }
@@ -466,7 +721,8 @@ export class RoomStore {
       viewerPlayerId: viewerId,
       viewerIsHost: viewer?.isHost ?? false,
       serverSeq: this.state.serverSeq,
-      locationStatus: this.locationStatus(nowMs),
+      // Teammates-only liveness (P2): opponents read as 'unknown'.
+      locationStatus: this.locationStatusFor(viewerId, nowMs),
       catches: this.state.catches,
       safetyState: this.safetyState(),
       missedAnnouncements: this.missedAnnouncements(viewerId),
@@ -606,6 +862,12 @@ export class RoomStore {
       sosActive: false,
       eventLog: [],
       shrinkIndexApplied: 0,
+      tickets: [],
+      idempotency: [],
+      idempotentReplies: [],
+      pendingPings: [],
+      pendingPingRecipients: {},
+      pendingShrink: null,
     };
     const store = new RoomStore(state);
     const persist: PersistIntent[] = [
@@ -833,7 +1095,37 @@ export class RoomStore {
         409,
       );
     }
+    // P1-7 start gate: the zone must be placed (a boundary of ≥ 3 points)
+    // and every active player must have a fix ≤ 120 s old. The error names
+    // the players without GPS in plain words. Freshness uses the live fix
+    // first, falling back to the durable `lastFixAt` (which survives a
+    // hibernate/wake while the live fix does not). Lobby clients stream
+    // fixes continuously, so a fresh fix is the normal case — a missing
+    // one means that player's GPS is off or the app is backgrounded.
     const config = this.room.config;
+    if (!config.zone || config.zone.boundary.length < 3) {
+      return errResult(
+        'Set the play zone first — the zone needs at least 3 points on the map.',
+        'CONFLICT',
+        409,
+      );
+    }
+    const withoutGps = active.filter((p) => {
+      const live = this.mem.latestFix[p.playerId];
+      const liveMs = live ? nowMs - live.timestampMs : Number.POSITIVE_INFINITY;
+      const lastMs =
+        p.lastFixAt === null
+          ? Number.POSITIVE_INFINITY
+          : nowMs - Date.parse(p.lastFixAt);
+      return Math.min(liveMs, lastMs) > START_GPS_FRESHNESS_MS;
+    });
+    if (withoutGps.length > 0) {
+      return errResult(
+        `Waiting for GPS from ${withoutGps.map((p) => p.displayName).join(', ')} — their location has not been reported in the last 2 minutes.`,
+        'CONFLICT',
+        409,
+      );
+    }
     const draw = assignRoles(active, {
       balanceHunters: config.balanceHunters ?? true,
       randomDraw: config.randomDraw ?? true,
@@ -1016,9 +1308,10 @@ export class RoomStore {
         issueCheck.retryAfterSeconds,
       );
     }
-    this.mem.tickets = this.mem.tickets.filter(
-      (t) => !(t.playerId === input.playerId && !t.redeemed),
-    );
+    // P1-4 (two tabs): a seat may hold several unredeemed tickets at once
+    // — one per tab. Registering a ticket for tab A must NOT revoke tab
+    // B's unredeemed ticket. Tickets stay single-use (redeem marks them),
+    // and the per-seat issue rate limit above is the abuse control.
     this.mem.tickets.push({
       ticketId: input.ticketId,
       playerId: input.playerId,
@@ -1147,9 +1440,14 @@ export class RoomStore {
       tags: confirmedTags(this.state.catches),
     });
     if (win) {
+      // The confirm/resolve caller pre-validated the transition (P1-2),
+      // so `ok: false` here is unreachable in practice; an illegal edge
+      // is never swallowed as an empty success.
       const done = this.completeMatch(win, nowMs);
-      events.push(...done.events);
-      persist.push(...done.persist);
+      if (done.ok) {
+        events.push(...done.events);
+        persist.push(...done.persist);
+      }
     }
     return { events, persist };
   }
@@ -1190,12 +1488,35 @@ export class RoomStore {
     ).toISOString();
     const held = this.mem.rawCatchTokens.get(c.catchId);
     if (held && input.nowMs < held.expiresAtMs) {
-      return okResult({ token: held.token, catchId: c.catchId, expiresAt }, sweep.events, sweep.persist);
+      // P2 (re-fetchable token): a second fetch ROTATES the token — mint
+      // a fresh one and invalidate the photographed old QR. The catch
+      // page always displays the latest fetched token, so the runner's
+      // on-screen QR stays valid; only a stale photograph dies.
+      const { token, tokenHash } = await issueCatchToken(c.catchId);
+      c.qrTokenHash = tokenHash;
+      this.mem.rawCatchTokens.set(c.catchId, {
+        token,
+        expiresAtMs: Date.parse(expiresAt),
+      });
+      return okResult(
+        { token, catchId: c.catchId, expiresAt },
+        sweep.events,
+        [...sweep.persist, { kind: 'catch-update', catch: c }],
+      );
     }
     // Raw token lost (e.g. DO hibernated — raw tokens are memory-only):
-    // mint a fresh one for the same pending catch; the old token is dead.
+    // mint a fresh one for the same pending catch, BUT keep the previous
+    // hash valid until it expires or is confirmed (P1-5) — the QR already
+    // displayed on the runner's screen must keep working. The previous
+    // hash is stored on the catch (durable) and accepted at confirm time.
+    // (Only when the token was LOST, not when it expired: an expired
+    // token is dead by TTL and is not preserved.)
     const { token, tokenHash } = await issueCatchToken(c.catchId);
+    const prev = c.qrTokenHash;
     c.qrTokenHash = tokenHash;
+    if (prev !== null && !held) {
+      (c as CatchEvent & { previousQrTokenHash?: string | null }).previousQrTokenHash = prev;
+    }
     this.mem.rawCatchTokens.set(c.catchId, {
       token,
       expiresAtMs: Date.parse(expiresAt),
@@ -1234,6 +1555,20 @@ export class RoomStore {
       const status = decided.code === 'FORBIDDEN' ? 403 : 409;
       return errResult(decided.reason, decided.code, status);
     }
+    // P1-2: validate the completion transition BEFORE mutating the catch
+    // — a 'confirmed' resolution that would complete the match from a
+    // phase that cannot complete is rejected with the catch untouched.
+    if (
+      input.decision === 'confirmed' &&
+      this.wouldCompleteOnConfirm(c, decided.value, input.nowMs) &&
+      !this.canCompleteMatch()
+    ) {
+      return errResult(
+        'The match cannot complete from its current phase — the catch stays disputed.',
+        'INVALID_STATE',
+        409,
+      );
+    }
     Object.assign(c, decided.value);
     this.mem.rawCatchTokens.delete(c.catchId);
     const events: OutboundEvent[] = [
@@ -1261,9 +1596,28 @@ export class RoomStore {
     reason: string | null,
     nowMs: number,
   ): OpResult<{ paused: boolean }> {
-    const paused = pauseMatch(this.room.phase, byPlayerId, nowMs);
+    // P0-2: pausing an already-paused match is an idempotent no-op — the
+    // ORIGINAL pausedFrom/pausedAt must survive, never be re-stamped.
+    // pauseMatch takes the stored pause state and returns it unchanged;
+    // without it the engine rejects, so the guard below passes it in.
+    const alreadyPaused = this.room.phase === 'SAFETY_PAUSED';
+    const paused = pauseMatch(
+      this.room.phase,
+      byPlayerId,
+      nowMs,
+      alreadyPaused
+        ? {
+            pausedFrom: this.state.pausedFrom ?? 'ACTIVE',
+            pausedAt: this.room.pausedAt ?? new Date(nowMs).toISOString(),
+          }
+        : undefined,
+    );
     if (!paused.ok) {
       return errResult(paused.reason, paused.code, 409);
+    }
+    if (alreadyPaused) {
+      // No-op success: keep the original pausedFrom/pausedAt exactly.
+      return okResult({ paused: true });
     }
     this.state.paused = true;
     this.state.pausedBy = byPlayerId;
@@ -1324,21 +1678,25 @@ export class RoomStore {
     return okResult({ phase: this.room.phase }, events, persist);
   }
 
-  /** Complete the match with a result (via RESOLVING; clock already stopped). */
+  /**
+   * Complete the match with a result (via RESOLVING; clock already stopped).
+   * P1-2: the transition is validated BEFORE anything mutates — an illegal
+   * edge returns `{ ok: false }` and the caller must not have mutated the
+   * catch yet (the confirm/resolve paths pre-check with
+   * `wouldCompleteOnConfirm` + `canCompleteMatch` first). A caller that
+   * gets `ok: false` treats it as a failed op, never as an empty success.
+   */
   completeMatch(
     result: MatchResult,
     nowMs: number,
-  ): { events: OutboundEvent[]; persist: PersistIntent[] } {
+  ): { ok: boolean; events: OutboundEvent[]; persist: PersistIntent[] } {
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
-    try {
-      if (this.room.phase !== 'RESOLVING') {
-        this.room.phase = transitionOrThrow(this.room.phase, 'RESOLVING');
-      }
-      this.room.phase = transitionOrThrow(this.room.phase, 'COMPLETED');
-    } catch {
-      return { events, persist };
+    if (!this.canCompleteMatch()) {
+      return { ok: false, events, persist };
     }
+    this.room.phase = transitionOrThrow(this.room.phase, 'RESOLVING');
+    this.room.phase = transitionOrThrow(this.room.phase, 'COMPLETED');
     this.room.result = result;
     this.bumpVersion();
     // Fixes are purged at match end; raw catch tokens die with the match.
@@ -1346,6 +1704,7 @@ export class RoomStore {
     this.mem.outsideZone = {};
     this.mem.rawCatchTokens.clear();
     this.mem.pendingPings = [];
+    this.mem.pendingPingRecipients.clear();
     events.push(
       this.emit('match.completed', { result }, this.allPlayerIds(), nowMs),
       this.roomStateEvent('match-completed', nowMs),
@@ -1355,7 +1714,7 @@ export class RoomStore {
       { kind: 'match-result', room: this.room },
       { kind: 'room-upsert', room: this.room },
     );
-    return { events, persist };
+    return { ok: true, events, persist };
   }
 
   cancelMatch(
@@ -1514,9 +1873,15 @@ export class RoomStore {
         };
       }),
       result: this.room.result,
+      // P1-6: ONLY players who were Runners when ejected. An ejected
+      // Hunter in this list would falsely break the clean sweep
+      // (scoring.ts caller contract). Ejection never changes a seat's
+      // matchRole, so the role at results time IS the role at ejection —
+      // except an Infection flip, which moves the seat to Hunters first,
+      // so a flipped-then-ejected seat correctly counts as a Hunter.
       ejectedRunnerIds: [...ejected].filter((id) => {
         const p = this.player(id);
-        return p !== undefined;
+        return p !== undefined && p.matchRole === 'runner';
       }),
     });
     return okResult({
@@ -1617,33 +1982,43 @@ export class RoomStore {
     events.push(this.roomStateEvent('player-left', nowMs));
     persist.push({ kind: 'room-upsert', room: this.room });
     void reason;
-    // Everyone gone while live: the match is abandoned, not left hanging.
-    if (
-      (this.room.phase === 'HEAD_START' || this.room.phase === 'ACTIVE') &&
-      this.activePlayers().length === 0
-    ) {
-      const durationSeconds =
-        this.room.startedAt === null
-          ? 0
-          : Math.max(0, Math.floor((nowMs - Date.parse(this.room.startedAt)) / 1000));
-      const result: MatchResult = {
-        outcome: 'abandoned',
-        durationSeconds,
-        caughtRunnerIds: this.caughtRunnerIds(),
-        survivingRunnerIds: freeRunnerIds(this.state.players, this.caughtRunnerIds()),
-        tags: confirmedTags(this.state.catches),
-      };
-      try {
-        this.room.phase = transitionOrThrow(this.room.phase, 'ABANDONED');
+    // P1-8: when the LAST player leaves — in ANY phase — the room ends
+    // instead of hanging forever. (Previously only HEAD_START/ACTIVE
+    // abandoned, so a room emptied while SAFETY_PAUSED stayed paused
+    // forever: alarmTick returns early for non-live phases while the
+    // alarm kept re-arming.) LOBBY empties to EXPIRED; a live/paused
+    // match abandons (HEAD_START has no ABANDONED edge, so it cancels);
+    // RESOLVING cancels. A terminal phase stops the alarm (the class
+    // deletes it) and frees the invite code (class unregisters it).
+    if (this.activePlayers().length === 0 && !isTerminalPhase(this.room.phase)) {
+      const from = this.room.phase;
+      const outcome = from === 'LOBBY' ? 'expire' : 'abandon';
+      const moved = transitionForEvent(from, outcome);
+      const target = moved.ok
+        ? moved.phase
+        : transitionForEvent(from, 'cancel').ok
+          ? 'CANCELLED'
+          : null;
+      if (target !== null) {
+        const durationSeconds =
+          this.room.startedAt === null
+            ? 0
+            : Math.max(0, Math.floor((nowMs - Date.parse(this.room.startedAt)) / 1000));
+        const result: MatchResult = {
+          outcome: target === 'EXPIRED' ? 'cancelled' : target === 'CANCELLED' ? 'cancelled' : 'abandoned',
+          durationSeconds,
+          caughtRunnerIds: this.caughtRunnerIds(),
+          survivingRunnerIds: freeRunnerIds(this.state.players, this.caughtRunnerIds()),
+          tags: confirmedTags(this.state.catches),
+        };
+        this.room.phase = target;
         this.room.result = result;
         this.bumpVersion();
         events.push(
           this.emit('match.cancelled', { result }, this.allPlayerIds(), nowMs),
-          this.roomStateEvent('match-abandoned', nowMs),
+          this.roomStateEvent('room-ended-empty', nowMs),
         );
         persist.push({ kind: 'match-result', room: this.room });
-      } catch {
-        // Phase edge raced with the tick; the tick will complete it.
       }
     }
     return { events, persist };
@@ -1651,26 +2026,24 @@ export class RoomStore {
 
   // -- pending pings ----------------------------------------------------------
 
-  /** Pings built but not yet delivered to any Hunter (TTL 300 s, memory only). */
-  acknowledgePingDelivery(pingId: string, nowMs: number): void {
-    const idx = this.mem.pendingPings.findIndex((p) => p.pingId === pingId);
-    if (idx === -1) return;
-    const [ping] = this.mem.pendingPings.splice(idx, 1);
-    if (ping) this.state.lastPingAtMs[ping.subjectPlayerId] = nowMs;
-  }
-
   /**
    * Pending pings for a player who just (re)connected. Pings are mutual
    * and role-scoped: a Hunter re-receives pending Runner pings
    * (recipientRole 'hunters'), a Runner re-receives pending Hunter pings
    * (recipientRole 'runners'). A player never receives a ping that reveals
-   * their own team. The caller acknowledges delivery per ping.
+   * their own team. Only pings this player has NOT yet received are
+   * returned (per-recipient ack): a ping delivered to one Hunter stays
+   * pending for an offline Hunter until they reconnect.
    */
   pendingPingsFor(playerId: string, _nowMs: number): Ping[] {
     const me = this.player(playerId);
     if (!me || me.matchRole === null) return [];
     const role: 'hunters' | 'runners' = me.matchRole === 'hunter' ? 'hunters' : 'runners';
-    return this.mem.pendingPings.filter((p) => p.recipientRole === role);
+    return this.mem.pendingPings.filter((p) => {
+      if (p.recipientRole !== role) return false;
+      const waiting = this.mem.pendingPingRecipients.get(p.pingId);
+      return waiting === undefined || waiting.has(playerId);
+    });
   }
 
   // -- alarm tick ---------------------------------------------------------------
@@ -1689,8 +2062,13 @@ export class RoomStore {
     const phase = this.room.phase;
 
     // (1) Purge stale fixes + expired pending pings + stale idempotency.
+    // Fixes purge after 30 s (LOCATION_FRESHNESS_SECONDS), not 120 s —
+    // the freshness window is 30 s, so a fix older than that is already
+    // 'unknown' everywhere it is read.
     for (const [pid, fix] of Object.entries(this.mem.latestFix)) {
-      if (nowMs - fix.timestampMs > FIX_TTL_MS) delete this.mem.latestFix[pid];
+      if (nowMs - fix.timestampMs > LOCATION_FRESHNESS_SECONDS * 1000) {
+        delete this.mem.latestFix[pid];
+      }
     }
     const pingsBefore = this.mem.pendingPings;
     this.mem.pendingPings = purgeExpiredPings(this.mem.pendingPings, nowMs);
@@ -1718,6 +2096,21 @@ export class RoomStore {
     for (const [cid, held] of [...this.mem.rawCatchTokens]) {
       if (nowMs >= held.expiresAtMs) this.mem.rawCatchTokens.delete(cid);
     }
+    // Purge redeemed/expired WS tickets (P2): a redeemed ticket is spent
+    // and an expired one is dead — keeping them only grows the registry.
+    // (Durable: the purge syncs to storage on the next save.)
+    if (this.mem.tickets.length > 0) {
+      this.mem.tickets = this.mem.tickets.filter(
+        (t) => !t.redeemed && nowMs <= t.expiresAtMs,
+      );
+    }
+    // Purge cached idempotency replies whose record already expired (P2):
+    // a reply without its (seat, commandId) record is unreachable.
+    if (this.mem.idempotentReplies.size > 0) {
+      for (const key of [...this.mem.idempotentReplies.keys()]) {
+        if (!this.mem.idempotency.has(key)) this.mem.idempotentReplies.delete(key);
+      }
+    }
 
     // Lazily expire overdue pending catches on every tick.
     const sweep = this.expireOverdueCatches(nowMs);
@@ -1731,6 +2124,23 @@ export class RoomStore {
       phase === 'EXPIRED'
     ) {
       return { events, persist };
+    }
+    // Idle-lobby expiry: a LOBBY older than 24 h transitions to EXPIRED
+    // via transitionForEvent (the class unregisters the invite code and
+    // the terminal phase stops the alarm). The tick runs every 30 s in
+    // the lobby, so expiry lands within half a minute of the deadline.
+    if (phase === 'LOBBY') {
+      const ageMs = nowMs - Date.parse(this.room.createdAt);
+      if (ageMs > LOBBY_EXPIRY_MS) {
+        const moved = transitionForEvent(phase, 'expire');
+        if (moved.ok) {
+          this.room.phase = moved.phase;
+          this.bumpVersion();
+          events.push(this.roomStateEvent('lobby-expired', nowMs));
+          persist.push({ kind: 'room-upsert', room: this.room });
+        }
+        return { events, persist };
+      }
     }
     if (this.room.startedAt === null) return { events, persist };
 
@@ -1777,6 +2187,14 @@ export class RoomStore {
         const oz = this.mem.outsideZone[p.playerId];
         if (!oz || oz.outsideSinceMs === null) continue;
         if (p.ejectedAt !== null || p.leftAt !== null) continue;
+        // Freeze ejection when the player's fix is stale (P2): no fresh
+        // evidence, no ejection — mirroring the location.update freeze
+        // for poor accuracy. A stale fix means we cannot prove the
+        // player is still outside the zone.
+        const fix = this.mem.latestFix[p.playerId];
+        if (!fix || nowMs - fix.timestampMs > LOCATION_FRESHNESS_SECONDS * 1000) {
+          continue;
+        }
         const totalMs = oz.outsideAccumMs + (nowMs - oz.outsideSinceMs);
         if (totalMs >= OUTSIDE_ZONE_RETURN_SECONDS * 1000) {
           const ejected = applyOutsideZoneEjection(p, nowMs);
@@ -1806,19 +2224,77 @@ export class RoomStore {
       }
     }
 
-    // (5) Zone shrink — draw the random-offset next zone, never concentric.
+    // (5) Zone shrink — ACTIVE ONLY (P2): shrinks never fire during
+    // HEAD_START. The next zone is previewed PREVIEW_LEAD_SECONDS (30 s)
+    // ahead (P1-18) via `previewShrinkBoundary` and STORED, so the
+    // previewed boundary is the one applied when the shrink fires —
+    // never a second, different draw.
     if (
+      this.room.phase === 'ACTIVE' &&
       this.room.config.zoneShrinkEnabled &&
       this.room.config.zone.boundary.length >= 3
     ) {
+      const intervalSeconds = this.room.config.zoneShrinkIntervalSeconds;
+      const nextIndex = this.state.shrinkIndexApplied;
+      const nextFireInSeconds = (nextIndex + 1) * intervalSeconds;
+      if (nextFireInSeconds < this.room.config.durationSeconds) {
+        const firesAtMs = startedAtMs + nextFireInSeconds * 1000;
+        if (firesAtMs > nowMs && firesAtMs - nowMs <= PREVIEW_LEAD_SECONDS * 1000) {
+          const pending = this.state.pendingShrink;
+          if (!pending || pending.shrinkIndex !== nextIndex) {
+            const drawn = previewShrinkBoundary(this.room.config.zone.boundary);
+            this.state.pendingShrink = {
+              boundary: drawn.boundary,
+              firesAtMs,
+              shrinkIndex: nextIndex,
+            };
+            this.bumpVersion();
+            events.push(
+              this.emit(
+                // 'zone.preview' is defined by the engine/shared contract
+                // (Meera); the cast goes away once it lands in
+                // WsServerPayloads.
+                'zone.preview' as WsServerMessageType,
+                { boundary: drawn.boundary, firesAtMs, shrinkIndex: nextIndex },
+                this.allPlayerIds(),
+                nowMs,
+              ),
+            );
+            persist.push({ kind: 'room-upsert', room: this.room });
+          } else if (pending.firesAtMs !== firesAtMs) {
+            // The pause shifted the deadlines: refresh the stored fire
+            // time and re-broadcast so the countdown stays honest.
+            pending.firesAtMs = firesAtMs;
+            this.bumpVersion();
+            events.push(
+              this.emit(
+                'zone.preview' as WsServerMessageType,
+                { boundary: pending.boundary, firesAtMs, shrinkIndex: nextIndex },
+                this.allPlayerIds(),
+                nowMs,
+              ),
+            );
+            persist.push({ kind: 'room-upsert', room: this.room });
+          }
+        }
+      }
       const target = shrinkIndexAt(
         elapsedSeconds,
-        this.room.config.zoneShrinkIntervalSeconds,
+        intervalSeconds,
         true,
       );
       while (this.state.shrinkIndexApplied < target) {
-        const drawn = randomOffsetShrinkBoundary(this.room.config.zone.boundary);
-        this.room.config.zone.boundary = drawn.boundary;
+        const idx = this.state.shrinkIndexApplied;
+        const pending = this.state.pendingShrink;
+        // Use the previewed boundary for this shrink when one was stored;
+        // otherwise draw fresh (e.g. the shrink fired without a preview
+        // because the DO woke after its fire time).
+        const boundary =
+          pending && pending.shrinkIndex === idx
+            ? pending.boundary
+            : randomOffsetShrinkBoundary(this.room.config.zone.boundary).boundary;
+        if (pending && pending.shrinkIndex === idx) this.state.pendingShrink = null;
+        this.room.config.zone.boundary = boundary;
         this.state.shrinkIndexApplied += 1;
         this.bumpVersion();
         events.push(
@@ -1863,6 +2339,9 @@ export class RoomStore {
         });
         if (!ping) continue; // No fix = no ping, never an invented position.
         this.mem.pendingPings.push(ping);
+        // Per-recipient delivery tracking: the ping stays pending for any
+        // Hunter who did not receive this broadcast.
+        this.notePingRecipients(ping.pingId, this.hunterPlayerIds());
         events.push(
           this.emit('ping', { ping }, this.hunterPlayerIds(), nowMs),
         );
@@ -1902,6 +2381,7 @@ export class RoomStore {
         });
         if (!ping) continue; // No fix = no ping, never an invented position.
         this.mem.pendingPings.push(ping);
+        this.notePingRecipients(ping.pingId, this.runnerPlayerIds());
         events.push(
           this.emit('ping', { ping }, this.runnerPlayerIds(), nowMs),
         );
@@ -2034,11 +2514,15 @@ export class RoomStore {
     // NOTE: the class passes the session ticket expiry separately.
 
     // Idempotency: a retry reuses the same commandId; replays get the
-    // original direct reply without re-applying or burning rate budget.
+    // original reply without re-applying or burning rate budget. The
+    // cached reply is delivered ONLY to the replaying player (recipients
+    // narrowed below) so a broadcast op is never re-broadcast to the
+    // whole room on a retry.
     if (typeof envelope.commandId === 'string' && envelope.commandId.length > 0) {
       if (isDuplicateCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs)) {
         const cached = this.mem.idempotentReplies.get(`${playerId}:${envelope.commandId}`) ?? [];
-        return { events: [...cached], persist };
+        const narrowed = cached.map((e) => ({ ...e, recipients: [playerId] }));
+        return { events: narrowed, persist };
       }
       this.mem.idempotency = rememberCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs);
     }
@@ -2056,14 +2540,54 @@ export class RoomStore {
 
     const direct = (t: WsServerMessageType, p: Record<string, unknown>): OutboundEvent =>
       this.emit(t, p, [playerId], nowMs);
+    // P1-9: cache the ACTUAL reply — broadcast events included, not an
+    // empty list. A genuine same-commandId replay gets the original
+    // reply (narrowed to the replier at the top of this function), never
+    // an empty `[]` that looks like success-with-nothing. Only events
+    // addressed to this player are cached: a direct event to the replier,
+    // or a broadcast the replier was among (its payload is identical for
+    // every recipient). Per-viewer events (emitPlayerEvent's role-filtered
+    // copies for OTHER seats) are never cached — replaying one to the
+    // wrong viewer would hand them another seat's view.
     const rememberReply = (evts: OutboundEvent[]): void => {
       if (typeof envelope.commandId === 'string' && envelope.commandId.length > 0) {
         this.mem.idempotentReplies.set(
           `${playerId}:${envelope.commandId}`,
-          evts.filter((e) => e.recipients.length === 1 && e.recipients[0] === playerId),
+          evts.filter(
+            (e) =>
+              (e.recipients.length === 1 && e.recipients[0] === playerId) ||
+              (e.recipients.length > 1 && e.recipients.includes(playerId)),
+          ),
         );
       }
     };
+
+    // Caught-Runner (spectator) comms block (P2): a caught Runner cannot
+    // send radio / quick signals / voice signals / pins / announcements
+    // to their live team. The founder can override this rule. (Their
+    // location fixes are still accepted — they are a real person in the
+    // field — and they can still receive everything.)
+    if (
+      this.isCaughtSpectator(playerId) &&
+      (type === 'radio.send' ||
+        type === 'signal.send' ||
+        type === 'voice.signal' ||
+        type === 'pin.place' ||
+        type === 'announcement.send')
+    ) {
+      events.push(
+        this.errorEvent(
+          playerId,
+          'FORBIDDEN',
+          'You are out — spectating players cannot message the live team.',
+          false,
+          undefined,
+          nowMs,
+        ),
+      );
+      rememberReply(events);
+      return { events, persist };
+    }
 
     switch (type) {
       case 'heartbeat': {
@@ -2175,7 +2699,9 @@ export class RoomStore {
             this.emit(
               'player.visibility',
               { playerId, locationQuality: quality, lastFixAt: me.lastFixAt },
-              this.allPlayerIds(),
+              // P2 liveness leak: an opponent's lastFixAt/quality goes to
+              // teammates only, never the whole room (lobby = whole lobby).
+              this.teamRecipients(playerId),
               nowMs,
             ),
           );
@@ -2245,6 +2771,12 @@ export class RoomStore {
           nowMs,
           hunterFix: this.mem.latestFix[playerId] ?? null,
           runnerFix: this.mem.latestFix[runnerId] ?? null,
+          // P1-11: physical tag — the engine enforces proximity on these.
+          positions: {
+            hunter: this.mem.latestFix[playerId] ?? null,
+            runner: this.mem.latestFix[runnerId] ?? null,
+          },
+          maxDistanceMeters: CATCH_MAX_DISTANCE_METERS,
         });
         if (!req.ok) {
           const status = req.code === 'FORBIDDEN' ? 403 : 409;
@@ -2283,11 +2815,19 @@ export class RoomStore {
           break;
         }
         const isRunnerConfirmer = playerId === c.runnerPlayerId;
+        // A token matches the current hash — or the preserved previous
+        // hash (P1-5: a QR displayed before a hibernate-driven re-mint
+        // stays valid until it expires or is confirmed). A rotated token
+        // (P2 re-fetch) has no preserved hash, so its old QR is dead.
+        const previousHash =
+          (c as CatchEvent & { previousQrTokenHash?: string | null }).previousQrTokenHash ?? null;
         const tokenValid =
           manualConfirm && isRunnerConfirmer
             ? true
             : typeof qrToken === 'string' && isValidCatchToken(qrToken)
-              ? await verifyCatchToken(c.catchId, qrToken, c.qrTokenHash)
+              ? (await verifyCatchToken(c.catchId, qrToken, c.qrTokenHash)) ||
+                (previousHash !== null &&
+                  (await verifyCatchToken(c.catchId, qrToken, previousHash)))
               : false;
         const conf = confirmCatch({
           catchEvent: c,
@@ -2300,9 +2840,32 @@ export class RoomStore {
           phase: this.room.phase,
           nowMs,
           ttlSeconds: CATCH_TOKEN_TTL_SECONDS,
+          // P1-11: physical tag — the engine rejects the confirm when
+          // either fix is missing/stale or the seats are too far apart.
+          positions: {
+            hunter: this.mem.latestFix[c.hunterPlayerId] ?? null,
+            runner: this.mem.latestFix[c.runnerPlayerId] ?? null,
+          },
+          maxDistanceMeters: CATCH_MAX_DISTANCE_METERS,
         });
         if (!conf.ok) {
           events.push(this.errorEvent(playerId, conf.code, conf.reason, false, undefined, nowMs));
+          break;
+        }
+        // P1-2: validate the completion transition BEFORE mutating the
+        // catch — if confirming would complete the match from a phase
+        // that cannot complete, reject without marking it confirmed.
+        if (this.wouldCompleteOnConfirm(c, conf.value, nowMs) && !this.canCompleteMatch()) {
+          events.push(
+            this.errorEvent(
+              playerId,
+              'INVALID_STATE',
+              'The match cannot complete from its current phase — the catch stays pending.',
+              false,
+              undefined,
+              nowMs,
+            ),
+          );
           break;
         }
         Object.assign(c, conf.value);
@@ -2343,7 +2906,12 @@ export class RoomStore {
         break;
       }
       case 'safety.pause': {
-        const r = this.doSafetyPause(playerId, typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null, nowMs);
+        const reason = typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null;
+        if (reason !== null && reason.length > REASON_MAX_CHARS) {
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `Pause reason must be at most ${REASON_MAX_CHARS} characters.`, false, undefined, nowMs));
+          break;
+        }
+        const r = this.doSafetyPause(playerId, reason, nowMs);
         if (!r.ok) {
           events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs));
           break;
@@ -2353,6 +2921,12 @@ export class RoomStore {
         break;
       }
       case 'safety.resume': {
+        // P1-10: only the host can resume — matching the REST lifecycle
+        // resume rule. (Pause is any player; resume is host-only.)
+        if (!me.isHost) {
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Only the host can resume the match.', false, undefined, nowMs));
+          break;
+        }
         const r = this.doSafetyResume(playerId, nowMs);
         if (!r.ok) {
           events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs));
@@ -2363,6 +2937,11 @@ export class RoomStore {
         break;
       }
       case 'safety.sos': {
+        const reason = typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null;
+        if (reason !== null && reason.length > REASON_MAX_CHARS) {
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `SOS reason must be at most ${REASON_MAX_CHARS} characters.`, false, undefined, nowMs));
+          break;
+        }
         const next = raiseSos(this.safetyState());
         this.state.sosActive = next.sosActive;
         events.push(
@@ -2380,12 +2959,17 @@ export class RoomStore {
           roomId: this.room.roomId,
           playerId,
           type: 'sos',
-          reason: typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null,
+          reason,
         });
         break;
       }
       case 'leave': {
-        const r = this.leaveSeat(playerId, typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null, nowMs);
+        const reason = typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null;
+        if (reason !== null && reason.length > REASON_MAX_CHARS) {
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `Leave reason must be at most ${REASON_MAX_CHARS} characters.`, false, undefined, nowMs));
+          break;
+        }
+        const r = this.leaveSeat(playerId, reason, nowMs);
         events.push(...r.events);
         persist.push(...r.persist);
         return { events, persist, close: { code: 1000, reason: 'Left the room.' } };
@@ -2495,6 +3079,20 @@ export class RoomStore {
           const sdp = typeof payload['sdp'] === 'string' ? payload['sdp'] : '';
           if (sdp.length > VOICE_SDP_MAX_BYTES) {
             events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice SDP payload is too large.', false, undefined, nowMs));
+            break;
+          }
+        }
+        // ICE candidate cap (P2): 8 KB, same as the SDP cap — an
+        // unbounded `candidate` is a free-text smuggling channel.
+        if (payload['candidate'] !== undefined) {
+          let candidateSize = 0;
+          try {
+            candidateSize = JSON.stringify(payload['candidate'])?.length ?? 0;
+          } catch {
+            candidateSize = VOICE_CANDIDATE_MAX_BYTES + 1;
+          }
+          if (candidateSize > VOICE_CANDIDATE_MAX_BYTES) {
+            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice ICE candidate is too large.', false, undefined, nowMs));
             break;
           }
         }

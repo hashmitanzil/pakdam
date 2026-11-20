@@ -81,7 +81,7 @@ test.describe('host setup (demo)', () => {
       hostPage.getByRole('group', { name: 'Pings every' }).getByText('Off'),
     ).toBeVisible();
     await expect(
-      hostPage.getByText('No pings. Hunters only see runners who leave the zone.'),
+      hostPage.getByText('No pings. Neither side sees the other — hunters get no locations at all, including for runners who leave the zone (no code emits a reveal on zone exit).'),
     ).toBeVisible();
     await hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }).click();
     await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
@@ -174,16 +174,19 @@ test.describe('host setup (demo)', () => {
     await expect(hostPage.getByText('Hunter', { exact: true })).toBeVisible();
   });
 
-  test('Show ping history toggle flips on', async ({ context }) => {
+  test('P1-26: no "Show ping history" toggle — the history was never implemented', async ({
+    context,
+  }) => {
+    // The dead toggle is removed: a visible control must never promise a
+    // feature that does not exist. The TeamControls section keeps Balance
+    // hunters + Random hunters only.
     const hostPage = await context.newPage();
     await createHostSetupRoom(hostPage);
-    const toggle = hostPage.getByRole('switch', { name: 'Show ping history' });
-    await expect(toggle).toHaveAttribute('aria-checked', 'false');
-    await toggle.click();
-    await expect(toggle).toHaveAttribute('aria-checked', 'true');
+    await expect(hostPage.getByRole('switch', { name: 'Show ping history' })).toBeHidden();
+    await expect(hostPage.getByText('Show ping history')).toBeHidden();
     await expect(
       hostPage.getByText("Hunters see each runner's earlier pings, not just the latest."),
-    ).toBeVisible();
+    ).toBeHidden();
   });
 
   test('guest cannot change settings: Settings opens a notice, not the sheet', async ({ context }) => {

@@ -9,7 +9,9 @@ import {
   ACCURACY_GOOD_M,
   BALANCED_HUNTER_TABLE,
   CATCH_TOKEN_HEX_LENGTH,
+  MAX_GEOMETRY_POINTS,
   MAX_PLAYERS,
+  MAX_ZONE_DIAMETER_M,
   MIN_PLAYERS,
   SUGGESTED_ZONE_RADIUS_BASE_M,
   SUGGESTED_ZONE_RADIUS_CAP_M,
@@ -35,9 +37,19 @@ export function isValidRoomCode(code: unknown): code is string {
   return typeof code === 'string' && ROOM_CODE_PATTERN.test(code);
 }
 
-/** Display name / codename: 1–30 characters after trimming. */
+/**
+ * Display name / codename: 1–30 characters after trimming. Letters,
+ * digits, spaces and common punctuation are allowed; control characters
+ * and newlines are rejected (a name must stay one visible line — a
+ * newline in a roster row breaks the lobby and the results list).
+ */
 export function isValidDisplayName(name: unknown): name is string {
-  return typeof name === 'string' && name.trim().length >= 1 && name.trim().length <= 30;
+  if (typeof name !== 'string') return false;
+  const trimmed = name.trim();
+  if (trimmed.length < 1 || trimmed.length > 30) return false;
+  // eslint-disable-next-line no-control-regex
+  if (/[\x00-\x1F\x7F]/.test(trimmed)) return false;
+  return true;
 }
 
 /** UUID (v4-shaped) check for ids generated with crypto.randomUUID(). */
@@ -76,27 +88,71 @@ export function isValidGeoPolygon(points: unknown, minPoints = 3): points is Geo
   return true;
 }
 
+/** Bounding-box diagonal of a boundary in metres (haversine, same Earth radius as @pakdam/shared). */
+function boundaryDiagonalMeters(points: GeoPolygon): number {
+  let minLat = 90;
+  let maxLat = -90;
+  let minLng = 180;
+  let maxLng = -180;
+  for (const p of points) {
+    minLat = Math.min(minLat, p.lat);
+    maxLat = Math.max(maxLat, p.lat);
+    minLng = Math.min(minLng, p.lng);
+    maxLng = Math.max(maxLng, p.lng);
+  }
+  const toRadians = (degrees: number): number => (degrees * Math.PI) / 180;
+  const dLat = toRadians(maxLat - minLat);
+  const dLng = toRadians(maxLng - minLng);
+  const sinLat = Math.sin(dLat / 2);
+  const sinLng = Math.sin(dLng / 2);
+  const h =
+    sinLat * sinLat +
+    Math.cos(toRadians(minLat)) * Math.cos(toRadians(maxLat)) * sinLng * sinLng;
+  return 2 * 6_371_000 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
 /**
  * Validate a zone boundary. Returns issue strings (empty = valid).
- * An empty boundary is allowed — it means the zone has not been placed yet
- * (a zone is never given a default place; the host places it by hand).
+ * An empty boundary means the zone has not been placed yet (a zone is
+ * never given a default place; the host places it by hand) — allowed
+ * here UNLESS `requirePlaced` is set, in which case an empty boundary
+ * is rejected. A placed boundary needs ≥ 3 points, ≤ 64 points, and a
+ * bounding-box diagonal ≤ 100 km (a boundary spanning the planet is
+ * rejected, not stored).
  */
-export function validateZoneBoundary(boundary: unknown): string[] {
+export function validateZoneBoundary(
+  boundary: unknown,
+  options?: { requirePlaced?: boolean },
+): string[] {
   const issues: string[] = [];
   if (!Array.isArray(boundary)) {
     issues.push('zone boundary must be an array of points');
     return issues;
   }
-  if (boundary.length === 0) return issues;
+  if (boundary.length === 0) {
+    if (options?.requirePlaced === true) {
+      issues.push('zone boundary is required — the host must place the zone (at least 3 points)');
+    }
+    return issues;
+  }
   if (boundary.length < 3) {
     issues.push('zone boundary needs at least 3 points to enclose a shape');
+    return issues;
+  }
+  if (boundary.length > MAX_GEOMETRY_POINTS) {
+    issues.push(`zone boundary must have at most ${MAX_GEOMETRY_POINTS} points`);
     return issues;
   }
   for (const point of boundary) {
     if (!isValidGeoPoint(point)) {
       issues.push('zone boundary contains a point outside lat ±90 / lng ±180');
-      break;
+      return issues;
     }
+  }
+  if (boundaryDiagonalMeters(boundary as GeoPolygon) > MAX_ZONE_DIAMETER_M) {
+    issues.push(
+      `zone boundary is too large — its span must fit inside ${MAX_ZONE_DIAMETER_M / 1000} km`,
+    );
   }
   return issues;
 }
@@ -108,14 +164,17 @@ export function validateZoneBoundary(boundary: unknown): string[] {
 /**
  * Validate a full RoomConfig. Returns issue strings (empty = valid).
  * Enforces the ranges from the protocol map: duration 300–10800 s,
- * head start 0–1800 s, ping 0 (off) or 30–1800 s, maxPlayers 3–30,
+ * head start 0–1800 s, ping 0 (off) or 30–1800 s, maxPlayers 2–30,
  * hunterCount 1..maxPlayers−1, zone radius ≥ 100 m with no maximum,
- * finalSizePercent null (Auto) or 0–100, hostOnSiteConfirmed required,
- * catchConfirmationRequired forced true, and the pick invariant
- * (teamAssignment 'selected' ⇒ at least 1 and at most maxPlayers − 1
- * picked ids — the exact count is decided at start from the roster, so
- * this validator cannot demand it; 'random' ⇒ no picked ids —
- * switching to Random clears the pick).
+ * finalSizePercent null (Auto) or a finite 1–100 (NaN rejected),
+ * hostOnSiteConfirmed required, catchConfirmationRequired forced true,
+ * and the pick invariant (teamAssignment 'selected' ⇒ at least 1 and at
+ * most maxPlayers − 1 picked ids — the exact count is decided at start
+ * from the roster, so this validator cannot demand it; 'random' ⇒ no
+ * picked ids — switching to Random clears the pick). The zone boundary
+ * must be placed (≥ 3 points, ≤ 64 points, span ≤ 100 km); geometry
+ * point counts are capped at 64 for zone / no-go / safe areas, and
+ * shrinkPhases[].atSeconds must be an integer in 0..86400.
  */
 export function validateRoomConfig(config: unknown): string[] {
   const issues: string[] = [];
@@ -187,23 +246,31 @@ export function validateRoomConfig(config: unknown): string[] {
     c.finalSizePercent !== undefined &&
     c.finalSizePercent !== null &&
     (typeof c.finalSizePercent !== 'number' ||
-      c.finalSizePercent < 0 ||
+      !Number.isFinite(c.finalSizePercent) ||
+      c.finalSizePercent < 1 ||
       c.finalSizePercent > 100)
   ) {
-    issues.push('finalSizePercent must be null (Auto) or a number between 0 and 100');
+    issues.push('finalSizePercent must be null (Auto) or a finite number between 1 and 100');
   }
   if (c.zoneShape !== undefined && c.zoneShape !== 'circle' && c.zoneShape !== 'draw') {
     issues.push("zoneShape must be 'circle' or 'draw'");
   }
   if (!Array.isArray(c.safeAreas)) {
     issues.push('safeAreas must be an array');
+  } else {
+    for (const area of c.safeAreas) {
+      if (!isValidGeoPolygon(area) || area.length > MAX_GEOMETRY_POINTS) {
+        issues.push('every safe area must be a polygon of 3–64 valid points');
+        break;
+      }
+    }
   }
   if (!Array.isArray(c.noGoAreas)) {
     issues.push('noGoAreas must be an array');
   } else {
     for (const area of c.noGoAreas) {
-      if (!isValidGeoPolygon(area)) {
-        issues.push('every no-go area must be a polygon of at least 3 valid points');
+      if (!isValidGeoPolygon(area) || area.length > MAX_GEOMETRY_POINTS) {
+        issues.push('every no-go area must be a polygon of 3–64 valid points');
         break;
       }
     }
@@ -211,13 +278,21 @@ export function validateRoomConfig(config: unknown): string[] {
   if (c.zone === undefined || typeof c.zone !== 'object' || c.zone === null) {
     issues.push('zone must be an object with a boundary');
   } else {
-    for (const issue of validateZoneBoundary(c.zone.boundary)) {
+    // A submitted config must carry a placed zone (≥ 3 points): an
+    // empty boundary is never a valid room config. The start gate checks
+    // it again, but a config that cannot start must not be stored.
+    for (const issue of validateZoneBoundary(c.zone.boundary, { requirePlaced: true })) {
       issues.push(`zone: ${issue}`);
     }
     if (Array.isArray(c.zone.shrinkPhases)) {
       for (const phase of c.zone.shrinkPhases) {
-        if (typeof phase.atSeconds !== 'number' || phase.atSeconds < 0) {
-          issues.push('every shrink phase needs a non-negative atSeconds');
+        if (
+          typeof phase.atSeconds !== 'number' ||
+          !Number.isInteger(phase.atSeconds) ||
+          phase.atSeconds < 0 ||
+          phase.atSeconds > 86400
+        ) {
+          issues.push('every shrink phase needs an integer atSeconds between 0 and 86400');
           break;
         }
         for (const issue of validateZoneBoundary(phase.boundary)) {

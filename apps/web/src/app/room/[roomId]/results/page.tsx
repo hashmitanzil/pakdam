@@ -10,11 +10,13 @@
  */
 'use client';
 
-import { use } from 'react';
+import { use, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import { scoreMatch } from '@pakdam/engine';
 import { useRoomState } from '@/components/match/useRoomState';
 import { ResultsTimeline, type TimelineEvent } from '@/components/catch/ResultsTimeline';
 import { Button } from '@/components/ui/Button';
+import { fetchLiveResults } from '@/lib/live-client';
 import { formatDurationShort } from '@/lib/utils';
 
 export default function ResultsPage({ params }: { params: Promise<{ roomId: string }> }) {
@@ -23,7 +25,71 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
 
   // The socket is closed after a match, so results also works from a plain
   // state fetch (live) or the demo store — the hook's first paint covers it.
-  const { mode, room, players, phase, loading, error, demo } = useRoomState(roomId);
+  const { mode, room, players, phase, loading, error, demo, session, retryConnection } = useRoomState(roomId);
+
+  const result = room?.result ?? null;
+
+  // Scores (P1-27): live calls GET /v1/rooms/:id/results (the server
+  // computes them); demo scores locally with the same engine rule.
+  const [liveScores, setLiveScores] = useState<Record<string, number> | null>(null);
+  const [scoresError, setScoresError] = useState<string | null>(null);
+  useEffect(() => {
+    if (mode !== 'live' || !result || !session?.reconnectToken) return;
+    let cancelled = false;
+    fetchLiveResults(roomId, session.playerId, session.reconnectToken)
+      .then((res) => {
+        if (!cancelled) setLiveScores(res.scores);
+      })
+      .catch(() => {
+        if (!cancelled) setScoresError('Scores could not be loaded.');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, result, roomId, session?.playerId, session?.reconnectToken]);
+
+  const demoScores = useMemo(() => {
+    if (mode !== 'demo' || !demo || !result) return null;
+    const startedAtMs = room?.startedAt ? Date.parse(room.startedAt) : null;
+    const endedAtMs =
+      startedAtMs !== null ? startedAtMs + result.durationSeconds * 1000 : Date.now();
+    const caught = new Set(
+      demo.catches.filter((c) => c.state === 'confirmed').map((c) => c.runnerPlayerId),
+    );
+    return scoreMatch({
+      players: players.map((p) => {
+        const freeUntil =
+          p.matchRole === 'runner'
+            ? p.ejectedAt !== null
+              ? Date.parse(p.ejectedAt)
+              : caught.has(p.playerId)
+                ? Date.parse(
+                    demo.catches.find(
+                      (c) => c.runnerPlayerId === p.playerId && c.state === 'confirmed',
+                    )?.confirmedAt ?? new Date(endedAtMs).toISOString(),
+                  )
+                : endedAtMs
+            : endedAtMs;
+        return {
+          playerId: p.playerId,
+          matchRole: p.matchRole,
+          freeSeconds:
+            startedAtMs === null
+              ? 0
+              : Math.max(0, Math.floor((freeUntil - startedAtMs) / 1000)),
+          caught: caught.has(p.playerId),
+          ejected: p.ejectedAt !== null,
+          tagsMade: demo.catches.filter(
+            (c) => c.hunterPlayerId === p.playerId && c.state === 'confirmed',
+          ).length,
+        };
+      }),
+      result,
+      ejectedRunnerIds: players.filter((p) => p.ejectedAt !== null).map((p) => p.playerId),
+    }).scores;
+  }, [mode, demo, result, players, room?.startedAt]);
+
+  const scores = mode === 'live' ? liveScores : demoScores;
 
   if (loading) {
     return (
@@ -38,14 +104,18 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
         <p className="py-6 text-center text-[15px] text-white">
           {error ?? 'No live seat saved on this device for this room.'}
         </p>
-        <Button variant="primary" onClick={() => router.push('/')}>
+        {/* A transient first-paint GET failure must not dead-end the
+            screen — Retry re-requests the snapshot (P1-23). */}
+        <Button variant="primary" onClick={retryConnection}>
+          Retry
+        </Button>
+        <Button variant="outline" onClick={() => router.push('/')}>
           Go home
         </Button>
       </main>
     );
   }
 
-  const result = room.result;
   const startedAtMs = room.startedAt ? new Date(room.startedAt).getTime() : null;
 
   if (!result) {
@@ -98,10 +168,21 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
               confirmedAt: c.confirmedAt as string,
             }))
         : [];
+  // "Match started — N players" counts the roster AT MATCH START, not
+  // the players still present at results time: joined by startedAt and
+  // not left before it. (A player who left mid-match still played.)
+  const startRosterCount =
+    startedAtMs === null
+      ? players.length
+      : players.filter((p) => {
+          if (Date.parse(p.joinedAt) > startedAtMs) return false;
+          return p.leftAt === null || Date.parse(p.leftAt) >= startedAtMs;
+        }).length;
+
   const events: TimelineEvent[] = [];
   events.push({
     atSeconds: 0,
-    text: `Match started — ${players.filter((p) => p.leftAt === null).length} players`,
+    text: `Match started — ${startRosterCount} players`,
   });
   // Tag entries are added even when `startedAt` is unknown: a result
   // implies the match started, but a null `startedAt` must never silently
@@ -143,6 +224,38 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
 
       {/* One-line stats — no grid. */}
       <p className="text-[15px] text-[#A1A1AA]">{stats}</p>
+
+      {/* Scores (P1-27): the server computes them (GET …/results); the
+          page never called the endpoint before. Highest first. */}
+      {scores ? (
+        <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
+          <h2 className="mb-3 text-[18px] font-bold text-white">Scores</h2>
+          <ul className="flex flex-col gap-2">
+            {[...players]
+              .map((p) => ({
+                playerId: p.playerId,
+                displayName: p.displayName,
+                points: scores[p.playerId] ?? 0,
+              }))
+              .sort((a, b) => b.points - a.points)
+              .map((entry) => (
+                <li
+                  key={entry.playerId}
+                  className="flex items-baseline justify-between gap-3"
+                >
+                  <span className="min-w-0 truncate text-[15px] font-semibold text-white">
+                    {entry.displayName}
+                  </span>
+                  <span className="text-[15px] font-bold text-white pakdam-numeric">
+                    {entry.points} {entry.points === 1 ? 'pt' : 'pts'}
+                  </span>
+                </li>
+              ))}
+          </ul>
+        </div>
+      ) : scoresError ? (
+        <p className="text-[14px] text-[#A1A1AA]">{scoresError}</p>
+      ) : null}
 
       {/* What happened — max 6, newest last. */}
       <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">

@@ -38,10 +38,20 @@ export function canTransition(from: MatchPhase, to: MatchPhase): boolean {
 /**
  * Attempt a phase transition. Returns the next phase, or a rejection with
  * the plain-words reason (and the `INVALID_STATE` error code the DO throws).
- * A transition to the same phase is a no-op success.
+ * A transition to the same phase is an ERROR, never a silent no-op
+ * success: an illegal edge is rejected, never silently applied — callers
+ * that already sit in the target phase must check first (or use the
+ * idempotent operation for that phase, e.g. `pauseMatch` with the
+ * existing pause state) instead of assuming the transition succeeded.
  */
 export function transition(from: MatchPhase, to: MatchPhase): TransitionResult {
-  if (from === to) return { ok: true, phase: to };
+  if (from === to) {
+    return {
+      ok: false,
+      code: 'INVALID_STATE',
+      reason: `Already in ${from} — a transition to the same phase is not a no-op success.`,
+    };
+  }
   if (canTransition(from, to)) return { ok: true, phase: to };
   return {
     ok: false,

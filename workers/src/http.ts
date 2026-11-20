@@ -33,8 +33,45 @@ import {
   newWsTicket,
 } from './auth.js';
 import { persistBugReport, persistGrievance, persistReportAudit, type SupabaseEnv } from './supabase.js';
+import { HttpRateLimiter, seatKey } from './rate-limit.js';
 import { recordTelemetry } from './telemetry.js';
 import type { Env } from './index.js';
+
+/** Max request body: 1 MB (P1-16). Larger bodies are rejected with 413. */
+export const MAX_BODY_BYTES = 1_048_576;
+
+/** UUID shape (v4-style, case-insensitive) — ids are `crypto.randomUUID()`. */
+export function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+/**
+ * Per-seat HTTP limiter, keyed by the TOKEN HASH (P1-14) — never by the
+ * unauthenticated client-supplied playerId. The hash is derived from the
+ * presented credential, so rotating playerIds cannot dodge the bucket.
+ * The Worker entry skips its pre-handler limit for seat routes; each
+ * handler below checks this limiter AFTER parsing the credential and
+ * BEFORE calling the DO.
+ */
+const seatLimiter = new HttpRateLimiter();
+
+async function checkSeatLimit(
+  routeKey: string,
+  roomId: string,
+  tokenHash: string,
+): Promise<Response | null> {
+  const check = seatLimiter.check(routeKey, seatKey(roomId, tokenHash));
+  if (check.allowed) return null;
+  const res = err('Too many tries — slow down.', 429);
+  const headers = new Headers(res.headers);
+  headers.set('Retry-After', String(check.retryAfterSeconds));
+  return new Response(res.body, { status: 429, headers });
+}
+
+/** 400 when a body id is present but not a UUID (P2, unvalidated ids). */
+function badUuid(field: string): Response {
+  return err(`${field} must be a valid id.`, 400);
+}
 
 export interface HttpContext {
   env: Env;
@@ -56,9 +93,19 @@ export function err(message: string, status: number, issues?: string[]): Respons
 }
 
 export async function parseBody(req: Request): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
+  let text: string;
+  try {
+    text = await req.text();
+  } catch {
+    return { ok: false, response: err('Invalid JSON body.', 400) };
+  }
+  // P1-16: cap the body at 1 MB before parsing it.
+  if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) {
+    return { ok: false, response: json({ error: 'Body too large (max 1 MB).' }, 413) };
+  }
   let raw: unknown;
   try {
-    raw = await req.json();
+    raw = JSON.parse(text) as unknown;
   } catch {
     return { ok: false, response: err('Invalid JSON body.', 400) };
   }
@@ -96,6 +143,11 @@ interface DoResponse {
   [key: string]: unknown;
 }
 
+/** Worker -> DO internal calls carry the shared secret (P2, /op auth). */
+function opSecretHeaders(env: Env): Record<string, string> {
+  return env.DO_OP_SECRET ? { 'x-pakdam-op-secret': env.DO_OP_SECRET } : {};
+}
+
 /** Call one DO op; maps DO failures onto HTTP errors. */
 async function callDo(
   env: Env,
@@ -108,7 +160,7 @@ async function callDo(
   try {
     res = await stub.fetch('http://room-do/op', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...opSecretHeaders(env) },
       body: JSON.stringify({ op, ...payload }),
     });
   } catch {
@@ -132,7 +184,7 @@ async function callRegistry(
   try {
     const res = await stub.fetch('http://code-registry/op', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...opSecretHeaders(env) },
       body: JSON.stringify({ op, ...payload }),
     });
     return (await res.json()) as DoResponse;
@@ -204,15 +256,21 @@ export async function handleCreateRoom(req: Request, ctx: HttpContext): Promise<
   const hostToken = newHostToken();
 
   // Register the code synchronously before the 201 returns (retry on collision).
+  // After 5 CONFLICT registrations, FAIL (P2) — never proceed with a code
+  // that is already taken.
   let roomCode = '';
+  let registered = false;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     roomCode = generateRoomCode();
     const reg = await callRegistry(ctx.env, 'register', { code: roomCode, roomId });
-    if (reg.ok) break;
+    if (reg.ok) {
+      registered = true;
+      break;
+    }
     if (reg.code === 'CONFLICT') continue;
     return err('Code registry unavailable — try again.', 503);
   }
-  if (!roomCode) return err('Could not allocate a room code — try again.', 503);
+  if (!registered || !roomCode) return err('Could not allocate a room code — try again.', 503);
 
   const created = await callDo(ctx.env, roomId, 'create', {
     roomId,
@@ -316,11 +374,15 @@ export async function handleWsTicket(
   const rawReconnect = asString(body['reconnectToken']);
   const purpose = body['purpose'] === 'renew' ? 'renew' : 'connect';
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawReconnect) return err('reconnectToken is required.', 400);
+  const reconnectTokenHash = await hashReconnectToken(rawReconnect);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/ws-ticket', roomId, reconnectTokenHash);
+  if (limited) return limited;
   const ticket = newWsTicket();
   const registered = await callDo(ctx.env, roomId, 'register-ticket', {
     playerId,
-    reconnectTokenHash: await hashReconnectToken(rawReconnect),
+    reconnectTokenHash,
     ticketId: ticket.ticketId,
     ticketHash: await hashTicketValue(ticket.ticket),
     purpose,
@@ -347,10 +409,14 @@ export async function handleRevokeTicket(
   const playerId = asString(body['playerId']);
   const rawReconnect = asString(body['reconnectToken']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawReconnect) return err('reconnectToken is required.', 400);
+  const reconnectTokenHash = await hashReconnectToken(rawReconnect);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/ws-ticket/revoke', roomId, reconnectTokenHash);
+  if (limited) return limited;
   const revoked = await callDo(ctx.env, roomId, 'revoke-tickets', {
     playerId,
-    reconnectTokenHash: await hashReconnectToken(rawReconnect),
+    reconnectTokenHash,
   });
   if (!revoked.ok) return doError(revoked);
   return json({ ok: true, revoked: revoked['revoked'] });
@@ -358,8 +424,10 @@ export async function handleRevokeTicket(
 
 /**
  * GET /v1/rooms/:id?playerId=… — recipient-filtered room state.
- * Authorization: Bearer <reconnectToken>. PlayerId alone 400s; a non-seat
- * playerId 404s (IDOR guard); a wrong token 403s.
+ * Authorization: Bearer <reconnectToken> ONLY (P1-13). The query-string
+ * `reconnectToken` fallback is removed — a token in the URL lands in
+ * edge access logs. PlayerId alone 400s; a non-seat playerId 404s (IDOR
+ * guard); a wrong token 403s.
  */
 export async function handleGetState(
   req: Request,
@@ -368,12 +436,16 @@ export async function handleGetState(
 ): Promise<Response> {
   const url = new URL(req.url);
   const playerId = url.searchParams.get('playerId');
-  const token = bearerToken(req) ?? url.searchParams.get('reconnectToken');
+  const token = bearerToken(req);
   if (!playerId) return err('playerId is required.', 400);
-  if (!token) return err('reconnectToken is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
+  if (!token) return err('Authorization: Bearer <reconnectToken> is required.', 400);
+  const reconnectTokenHash = await hashReconnectToken(token);
+  const limited = await checkSeatLimit('GET /v1/rooms/:id', roomId, reconnectTokenHash);
+  if (limited) return limited;
   const state = await callDo(ctx.env, roomId, 'get-state', {
     playerId,
-    reconnectTokenHash: await hashReconnectToken(token),
+    reconnectTokenHash,
   });
   if (!state.ok) return doError(state);
   return json({ ok: true, ...stripDoEnvelope(state) });
@@ -391,10 +463,14 @@ export async function handleStart(
   const playerId = asString(body['playerId']);
   const rawHost = asString(body['hostToken']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
+  const hostTokenHash = await hashHostToken(rawHost);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/start', roomId, hostTokenHash);
+  if (limited) return limited;
   const started = await callDo(ctx.env, roomId, 'start', {
     playerId,
-    hostTokenHash: await hashHostToken(rawHost),
+    hostTokenHash,
   });
   if (!started.ok) return doError(started);
   return json({ ok: true, ...stripDoEnvelope(started) });
@@ -412,6 +488,7 @@ export async function handleUpdateConfig(
   const playerId = asString(body['playerId']);
   const rawHost = asString(body['hostToken']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
   if (typeof body['config'] !== 'object' || body['config'] === null) {
     return err('config is required.', 400);
@@ -420,9 +497,12 @@ export async function handleUpdateConfig(
   if (issues.length > 0) {
     return err('Room config is not valid.', 400, issues);
   }
+  const hostTokenHash = await hashHostToken(rawHost);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/config', roomId, hostTokenHash);
+  if (limited) return limited;
   const updated = await callDo(ctx.env, roomId, 'update-config', {
     playerId,
-    hostTokenHash: await hashHostToken(rawHost),
+    hostTokenHash,
     config: body['config'],
   });
   if (!updated.ok) return doError(updated);
@@ -442,11 +522,16 @@ export async function handleRemovePlayer(
   const rawHost = asString(body['hostToken']);
   const targetPlayerId = asString(body['targetPlayerId']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
   if (!targetPlayerId) return err('targetPlayerId is required.', 400);
+  if (!isUuid(targetPlayerId)) return badUuid('targetPlayerId');
+  const hostTokenHash = await hashHostToken(rawHost);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/remove-player', roomId, hostTokenHash);
+  if (limited) return limited;
   const removed = await callDo(ctx.env, roomId, 'remove-player', {
     playerId,
-    hostTokenHash: await hashHostToken(rawHost),
+    hostTokenHash,
     targetPlayerId,
   });
   if (!removed.ok) return doError(removed);
@@ -465,7 +550,20 @@ export async function handleRegenerateCode(
   const playerId = asString(body['playerId']);
   const rawHost = asString(body['hostToken']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
+  const hostTokenHash = await hashHostToken(rawHost);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/regenerate-code', roomId, hostTokenHash);
+  if (limited) return limited;
+  // Verify-then-register (P2): the DO confirms host authority BEFORE the
+  // new code is registered, so a failed host check never squats a code
+  // (and a failure after registration leaves no orphan mapping — the
+  // fresh code is unregistered below).
+  const verified = await callDo(ctx.env, roomId, 'verify-host-token', {
+    playerId,
+    hostTokenHash,
+  });
+  if (!verified.ok) return doError(verified);
   const newCode = generateRoomCode();
   const reg = await callRegistry(ctx.env, 'register', { code: newCode, roomId });
   if (!reg.ok) {
@@ -475,7 +573,7 @@ export async function handleRegenerateCode(
   }
   const swapped = await callDo(ctx.env, roomId, 'regenerate-code', {
     playerId,
-    hostTokenHash: await hashHostToken(rawHost),
+    hostTokenHash,
     newCode,
   });
   if (!swapped.ok) {
@@ -505,10 +603,14 @@ export async function handleHostToken(
   const playerId = asString(body['playerId']);
   const rawReconnect = asString(body['reconnectToken']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawReconnect) return err('reconnectToken is required.', 400);
+  const reconnectTokenHash = await hashReconnectToken(rawReconnect);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/host/token', roomId, reconnectTokenHash);
+  if (limited) return limited;
   const minted = await callDo(ctx.env, roomId, 'issue-host-token', {
     playerId,
-    reconnectTokenHash: await hashReconnectToken(rawReconnect),
+    reconnectTokenHash,
   });
   if (!minted.ok) return doError(minted);
   return json({ ok: true, hostToken: minted['hostToken'] });
@@ -527,11 +629,16 @@ export async function handleHostTransfer(
   const rawHost = asString(body['hostToken']);
   const newHostPlayerId = asString(body['newHostPlayerId']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
   if (!newHostPlayerId) return err('newHostPlayerId is required.', 400);
+  if (!isUuid(newHostPlayerId)) return badUuid('newHostPlayerId');
+  const hostTokenHash = await hashHostToken(rawHost);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/host/transfer', roomId, hostTokenHash);
+  if (limited) return limited;
   const transferred = await callDo(ctx.env, roomId, 'transfer-host', {
     playerId,
-    hostTokenHash: await hashHostToken(rawHost),
+    hostTokenHash,
     newHostPlayerId,
   });
   if (!transferred.ok) return doError(transferred);
@@ -555,11 +662,16 @@ export async function handleCatchToken(
   const rawReconnect = asString(body['reconnectToken']);
   const catchId = asString(body['catchId']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawReconnect) return err('reconnectToken is required.', 400);
   if (!catchId) return err('catchId is required.', 400);
+  if (!isUuid(catchId)) return badUuid('catchId');
+  const reconnectTokenHash = await hashReconnectToken(rawReconnect);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/catch-token', roomId, reconnectTokenHash);
+  if (limited) return limited;
   const got = await callDo(ctx.env, roomId, 'get-catch-token', {
     playerId,
-    reconnectTokenHash: await hashReconnectToken(rawReconnect),
+    reconnectTokenHash,
     catchId,
   });
   if (!got.ok) return doError(got);
@@ -591,16 +703,21 @@ export async function handleResolveCatch(
   const decision = body['decision'];
   const reason = asString(body['reason']);
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
+  if (!isUuid(catchId)) return badUuid('catchId');
   if (decision !== 'confirmed' && decision !== 'rejected') {
     return err("decision must be 'confirmed' or 'rejected'.", 400);
   }
   if (reason !== null && reason.length > 500) {
     return err('reason must be at most 500 characters.', 400);
   }
+  const hostTokenHash = await hashHostToken(rawHost);
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/catches/:cid/resolve', roomId, hostTokenHash);
+  if (limited) return limited;
   const resolved = await callDo(ctx.env, roomId, 'resolve-catch', {
     playerId,
-    hostTokenHash: await hashHostToken(rawHost),
+    hostTokenHash,
     catchId,
     decision,
     ...(reason !== null ? { reason } : {}),
@@ -631,11 +748,24 @@ export async function handleLifecycle(
     return err("action must be 'start', 'pause', 'resume' or 'end'.", 400);
   }
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
+  if (!rawHost && !rawReconnect) {
+    return err('hostToken or reconnectToken is required.', 400);
+  }
+  // Seat limit, keyed by whichever credential is presented (P1-14):
+  // host token first, else the reconnect token.
+  const hostTokenHash = rawHost ? await hashHostToken(rawHost) : null;
+  const reconnectTokenHash = rawReconnect ? await hashReconnectToken(rawReconnect) : null;
+  const limitHash = hostTokenHash ?? reconnectTokenHash;
+  if (limitHash !== null) {
+    const limited = await checkSeatLimit('POST /v1/rooms/:id/lifecycle', roomId, limitHash);
+    if (limited) return limited;
+  }
   const done = await callDo(ctx.env, roomId, 'lifecycle', {
     action,
     playerId,
-    ...(rawHost ? { hostTokenHash: await hashHostToken(rawHost) } : {}),
-    ...(rawReconnect ? { reconnectTokenHash: await hashReconnectToken(rawReconnect) } : {}),
+    ...(hostTokenHash ? { hostTokenHash } : {}),
+    ...(reconnectTokenHash ? { reconnectTokenHash } : {}),
   });
   if (!done.ok) return doError(done);
   return json({ ok: true, ...stripDoEnvelope(done) });
@@ -649,12 +779,17 @@ export async function handleResults(
 ): Promise<Response> {
   const url = new URL(req.url);
   const playerId = url.searchParams.get('playerId');
-  const token = bearerToken(req) ?? url.searchParams.get('reconnectToken');
+  // Bearer only (P1-13) — no query-string reconnectToken fallback.
+  const token = bearerToken(req);
   if (!playerId) return err('playerId is required.', 400);
-  if (!token) return err('reconnectToken is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
+  if (!token) return err('Authorization: Bearer <reconnectToken> is required.', 400);
+  const reconnectTokenHash = await hashReconnectToken(token);
+  const limited = await checkSeatLimit('GET /v1/rooms/:id/results', roomId, reconnectTokenHash);
+  if (limited) return limited;
   const results = await callDo(ctx.env, roomId, 'get-results', {
     playerId,
-    reconnectTokenHash: await hashReconnectToken(token),
+    reconnectTokenHash,
   });
   if (!results.ok) return doError(results);
   return json({ ok: true, ...stripDoEnvelope(results) });
@@ -672,9 +807,30 @@ export async function handleReports(req: Request, ctx: HttpContext): Promise<Res
   const targetPlayerId = asString(body['targetPlayerId']);
   const kind = body['kind'];
   if (!roomId) return err('roomId is required.', 400);
+  if (!isUuid(roomId)) return badUuid('roomId');
   if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
+  if (targetPlayerId !== null && !isUuid(targetPlayerId)) return badUuid('targetPlayerId');
   if (kind !== 'report' && kind !== 'block') {
     return err("kind must be 'report' or 'block'.", 400);
+  }
+  // P1-15: unauthenticated intake is closed — the room must exist and
+  // the reporter must be a member of it (the target too, when named).
+  // No token is presented here, so this is membership existence, not
+  // credential verification; the write stays an audit record only.
+  const exists = await callDo(ctx.env, roomId, 'room-exists', {});
+  if (!exists.ok || exists['exists'] !== true) {
+    return err('No live room for that roomId.', 404);
+  }
+  const member = await callDo(ctx.env, roomId, 'check-member', { playerId });
+  if (!member.ok || member['member'] !== true) {
+    return err('The reporter is not a member of this room.', 403);
+  }
+  if (targetPlayerId !== null) {
+    const targetMember = await callDo(ctx.env, roomId, 'check-member', { playerId: targetPlayerId });
+    if (!targetMember.ok || targetMember['member'] !== true) {
+      return err('The reported player is not a member of this room.', 403);
+    }
   }
   ctx.ctx.waitUntil(
     persistReportAudit(ctx.env as SupabaseEnv, {
@@ -696,12 +852,33 @@ export async function handleBugReport(req: Request, ctx: HttpContext): Promise<R
   if (!description || description.trim().length === 0 || description.length > 5000) {
     return err('description must be 1–5000 characters.', 400);
   }
+  // P2: free-text caps — deviceInfo / appVersion ≤ 500 chars each.
+  const deviceInfo = asString(body['deviceInfo']);
+  const appVersion = asString(body['appVersion']);
+  if (deviceInfo !== null && deviceInfo.length > 500) {
+    return err('deviceInfo must be at most 500 characters.', 400);
+  }
+  if (appVersion !== null && appVersion.length > 500) {
+    return err('appVersion must be at most 500 characters.', 400);
+  }
+  // P1-15: a named room must exist (roomId is optional — a bug may be
+  // filed without a room — but a present one is validated).
+  const roomId = asString(body['roomId']);
+  const playerId = asString(body['playerId']);
+  if (roomId !== null && !isUuid(roomId)) return badUuid('roomId');
+  if (playerId !== null && !isUuid(playerId)) return badUuid('playerId');
+  if (roomId !== null) {
+    const exists = await callDo(ctx.env, roomId, 'room-exists', {});
+    if (!exists.ok || exists['exists'] !== true) {
+      return err('No live room for that roomId.', 404);
+    }
+  }
   ctx.ctx.waitUntil(
     persistBugReport(ctx.env as SupabaseEnv, {
-      roomId: asString(body['roomId']),
-      playerId: asString(body['playerId']),
-      deviceInfo: asString(body['deviceInfo']),
-      appVersion: asString(body['appVersion']),
+      roomId,
+      playerId,
+      deviceInfo,
+      appVersion,
       description: description.trim(),
     }),
   );
@@ -721,9 +898,16 @@ export async function handleGrievance(req: Request, ctx: HttpContext): Promise<R
   if (channel !== 'in-app' && channel !== 'email') {
     return err("channel must be 'in-app' or 'email'.", 400);
   }
+  // P2: complainantRef ≤ 500 chars. (Grievances carry no room/player
+  // fields, so no room validation applies here — see the P1-15 note in
+  // the report.)
+  const complainantRef = asString(body['complainantRef']);
+  if (complainantRef !== null && complainantRef.length > 500) {
+    return err('complainantRef must be at most 500 characters.', 400);
+  }
   ctx.ctx.waitUntil(
     persistGrievance(ctx.env as SupabaseEnv, {
-      complainantRef: asString(body['complainantRef']),
+      complainantRef,
       channel,
       summary: summary.trim(),
     }),

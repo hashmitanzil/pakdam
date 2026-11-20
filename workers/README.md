@@ -134,12 +134,17 @@ game request. The DO stays the authority when Supabase is absent.
   field measurement.
 - **Snapshot + privacy rules.** Snapshots carry no raw coordinates, no
   pending pings, no token hashes; each seat sees its OWN role/team only.
-  Fixes live in DO memory only (purged after 120 s and at match end); raw
-  catch tokens live in DO memory only; WS tickets are memory-only and never
-  persisted. Raw tokens of any kind are never logged or stored.
+  Fixes live in DO memory only (purged after 30 s — the freshness window
+  — and at match end); raw catch tokens live in DO memory only. The WS
+  ticket registry (hashes only), idempotency records + cached replies,
+  pending pings and the pending shrink preview ARE persisted durably in
+  DO storage, so a hibernate/wake does not invalidate a minted ticket,
+  lose a retry's reply, or drop an undelivered ping. Raw tokens of any
+  kind are never logged or stored.
 - **CSP / HSTS** are set on every HTTP response (the old build had none).
 - **Supabase schema:** no change needed — deploy set stays 0001 + 0003 +
-  0004 in order; 0002 RLS stays held in `migrations-deferred/`.
+  0004 in order; 0002 RLS is HELD (not written yet — no RLS migration
+  exists in this repo).
 - **Files:** `src/index.ts` (entry/routing/CORS/headers/rate limits),
   `src/http.ts` (route handlers), `src/room-do.ts` (DO state ops over
   `@pakdam/engine`), `src/room-do-class.ts` (DO classes: sockets, alarm,

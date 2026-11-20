@@ -8,27 +8,38 @@
  *
  * Server rules:
  * - `catch.request`: Hunter only, ACTIVE only, target a free, present,
- *   non-suspended Runner; one pending catch per Runner (a re-request by the
+ *   non-suspended Runner; the requesting Hunter must not be suspended or
+ *   disconnected either; one pending catch per Runner (a re-request by the
  *   SAME Hunter returns the open claim — idempotent; a different Hunter gets
- *   CONFLICT); an already-caught Runner cannot be claimed again.
+ *   CONFLICT); an already-caught Runner cannot be claimed again. The claim
+ *   opens only when the Hunter and Runner are physically close (see below).
  * - `catch.confirm`: the named Runner (QR token, or `manualConfirm` with no
  *   token) OR the claiming Hunter (valid QR token) may confirm. Requires
  *   ACTIVE, Runner still free and non-suspended (a suspended Runner blocks
  *   the confirm — the catch-22, fixed by resume-on-hello), claim still
  *   pending and unexpired. A second confirm is CONFLICT, never a double-apply.
+ * - PHYSICAL TAGS (founder decision): a tag confirms ONLY when (a valid
+ *   token is presented OR the Runner manually confirms) AND the Hunter and
+ *   the Runner both have a recent fix AND the distance between them is
+ *   ≤ CATCH_MAX_DISTANCE_METERS (100 m). Missing/stale fixes reject with
+ *   "Waiting for GPS — move closer and try again". This applies to BOTH
+ *   the hunter-scan-confirms-directly path and the manual-confirm path —
+ *   a tag must not complete with both phones in different cities.
  * - `catch.dispute`: Runner-only, on a pending claim; an overdue claim
  *   expires instead of disputing. A disputed catch goes to host resolution;
  *   re-confirming a disputed catch is rejected server-side.
  * - QR token: 128-bit (32 hex chars) fresh token, hash =
  *   `sha256(catchId + ':' + raw)`, single-use + TTL, QR-only carriage.
- * - GPS is supporting evidence only: 'present'/'absent'/'stale' — absent or
- *   stale GPS is "no GPS evidence", never negative evidence.
+ * - GPS evidence (`gpsEvidence`) is a plausibility record only
+ *   ('present'/'absent'/'stale') — the physical-tag gate above is the
+ *   separate, enforcing check in `confirmCatch` / `requestCatch`.
  *
  * Idempotency: retries reuse the same `commandId`; the DO drops repeats for
  * 10 min (see `isDuplicateCommand` / `rememberCommand`).
  */
 import {
   CATCH_CONFIRMATION_REQUIRED,
+  CATCH_MAX_DISTANCE_METERS,
   CATCH_TOKEN_TTL_SECONDS,
   IDEMPOTENCY_TTL_MS,
   STALE_FIX_MS,
@@ -170,6 +181,50 @@ export function gpsEvidenceForCatch(
   return distance <= CATCH_PROXIMITY_PLAUSIBILITY_M ? 'present' : 'absent';
 }
 
+/**
+ * The physical-tag gate: both phones must have a recent fix and be within
+ * `maxDistanceMeters` of each other. Missing or stale fixes reject with
+ * STALE_LOCATION ("Waiting for GPS — move closer and try again"); too far
+ * apart rejects with FORBIDDEN. This is the ENFORCING check — unlike
+ * `gpsEvidenceForCatch` (plausibility only), a failure here blocks the
+ * tag. Callers pass the DO's latest fixes (`mem.latestFix`) for both
+ * seats; `maxDistanceMeters` defaults to CATCH_MAX_DISTANCE_METERS (100 m).
+ */
+export function checkCatchProximity(input: {
+  hunterFix: LocationFix | null;
+  runnerFix: LocationFix | null;
+  nowMs: number;
+  maxDistanceMeters?: number;
+}): CatchResult<void> {
+  const maxDistanceMeters = input.maxDistanceMeters ?? CATCH_MAX_DISTANCE_METERS;
+  if (input.hunterFix === null || input.runnerFix === null) {
+    return {
+      ok: false,
+      code: 'STALE_LOCATION',
+      reason: 'Waiting for GPS — move closer and try again.',
+    };
+  }
+  if (
+    input.nowMs - input.hunterFix.timestampMs > STALE_FIX_MS ||
+    input.nowMs - input.runnerFix.timestampMs > STALE_FIX_MS
+  ) {
+    return {
+      ok: false,
+      code: 'STALE_LOCATION',
+      reason: 'Waiting for GPS — move closer and try again.',
+    };
+  }
+  const distance = haversineMeters(input.hunterFix, input.runnerFix);
+  if (distance > maxDistanceMeters) {
+    return {
+      ok: false,
+      code: 'FORBIDDEN',
+      reason: 'You are too far apart to tag — stand next to the Runner and try again.',
+    };
+  }
+  return { ok: true, value: undefined };
+}
+
 // ---------------------------------------------------------------------------
 // Request / confirm / dispute / resolve
 // ---------------------------------------------------------------------------
@@ -248,6 +303,14 @@ export function requestCatch(input: {
   nowMs: number;
   hunterFix: LocationFix | null;
   runnerFix: LocationFix | null;
+  /**
+   * Latest fixes for both seats (the DO passes `mem.latestFix` for the
+   * Hunter and the Runner). When given, the physical-tag gate runs on
+   * these; otherwise it runs on `hunterFix` / `runnerFix`.
+   */
+  positions?: { hunter: LocationFix | null; runner: LocationFix | null };
+  /** Max Hunter↔Runner distance for a tag; defaults to CATCH_MAX_DISTANCE_METERS (100 m). */
+  maxDistanceMeters?: number;
 }): CatchResult<CatchEvent> {
   if (input.phase !== 'ACTIVE') {
     return { ok: false, code: 'INVALID_STATE', reason: 'Catches can only be made while the match is live.' };
@@ -257,6 +320,15 @@ export function requestCatch(input: {
   }
   if (input.hunter.ejectedAt !== null || input.hunter.leftAt !== null) {
     return { ok: false, code: 'FORBIDDEN', reason: 'An ejected or departed Hunter cannot tag.' };
+  }
+  // A suspended or disconnected Hunter cannot open a claim — only the
+  // Runner's state was gated before; the Hunter's matters just as much
+  // (a Hunter whose phone is in a pocket cannot physically tag anyone).
+  if (
+    input.hunter.connectionState === 'suspended' ||
+    input.hunter.connectionState === 'disconnected'
+  ) {
+    return { ok: false, code: 'FORBIDDEN', reason: 'A suspended or disconnected Hunter cannot tag.' };
   }
   const open = openCatchForRunner(input.catches, input.runner.playerId);
   if (open !== null) {
@@ -268,6 +340,16 @@ export function requestCatch(input: {
   if (!isCatchableRunner(input.runner, input.caughtRunnerIds)) {
     return { ok: false, code: 'CONFLICT', reason: 'That Runner cannot be caught right now.' };
   }
+  // Physical-tag gate: the Hunter and the Runner must both have a recent
+  // fix within maxDistanceMeters — a claim opened from another city is
+  // rejected here, not just at confirm time.
+  const proximity = checkCatchProximity({
+    hunterFix: input.positions?.hunter ?? input.hunterFix,
+    runnerFix: input.positions?.runner ?? input.runnerFix,
+    nowMs: input.nowMs,
+    maxDistanceMeters: input.maxDistanceMeters,
+  });
+  if (!proximity.ok) return proximity;
   const now = new Date(input.nowMs).toISOString();
   return {
     ok: true,
@@ -294,6 +376,11 @@ export function requestCatch(input: {
  * unexpired. A second confirm is CONFLICT, never a double-apply.
  * `tokenValid` is the result of `verifyCatchToken` (or true for a manual
  * Runner confirm, which carries no token by design).
+ * PHYSICAL TAG: `positions` (required — the DO passes `mem.latestFix`
+ * for the Hunter and the Runner) must show both seats with a recent fix
+ * within `maxDistanceMeters` (default CATCH_MAX_DISTANCE_METERS, 100 m);
+ * otherwise the tag is rejected. The gate applies to BOTH the
+ * hunter-scan-confirms-directly path and the manual-confirm path.
  */
 export function confirmCatch(input: {
   catchEvent: CatchEvent;
@@ -306,6 +393,10 @@ export function confirmCatch(input: {
   phase: MatchPhase;
   nowMs: number;
   ttlSeconds?: number;
+  /** Latest fixes for the Hunter and the Runner (DO `mem.latestFix`). Required — a tag without both fixes cannot be confirmed. */
+  positions: { hunter: LocationFix | null; runner: LocationFix | null };
+  /** Max Hunter↔Runner distance for a tag; defaults to CATCH_MAX_DISTANCE_METERS (100 m). */
+  maxDistanceMeters?: number;
 }): CatchResult<CatchEvent> {
   const c = input.catchEvent;
   if (input.phase !== 'ACTIVE') {
@@ -345,9 +436,16 @@ export function confirmCatch(input: {
   } else if (!input.tokenValid) {
     return { ok: false, code: 'FORBIDDEN', reason: 'That QR token does not match this catch.' };
   }
-  if (input.confirmerRole === null && !isRunner && !isHunter) {
-    return { ok: false, code: 'FORBIDDEN', reason: 'Only the Runner or the claiming Hunter can confirm this catch.' };
-  }
+  // Physical-tag gate (both paths): the Hunter and the Runner must be
+  // next to each other with fresh GPS. A token/manual confirm from
+  // another city does not complete the tag.
+  const proximity = checkCatchProximity({
+    hunterFix: input.positions.hunter,
+    runnerFix: input.positions.runner,
+    nowMs: input.nowMs,
+    maxDistanceMeters: input.maxDistanceMeters,
+  });
+  if (!proximity.ok) return proximity;
   return {
     ok: true,
     value: {
@@ -362,6 +460,9 @@ export function confirmCatch(input: {
 /**
  * Dispute a catch. Runner-only, on a pending claim; an overdue claim
  * expires instead of disputing. A disputed catch goes to host resolution.
+ * Dispute requires the match to be ACTIVE — pass the room phase; when
+ * `phase` is provided and is not ACTIVE the dispute is rejected (the DO
+ * always passes its phase; `resolveCatchOp` enforces the same rule).
  */
 export function disputeCatch(input: {
   catchEvent: CatchEvent;
@@ -371,6 +472,9 @@ export function disputeCatch(input: {
   ttlSeconds?: number;
 }): CatchResult<CatchEvent> {
   const c = input.catchEvent;
+  if (input.phase !== 'ACTIVE') {
+    return { ok: false, code: 'INVALID_STATE', reason: 'Catches can only be disputed while the match is live.' };
+  }
   if (input.disputerId !== c.runnerPlayerId) {
     return { ok: false, code: 'FORBIDDEN', reason: 'Only the Runner can dispute this catch.' };
   }
@@ -399,15 +503,21 @@ export function disputeCatch(input: {
  * Host-resolve a disputed catch. Decision 'confirmed' applies the mode
  * rule; 'rejected' voids the claim. The host's decision is final.
  * Re-confirming a disputed catch is rejected server-side — only this path
- * decides it.
+ * decides it. Resolution requires the match to be ACTIVE — pass the room
+ * phase; when `phase` is provided and is not ACTIVE the resolution is
+ * rejected (the DO's `resolveCatchOp` enforces the same rule).
  */
 export function resolveCatch(input: {
   catchEvent: CatchEvent;
   resolverIsHost: boolean;
   decision: 'confirmed' | 'rejected';
   nowMs: number;
+  phase?: MatchPhase;
 }): CatchResult<CatchEvent> {
   const c = input.catchEvent;
+  if (input.phase !== undefined && input.phase !== 'ACTIVE') {
+    return { ok: false, code: 'INVALID_STATE', reason: 'Catches can only be resolved while the match is live.' };
+  }
   if (!input.resolverIsHost) {
     return { ok: false, code: 'FORBIDDEN', reason: 'Only the host can resolve a disputed catch.' };
   }

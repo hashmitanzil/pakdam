@@ -1,6 +1,31 @@
-node_modules
-.next
-.env
-.env.local
-dist
+# Pakdam — never commit generated, local, or secret files.
+# (The zip recipe excludes these too; this file protects the tree from commits.)
+
+# Dependencies
+node_modules/
+
+# Builds
+.next/
+dist/
+build/
+out/
+
+# Cloudflare / Wrangler
+.wrangler/
+
+# TypeScript incremental build info
 *.tsbuildinfo
+
+# Tests
+test-results/
+playwright-report/
+coverage/
+
+# macOS / Windows / editors
+.DS_Store
+Thumbs.db
+*.local
+
+# Secrets — never commit. Use the Secure Vault / wrangler secret put.
+.env*
+!.env.example

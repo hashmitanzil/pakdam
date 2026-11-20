@@ -41,7 +41,13 @@ export function CatchQR({
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  const scannedRef = useRef(false);
+  // The decode loop NEVER exits on the first decode (P1-28): a wrong scan
+  // must let the Hunter re-scan in place, not force Cancel → "Scan their
+  // QR" again. The loop keeps running until a valid scan or Cancel; the
+  // same QR value is ignored for 3 s so one frame is not reported twice,
+  // and "Scan again" clears the lock immediately.
+  const lastScannedRef = useRef<{ value: string; atMs: number } | null>(null);
+  const [, setScanNonce] = useState(0);
   const onScanRef = useRef(onScan);
   onScanRef.current = onScan;
   const onScanErrorRef = useRef(onScanError);
@@ -71,7 +77,7 @@ export function CatchQR({
     if (mode !== 'scan') return;
     let raf = 0;
     let stopped = false;
-    scannedRef.current = false;
+    lastScannedRef.current = null;
 
     const decodeLoop = () => {
       if (stopped) return;
@@ -87,10 +93,16 @@ export function CatchQR({
           ctx.drawImage(video, 0, 0, width, height);
           const imageData = ctx.getImageData(0, 0, width, height);
           const result = jsQR(imageData.data, width, height);
-          if (result?.data && !scannedRef.current) {
-            scannedRef.current = true;
-            onScanRef.current(result.data.trim());
-            return;
+          if (result?.data) {
+            const value = result.data.trim();
+            const last = lastScannedRef.current;
+            // Same QR within 3 s = the same frame re-read: ignore it.
+            // A different QR, or the same one after a wrong scan cooled
+            // off, is reported — the loop keeps running either way.
+            if (!last || last.value !== value || Date.now() - last.atMs > 3000) {
+              lastScannedRef.current = { value, atMs: Date.now() };
+              onScanRef.current(value);
+            }
           }
         }
       }
@@ -166,6 +178,19 @@ export function CatchQR({
       {cameraError ? (
         <p className="text-center text-[14px] text-[#EF4444]">{cameraError}</p>
       ) : null}
+      {/* After a wrong scan ("That QR didn't match") the camera keeps
+          running — tap Scan again to re-read at once instead of
+          cancelling out and reopening the scanner. */}
+      <button
+        type="button"
+        onClick={() => {
+          lastScannedRef.current = null;
+          setScanNonce((n) => n + 1);
+        }}
+        className="self-center text-[15px] font-semibold text-white"
+      >
+        Scan again
+      </button>
       <button
         type="button"
         onClick={onManualFallback}

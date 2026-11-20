@@ -141,16 +141,15 @@ Commands sent while disconnected are DISCARDED, never queued. This queue holds O
 - `ageLabelFromTimestamp(timestampMs, nowMs?)` — `0:20 ago`.
 - `formatCountdown(totalSeconds)` / `formatClock(msRemaining)` — `mm:ss` countdown / match clock.
 - `distanceMeters(a, b)` / `formatDistance(meters)` — great-circle distance; `420 m` / `1.2 km`.
-- `formatZoneSize(startRadiusM, finalRadiusM | null)` — `500 m → 125 m` (start → final; `Auto` when null).
+- `formatZoneSize(startRadiusM, finalRadiusM | null)` — `500 m → 211 m` (start → final; `Auto` when null).
 - `formatDurationShort(totalSeconds)` — `45 s` / `3 min`.
 - `initialsForName(displayName)` — avatar initials (first letters of the first two words).
 
 ## `../components/ui/` — primitives (SCRAM-SPEC §11)
 
 - `Button({ variant, children })` — `variant`: `'primary'` (red #EF4444, 56 px, full width) | `'outline'` | `'ghost'` | `'blocked'` (grey bar — stays tappable so the tap can answer in plain language; never a disabled button).
-- `Toggle({ checked, onChange, label, disabled? })` — iOS-style, red ON, grey OFF, 52×32 px.
+- `Toggle({ checked, onChange, label, disabled? })` — iOS-style, red ON, grey OFF, 48×24 px capsule, 22 px knob.
 - `Stepper({ value, onChange, step?, min?, max?, label, format?, disabled? })` — − / + dark squares, bold centred value.
-- `Slider({ steps, value, onChange, label, format?, disabled? })` — discrete steps, red fill, snaps on release.
 - `BottomTabs({ active, onChange, radioUnread? })` — `Map | Radio | ···`, active = red-tinted pill; Radio badge = unread count.
 - `Sheet({ open, onClose, title?, children })` — bottom sheet, radius 20 px top, drag handle, Escape/backdrop closes.
 - `Pill({ tone, children })` / `Badge({ count })` — `tone`: `'host'` (red outline) | `'ready'` (green outline) | `'hunter'` (red fill) | `'runner'` (white fill) | `'random'` | `'neutral'` | `'warning'`; Badge = red dot with white number.
@@ -163,6 +162,7 @@ Commands sent while disconnected are DISCARDED, never queued. This queue holds O
 - `isOlaConfigured()` — false when no key is set: do NOT construct a map (show the missing-key banner).
 - `olaTransformRequest(url, resourceType?)` — appends `api_key` to EVERY `api.olamaps.io` request.
 - `createOlaMap({ container, center?, hasFix?, zoom? })` — constructs the map (null when unconfigured). Callers must call `map.resize()` after resize / hidden-then-shown.
+- `fetchCleanedOlaStyle()` / `cleanOlaStyle(style)` — the Ola style JSON declares a `3d_model_data` layer whose `3d_model` source layer does not exist in the vectordata tiles, so the style is fetched, stripped of those layers, and passed to MapLibre as a cleaned OBJECT (never the URL). A failed fetch falls back to the URL so the caller's error banner shows the real detail.
 - `shouldRefly(lastCentre, fix, lastAccuracyMeters)` — re-centre only when the fix moved > 25 m or accuracy at least halved.
 - Zone/ping/no-go overlay colours: `ZONE_LINE_COLOR` / `ZONE_FILL_COLOR` / `PING_FILL_COLOR` / `NO_GO_FILL_COLOR`.
 - `maplibre-gl` is a dependency of `@pakdam/web` (`maplibre-gl@^5.0.0`); the module imports it dynamically at runtime.

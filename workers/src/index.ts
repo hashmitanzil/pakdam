@@ -11,7 +11,7 @@
  * `CodeRegistryDO`. The Worker never validates a WS ticket against its own
  * store and never stores a ticket, token, or fix.
  */
-import { HttpRateLimiter, clientIp, seatKey } from './rate-limit.js';
+import { HttpRateLimiter, clientIp } from './rate-limit.js';
 import {
   err,
   handleBugReport,
@@ -34,6 +34,7 @@ import {
   handleUpdateConfig,
   handleWsTicket,
   handleWsUpgrade,
+  isUuid,
   type HttpContext,
 } from './http.js';
 import { flushTelemetry } from './telemetry.js';
@@ -47,6 +48,12 @@ export interface Env {
   SUPABASE_SERVICE_ROLE_KEY?: string;
   /** Optional comma-separated allowlist; defaults below when unset. */
   ALLOWED_ORIGINS?: string;
+  /**
+   * Worker<->DO shared secret for internal /op calls (P2). When set,
+   * the DO rejects /op calls without it; when unset the check is skipped
+   * (dev). Set in production via `wrangler secret put DO_OP_SECRET`.
+   */
+  DO_OP_SECRET?: string;
 }
 
 const limiter = new HttpRateLimiter();
@@ -288,15 +295,26 @@ export default {
         const params = route.match(segments);
         if (params === null) continue;
 
+        // Unvalidated ids (P2): malformed room/catch ids are rejected
+        // here, before any DO is instantiated.
+        if (params['id'] !== undefined && !isUuid(params['id'])) {
+          return withHeaders(err('Invalid room id.', 400), cors);
+        }
+        if (params['cid'] !== undefined && !isUuid(params['cid'])) {
+          return withHeaders(err('Invalid catch id.', 400), cors);
+        }
+
         // Per-route rate limit, before the handler runs. Seat-scoped
-        // routes key on room + playerId (body for POST, query for GET);
-        // unauthenticated routes and the WS upgrade key on client IP.
-        // NOTE: the WS upgrade keys on IP at the HTTP layer because the
-        // seat is unknown before ticket validation; per-seat WS limits
-        // apply after attach, inside the DO. Join + by-code key on the
-        // room/code, not the IP (NAT-JOIN: 30 players on one venue WiFi
-        // share one IP — per-IP join would 429 the 6th player).
-        let key = clientIp(req);
+        // routes are NOT limited here: the handler limits them AFTER
+        // parsing the credential, keyed by the token hash (P1-14) — a
+        // pre-handler key would have to trust the unauthenticated
+        // client-supplied playerId. Unauthenticated routes and the WS
+        // upgrade are limited here. Join + by-code key on the room/code,
+        // not the IP (NAT-JOIN: 30 players on one venue WiFi share one
+        // IP — per-IP join would 429 the 6th player). The WS upgrade keys
+        // on the ROOM (P1-12, 60/min/room in the calibration table), not
+        // the client IP — a venue NAT must not throttle a whole roster's
+        // reconnects.
         const isSeatRoute =
           route.rateKey.includes('/ws-ticket') ||
           route.rateKey.includes('/start') ||
@@ -309,47 +327,43 @@ export default {
           route.rateKey.includes('/resolve') ||
           route.rateKey.includes('/results') ||
           route.rateKey === 'GET /v1/rooms/:id';
+        const isWsRoute = route.rateKey === 'WS /v1/rooms/:id/ws';
         const isJoinRoute = route.rateKey === 'POST /v1/rooms/:id/join';
         const isByCodeRoute = route.rateKey === 'GET /v1/rooms/by-code/:code';
-        if (isSeatRoute || isJoinRoute) {
-          let playerId: string | null = url.searchParams.get('playerId');
-          let roomCode: string | null = null;
-          if (req.method === 'POST') {
-            // Peek at the body once for the rate-limit key; the handler
-            // parses it again (a Request body can only be read once per
-            // clone, so clone here).
-            try {
-              const peek = (await req.clone().json()) as Record<string, unknown>;
-              if (typeof peek['playerId'] === 'string') playerId = peek['playerId'] as string;
-              if (typeof peek['roomCode'] === 'string') roomCode = peek['roomCode'] as string;
-            } catch {
-              // Unparseable body: the handler will 400; still rate-limit below.
+        if (!isSeatRoute) {
+          let key = clientIp(req);
+          if (isWsRoute) {
+            key = `ws:${params['id'] ?? 'unknown'}`;
+          } else if (isJoinRoute) {
+            let roomCode: string | null = null;
+            if (req.method === 'POST') {
+              // Peek at the body once for the rate-limit key; the handler
+              // parses it again (a Request body can only be read once per
+              // clone, so clone here).
+              try {
+                const peek = (await req.clone().json()) as Record<string, unknown>;
+                if (typeof peek['roomCode'] === 'string') roomCode = peek['roomCode'] as string;
+              } catch {
+                // Unparseable body: the handler will 400; still rate-limit below.
+              }
             }
-          }
-          if (isJoinRoute) {
             // Room + code bucket (35/min in the table): a full roster on
             // one NAT IP joins inside a minute without a 429.
             key = `join:${params['id'] ?? 'unknown'}:${roomCode ?? ''}`;
-          } else if (playerId) {
-            key = seatKey(params['id'] ?? 'unknown', playerId);
-          } else {
-            // No seat yet: scope to this IP within this room, never to a
-            // single shared `roomId:anonymous` window for all strangers.
-            key = `anon:${params['id'] ?? 'unknown'}:${clientIp(req)}`;
+          } else if (isByCodeRoute) {
+            // The code itself is the bucket (35/min in the table).
+            key = `by-code:${params['code'] ?? ''}`;
           }
-        } else if (isByCodeRoute) {
-          // The code itself is the bucket (35/min in the table).
-          key = `by-code:${params['code'] ?? ''}`;
-        }
-        const check = limiter.check(route.rateKey, key);
-        if (!check.allowed) {
-          const res = err('Too many tries — slow down.', 429);
-          const headers = new Headers(res.headers);
-          headers.set('Retry-After', String(check.retryAfterSeconds));
-          return withHeaders(
-            new Response(res.body, { status: 429, headers }),
-            cors,
-          );
+          const check = limiter.check(route.rateKey, key);
+          if (!check.allowed) {
+            const res = err('Too many tries — slow down.', 429);
+            const headers = new Headers(res.headers);
+            headers.set('Retry-After', String(check.retryAfterSeconds));
+            return withHeaders(
+              new Response(res.body, { status: 429, headers }),
+              cors,
+            );
+          }
         }
 
         const res = await route.handler(req, httpCtx, params, null);

@@ -44,7 +44,7 @@ test.describe('live HUD (demo)', () => {
       await expect(hostPage.getByText('Outlast the clock. Hunters see you only when you ping.')).toBeVisible();
     }
     await expect(
-      hostPage.getByText("Alerts reach you with your phone locked. Just don't swipe Pakdam closed."),
+      hostPage.getByText("Keep the app open — alerts arrive while you're playing. There are no push notifications when the app is closed."),
     ).toBeVisible();
     await hostPage.getByRole('button', { name: "Let's go", exact: true }).click();
     await expect(hostPage.getByText('You’re it.', { exact: true })).toBeHidden();

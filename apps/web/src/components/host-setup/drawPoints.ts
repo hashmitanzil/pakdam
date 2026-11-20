@@ -13,6 +13,7 @@ import {
   type GeoPolygon,
 } from '@pakdam/engine';
 import {
+  SHRINK_RADIUS_FACTOR,
   ZONE_RADIUS_DEFAULT_M,
   ZONE_RADIUS_MIN_M,
   haversineMeters,
@@ -59,9 +60,27 @@ export function clampRadiusMeters(radiusMeters: number): number {
   return Math.max(ZONE_RADIUS_MIN_M, Math.round(radiusMeters));
 }
 
-/** Auto final size = ~25% of the start radius (after two quarter-shrinks). */
+/**
+ * Shrinks per game (the schedule: one shrink per third of the round —
+ * `shrinkIntervalForDurationSeconds` in @pakdam/shared). Each shrink
+ * keeps SHRINK_RADIUS_FACTOR of the radius, so the final ring is
+ * 0.75³ ≈ 42% of the start radius after 3 shrinks.
+ */
+export const AUTO_FINAL_SHRINK_COUNT = 3;
+
+/** Auto final size = ~42% of the start radius (0.75³ after 3 shrinks). */
 export function autoFinalRadiusMeters(startRadiusMeters: number): number {
-  return Math.max(25, Math.round(clampRadiusMeters(startRadiusMeters) * 0.25));
+  return Math.max(
+    25,
+    Math.round(
+      clampRadiusMeters(startRadiusMeters) * SHRINK_RADIUS_FACTOR ** AUTO_FINAL_SHRINK_COUNT,
+    ),
+  );
+}
+
+/** Auto final size as a percent of the start radius (~42% after 3 shrinks). */
+export function autoFinalSizePercent(): number {
+  return Math.round(SHRINK_RADIUS_FACTOR ** AUTO_FINAL_SHRINK_COUNT * 100);
 }
 
 /** Final-size ring for a drawn polygon: the drawn shape scaled toward its

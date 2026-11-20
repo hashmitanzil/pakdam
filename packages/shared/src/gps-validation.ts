@@ -5,8 +5,10 @@
  * Foundational rules:
  *  - Only fixes accurate to ±50 m or better are ever sent.
  *  - Poor accuracy is warned, never treated as cheating, never a rejection.
- *  - GPS is supporting evidence for a catch only — never proof, never a
- *    rejection on its own.
+ *  - GPS evidence (`gpsEvidence`) is supporting only — never proof. But a
+ *    tag itself is PHYSICAL: `confirmCatch` / `requestCatch` reject when
+ *    either phone has no recent fix or the two are more than
+ *    CATCH_MAX_DISTANCE_METERS apart (see @pakdam/engine `catch.ts`).
  *  - Foreground-only: location stops when the tab hides.
  */
 import {
@@ -17,6 +19,16 @@ import {
   ZONE_AUTO_CENTRE_MAX_ACCURACY_M,
   CATCH_PROXIMITY_PLAUSIBILITY_M,
 } from './calibration.js';
+
+/**
+ * Upper bound on fix accuracy: a fix worse than ±1000 m is rejected
+ * outright. The client-side ±50 m send rule is unenforced server-side
+ * (the server only warns on poor accuracy), so without a bound a
+ * kilometre-wide fix could anchor a catch, a ping, or a zone decision.
+ * 1000 m is a validity bound, not a quality bar — the ±50 m send rule
+ * and the accuracy tiers still decide what is usable.
+ */
+export const MAX_FIX_ACCURACY_METERS = 1000;
 import type { GeoPoint, LocationFix, LocationQuality } from './types.js';
 import { classifyAccuracy } from './validation.js';
 
@@ -46,7 +58,8 @@ export interface FixValidationResult {
 /**
  * Validate one fix (`validateFix`).
  * Rejects: bad shape/range (lat ±90, lng ±180, accuracy > 0 finite, valid
- * timestamp), timestamp > 5 min in the future (clock skew / replay), a fix
+ * timestamp), accuracy worse than MAX_FIX_ACCURACY_METERS (±1000 m),
+ * timestamp > 5 min in the future (clock skew / replay), a fix
  * > 60 s old on arrival, an exact duplicate of the previous accepted fix.
  * Warns only: poor accuracy, impossible movement (> 30 m/s from the previous
  * fix). `nowMs` defaults to Date.now(); pass it explicitly in tests.
@@ -77,6 +90,8 @@ export function validateFix(
   }
   if (typeof f.accuracyMeters !== 'number' || !Number.isFinite(f.accuracyMeters) || f.accuracyMeters <= 0) {
     errors.push('fix accuracyMeters must be a finite number greater than 0');
+  } else if (f.accuracyMeters > MAX_FIX_ACCURACY_METERS) {
+    errors.push(`fix accuracyMeters must be at most ${MAX_FIX_ACCURACY_METERS} m`);
   }
   if (typeof f.timestampMs !== 'number' || !Number.isFinite(f.timestampMs)) {
     errors.push('fix timestampMs must be a finite epoch-milliseconds number');

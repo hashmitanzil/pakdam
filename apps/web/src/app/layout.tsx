@@ -3,6 +3,7 @@ import './globals.css';
 // MapLibre GL JS requires its stylesheet for the map canvas to render.
 // Without it the style and tiles load but the canvas paints blank.
 import 'maplibre-gl/dist/maplibre-gl.css';
+import { PwaBootstrap } from '@/components/PwaBootstrap';
 
 export const metadata: Metadata = {
   title: 'Pakdam — Hide. Run. Don\'t get caught.',
@@ -15,8 +16,12 @@ export const metadata: Metadata = {
     title: 'Pakdam',
   },
   icons: {
-    icon: '/icon.svg',
-    apple: '/icon.svg',
+    icon: [
+      { url: '/icon-192.png', sizes: '192x192', type: 'image/png' },
+      { url: '/icon-512.png', sizes: '512x512', type: 'image/png' },
+      { url: '/icon.svg', type: 'image/svg+xml' },
+    ],
+    apple: '/icon-192.png',
   },
 };
 
@@ -33,7 +38,10 @@ export default function RootLayout({
 }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        {children}
+        <PwaBootstrap />
+      </body>
     </html>
   );
 }

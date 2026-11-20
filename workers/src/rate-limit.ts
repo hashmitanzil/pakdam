@@ -90,12 +90,16 @@ export class HttpRateLimiter {
   }
 }
 
-/** Best client-IP guess: CF-Connecting-IP first, then X-Forwarded-For. */
+/**
+ * Client IP: CF-Connecting-IP ONLY (P2). The X-Forwarded-For fallback is
+ * removed — XFF is client-controlled and trivially spoofed, so trusting
+ * it lets an attacker pick their own rate-limit bucket (or frame another
+ * IP). Behind Cloudflare the connecting IP is always present; anything
+ * else is 'unknown'.
+ */
 export function clientIp(req: Request): string {
   const cf = req.headers.get('CF-Connecting-IP');
   if (cf) return cf.trim();
-  const forwarded = req.headers.get('X-Forwarded-For');
-  if (forwarded) return forwarded.split(',')[0]?.trim() ?? 'unknown';
   return 'unknown';
 }
 

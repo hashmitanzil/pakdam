@@ -20,8 +20,9 @@
  * a caught spectator — this exclusion only applies while the viewer is
  * still a Runner.)
  *
- * `activeCatches` holds pending catches only, recipient-filtered to the
- * parties + the host. Decided catches (confirmed / disputed) appear in
+ * `activeCatches` holds pending AND disputed catches (a disputed catch
+ * still needs host resolution), recipient-filtered to the parties + the
+ * host. Decided catches (confirmed / disputed) appear in
  * `decidedCatches` instead, so the after-tagged screen and auto-spectator
  * state survive a reload — a snapshot is the whole truth, and a decided
  * catch must be rebuildable from it, not only from live `catch.*` events.
@@ -56,8 +57,14 @@ export function playersViewFor(
 }
 
 /**
- * Pending catches this viewer may see: the parties to the catch, plus the
- * host. Confirmed/disputed/rejected/expired catches never appear.
+ * Pending AND disputed catches this viewer may see: the parties to the
+ * catch, plus the host. A disputed catch is still "active" from the
+ * host's perspective — it needs resolution — so it must not vanish from
+ * the host UI after a reload (it also still appears in
+ * `decidedCatchesFor` below; the client merges the two lists). The
+ * dispute state is currently unreachable via the UI (founder decision:
+ * no dispute button), so this is defense-in-depth. Confirmed / rejected /
+ * expired catches never appear here.
  */
 export function activeCatchesFor(
   viewerPlayerId: string,
@@ -67,7 +74,7 @@ export function activeCatchesFor(
   return catches
     .filter(
       (c) =>
-        isPendingCatch(c) &&
+        (isPendingCatch(c) || c.state === 'disputed') &&
         (viewerIsHost ||
           c.hunterPlayerId === viewerPlayerId ||
           c.runnerPlayerId === viewerPlayerId),

@@ -48,6 +48,7 @@ import { RulesControls, TeamControls } from '../../../../components/host-setup/S
 import { effectiveHunterCount } from '../../../../components/host-setup/draft';
 import {
   autoFinalRadiusMeters,
+  autoFinalSizePercent,
   boundaryCentre,
   boundaryRadiusMeters,
   circleBoundary,
@@ -92,6 +93,8 @@ export default function SetupPage() {
   const [session, setSession] = useState<PakdamSession | null | undefined>(undefined);
   const [lobby, setLobby] = useState<LobbyState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  /** Bumped by Retry — re-runs the seat/state load (P1-23). */
+  const [loadNonce, setLoadNonce] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [gpsNote, setGpsNote] = useState<string | null>(null);
   const [zone, setZone] = useState<ZoneState | null>(null);
@@ -133,7 +136,7 @@ export default function SetupPage() {
   const isHost = me?.isHost ?? session?.isHost ?? false;
   const config = lobby?.room.config ?? null;
   const activePlayers = (lobby?.players ?? []).filter((p) => p.leftAt === null);
-  // Final size is always Auto (~25% of the start radius) — no manual control.
+  // Final size is always Auto (~42% of the start radius, 0.75³ after 3 shrinks) — no manual control.
   const finalRadius = config
     ? autoFinalRadiusMeters(
         zone?.radiusMeters ?? boundaryRadiusMeters(config.zone.boundary),
@@ -199,7 +202,7 @@ export default function SetupPage() {
       watch.stop();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [roomId]);
+  }, [roomId, loadNonce]);
 
   // -- Setup is host-only: anyone else goes to the lobby. ----------------
   useEffect(() => {
@@ -304,7 +307,11 @@ export default function SetupPage() {
         draft.shape === 'draw'
           ? drawPointsToBoundary(draft.drawPoints)
           : circleBoundary(draft.centre, draft.radiusMeters);
-      if (boundary.length < 3) return;
+      // A Draw with < 3 corners is NOT a valid zone — but the config must
+      // still reflect the current mode: push an EMPTY boundary (the
+      // validator allows it: "not placed yet") instead of silently
+      // keeping the old circle as the active zone. The host sees the
+      // "Place at least 3 corners" hint until the shape closes.
       applyConfig({
         ...current.room.config,
         zone: { ...current.room.config.zone, boundary },
@@ -366,9 +373,10 @@ export default function SetupPage() {
   // -- Zone draft handlers (map + inline controls). ----------------------
   const onZoneChange = (draft: ZoneDraft): void => {
     setZone(draft);
-    if (draft.shape === 'circle' || draft.drawPoints.length >= 3) {
-      applyZoneToConfig(draft);
-    }
+    // Always push: a Draw with < 3 corners clears the server zone to an
+    // empty boundary (see applyZoneToConfig) instead of leaving the old
+    // circle active while the host draws.
+    applyZoneToConfig(draft);
   };
 
   // -- Inline zone controls (Circle | Draw lives on the create screen).
@@ -493,8 +501,19 @@ export default function SetupPage() {
         <p className="text-[15px] text-white">
           {loadError ?? 'No live seat saved on this device for this room.'}
         </p>
-        <div className="mt-4">
-          <Button variant="primary" onClick={() => router.push('/')}>
+        {/* A transient first-paint GET failure must not dead-end the
+            screen — Retry re-runs the load (P1-23). */}
+        <div className="mt-4 flex flex-col gap-3">
+          <Button
+            variant="primary"
+            onClick={() => {
+              setLoadError(null);
+              setLoadNonce((n) => n + 1);
+            }}
+          >
+            Retry
+          </Button>
+          <Button variant="outline" onClick={() => router.push('/')}>
             Go home
           </Button>
         </div>
@@ -583,7 +602,8 @@ export default function SetupPage() {
                 <Stepper
                   label="Zone size"
                   value={zone.radiusMeters}
-                  step={50}
+                  // Step 50 m below 500 m, 100 m above (SCRAM-SPEC §6).
+                  step={zone.radiusMeters < 500 ? 50 : 100}
                   min={100}
                   format={(v) => formatDistance(v)}
                   onChange={setRadius}
@@ -592,7 +612,8 @@ export default function SetupPage() {
                   {formatDistance(zone.radiusMeters * 2)} across
                 </p>
                 <p className="text-[13px] text-[#A1A1AA]">
-                  Final size Auto · {formatDistance(finalRadius ?? zone.radiusMeters)}
+                  Final size Auto · ~{autoFinalSizePercent()}% (
+                  {formatDistance(finalRadius ?? zone.radiusMeters)})
                 </p>
                 <p className="mt-2 text-[13px] text-[#A1A1AA]">
                   Drag the map to move the zone. Runners have to stay inside it.
@@ -615,6 +636,11 @@ export default function SetupPage() {
                     ? drawSizeRangeLabel(zone.drawPoints)
                     : 'Tap the map to place corners.'}
                 </p>
+                {zone.drawPoints.length < 3 ? (
+                  <p className="mt-1 text-[13px] text-[#F59E0B]">
+                    Place at least 3 corners — the zone is not set yet.
+                  </p>
+                ) : null}
                 <p className="mt-2 text-[13px] text-[#A1A1AA]">
                   Drag a corner to move it, or the middle to move the whole zone.
                 </p>

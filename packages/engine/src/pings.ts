@@ -1,11 +1,16 @@
 /**
  * Pakdam engine — pings.
  *
- * A ping is a coarse area, never an exact pin: centre = the subject's latest
- * server-held fix, radius 150 m, mutual — a ping for a Runner goes to
- * Hunters, and a ping for a Hunter goes to Runners, so both sides learn the
- * other's location when it fires. No fix = no ping, never an invented
- * position.
+ * A ping is a coarse area, never an exact pin — with one honest caveat:
+ * the area's centre IS the subject's exact latest fix (lat/lng), and the
+ * 150 m radius is the coarseness. "Coarse area" means the recipient sees
+ * a 150 m circle around the subject's true position, not a jittered or
+ * sector-rounded position — the uncertainty is the radius, not the
+ * centre. Mutual: a ping for a Runner goes to Hunters, and a ping for a
+ * Hunter goes to Runners, so both sides learn the other's location when
+ * it fires. No fix = no ping, never an invented position.
+ * (Mechanic unchanged — mutual pings are intended; only the docstring
+ * was dishonest about what the centre is.)
  *
  * Schedule: ACTIVE phase only, play zone ON, `pingIntervalSeconds > 0`;
  * one ping per free player per interval; the first ping lands one interval

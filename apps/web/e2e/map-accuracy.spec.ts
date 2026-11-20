@@ -16,13 +16,13 @@ import {
 test.describe('zone accuracy (demo)', () => {
   test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
 
-  test('default zone is 500 m → 125 m (Auto final size is 25%)', async ({ context }) => {
+  test('default zone is 500 m → 211 m (Auto final size is ~42%)', async ({ context }) => {
     const hostPage = await context.newPage();
     await createHostSetupRoom(hostPage);
     await expect(
       hostPage.getByRole('group', { name: 'Zone size' }).getByText('500 m'),
     ).toBeVisible();
-    await expect(hostPage.getByText('Final size Auto · 125 m')).toBeVisible();
+    await expect(hostPage.getByText('Final size Auto · ~42% (211 m)')).toBeVisible();
     await hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }).click();
     await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
     await expect(hostPage.getByLabel('Game summary')).toContainText('500m zone');
@@ -56,12 +56,12 @@ test.describe('zone accuracy (demo)', () => {
     await expect(hostPage.getByLabel('Game summary')).toContainText('1100m zone');
   });
 
-  test('Final size is always Auto · 125 m — no manual final-size control', async ({
+  test('Final size is always Auto · ~42% — no manual final-size control', async ({
     context,
   }) => {
     const hostPage = await context.newPage();
     await createHostSetupRoom(hostPage);
-    await expect(hostPage.getByText('Final size Auto · 125 m')).toBeVisible();
+    await expect(hostPage.getByText('Final size Auto · ~42% (211 m)')).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Increase Final size' })).toBeHidden();
     await expect(hostPage.getByText('Fixed — tap for Auto')).toBeHidden();
   });

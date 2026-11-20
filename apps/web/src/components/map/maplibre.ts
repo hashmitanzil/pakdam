@@ -13,6 +13,19 @@
  * banner instead). If the key is wrong, the style load fails 401 and the
  * caller fails gracefully the same way.
  *
+ * STYLE FIX (founder-reported, live site): the Ola style JSON declares a
+ * style layer `3d_model_data` whose `source-layer` is `3d_model` on the
+ * source `vectordata` — but the vectordata tiles contain NO `3d_model`
+ * source layer, so MapLibre refuses the whole style:
+ * "Source layer "3d_model" does not exist on source "vectordata" as
+ * specified by style layer "3d_model_data"." This is a STYLE error, not a
+ * network/key error. `createOlaMap` therefore fetches the style JSON
+ * first, strips every layer that references the missing `3d_model`
+ * source layer (and the `3d_model_data` layer itself), and passes the
+ * CLEANED STYLE OBJECT to MapLibre — never the style URL. If the style
+ * fetch itself fails, it falls back to the URL so the caller's existing
+ * error banner still shows the real detail.
+ *
  * NOTE: `maplibre-gl` IS in this package's dependency list; the dynamic
  * import below resolves at runtime.
  */
@@ -105,7 +118,54 @@ export function olaTransformRequest(
   }
 }
 
-/** Minimal structural surface of the MapLibre Map the helpers need. */
+/** Style-layer ids that reference a source layer the Ola tiles do not ship. */
+const INCOMPATIBLE_STYLE_LAYER_IDS = new Set(['3d_model_data', '3d_model']);
+/** Source layers missing from the Ola `vectordata` tiles. */
+const INCOMPATIBLE_SOURCE_LAYERS = new Set(['3d_model']);
+
+/**
+ * Strip layers MapLibre cannot render from a fetched Ola style object:
+ * any layer whose `source-layer` is `3d_model` (missing from the
+ * `vectordata` tiles) and any layer with id `3d_model_data` (the style
+ * layer that references it). Defensive: unknown/malformed layers are
+ * kept — only the known-incompatible ones are dropped. Returns the
+ * style unchanged (same object shape) when there is nothing to strip,
+ * and null when the input is not a style object at all.
+ */
+export function cleanOlaStyle(style: unknown): Record<string, unknown> | null {
+  if (!style || typeof style !== 'object') return null;
+  const layers = (style as { layers?: unknown }).layers;
+  if (!Array.isArray(layers)) return style as Record<string, unknown>;
+  const cleaned = layers.filter((layer) => {
+    if (!layer || typeof layer !== 'object') return true;
+    const id = (layer as { id?: unknown }).id;
+    const sourceLayer = (layer as { 'source-layer'?: unknown })['source-layer'];
+    if (typeof id === 'string' && INCOMPATIBLE_STYLE_LAYER_IDS.has(id)) return false;
+    if (
+      typeof sourceLayer === 'string' &&
+      INCOMPATIBLE_SOURCE_LAYERS.has(sourceLayer)
+    )
+      return false;
+    return true;
+  });
+  return { ...(style as Record<string, unknown>), layers: cleaned };
+}
+
+/**
+ * Fetch the Ola style JSON (key appended, like every other Ola request)
+ * and return the cleaned style object, or null when the fetch / parse
+ * fails. Callers fall back to the style URL on null so the existing
+ * error banner still shows the real failure detail.
+ */
+export async function fetchCleanedOlaStyle(): Promise<Record<string, unknown> | null> {
+  try {
+    const response = await fetch(buildOlaStyleUrl());
+    if (!response.ok) return null;
+    return cleanOlaStyle((await response.json()) as unknown);
+  } catch {
+    return null;
+  }
+}
 export interface MapLibreMapLike {
   resize(): void;
   remove(): void;
@@ -114,7 +174,13 @@ export interface MapLibreMapLike {
   getCenter(): { lng: number; lat: number };
   getZoom(): number;
   flyTo(options: { center: [number, number]; zoom?: number; duration?: number }): void;
-  easeTo(options: { center?: [number, number]; zoom?: number; duration?: number }): void;
+  easeTo(options: {
+    center?: [number, number];
+    zoom?: number;
+    /** Bearing in degrees (0 = north up); the N button resets this. */
+    bearing?: number;
+    duration?: number;
+  }): void;
   fitBounds(
     bounds: [[number, number], [number, number]],
     options?: { padding?: number; duration?: number },
@@ -147,9 +213,15 @@ export async function createOlaMap(
 ): Promise<MapLibreMapLike | null> {
   if (!isOlaConfigured()) return null;
   const maplibre = await import('maplibre-gl');
+  // The Ola style declares a `3d_model_data` layer whose source layer
+  // `3d_model` does not exist in the vectordata tiles — MapLibre refuses
+  // the whole style if it is passed the URL as-is. Fetch + strip first
+  // and pass the cleaned style OBJECT; on a fetch failure fall back to
+  // the URL so the caller's error banner shows the real detail.
+  const cleanedStyle = await fetchCleanedOlaStyle();
   const map = new maplibre.Map({
     container: options.container,
-    style: buildOlaStyleUrl(),
+    style: (cleanedStyle ?? buildOlaStyleUrl()) as unknown as import('maplibre-gl').StyleSpecification,
     transformRequest: (url: string, resourceType?: string) =>
       olaTransformRequest(url, resourceType),
     center: options.center

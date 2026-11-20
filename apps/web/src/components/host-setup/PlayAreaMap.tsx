@@ -49,7 +49,7 @@ export interface PlayAreaMapProps {
   radiusMeters: number;
   shape: ZoneShape;
   drawPoints: GeoPoint[];
-  /** Null = Auto final size (~25% of the start radius). */
+  /** Null = Auto final size (~42% of the start radius, 0.75³ after 3 shrinks). */
   finalRadiusMeters: number | null;
   noGoAreas: GeoPolygon[];
   /** False for guests: the map renders read-only. */

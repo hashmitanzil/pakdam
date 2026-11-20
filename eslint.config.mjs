@@ -3,6 +3,7 @@
 import js from "@eslint/js";
 import tseslint from "typescript-eslint";
 import reactHooks from "eslint-plugin-react-hooks";
+import nextPlugin from "@next/eslint-plugin-next";
 
 export default tseslint.config(
   js.configs.recommended,
@@ -16,6 +17,18 @@ export default tseslint.config(
     rules: {
       "react-hooks/rules-of-hooks": "error",
       "react-hooks/exhaustive-deps": "warn",
+    },
+  },
+  {
+    // Next.js plugin — the build warns when it is not detected. Scoped
+    // to the web app only (the Worker/engine/shared packages are not
+    // Next apps). `recommended` + `core-web-vitals` rule sets, applied
+    // as plain rules over the flat-config plugin object.
+    files: ["apps/web/**/*.{js,jsx,ts,tsx}"],
+    plugins: { "@next/next": nextPlugin },
+    rules: {
+      ...nextPlugin.configs.recommended.rules,
+      ...nextPlugin.configs["core-web-vitals"].rules,
     },
   },
   {

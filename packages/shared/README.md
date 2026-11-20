@@ -19,9 +19,10 @@ only** — no I/O, no secrets, no imports from `engine`, `workers`, or `web`.
   and `HEARTBEAT_MISSED_LIMIT = 3` (from the old client's defaults).
 - **OPEN values are placeholders to measure**, not requirements — every one is
   flagged `OPEN` in `src/calibration.ts` and grouped in `CALIBRATION_OPEN`.
-- **Server-count note:** the protocol map states 35 server→client WS types but
-  enumerates 34 distinct names; `WS_SERVER_TYPES` implements the 34 enumerated
-  types exactly (see `src/events.ts`).
+- **Server-count note:** the protocol map states 35 server→client WS types and
+  its §2.4 table now enumerates all 35 (34 named types + `zone.preview`, added
+  by the shrink-preview fix); `WS_SERVER_TYPES` implements all 35 exactly
+  (see `src/events.ts`).
 
 ## Public API
 
@@ -49,7 +50,7 @@ Protocol (frozen v2.1):
 
 Fixed founder rules (NOT calibration):
 
-- `MIN_PLAYERS` — minimum players to start: 3 (server + client gates agree).
+- `MIN_PLAYERS` — minimum players to start: 2 (server + client gates agree).
 - `MAX_PLAYERS` — maximum players in a room: 30.
 - `ZONE_RADIUS_MIN_M` — zone radius minimum: 100 m.
 - `ZONE_RADIUS_DEFAULT_M` — zone radius default: 500 m.
@@ -59,11 +60,16 @@ Fixed founder rules (NOT calibration):
 - `ZONE_AUTO_CENTRE_MAX_ACCURACY_M` — never auto-centre on a fix worse than ±50 m.
 - `OUTSIDE_ZONE_RETURN_SECONDS` — outside-zone return countdown: 30 s, then ejection.
 - `SHRINK_RADIUS_FACTOR` — each shrink keeps 75% of the radius.
+- `SHRINK_COUNT_PER_ROUND` — exactly 3 shrinks per round.
+- `PREVIEW_LEAD_SECONDS` — shrink preview lead: 30 s before the shrink.
+- `MAX_GEOMETRY_POINTS` — geometry point cap: 64 per boundary.
+- `MAX_ZONE_DIAMETER_M` — max zone span (bounding-box diagonal): 100 km.
 - `MIN_NEXT_ZONE_OFFSET_M` — next-zone draws within 10 m of centre are re-drawn.
 - `SHRINK_MAX_ATTEMPTS` — random next-zone draw attempts before fallbacks: 50.
 - `CATCH_CONFIRMATION_REQUIRED` — runner confirmation is always required: true.
 - `CATCH_TOKEN_HEX_LENGTH` — fresh catch token length: 32 hex chars.
 - `CATCH_TOKEN_BITS` — fresh catch token entropy: 128 bits.
+- `CATCH_MAX_DISTANCE_METERS` — physical-tag rule: Hunter and Runner must be within 100 m with recent fixes, or the tag is rejected.
 - `SCORING_RUNNER_PER_3_MIN_FREE` — Runner +1 per whole 3 min free.
 - `SCORING_RUNNER_NEVER_CAUGHT` — Runner +10 never caught.
 - `SCORING_HUNTER_PER_TAG` — Hunter +3 per confirmed tag.
@@ -94,8 +100,7 @@ OPEN — measure in the field before any public pilot:
 - `CLOCK_SKEW_MS` — fix > 5 min in the future is rejected (OPEN).
 - `STALE_FIX_MS` — fix > 60 s old on arrival is rejected (OPEN).
 - `MAX_PLAUSIBLE_SPEED_MPS` — impossible movement > 30 m/s warns only (OPEN).
-- `WRONG_SCAN_MAX` — demo-only wrong-scan cooldown: 3 wrong scans (OPEN).
-- `WRONG_SCAN_LOCK_SECONDS` — demo-only wrong-scan lock: 30 s (OPEN).
+- `WRONG_SCAN_MAX` / `WRONG_SCAN_LOCK_SECONDS` — DELETED (dead calibration; failed confirms are limited by the WS `catch.confirm` 5/min/seat limit).
 - `BALANCED_HUNTER_TABLE` — Hunter balance table by roster size (OPEN).
 - `SUGGESTED_ZONE_RADIUS_BASE_M` — suggested radius base: 200 m (OPEN).
 - `SUGGESTED_ZONE_RADIUS_PER_PLAYER_M` — suggested radius per extra player: 25 m (OPEN).
@@ -128,9 +133,9 @@ OPEN — measure in the field before any public pilot:
 - `ZoneConfig` — play zone: boundary + shrink-phase placeholders (server re-draws per shrink).
 - `HouseRules` — the host's house rules for a room.
 - `RoomConfig` — full room config: house rules + zone + areas + host picks.
-- `DEFAULT_HOST_TOGGLES` — Balance ON, Random ON, ping history OFF.
-- `LEGACY_HOST_TOGGLES` — rooms saved before toggles resolve to all OFF.
+- `DEFAULT_HOST_TOGGLES` — Balance ON, Random ON.
 - `DEFAULT_ROOM_CONFIG` — create-page defaults (Classic, 30 min, 3 min head start, 3 min pings, 500 m zone).
+  (`LEGACY_HOST_TOGGLES` and the `showPingHistory` toggle were REMOVED — dead, nothing read them.)
 - `Player` — a seat (server-only `reconnectTokenHash` included; never sent).
 - `PlayerView` — what a seat sees: hash stripped, other seats' roles `null`.
 - `MatchResult` — outcome + duration + caught/surviving Runner ids (no routes, no trails).
@@ -187,7 +192,7 @@ Client → server (22 types) — payload per type + the type union + the array +
 - `WS_CLIENT_TYPES` — the 22 client→server type names in contract order.
 - `isWsClientMessageType` — guard: is this string a known client→server type?
 
-Server → client (34 enumerated types; see the note at the top of this README):
+Server → client (35 enumerated types; see the note at the top of this README):
 
 - `WelcomePayload` — welcome: playerId, serverSeq, serverTs, protocolVersion.
 - `RoomStatePayload` — room.state: phase, version, serverSeq, reason.
@@ -198,6 +203,7 @@ Server → client (34 enumerated types; see the note at the top of this README):
 - `PingEventPayload` — ping: the ping + serverSeq (append, dedup by pingId, never timer-removed).
 - `PingExpiredPayload` — ping.expired: pingId, subjectPlayerId, expiresAt.
 - `ZoneUpdatePayload` — zone.update: the new zone, phase, serverSeq.
+- `ZonePreviewPayload` — zone.preview: the next boundary, firesAtMs, shrinkIndex (1–3); broadcast 30 s before the shrink.
 - `CatchEventPayload` — catch.requested / confirmed / disputed / expired / rejected: the catch + serverSeq.
 - `SafetyPausedPayload` — safety.paused: byPlayerId, reason, serverSeq.
 - `SafetyResumedPayload` — safety.resumed: byPlayerId, reason, serverSeq.
@@ -235,13 +241,13 @@ Game events (audit log, 10 types):
 
 - `ROOM_CODE_PATTERN` — room code regex: exactly 6 chars A–Z0–9.
 - `isValidRoomCode` — is this a valid 6-letter invite code?
-- `isValidDisplayName` — display name / codename: 1–30 chars after trimming.
+- `isValidDisplayName` — display name / codename: 1–30 chars after trimming; control characters and newlines rejected.
 - `UUID_PATTERN` — UUID regex for ids.
 - `isUuid` — is this a UUID-shaped id?
 - `isValidGeoPoint` — lat ±90, lng ±180, both finite.
 - `isValidGeoPolygon` — a boundary of ≥ 3 valid points (default min 3).
-- `validateZoneBoundary` — zone-boundary issues (empty = unplaced zone, allowed).
-- `validateRoomConfig` — full config issues: ranges, pick invariant, host-on-site, forced catch confirmation.
+- `validateZoneBoundary` — zone-boundary issues (empty = unplaced zone, allowed unless `requirePlaced` is set; placed boundaries need 3–64 points and a span ≤ 100 km).
+- `validateRoomConfig` — full config issues: ranges, pick invariant, host-on-site, forced catch confirmation; the zone boundary must be placed (≥ 3 points), safe/no-go areas must be valid polygons (3–64 points), `shrinkPhases[].atSeconds` must be an integer in 0..86400, `finalSizePercent` must be null or a finite 1–100.
 - `CATCH_TOKEN_PATTERN` — fresh catch-token regex: 32 uppercase hex chars.
 - `isValidCatchToken` — is this a fresh ≥128-bit catch token? (12-char form rejected.)
 - `classifyAccuracy` — GPS tier: good ≤ 10 m, fair ≤ 25 m, poor ≤ 60 m (OPEN).
@@ -265,7 +271,8 @@ Game events (audit log, 10 types):
 ### `src/gps-validation.ts` — GPS rules
 
 - `FixValidationResult` — fix validation result: ok, errors, warnings, quality.
-- `validateFix` — fix validation: rejects bad shape/range, clock skew, stale, exact duplicate; warns on poor accuracy / impossible movement.
+- `MAX_FIX_ACCURACY_METERS` — fix accuracy bound: fixes worse than ±1000 m are rejected.
+- `validateFix` — fix validation: rejects bad shape/range, accuracy > 1000 m, clock skew, stale, exact duplicate; warns on poor accuracy / impossible movement.
 - `canAutoCentreZone` — may the zone auto-centre on this fix? (never worse than ±50 m.)
 - `isFixSendable` — may this fix be sent at all? (same ±50 m rule.)
 - `LocationStatus` — per-player location status: `known | unknown`.

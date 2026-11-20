@@ -16,6 +16,8 @@
  */
 import {
   MIN_NEXT_ZONE_OFFSET_M,
+  OUTSIDE_ZONE_RETURN_SECONDS,
+  SHRINK_COUNT_PER_ROUND,
   SHRINK_MAX_ATTEMPTS,
   SHRINK_RADIUS_FACTOR,
   ZONE_RADIUS_MIN_M,
@@ -24,10 +26,7 @@ import {
   haversineMeters,
 } from '@pakdam/shared';
 
-export { haversineMeters, ZONE_RADIUS_MIN_M };
-
-/** Outside-zone return countdown: 30 s, then ejection (fixed founder rule). */
-export const OUTSIDE_ZONE_RETURN_SECONDS = 30;
+export { haversineMeters, OUTSIDE_ZONE_RETURN_SECONDS, ZONE_RADIUS_MIN_M };
 
 /**
  * Metres per degree of latitude (equirectangular approximation). This MUST
@@ -222,8 +221,11 @@ export function isPointInZone(point: GeoPoint, boundary: GeoPolygon): boolean {
 // ---------------------------------------------------------------------------
 
 /**
- * Shrink times (seconds from match start): every `intervalSeconds` while
- * `< durationSeconds`. Empty when shrinking is off.
+ * Shrink times (seconds from match start): exactly 3 shrinks per round —
+ * [I, 2I, 3I] where I is the shrink interval (duration/3 by the
+ * auto-adjust, so a 30-min round shrinks at 10, 20 and 30 min). The old
+ * `t < duration` loop emitted only 2 shrinks (the third landed exactly at
+ * match end and was dropped). Empty when shrinking is off.
  */
 export function shrinkTimesSeconds(
   durationSeconds: number,
@@ -231,21 +233,37 @@ export function shrinkTimesSeconds(
   shrinkEnabled: boolean,
 ): number[] {
   if (!shrinkEnabled || intervalSeconds <= 0) return [];
+  void durationSeconds;
   const times: number[] = [];
-  for (let t = intervalSeconds; t < durationSeconds; t += intervalSeconds) {
-    times.push(t);
+  for (let k = 1; k <= SHRINK_COUNT_PER_ROUND; k += 1) {
+    times.push(k * intervalSeconds);
   }
   return times;
 }
 
-/** How many shrinks have fired by `elapsedSeconds` into the match. */
+/**
+ * Final radius factor after `shrinkCount` shrinks of 0.75 each:
+ * 0.75^3 = 0.42 after the standard 3 shrinks — the final zone is 42% of
+ * the start radius, NOT 25% (25% needs 5 shrinks). The setup copy and
+ * the final-size ring must use this helper, never a hardcoded 25%.
+ */
+export function finalRadiusFactor(shrinkCount: number = SHRINK_COUNT_PER_ROUND): number {
+  return SHRINK_RADIUS_FACTOR ** Math.max(0, Math.floor(shrinkCount));
+}
+
+/** Final radius as a whole percent of the start radius (42 after 3 shrinks). */
+export function finalRadiusPercent(shrinkCount: number = SHRINK_COUNT_PER_ROUND): number {
+  return Math.round(finalRadiusFactor(shrinkCount) * 100);
+}
+
+/** How many shrinks have fired by `elapsedSeconds` into the match (max 3). */
 export function shrinkIndexAt(
   elapsedSeconds: number,
   intervalSeconds: number,
   shrinkEnabled: boolean,
 ): number {
   if (!shrinkEnabled || intervalSeconds <= 0 || elapsedSeconds < 0) return 0;
-  return Math.floor(elapsedSeconds / intervalSeconds);
+  return Math.min(SHRINK_COUNT_PER_ROUND, Math.floor(elapsedSeconds / intervalSeconds));
 }
 
 /** Epoch ms of the next shrink after `nowMs`, or null when none is scheduled. */
@@ -359,6 +377,26 @@ export function randomOffsetShrinkBoundary(
 
   // Last resort only: the concentric scaled copy itself.
   return { boundary: scaled, method: 'concentric-last-resort', offsetMeters: 0 };
+}
+
+/**
+ * Preview the NEXT zone boundary ahead of a shrink (P1-18). Same draw as
+ * `randomOffsetShrinkBoundary` — the DO calls this PREVIEW_LEAD_SECONDS
+ * (30 s) before the shrink, broadcasts it as the `zone.preview` event
+ * (payload `{ boundary, firesAtMs, shrinkIndex }`), and the client draws
+ * the dashed preview ring + "Next zone in MM:SS". The DO should STORE the
+ * previewed boundary and apply that same boundary when the shrink fires,
+ * so the preview is the real next zone — not a second, different draw.
+ */
+export function previewShrinkBoundary(
+  boundary: GeoPolygon,
+  options: {
+    factor?: number;
+    random?: () => number;
+    maxAttempts?: number;
+  } = {},
+): ShrinkDrawResult {
+  return randomOffsetShrinkBoundary(boundary, options);
 }
 
 // ---------------------------------------------------------------------------

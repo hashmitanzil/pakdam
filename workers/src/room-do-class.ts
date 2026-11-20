@@ -11,11 +11,20 @@
  *
  * HIBERNATION: sockets use the hibernation API (`acceptWebSocket` with a
  * playerId tag). Per-socket session records (ticket binding, heartbeat
- * bookkeeping, hello state) are keyed by PLAYER, not by tab, in durable
- * storage (`session:<playerId>`) with a memory cache — a seat is one player,
- * and ticket/heartbeat state is per-seat. Durable game state is persisted
- * after every mutation (`room-state-v1`); memory-only state (fixes, tickets,
- * rate windows) is rebuilt empty after a wake, per the spec split.
+ * bookkeeping, hello state) are keyed by PLAYER + TAB (`session:<playerId>:<sessionId>`,
+ * P1-4) in durable storage with a memory cache — two tabs are two
+ * independent sessions: closing one tab suspends nothing while the other
+ * tab's socket is alive, and deleting one tab's session never breaks the
+ * other. Durable game state is persisted after every mutation
+ * (`room-state-v1`); the ticket registry, idempotency records + replies,
+ * pending pings and the pending shrink preview persist with it (P1-5),
+ * while memory-only state (fixes, rate windows, raw catch tokens) is
+ * rebuilt empty after a wake, per the spec split.
+ *
+ * SOCKET IDENTITY (P0-3): the socket's real identity is the tag set at
+ * upgrade from the redeemed ticket. Every envelope's `playerId` is
+ * compared against that tag BEFORE any session lookup — a client that
+ * claims another seat's id gets an error + close (4403).
  *
  * CLOSE CONTRACT (the client follows `WS_CLOSE_CODE_ACTION`):
  * - 4400 bad request — fresh ticket, reconnect once; surface the failure.
@@ -31,6 +40,7 @@ import {
   HEARTBEAT_MISSED_LIMIT,
   RENEWAL_WARNING_MS,
   hashWsTicket,
+  newId,
   type WsServerMessageType,
 } from '@pakdam/shared';
 import {
@@ -50,6 +60,8 @@ import {
 import type { Env } from './index.js';
 
 interface SessionRecord {
+  /** Per-tab session id (one per socket; two tabs = two records, P1-4). */
+  sessionId: string;
   playerId: string;
   ticketId: string;
   ticketExpiresAtMs: number;
@@ -57,6 +69,28 @@ interface SessionRecord {
   lastHeartbeatAtMs: number;
   missedHeartbeats: number;
   helloDone: boolean;
+}
+
+/** Max DO /op body: 1 MB (P1-16). Larger bodies are rejected with 413. */
+const MAX_OP_BODY_BYTES = 1_048_576;
+
+/** Read a request body as text with a 1 MB cap (P1-16). */
+async function readCappedBody(
+  req: Request,
+): Promise<{ ok: true; text: string } | { ok: false; response: Response }> {
+  let text: string;
+  try {
+    text = await req.text();
+  } catch {
+    return { ok: false, response: json({ ok: false, error: 'Unreadable body.', code: 'VALIDATION_FAILED', status: 400 }, 400) };
+  }
+  if (new TextEncoder().encode(text).length > MAX_OP_BODY_BYTES) {
+    return {
+      ok: false,
+      response: json({ ok: false, error: 'Body too large (max 1 MB).', code: 'PAYLOAD_TOO_LARGE', status: 413 }, 413),
+    };
+  }
+  return { ok: true, text };
 }
 
 function json(data: unknown, status: number = 200): Response {
@@ -104,13 +138,21 @@ export class RoomDO implements DurableObject {
       if (this.loaded) return;
       const raw = await this.ctx.storage.get<RoomDoState>(STATE_KEY);
       const restored = raw === undefined ? null : restoreState(raw);
-      if (restored) this.store = new RoomStore(restored, emptyMemory());
+      if (restored) {
+        this.store = new RoomStore(restored, emptyMemory());
+        // P1-5: tickets, idempotency + replies, pending pings and the
+        // pending shrink preview survive the wake with the game state.
+        this.store.restoreDurableMemory();
+      }
       this.loaded = true;
     });
   }
 
   private async save(): Promise<void> {
     if (!this.store) return;
+    // P1-5: sync the durable-backed memory maps into the state first,
+    // so the ticket registry / idempotency / pending pings persist.
+    this.store.syncDurableMemory();
     await this.ctx.storage.put(STATE_KEY, durableSnapshot(this.store.state));
   }
 
@@ -128,11 +170,12 @@ export class RoomDO implements DurableObject {
     if (
       phase === 'HEAD_START' ||
       phase === 'ACTIVE' ||
-      phase === 'SAFETY_PAUSED' ||
-      phase === 'RESOLVING'
+      phase === 'SAFETY_PAUSED'
     ) {
       return 1000;
     }
+    // RESOLVING ticks at 30 s, not 1 s: the match clock has stopped and
+    // nothing is live — "1 s while live" does not cover resolving.
     return 30_000;
   }
 
@@ -156,63 +199,158 @@ export class RoomDO implements DurableObject {
     }
     await this.save();
     await this.armAlarm();
+    await this.maybeUnregisterCode();
   }
 
-  // -- sessions (durable storage, keyed by player) --------------------------
+  // -- sessions (durable storage, keyed by player + tab) --------------------
 
-  private async getSession(playerId: string): Promise<SessionRecord | null> {
-    const cached = this.sessions.get(playerId);
-    if (cached) return cached;
+  /** Storage key for one tab's session. Legacy records (pre-P1-4) have no
+   * tab suffix and live under `session:<playerId>`. */
+  private sessionKey(playerId: string, sessionId: string): string {
+    return sessionId === 'legacy'
+      ? `session:${playerId}`
+      : `session:${playerId}:${sessionId}`;
+  }
+
+  private sessionCacheKey(playerId: string, sessionId: string): string {
+    return `${playerId}:${sessionId}`;
+  }
+
+  private async getSession(
+    playerId: string,
+    sessionId?: string,
+  ): Promise<SessionRecord | null> {
+    if (sessionId !== undefined) {
+      const key = this.sessionCacheKey(playerId, sessionId);
+      const cached = this.sessions.get(key);
+      if (cached) return cached;
+      const rec = await this.ctx.storage.get<SessionRecord>(
+        this.sessionKey(playerId, sessionId),
+      );
+      if (rec === undefined) return null;
+      if (!rec.sessionId) rec.sessionId = sessionId;
+      this.sessions.set(key, rec);
+      return rec;
+    }
+    // No tab given (legacy path): any cached record for the seat, else the
+    // legacy key. New sockets always carry a tab tag, so this is a fallback.
+    for (const rec of this.sessions.values()) {
+      if (rec.playerId === playerId) return rec;
+    }
     const rec = await this.ctx.storage.get<SessionRecord>(`session:${playerId}`);
     if (rec === undefined) return null;
-    this.sessions.set(playerId, rec);
+    if (!rec.sessionId) rec.sessionId = 'legacy';
+    this.sessions.set(this.sessionCacheKey(playerId, rec.sessionId), rec);
     return rec;
   }
 
   private async putSession(rec: SessionRecord): Promise<void> {
-    this.sessions.set(rec.playerId, rec);
-    await this.ctx.storage.put(`session:${rec.playerId}`, rec);
+    this.sessions.set(this.sessionCacheKey(rec.playerId, rec.sessionId), rec);
+    await this.ctx.storage.put(this.sessionKey(rec.playerId, rec.sessionId), rec);
   }
 
-  private async deleteSession(playerId: string): Promise<void> {
-    this.sessions.delete(playerId);
-    await this.ctx.storage.delete(`session:${playerId}`);
+  /** Delete ONE tab's session record (P1-4) — never the seat's others. */
+  private async deleteSession(playerId: string, sessionId?: string): Promise<void> {
+    if (sessionId === undefined) {
+      await this.deleteSessionsForPlayer(playerId);
+      return;
+    }
+    this.sessions.delete(this.sessionCacheKey(playerId, sessionId));
+    await this.ctx.storage.delete(this.sessionKey(playerId, sessionId));
+  }
+
+  /** Delete EVERY session record for a seat (seat removed / left for good). */
+  private async deleteSessionsForPlayer(playerId: string): Promise<void> {
+    for (const key of [...this.sessions.keys()]) {
+      if (key.startsWith(`${playerId}:`)) this.sessions.delete(key);
+    }
+    const map = await this.ctx.storage.list<SessionRecord>({
+      prefix: `session:${playerId}`,
+    });
+    for (const key of map.keys()) {
+      await this.ctx.storage.delete(key);
+    }
   }
 
   private async listSessions(): Promise<SessionRecord[]> {
     const map = await this.ctx.storage.list<SessionRecord>({ prefix: 'session:' });
     const out: SessionRecord[] = [];
     for (const rec of map.values()) {
-      this.sessions.set(rec.playerId, rec);
+      if (!rec.sessionId) rec.sessionId = 'legacy';
+      this.sessions.set(this.sessionCacheKey(rec.playerId, rec.sessionId), rec);
       out.push(rec);
     }
     return out;
   }
 
+  /**
+   * Best-effort invite-code release: when the room reaches a terminal
+   * phase (EXPIRED / ABANDONED / CANCELLED / COMPLETED) the code dies so
+   * it can be reused. Called after every mutation path; a no-op while
+   * the room is still live. Failures are swallowed — the room is already
+   * terminal, and a stale code only fails closed at join time.
+   */
+  private async maybeUnregisterCode(): Promise<void> {
+    if (!this.store) return;
+    const phase = this.store.room.phase;
+    if (
+      phase !== 'EXPIRED' &&
+      phase !== 'ABANDONED' &&
+      phase !== 'CANCELLED' &&
+      phase !== 'COMPLETED'
+    ) {
+      return;
+    }
+    try {
+      const stub = this.env.CODE_REGISTRY_DO.get(
+        this.env.CODE_REGISTRY_DO.idFromName('pakdam-code-registry'),
+      );
+      await stub.fetch('http://code-registry/op', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(this.env.DO_OP_SECRET
+            ? { 'x-pakdam-op-secret': this.env.DO_OP_SECRET }
+            : {}),
+        },
+        body: JSON.stringify({
+          op: 'unregister',
+          code: this.store.room.roomCode,
+          roomId: this.store.room.roomId,
+        }),
+      });
+    } catch {
+      // Best effort only.
+    }
+  }
+
   // -- fan-out ---------------------------------------------------------------
 
   /**
-   * Deliver outbound events to connected sockets. Returns, per ping event,
-   * whether any Hunter socket received it (undelivered pings stay pending).
+   * Deliver outbound events to connected sockets. Per-recipient ping ack
+   * (P2): a ping is acknowledged only for the seats that actually
+   * received this broadcast — an offline Hunter's copy stays pending.
    */
   private async deliver(events: OutboundEvent[], nowMs: number): Promise<void> {
     if (!this.store) return;
     for (const event of events) {
       const text = JSON.stringify(serverEnvelope(this.store.room.roomId, event));
-      let delivered = 0;
+      const deliveredIds: string[] = [];
       for (const playerId of event.recipients) {
         for (const ws of this.ctx.getWebSockets(playerId)) {
           try {
             ws.send(text);
-            delivered += 1;
+            if (!deliveredIds.includes(playerId)) deliveredIds.push(playerId);
           } catch {
             // Socket died between lookup and send; close handling suspends.
           }
         }
       }
-      if (event.type === 'ping' && delivered > 0) {
+      if (event.type === 'ping' && deliveredIds.length > 0) {
         const ping = (event.payload['ping'] as { pingId?: string } | undefined);
-        if (ping?.pingId) this.store.acknowledgePingDelivery(ping.pingId, nowMs);
+        if (ping?.pingId) {
+          this.store.acknowledgePingDeliveryFor(ping.pingId, deliveredIds, nowMs);
+        }
       }
     }
   }
@@ -241,9 +379,23 @@ export class RoomDO implements DurableObject {
       return json({ ok: false, error: 'Not found.', code: 'NOT_FOUND', status: 404 }, 404);
     }
 
+    // Worker<->DO shared secret (P2): the Worker sends it on every
+    // internal /op call; the DO rejects without it when configured.
+    // When DO_OP_SECRET is unset (dev) the check is skipped — the
+    // founder must set it in production (`wrangler secret put
+    // DO_OP_SECRET`) for enforcement.
+    const configuredSecret = this.env.DO_OP_SECRET;
+    if (configuredSecret) {
+      if (req.headers.get('x-pakdam-op-secret') !== configuredSecret) {
+        return json({ ok: false, error: 'Forbidden.', code: 'FORBIDDEN', status: 403 }, 403);
+      }
+    }
+
+    const capped = await readCappedBody(req);
+    if (!capped.ok) return capped.response;
     let body: Record<string, unknown>;
     try {
-      body = (await req.json()) as Record<string, unknown>;
+      body = JSON.parse(capped.text) as Record<string, unknown>;
     } catch {
       return json({ ok: false, error: 'Invalid JSON body.', code: 'VALIDATION_FAILED', status: 400 }, 400);
     }
@@ -294,6 +446,14 @@ export class RoomDO implements DurableObject {
     }
 
     if (!this.store) {
+      // P1-15 intake validation ops answer even without a room: a
+      // nonexistent room is `exists: false`, never an error.
+      if (op === 'room-exists') {
+        return json({ ok: true, exists: false });
+      }
+      if (op === 'check-member') {
+        return json({ ok: true, member: false });
+      }
       return json({ ok: false, error: 'Room not found.', code: 'ROOM_NOT_FOUND', status: 404 }, 404);
     }
     const store = this.store;
@@ -302,6 +462,18 @@ export class RoomDO implements DurableObject {
     const hostTokenHash = asString(body['hostTokenHash']);
 
     switch (op) {
+      case 'room-exists': {
+        // P1-15: intake validation — does this room exist at all? No
+        // credential needed; a room id is a random UUID, not a secret.
+        return json({ ok: true, exists: true });
+      }
+      case 'check-member': {
+        // P1-15: is this playerId an active seat in the room? No
+        // credential — membership existence only, no state is revealed.
+        if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
+        const seat = store.player(playerId);
+        return json({ ok: true, member: seat !== undefined && seat.leftAt === null });
+      }
       case 'add-player': {
         const r = await store.addPlayerAsync({
           displayName: asString(body['displayName']) ?? '',
@@ -499,7 +671,8 @@ export class RoomDO implements DurableObject {
           // Already gone.
         }
       }
-      await this.deleteSession(d.playerId);
+      // Seat-level removal: every tab's session goes (P1-4).
+      await this.deleteSessionsForPlayer(d.playerId);
     }
   }
 
@@ -527,8 +700,12 @@ export class RoomDO implements DurableObject {
     const { playerId, ticketId, expiresAtMs } = redeemed.value;
     const pair = new WebSocketPair();
     const [client, server] = [pair[0] as WebSocket, pair[1] as WebSocket];
-    this.ctx.acceptWebSocket(server, [playerId]);
+    // P1-4: each socket gets its own tab session — the tag carries the
+    // seat AND the tab, so two tabs never share a session record.
+    const sessionId = newId();
+    this.ctx.acceptWebSocket(server, [playerId, `tab:${sessionId}`]);
     await this.putSession({
+      sessionId,
       playerId,
       ticketId,
       ticketExpiresAtMs: expiresAtMs,
@@ -574,7 +751,41 @@ export class RoomDO implements DurableObject {
       }
       return;
     }
-    const session = await this.getSession(playerId);
+    // P0-3 (WS impersonation): the socket's REAL identity is the tag set
+    // at upgrade from the redeemed ticket — never the envelope. Victim
+    // playerIds are in every snapshot, so a client that claims another
+    // seat's id must be rejected BEFORE any session lookup. The tag is
+    // `[playerId, tab:<sessionId>]`; the tab tag also binds this message
+    // to one tab's session record (P1-4).
+    const tags = this.ctx.getTags(ws);
+    const socketPlayerId = tags.find((t) => !t.startsWith('tab:')) ?? null;
+    const tabTag = tags.find((t) => t.startsWith('tab:'));
+    const tabSessionId = tabTag !== undefined ? tabTag.slice('tab:'.length) : undefined;
+    if (socketPlayerId === null || socketPlayerId !== playerId) {
+      const envelope = JSON.stringify({
+        v: 1,
+        type: 'error',
+        roomId: this.store.room.roomId,
+        payload: {
+          code: 'FORBIDDEN',
+          message: 'Socket identity does not match the message playerId.',
+          retryable: false,
+          serverTs: new Date(nowMs).toISOString(),
+        },
+      });
+      try {
+        ws.send(envelope);
+      } catch {
+        // Socket already gone; the close below still applies.
+      }
+      try {
+        ws.close(4403, 'Socket identity does not match the message playerId.');
+      } catch {
+        // Ignore.
+      }
+      return;
+    }
+    const session = await this.getSession(playerId, tabSessionId);
     if (!session) {
       try {
         ws.close(4401, 'No session — reconnect with a fresh ticket.');
@@ -591,9 +802,13 @@ export class RoomDO implements DurableObject {
       }
     };
 
-    // Any inbound traffic proves liveness (heartbeat bookkeeping).
-    session.lastHeartbeatAtMs = nowMs;
-    session.missedHeartbeats = 0;
+    // Heartbeat liveness (P2): only an actual `heartbeat` message — or a
+    // location update, which proves the same thing — resets the timer.
+    // Any other inbound traffic does NOT prove the socket is alive.
+    if (type === 'heartbeat' || type === 'location.update') {
+      session.lastHeartbeatAtMs = nowMs;
+      session.missedHeartbeats = 0;
+    }
 
     if (!session.helloDone) {
       if (type !== 'hello') {
@@ -674,7 +889,7 @@ export class RoomDO implements DurableObject {
     }
 
     const result = await this.store.handleWsMessage(
-      { playerId, sessionId: session.ticketId },
+      { playerId, sessionId: session.sessionId },
       {
         type,
         commandId: typeof data['commandId'] === 'string' ? (data['commandId'] as string) : undefined,
@@ -688,12 +903,16 @@ export class RoomDO implements DurableObject {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, result.persist));
     }
     if (result.close) {
-      await this.deleteSession(playerId);
+      // P1-4: leaving/closing removes THIS tab's session only — a second
+      // tab's session (and socket) is untouched. The seat itself left,
+      // so the other tab's next message gets a 4403 close.
+      await this.deleteSession(playerId, session.sessionId);
       closeSocket(result.close.code, result.close.reason);
     }
     await this.maybeWarnRenewal(session, nowMs);
     await this.save();
     await this.armAlarm();
+    await this.maybeUnregisterCode();
   }
 
   /** Warn once when the socket's ticket expires within 30 s. */
@@ -728,9 +947,11 @@ export class RoomDO implements DurableObject {
   }
 
   /**
-   * Socket close marks the seat suspended — NEVER removal. A close event
-   * does not name its seat, so sweep every session: any seat with no
-   * remaining socket and still in the room is suspended.
+   * Socket close marks the seat suspended — NEVER removal, and NEVER
+   * while another tab's socket is still alive (P1-4). A close event does
+   * not name its seat, so sweep every session: a tab with no remaining
+   * socket loses its record; a seat with no remaining socket at all is
+   * suspended. A surviving tab's reconnect no longer races this sweep.
    */
   private async suspendClosedSeats(nowMs: number): Promise<void> {
     if (!this.store) return;
@@ -740,14 +961,17 @@ export class RoomDO implements DurableObject {
     for (const session of sessions) {
       const seat = this.store.player(session.playerId);
       if (!seat || seat.leftAt !== null) {
-        await this.deleteSession(session.playerId);
+        await this.deleteSessionsForPlayer(session.playerId);
         continue;
       }
+      // This tab is gone only when its own tag has no socket left.
+      if (this.ctx.getWebSockets(`tab:${session.sessionId}`).length > 0) continue;
+      await this.deleteSession(session.playerId, session.sessionId);
+      // Suspend only when NO socket remains for the whole seat.
       if (this.ctx.getWebSockets(session.playerId).length > 0) continue;
       const r = this.store.suspendSeat(session.playerId, 'network-lost', nowMs);
       events.push(...r.events);
       persist.push(...r.persist);
-      await this.deleteSession(session.playerId);
     }
     if (events.length > 0) await this.deliver(events, nowMs);
     if (persist.length > 0) {
@@ -775,21 +999,25 @@ export class RoomDO implements DurableObject {
       if (!session.helloDone) continue;
       const missed = Math.floor((nowMs - session.lastHeartbeatAtMs) / HEARTBEAT_INTERVAL_MS);
       if (missed >= HEARTBEAT_MISSED_LIMIT) {
-        // Dead socket: close it (1006, 'heartbeat timeout') so the client
+        // Dead socket: close it (1011, 'heartbeat timeout') so the client
         // reconnect path re-syncs via snapshot; the seat is suspended.
-        for (const ws of this.ctx.getWebSockets(session.playerId)) {
+        // 1006 is reserved (RFC 6455 §7.4) and must never be sent. Only
+        // THIS tab's sockets close (P1-4) — a second tab is unaffected —
+        // and the seat suspends only when no socket remains for it.
+        for (const ws of this.ctx.getWebSockets(`tab:${session.sessionId}`)) {
           try {
-            ws.close(1006, 'heartbeat timeout');
+            ws.close(1011, 'heartbeat timeout');
           } catch {
             // Already gone.
           }
         }
+        await this.deleteSession(session.playerId, session.sessionId);
+        if (this.ctx.getWebSockets(session.playerId).length > 0) continue;
         const r = this.store.suspendSeat(session.playerId, 'heartbeat-timeout', nowMs);
         await this.deliver(r.events, nowMs);
         if (r.persist.length > 0) {
           this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, r.persist));
         }
-        await this.deleteSession(session.playerId);
         continue;
       }
       session.missedHeartbeats = missed;
@@ -799,6 +1027,7 @@ export class RoomDO implements DurableObject {
 
     await this.save();
     await this.armAlarm();
+    await this.maybeUnregisterCode();
   }
 }
 
@@ -808,18 +1037,30 @@ export class RoomDO implements DurableObject {
 
 export class CodeRegistryDO implements DurableObject {
   private readonly ctx: DurableObjectState;
+  private readonly env: Env;
 
-  constructor(ctx: DurableObjectState, _env: Env) {
+  constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
+    this.env = env;
   }
 
   async fetch(req: Request): Promise<Response> {
     if (req.method !== 'POST') {
       return json({ ok: false, error: 'Method not allowed.', code: 'VALIDATION_FAILED', status: 405 }, 405);
     }
+    // Same Worker<->DO shared secret as the room DO (P2); skipped when
+    // DO_OP_SECRET is unset (dev).
+    const configuredSecret = this.env.DO_OP_SECRET;
+    if (configuredSecret) {
+      if (req.headers.get('x-pakdam-op-secret') !== configuredSecret) {
+        return json({ ok: false, error: 'Forbidden.', code: 'FORBIDDEN', status: 403 }, 403);
+      }
+    }
+    const capped = await readCappedBody(req);
+    if (!capped.ok) return capped.response;
     let body: Record<string, unknown>;
     try {
-      body = (await req.json()) as Record<string, unknown>;
+      body = JSON.parse(capped.text) as Record<string, unknown>;
     } catch {
       return json({ ok: false, error: 'Invalid JSON body.', code: 'VALIDATION_FAILED', status: 400 }, 400);
     }

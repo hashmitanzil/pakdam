@@ -78,10 +78,11 @@ export function resolveHunterCount(input: {
   hostHunterCount: number;
 }): number {
   if (input.balanceHunters) return balancedHunterCount(input.rosterSize);
-  // No silent clamp: the host's chosen count is honoured as-is. A count
-  // that leaves no Runner is rejected by the caller (assignRoles) with a
-  // plain-words reason, and by the client start gate before that — never
-  // silently reduced to fewer Hunters than the host chose.
+  // Clamped to at least 1 Hunter: the host's chosen count is honoured
+  // as-is above that floor (a count of 0 or negative is clamped to 1,
+  // not silently reduced from a larger choice). A count that leaves no
+  // Runner is rejected by the caller (assignRoles) with a plain-words
+  // reason, and by the client start gate before that.
   return Math.max(1, Math.floor(input.hostHunterCount));
 }
 

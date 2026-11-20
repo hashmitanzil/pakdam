@@ -103,6 +103,7 @@ export class PakdamSocket {
   private lastRetryAfterSeconds = 0;
   private reconnectAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private leaveTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private missedHeartbeats = 0;
   private freshTicketReconnectUsed = false;
@@ -153,12 +154,18 @@ export class PakdamSocket {
     await this.connect();
   }
 
-  /** Clean close: best-effort `leave`, then close 1000. Never auto-reconnects. */
+  /**
+   * Clean close: plain close, NO `leave` (P0-1). The socket close only
+   * suspends the seat — the player is still in the room and a reconnect
+   * resumes them. Leaving the room is `leave()` below: it sends `leave`
+   * first, then closes. Cleanups (unmount / tab close) MUST call this,
+   * never `leave()`, or a remount / reconnect would drop the seat.
+   */
   close(reason: string | null = null): void {
+    void reason;
     this.closedByClient = true;
     this.clearTimers();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.sendCommand('leave', { reason });
       this.ws.close(1000, 'client closed');
     }
     this.ws = null;
@@ -166,9 +173,42 @@ export class PakdamSocket {
     this.detachVisibility();
   }
 
+  /**
+   * Leave the room: best-effort `leave`, then close (P0-1). The `leave`
+   * frame is given a short grace (200 ms) to flush before the socket
+   * closes — closing immediately after `send` can drop the frame, and
+   * the server would only suspend the seat instead of marking it left.
+   * The server also closes the socket (1000) once it processes `leave`;
+   * whichever close lands first wins and the grace timer is cleared.
+   */
+  leave(reason: string | null = null): boolean {
+    this.closedByClient = true;
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.close();
+      return false;
+    }
+    const sent = this.sendCommand('leave', { reason });
+    if (!sent) {
+      this.close();
+      return false;
+    }
+    this.leaveTimer = setTimeout(() => {
+      this.leaveTimer = null;
+      this.close();
+    }, 200);
+    return true;
+  }
+
   // -- Outbound commands (all via sendCommand; false when disconnected) ---
 
-  /** Send a command. Retries must reuse the same `commandId` (the DO drops repeats for 10 min). */
+  /**
+   * Send a command. Retries must reuse the same `commandId` (the DO drops
+   * repeats for 10 min) — pass the original id back in; a retry that mints
+   * a fresh id is a new command and can double-apply (P1-9). There is no
+   * automatic resend in this client: commands sent while disconnected are
+   * discarded, never queued (R12), so the only retries are explicit ones
+   * by the caller, which must carry the same `commandId`.
+   */
   sendCommand<TPayload extends AnyPayload>(
     type: WsClientMessageType,
     payload: TPayload,
@@ -281,10 +321,6 @@ export class PakdamSocket {
 
   safetySos(reason: string | null = null): boolean {
     return this.sendCommand('safety.sos', { reason });
-  }
-
-  leave(reason: string | null = null): boolean {
-    return this.sendCommand('leave', { reason });
   }
 
   /** Best-effort suspension notice (exempt from WS rate limits). */
@@ -488,11 +524,12 @@ export class PakdamSocket {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
       this.missedHeartbeats += 1;
       if (this.missedHeartbeats > this.options.heartbeatMissedLimit) {
-        // Dead socket: close it (1006, 'heartbeat timeout') so the
-        // reconnect path re-syncs via snapshot.
+        // Dead socket: close it (1011, 'heartbeat timeout') so the
+        // reconnect path re-syncs via snapshot. 1006 is reserved
+        // (RFC 6455 §7.4) and must never be sent.
         this.stopHeartbeat();
         try {
-          this.ws.close(1006, 'heartbeat timeout');
+          this.ws.close(1011, 'heartbeat timeout');
         } catch {
           // Already closing.
         }
@@ -511,6 +548,10 @@ export class PakdamSocket {
 
   private clearTimers(): void {
     this.stopHeartbeat();
+    if (this.leaveTimer !== null) {
+      clearTimeout(this.leaveTimer);
+      this.leaveTimer = null;
+    }
     if (this.reconnectTimer !== null) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

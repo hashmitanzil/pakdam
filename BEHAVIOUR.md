@@ -21,14 +21,18 @@ no leaderboard, no points store — the match, its catches and its result are th
   with a stepper. Random ON (default) draws Hunters at random; Random OFF lets the host tap roster names to pick
   them. Roles are drawn once, at head start, and never re-drawn.
 - **Defaults:** Classic · 30 min round · 3 min head start · pings every 3 min · zone 500 m radius · shrinking ON
-  every 10 min (−25% radius per shrink) · ping history OFF · play zone ON · final size Auto.
-- **Readiness gate (server + client must agree).** Start needs active seats ≥ 3 (`MIN_PLAYERS = 3`) **and** every
+  every 10 min (−25% radius per shrink) · play zone ON · final size Auto.
+- **Readiness gate (server + client must agree).** Start needs active seats ≥ 2 (`MIN_PLAYERS = 2`) **and** every
   active seat ready. One tap — "I'm ready" — sends ready and confirms the briefing together. A blocked Start
   always says why in one line; never a silent disabled button.
 - **Zone.** Circle or host-drawn polygon (tap-to-place, 3 taps = triangle), radius min 100 m, no maximum. Never
   auto-centred on a fix worse than ±50 m — the host places it by hand instead. Each shrink scales the zone to 75%
   of its radius, then moves it to a **random position fully inside the old boundary — never concentric**
-  (near-concentric draws are discarded and re-drawn). The next zone is hidden until the shrink preview.
+  (near-concentric draws are discarded and re-drawn). Exactly 3 shrinks per round, at duration/3, 2·duration/3
+  and duration (a 30-min round shrinks at 10, 20 and 30 min), so after 3 shrinks the radius is 0.75³ = 42% of
+  the start radius (not 25%). Final size is Auto-only — no manual control. 30 s before each shrink the server
+  broadcasts a `zone.preview` with the next boundary; the client draws the dashed preview ring + "Next zone in
+  MM:SS" and never guesses a boundary of its own.
 - **Outside the zone: 30 s, then ejection.** A player outside gets a 30-second return countdown on their own
   screen; at 0 they are ejected. Poor GPS freezes the countdown (counted seconds stay); back inside clears it.
   Ejection is never undone by rejoining, and an ejected Runner counts as out for win purposes but is recorded as
@@ -43,11 +47,16 @@ no leaderboard, no points store — the match, its catches and its result are th
   replaces it, showing its age (e.g. `0:20 ago`). No fix = no ping, never an invented position. Ping dots are
   coloured by the subject's team: GREEN for a Runner, RED for a Hunter.
 - **Catch flow — tag → QR → runner confirms → manual fallback, NO catch code.** Hunter tags in person; Runner
-  shows their QR (`SHOW MY QR`); Hunter scans it; Runner confirms on their own phone (`YES, I WAS TAGGED` /
-  `NO — DISPUTE`). If the camera fails, manual fallback: Hunter picks the Runner from a name list, Runner confirms
-  the same way. No code is ever shown, spoken or typed — the token lives only inside the QR. A disputed catch goes
-  to the host, whose decision is final. Runner confirmation is always required; a tag never counts at once. The
-  catch page auto-selects the effective Runner (URL param → my open claim → picker choice → my latest confirmed
+  shows their QR (`SHOW MY QR`); Hunter scans it; Runner confirms on their own phone (`YES, I WAS TAGGED`).
+  There is NO dispute button (founder decision — the disputed state exists server-side only as
+  defense-in-depth and is unreachable from the UI; the host resolve endpoint stays server-only). If the camera
+  fails, manual fallback: Hunter picks the Runner from a name list, Runner confirms the same way. A Hunter who
+  scanned a valid QR token may also confirm directly (hunter-scan-confirms-directly). No code is ever shown,
+  spoken or typed — the token lives only inside the QR. Runner confirmation is always required; a tag never
+  counts at once. **A tag is physical:** it confirms only when the Hunter and the Runner both have a recent fix
+  and are within 100 m of each other (`CATCH_MAX_DISTANCE_METERS`) — missing/stale GPS answers "Waiting for GPS
+  — move closer and try again". A tag must not complete with both phones in different cities. The catch page
+  auto-selects the effective Runner (URL param → my open claim → picker choice → my latest confirmed
   catch) and otherwise shows a name-only picker — never a "No Runner selected" dead end, and never a role reveal
   (a wrong pick is rejected by the server in plain words).
 - **Safety, during play only.** Any player may pause the match (clock freezes; resume returns to the phase paused
@@ -57,10 +66,11 @@ no leaderboard, no points store — the match, its catches and its result are th
   running and a pending catch cannot complete while the Runner is suspended. See §6 for the resume rule.
 - **Scoring (completed matches only).** Runner +1 per whole 3 min free; +10 never caught (still free at end);
   Hunter +3 per confirmed tag; +10 clean sweep to every Hunter on the winning side when every Runner was caught
-  (ejected Runners break the sweep).
+  (ejected Runners break the sweep). A flipped Infection Runner keeps the Runner free-time points earned before
+  the flip (free time stops at the flip) and earns Hunter tag points for tags made after flipping.
 - **Location honesty.** Only fixes accurate to ±50 m or better are ever sent. Poor accuracy is warned, never
-  treated as cheating. GPS is supporting evidence for a catch only — never proof, never a rejection on its own.
-  Foreground-only: location stops when the tab hides.
+  treated as cheating. GPS evidence (`gpsEvidence`) is supporting only — but a tag itself is physical (see the
+  catch flow: both phones need a recent fix within 100 m). Foreground-only: location stops when the tab hides.
 
 ## 3. Protocol in brief
 
@@ -105,10 +115,10 @@ and protocol version must be 1.
 `briefing.confirm`; radio / voice — `radio.send`, `signal.send`, `voice.signal`; other — `pin.place`,
 `announcement.send`, `leave`, `player.suspended`.
 
-**Server → client (34 types):** connection — `welcome`, `snapshot`, `room.state`, `ticket.renewal-required`,
+**Server → client (35 types):** connection — `welcome`, `snapshot`, `room.state`, `ticket.renewal-required`,
 `auth.refreshed`, `heartbeat.ack`, `error`; roster — `player.joined`, `player.left`, `player.removed`,
 `player.suspended`, `player.resumed`, `player.visibility`, `host.transferred`; play — `ping`, `ping.expired`,
-`zone.update`, `reveal`, `pin`, `signal`, `radio`, `voice.signal`, `announcement`; catch — `catch.requested`,
+`zone.update`, `zone.preview`, `reveal`, `pin`, `signal`, `radio`, `voice.signal`, `announcement`; catch — `catch.requested`,
 `catch.confirmed`, `catch.disputed`, `catch.expired`, `catch.rejected`; safety — `safety.paused`,
 `safety.resumed`, `sos.raised`; match — `match.started`, `match.completed`, `match.cancelled`.
 
@@ -143,13 +153,16 @@ with a Retry button (retry resets attempts and fetches a fresh ticket). On tab-h
 ## 4. Room state + state machine
 
 **Snapshot payload** (`WsSnapshotPayload`) — the whole truth the UI renders: `{ room, players, phase, version,
-serverSeq, locationStatus, activeCatches, safetyState, missedAnnouncements }`. `room` is `{ roomId, roomCode,
-hostPlayerId, phase, version, config, createdAt, startedAt, endsAt, pausedAt, result }`; `result` is `{ outcome,
-durationSeconds, caughtRunnerIds, survivingRunnerIds }` — no routes, no coordinate trails. `players` are
-`PlayerView`: each seat sees its **own** role/team only — every other seat's role is `null` (the Hunter's catch
-picker shows names only; caught/survivor lists come from `room.result` only). `locationStatus` is per-player
-`known | unknown`; `activeCatches` holds pending catches only (confirmed ones never appear — the catch page keeps
-a session-only list of those it saw arrive); `safetyState` is `{ paused, pausedBy, pausedAt, sosActive }`.
+serverSeq, locationStatus, activeCatches, decidedCatches, teammateIds, teammateFixes, safetyState,
+missedAnnouncements }`. `room` is `{ roomId, roomCode, hostPlayerId, phase, version, config, createdAt, startedAt,
+endsAt, pausedAt, result }`; `result` is `{ outcome, durationSeconds, caughtRunnerIds, survivingRunnerIds, tags }`
+— no routes, no coordinate trails. `players` are `PlayerView`: each seat sees its **own** role/team only — every
+other seat's role is `null` (the Hunter's catch picker shows names only; caught/survivor lists come from
+`room.result` only). `locationStatus` is per-player `known | unknown`; `activeCatches` holds pending AND disputed
+catches (a disputed catch still needs host resolution); `decidedCatches` holds confirmed/disputed catches so the
+after-tagged screen and auto-spectator state survive a reload; `teammateIds` / `teammateFixes` carry the viewer's
+teammates' live positions (opponents never; a caught Runner gets an empty view); `safetyState` is
+`{ paused, pausedBy, pausedAt, sosActive }`.
 
 **What a snapshot never carries:** raw coordinates, pending pings, token hashes. Pings arrive only as `ping`
 events after connect; a reconnect loses earlier pings.
@@ -170,9 +183,11 @@ tickets, rate-limit windows, idempotency set.
 ## 5. Supabase schema in brief
 
 **Verdict: no schema change is needed.** Deploy set stays **0001 + 0003 + 0004** in order on the same project
-(Mumbai); **0002 RLS stays held** in `migrations-deferred/` until the auth-method decision (OD-022) lands — guest
-seats have no profile, so the held policies could never satisfy them. If the schema ever changes, write a new
-numbered migration; never edit 0001/0003/0004 in place on a live project. The Worker talks to Supabase over plain
+(Mumbai); **0002 RLS is HELD and not written yet** — there is no `migrations-deferred/` folder and no RLS
+policies exist anywhere in the tree. RLS was deliberately held until the auth-method decision (OD-022) lands —
+guest seats have no profile, so the held policies could never satisfy them. Do NOT write RLS policies until the
+founder approves the auth method. If the schema ever changes, write a new numbered migration; never edit
+0001/0003/0004 in place on a live project. The Worker talks to Supabase over plain
 `fetch` to PostgREST, no client SDK; `SUPABASE_URL` is a plain `[vars]` value in `wrangler.toml`, the service-role
 key is a secret. Persistence is best-effort by design — a failed insert never fails a game request. Never
 persisted: raw coordinates, raw tokens of any kind (hashes only), WS tickets.
@@ -207,7 +222,7 @@ cannot judge whether a place is dangerous; the real safety layer is the host's v
   after a valid hello; the demo path resumes on catch-page arrival and on tab-visible. A suspended Runner must be
   able to confirm a catch — that was the old catch-22.
 - [ ] **Catch auto-select + name-only picker, QR + manual fallback, no catch code** (§2 catch flow).
-- [ ] **Readiness gate: every player ready + MIN_PLAYERS = 3** (§2), client and server gates agreeing.
+- [ ] **Readiness gate: every player ready + MIN_PLAYERS = 2** (§2), client and server gates agreeing.
 - [ ] **Random next zone per shrink, never concentric** (§2).
 - [ ] **Pings stay until the next ping** (§2), with age shown.
 - [ ] **Team-only voice radio.** WebRTC P2P between teammates only; the DO rejects cross-team signals.
@@ -227,12 +242,33 @@ cannot judge whether a place is dangerous; the real safety layer is the host's v
 - [ ] **Snapshot + privacy rules** (§4): no raw coordinates, no pending pings, no token hashes; role secrecy;
   fixes in DO memory only.
 - [ ] **CSP / HSTS headers** on the Worker (the old build had none).
-- [ ] **Catch-resolve path decided:** either wire the host resolve endpoint into the UI or delete it — no
-  half-wired third state.
+- [ ] **Catch-resolve path decided:** NO dispute button (founder decision) — the host resolve endpoint stays
+  server-only and the disputed state is unreachable from the UI; no half-wired third state in the client.
 - [ ] **Demo parity:** demo pings auto-fire on schedule; demo shrink uses the random-offset draw; demo SOS says
   plainly it notifies nobody.
 - [ ] **Session credentials:** one sessionStorage key, two separate tokens (reconnect vs host — sending one as
   the other 403s), empty token on restore never overwrites a good stored token.
+
+### Founder-ordered deviations from the SCRAM reference
+
+Where the SCRAM spec (the video reference) and the decided Pakdam build disagree, Pakdam wins. The deviations
+that keep resurfacing in audits, so they are recorded here rather than re-litigated:
+
+- **Setup is two screens (setup → lobby), not one.** The host configures the game, then the lobby is a
+  separate screen.
+- **Steppers, not sliders.** All numeric controls are ShadowHunt −/+ steppers (round length, head start, ping
+  interval, zone radius, shrink interval, Hunter count, corners).
+- **No join input on the home screen.** Joining happens by code from the create/join flow, not from a home
+  input box.
+- **Toggle shape:** plain switches, no custom toggle component.
+- **Hunter-scan-confirms-directly.** A Hunter who scanned a valid QR token may confirm the tag themself; the
+  Runner's manual confirm is the fallback, not the only path.
+- **Final size Auto-only.** No final-size control; the final radius is 0.75³ = 42% after the 3 shrinks.
+- **No dispute.** There is no dispute button and no dispute UI; the disputed state exists server-side only.
+- **No no-go zone.** The host-drawn no-go area feature is not built; the `noGoAreas` type/validation/plumbing
+  stays dormant in the tree and must not be removed or revived without a founder decision.
+- **MIN_PLAYERS = 2, not 3.** The SCRAM spec's "min 3 to start" is superseded; the balance table starts at
+  2–4 players → 1 Hunter.
 
 ## 7. Pointers
 

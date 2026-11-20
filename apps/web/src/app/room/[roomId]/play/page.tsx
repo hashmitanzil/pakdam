@@ -19,6 +19,8 @@ import { use, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   OUTSIDE_ZONE_RETURN_SECONDS,
+  ZONE_AUTO_CENTRE_MAX_ACCURACY_M,
+  type GeoPolygon,
   type LocationFix,
   type MatchPhase,
   type Ping,
@@ -34,6 +36,8 @@ import { useRoomState } from '@/components/match/useRoomState';
 import { StatusStrip } from '@/components/hud/StatusStrip';
 import { PlayerDots, type PlayerDot } from '@/components/hud/PlayerDots';
 import { PlayMap } from '@/components/hud/PlayMap';
+import { effectiveHunterCount } from '@/components/host-setup/draft';
+import { endLiveMatch } from '@/lib/live-client';
 import { RadioStrip } from '@/components/radio/RadioStrip';
 import { PTTButton } from '@/components/radio/PTTButton';
 import { SafetyControls } from '@/components/match/SafetyControls';
@@ -47,6 +51,7 @@ import { requestWakeLock } from '@/lib/wake-lock';
 import { clearSession } from '@/lib/session-credentials';
 import {
   ejectPlayer,
+  endDemoMatch,
   getRoom,
   hostCheckin,
   leaveRoom,
@@ -102,7 +107,26 @@ export default function PlayPage({
     retryConnection,
     refreshDemo,
     sendRadio,
+    reveals,
+    sendReveal,
+    leave,
   } = state;
+
+  /**
+   * `nextZonePreview` (P1-18: the DO's `zone.preview`, 30 s before a
+   * shrink) has not landed in the hook yet — read it through a defensive
+   * cast so this page compiles and picks it up the moment it does.
+   * `reveals` / `sendReveal` / `leave` are already on the hook and are
+   * destructured above.
+   */
+  const hookExtras = state as unknown as {
+    nextZonePreview?: {
+      boundary: GeoPolygon;
+      firesAtMs: number;
+      shrinkIndex: number;
+    } | null;
+  };
+  const nextZonePreview = hookExtras.nextZonePreview ?? null;
 
   const [tab, setTab] = useState<BottomTabId>('map');
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -114,6 +138,9 @@ export default function PlayPage({
   const [radioUnread, setRadioUnread] = useState(0);
   const [leaveArmed, setLeaveArmed] = useState(false);
   const [sosSent, setSosSent] = useState(false);
+  // Hold-to-reveal (P1-19): press-and-hold ~1 s, then sendReveal fires.
+  const [revealHolding, setRevealHolding] = useState(false);
+  const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Voice radio state (live only — demo has no signalling channel).
   const [voiceRadio, setVoiceRadio] = useState<VoiceRadio | null>(null);
@@ -163,6 +190,14 @@ export default function PlayPage({
       if (handle) void handle.release();
     };
   }, []);
+
+  // A hold-to-reveal timer must never fire after unmount.
+  useEffect(
+    () => () => {
+      if (revealTimerRef.current) clearTimeout(revealTimerRef.current);
+    },
+    [],
+  );
 
   // Role reveal, once per role (an Infection flip shows it again).
   useEffect(() => {
@@ -236,7 +271,7 @@ export default function PlayPage({
       return;
     }
     // Poor GPS freezes the countdown — seconds already counted stay.
-    if (fix.accuracyMeters <= 50) {
+    if (fix.accuracyMeters <= ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
       outsideAccumRef.current += 1000;
     }
     const left = Math.max(
@@ -322,7 +357,11 @@ export default function PlayPage({
     () => players.filter((p) => p.leftAt === null),
     [players],
   );
-  const hunterCount = room?.config.hunterCount ?? 0;
+  // Effective Hunter count (Balance ON reads the balance table from the
+  // roster; Balance OFF honours the host's stepper) — never the raw
+  // `config.hunterCount`, which the server does not draw while Balance
+  // is ON. The HUD "runners left" and the role-reveal text use this.
+  const hunterCount = room ? effectiveHunterCount(room.config, activePlayers.length) : 0;
   const runnersTotal = Math.max(0, activePlayers.length - hunterCount);
   const caughtIds = useMemo(
     () =>
@@ -453,11 +492,15 @@ export default function PlayPage({
         playerId: `ping-${ping.pingId}`,
         displayName: subject.displayName,
         tone: ping.recipientRole === 'hunters' ? 'ping-runner' : 'ping-hunter',
-        label: ageLabelFromTimestamp(new Date(ping.createdAt).getTime(), nowMs),
+        // Demo pings are simulated (fired by the local store, not the
+        // server) — labelled so, wherever they are shown.
+        label:
+          ageLabelFromTimestamp(new Date(ping.createdAt).getTime(), nowMs) +
+          (mode === 'demo' ? ' · (simulated)' : ''),
       });
     }
     return out;
-  }, [players, myPlayer, myPlayerId, teammateIds, visiblePings, nowMs, amCaught, isSpectator]);
+  }, [players, myPlayer, myPlayerId, teammateIds, visiblePings, nowMs, amCaught, isSpectator, mode]);
 
   const myLastFixMs = myPlayer?.lastFixAt ? new Date(myPlayer.lastFixAt).getTime() : null;
   const isSuspended = myPlayer?.connectionState === 'suspended';
@@ -523,7 +566,11 @@ export default function PlayPage({
   };
   const handleAnnounceSafe = () => {
     if (mode === 'live') {
-      socketRef.current?.sendCheckIn();
+      // Failure feedback, like SOS / pause / resume: a silent no-send
+      // leaves the player thinking the host was told.
+      if (!socketRef.current?.sendCheckIn()) {
+        setNotice('Not connected — "I\'m safe" was not sent. Wait for the reconnect, then tap again.');
+      }
     } else {
       const current = getRoom(roomId);
       if (current) {
@@ -538,13 +585,54 @@ export default function PlayPage({
       return;
     }
     if (mode === 'live') {
-      socketRef.current?.close('left from play');
+      // P0-1: the hook's `leave()` sends `leave` then closes. Plain
+      // `close()` no longer leaves — never call it here.
+      leave();
     } else {
       const current = getRoom(roomId);
       if (current) leaveRoom(current, myPlayerId);
     }
     clearSession(roomId);
     router.push('/');
+  };
+  const handleEndRound = () => {
+    if (!isHost) return;
+    if (mode === 'live') {
+      void endLiveMatch(roomId).catch(() => {
+        setNotice('Could not end the round — check your connection and try again.');
+      });
+      return;
+    }
+    const current = getRoom(roomId);
+    if (current) {
+      endDemoMatch(current);
+      refreshDemo();
+    }
+  };
+  // Hold-to-reveal (P1-19): press-and-hold ~1 s, then the reveal is sent.
+  // Releasing early cancels — a tap never reveals by accident. The hook
+  // sends my current fix (live only); a false return means no fresh fix
+  // or no connection, and the player is told so.
+  const startRevealHold = () => {
+    if (revealTimerRef.current) return;
+    setRevealHolding(true);
+    revealTimerRef.current = setTimeout(() => {
+      revealTimerRef.current = null;
+      setRevealHolding(false);
+      const sent = sendReveal(myFixRef.current ?? undefined);
+      setNotice(
+        sent
+          ? 'Reveal sent — your position is shared briefly.'
+          : 'Reveal was not sent — make sure your location is on, then hold again.',
+      );
+    }, 1000);
+  };
+  const cancelRevealHold = () => {
+    if (revealTimerRef.current) {
+      clearTimeout(revealTimerRef.current);
+      revealTimerRef.current = null;
+    }
+    setRevealHolding(false);
   };
   const handleResumeSharing = () => {
     if (mode !== 'demo') return;
@@ -570,7 +658,12 @@ export default function PlayPage({
         <p className="py-6 text-center text-[15px] text-white">
           {error ?? 'No live seat saved on this device for this room.'}
         </p>
-        <Button variant="primary" onClick={() => router.push('/')}>
+        {/* A transient first-paint GET failure must not dead-end the
+            screen — Retry re-requests the snapshot (P1-23). */}
+        <Button variant="primary" onClick={retryConnection}>
+          Retry
+        </Button>
+        <Button variant="outline" onClick={() => router.push('/')}>
           Go home
         </Button>
       </main>
@@ -659,7 +752,7 @@ export default function PlayPage({
       {mode === 'live' && socketState === 'reconnect-failed' ? (
         <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3">
           <p className="text-[14px] text-white">
-            {socketError ?? 'Not connected — your readiness was not sent.'}
+            {socketError ?? 'Not connected — the match will resume when the connection returns.'}
           </p>
           <button
             type="button"
@@ -680,12 +773,19 @@ export default function PlayPage({
         <div className="relative min-h-[420px] flex-1">
           <PlayMap
             zoneBoundary={zoneBoundary}
+            // Next-zone preview (P1-18): the DO's `zone.preview`, 30 s
+            // before the shrink — dashed ring + "Next zone in MM:SS".
+            // Null outside the preview window; the next zone is never guessed.
+            nextZoneBoundary={nextZonePreview?.boundary ?? null}
+            nextZoneFiresAtMs={nextZonePreview?.firesAtMs ?? null}
             pings={visiblePings}
             noGoAreas={room.config.noGoAreas}
             myFix={myFix}
             // Teammates' live positions (green dots). A spectator sees no
             // live dots, so nothing is passed while spectating.
             teammateFixes={isSpectator ? {} : teammateFixes}
+            reveals={reveals}
+            nowMs={nowMs}
           />
           <PlayerDots dots={dots} />
           <div className="absolute bottom-3 right-3 z-10 flex flex-col items-center gap-3">
@@ -753,6 +853,41 @@ export default function PlayPage({
         </p>
       ) : null}
 
+      {/* Hold-to-reveal (P1-19): press-and-hold ~1 s to share your
+          position with everyone. Releasing early cancels — a tap never
+          reveals by accident. Live only: the hook's sendReveal has no
+          demo path (it returns false there), so the button stays hidden
+          in demo instead of always failing. */}
+      {tab === 'map' && mode === 'live' && myRole && !isSpectator ? (
+        <button
+          type="button"
+          aria-label="Hold to reveal your position"
+          onPointerDown={startRevealHold}
+          onPointerUp={cancelRevealHold}
+          onPointerLeave={cancelRevealHold}
+          onPointerCancel={cancelRevealHold}
+          onContextMenu={(e) => e.preventDefault()}
+          className={`flex h-12 w-full select-none items-center justify-center rounded-[14px] border text-[15px] font-bold text-white transition-colors ${
+            revealHolding ? 'border-[#F59E0B] bg-[#F59E0B]/30' : 'border-[#26262B] bg-[#141416]'
+          }`}
+        >
+          {revealHolding ? 'Keep holding to reveal…' : 'Hold to reveal your position'}
+        </button>
+      ) : null}
+
+      {/* Incoming reveals: someone shared their position — amber ring on
+          the map, named here. Expired reveals drop off on their own. */}
+      {tab === 'map' &&
+      reveals.filter((r) => r.expiresAtMs > nowMs).length > 0 ? (
+        <p className="text-center text-[13px] text-[#F59E0B]">
+          {reveals
+            .filter((r) => r.expiresAtMs > nowMs)
+            .map((r) => r.displayName)
+            .join(', ')}{' '}
+          revealed their position
+        </p>
+      ) : null}
+
       {announcements.length > 0 && tab === 'map' ? (
         <p className="text-center text-[13px] text-[#A1A1AA]">
           {announcements[announcements.length - 1]?.text}
@@ -767,10 +902,21 @@ export default function PlayPage({
 
       <Sheet open={tab === 'more'} onClose={() => setTab('map')} title="More">
         <div className="flex flex-col gap-4">
-          {/* No "End the round" row here on purpose: ending a match is a
-              server-only lifecycle action (POST …/lifecycle, host-only) with
-              no client protocol path — no WS message and no UI call. Do not
-              add the row until that path is wired. */}
+          {/* Host only: end the round early (POST …/lifecycle, host-only).
+              The match completes with the mode-aware outcome and the play
+              screen redirects to results. */}
+          {isHost && (phase === 'HEAD_START' || phase === 'ACTIVE' || phase === 'SAFETY_PAUSED') ? (
+            <button
+              type="button"
+              onClick={() => {
+                setTab('map');
+                handleEndRound();
+              }}
+              className="self-start text-[15px] font-semibold text-[#EF4444]"
+            >
+              End the round
+            </button>
+          ) : null}
           <SafetyControls
             phase={phase}
             paused={safetyState.paused}
@@ -816,7 +962,7 @@ export default function PlayPage({
             <p className="max-w-[320px] text-[17px] leading-snug">
               {reveal === 'hunter'
                 ? `Find and tag all ${runnersTotal} runners in ${formatDurationShort(room.config.durationSeconds)}. They get a ${formatDurationShort(room.config.headStartSeconds)} head start.`
-                : 'Outlast the clock. You see each other only when you ping.'}
+                : 'Outlast the clock. Hunters see you only when you ping.'}
             </p>
             {teammates.length > 0 ? (
               <p className="text-[14px] text-white/85">
@@ -825,7 +971,7 @@ export default function PlayPage({
               </p>
             ) : null}
             <p className="text-[13px] text-white/70">
-              Alerts reach you with your phone locked. Just don&apos;t swipe Pakdam closed.
+              Keep the app open — alerts arrive while you&apos;re playing. There are no push notifications when the app is closed.
             </p>
           </div>
           <button

@@ -67,7 +67,8 @@ test.describe('join + lobby (demo)', () => {
     await expect(hostPage.getByText('Play zone')).toBeVisible();
     await expect(hostPage.getByText('Balance hunters')).toBeVisible();
     await expect(hostPage.getByText('Random hunters')).toBeVisible();
-    await expect(hostPage.getByText('Show ping history')).toBeVisible();
+    // P1-26: the dead "Show ping history" toggle is removed.
+    await expect(hostPage.getByText('Show ping history')).toBeHidden();
     await expect(
       hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }),
     ).toBeVisible();

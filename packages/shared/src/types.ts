@@ -163,6 +163,14 @@ export type ZoneShape = 'circle' | 'draw';
 /** The play zone: boundary + scheduled shrink boundaries (size placeholders only — the server re-draws the real boundary per shrink). */
 export interface ZoneConfig {
   boundary: GeoPolygon;
+  /**
+   * RESERVED / UNUSED: pre-computed shrink-phase boundaries from the old
+   * build. Nothing reads them — the server re-draws the real boundary per
+   * shrink (`randomOffsetShrinkBoundary`) and previews it via
+   * `zone.preview`. Kept in the type only because stored configs and the
+   * create page still carry an (empty) array; validators check its shape
+   * but no code may treat it as the shrink schedule. Do not revive it.
+   */
   shrinkPhases: { atSeconds: number; boundary: GeoPolygon }[];
 }
 
@@ -170,7 +178,7 @@ export interface ZoneConfig {
 export interface HouseRules {
   mode: MatchMode;
   teamAssignment: TeamAssignment;
-  /** 3–30. */
+  /** 2–30 (MIN_PLAYERS = 2). */
   maxPlayers: number;
   /** Host-picked or balance-derived Hunter count; 1..n−1. */
   hunterCount: number;
@@ -193,10 +201,18 @@ export interface HouseRules {
   playZoneEnabled?: boolean;
   /** Hunters can talk (default ON). When OFF, Hunters read but cannot send voice or text. */
   huntersCanTalk?: boolean;
-  /** Final zone size as a percent of the start size; null = Auto. */
+  /**
+   * RESERVED / UNUSED: final zone size as a percent of the start size.
+   * Founder decision: Final size is Auto-only — the UI offers no control
+   * and the value must stay `null`. The final radius is derived, not
+   * configured: 0.75^3 = 42% after the 3 shrinks (`finalRadiusPercent`
+   * in @pakdam/engine). Kept in the type only because stored configs
+   * carry `null`; validators accept `null` or a finite 1–100 number but
+   * no code may treat a non-null value as a live setting.
+   */
   finalSizePercent?: number | null;
-  /** Ping history OFF (default): Hunters see only the latest ping per Runner. */
-  showPingHistory?: boolean;
+  // NOTE: `showPingHistory` was REMOVED (dead toggle — nothing read it;
+  // the setup UI carried a toggle for it that did nothing). Do not re-add.
 }
 
 /** Full room config = house rules + zone + areas + host picks. */
@@ -213,24 +229,17 @@ export interface RoomConfig extends HouseRules {
   hostOnSiteConfirmed: boolean;
 }
 
-/** Host-toggle defaults: Balance ON, Random draw ON, ping history OFF. */
+/** Host-toggle defaults: Balance ON, Random draw ON. */
 export const DEFAULT_HOST_TOGGLES = {
   balanceHunters: true,
   randomDraw: true,
-  showPingHistory: false,
 } as const;
 
-/**
- * Legacy rooms saved before toggles existed resolve to all OFF.
- * Use this when a stored config has no toggle fields.
- */
-export const LEGACY_HOST_TOGGLES = {
-  balanceHunters: false,
-  randomDraw: false,
-  showPingHistory: false,
-} as const;
+// NOTE: `LEGACY_HOST_TOGGLES` was REMOVED — dead constant, used nowhere
+// except the shared README. Rooms saved before toggles existed resolve to
+// the defaults above; do not re-add a legacy all-OFF set.
 
-/** Create-page defaults: Classic · 30 min · 3 min head start · pings every 3 min · 500 m zone · shrinking ON every 10 min · Balance ON · Random ON · ping history OFF · play zone ON · final size Auto. */
+/** Create-page defaults: Classic · 30 min · 3 min head start · pings every 3 min · 500 m zone · shrinking ON every 10 min · Balance ON · Random ON · play zone ON · final size Auto. */
 export const DEFAULT_ROOM_CONFIG: RoomConfig = {
   mode: 'classic',
   teamAssignment: 'random',
@@ -247,7 +256,6 @@ export const DEFAULT_ROOM_CONFIG: RoomConfig = {
   playZoneEnabled: true,
   huntersCanTalk: true,
   finalSizePercent: null,
-  showPingHistory: false,
   zone: { boundary: [], shrinkPhases: [] },
   zoneShape: 'circle',
   safeAreas: [],

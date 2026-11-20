@@ -15,6 +15,8 @@ import type { PlayerView } from '@pakdam/shared';
 import { Pill } from '../ui/Pill';
 import { initialsForName } from '../../lib/utils';
 import { locationFreshnessLabel } from '../../lib/geolocation';
+import { submitReport } from '../../lib/live-client';
+import { isLiveTransportEnabled } from '../../lib/websocket';
 
 export interface RosterProps {
   players: PlayerView[];
@@ -46,7 +48,30 @@ export function Roster({
   onRemove,
 }: RosterProps) {
   const [menuFor, setMenuFor] = useState<string | null>(null);
+  const [actionNote, setActionNote] = useState<string | null>(null);
   const active = players.filter((p) => p.leftAt === null);
+
+  // Report / Block (POST /v1/reports): audit record ONLY — a block does
+  // NOT remove or silence anyone. Live only; demo has no Worker to
+  // receive the report.
+  const handleReport = (target: PlayerView, kind: 'report' | 'block'): void => {
+    setMenuFor(null);
+    if (!isLiveTransportEnabled()) {
+      setActionNote('Reports need the live server — not available in a demo game.');
+      return;
+    }
+    void submitReport(target.roomId, target.playerId, kind)
+      .then(() => {
+        setActionNote(
+          kind === 'report'
+            ? `${target.displayName} reported — the host reviews it later.`
+            : `${target.displayName} blocked — recorded for the host. Blocking does not remove or silence them.`,
+        );
+      })
+      .catch(() => {
+        setActionNote('Could not send that — check your connection and try again.');
+      });
+  };
   const sorted = [...active].sort((a, b) => {
     if (a.playerId === hostPlayerId) return -1;
     if (b.playerId === hostPlayerId) return 1;
@@ -123,6 +148,20 @@ export function Roster({
                   <span className="absolute right-0 top-9 z-10 flex flex-col rounded-[10px] border border-[#26262B] bg-[#1E1E22] py-1 shadow-lg">
                     <button
                       type="button"
+                      onClick={() => handleReport(player, 'report')}
+                      className="px-4 py-2 text-left text-[15px] font-semibold text-white"
+                    >
+                      Report
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleReport(player, 'block')}
+                      className="px-4 py-2 text-left text-[15px] font-semibold text-white"
+                    >
+                      Block
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => {
                         setMenuFor(null);
                         onRemove?.(player.playerId);
@@ -141,6 +180,11 @@ export function Roster({
       {pickingHunters && isHost ? (
         <li className="pt-3 text-[13px] text-[#A1A1AA]">
           {selectedHunterIds.length} of {hunterCount} Hunters picked — tap a player to pick them.
+        </li>
+      ) : null}
+      {actionNote ? (
+        <li className="pt-3 text-[13px] text-[#A1A1AA]" role="status">
+          {actionNote}
         </li>
       ) : null}
     </ul>

@@ -24,8 +24,8 @@ import {
   DEFAULT_ROOM_CONFIG,
   MATCH_PHASE_TRANSITIONS,
   MIN_PLAYERS,
+  PENDING_PING_TTL_SECONDS,
   PING_AREA_RADIUS_M,
-  SHRINK_RADIUS_FACTOR,
   TERMINAL_PHASES,
   balancedHunterCount,
   isValidDisplayName,
@@ -44,7 +44,7 @@ import {
   type Room,
   type RoomConfig,
 } from '@pakdam/shared';
-import { confirmedTags } from '@pakdam/engine';
+import { confirmedTags, randomOffsetShrinkBoundary as engineRandomOffsetShrinkBoundary } from '@pakdam/engine';
 
 export type { CatchEvent, CatchView, GeoPoint, GeoPolygon, LocationFix, MatchPhase, MatchResult, Ping, Player, Room, RoomConfig };
 
@@ -109,125 +109,21 @@ function saveRoom(room: DemoRoom): void {
   writeRooms(rooms);
 }
 
-// -- Geometry helpers (local; the engine package owns the canonical ones) ---
-
-function haversineMeters(a: GeoPoint, b: GeoPoint): number {
-  const R = 6_371_000;
-  const dLat = ((b.lat - a.lat) * Math.PI) / 180;
-  const dLng = ((b.lng - a.lng) * Math.PI) / 180;
-  const la1 = (a.lat * Math.PI) / 180;
-  const la2 = (b.lat * Math.PI) / 180;
-  const h =
-    Math.sin(dLat / 2) ** 2 + Math.cos(la1) * Math.cos(la2) * Math.sin(dLng / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(h));
-}
-
-function pointInPolygon(point: GeoPoint, polygon: GeoPolygon): boolean {
-  let inside = false;
-  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-    const a = polygon[i];
-    const b = polygon[j];
-    if (!a || !b) continue;
-    const crosses =
-      a.lng > point.lng !== b.lng > point.lng &&
-      point.lat <
-        ((b.lat - a.lat) * (point.lng - a.lng)) / (b.lng - a.lng) + a.lat;
-    if (crosses) inside = !inside;
-  }
-  return inside;
-}
-
-function polygonCentroid(polygon: GeoPolygon): GeoPoint {
-  let lat = 0;
-  let lng = 0;
-  for (const p of polygon) {
-    lat += p.lat;
-    lng += p.lng;
-  }
-  return { lat: lat / polygon.length, lng: lng / polygon.length };
-}
-
-function scalePolygonToward(polygon: GeoPolygon, centre: GeoPoint, factor: number): GeoPolygon {
-  return polygon.map((p) => ({
-    lat: centre.lat + (p.lat - centre.lat) * factor,
-    lng: centre.lng + (p.lng - centre.lng) * factor,
-  }));
-}
-
-function polygonFullyInside(inner: GeoPolygon, outer: GeoPolygon): boolean {
-  return inner.every((p) => pointInPolygon(p, outer));
-}
-
-function offsetPolygon(polygon: GeoPolygon, dLat: number, dLng: number): GeoPolygon {
-  return polygon.map((p) => ({ lat: p.lat + dLat, lng: p.lng + dLng }));
-}
+// -- Zone shrink: the engine owns the canonical random-offset draw (§4.5).
+// This wrapper keeps the demo store's GeoPolygon-returning call shape;
+// the draw itself (random offset, never concentric, fallbacks) lives in
+// @pakdam/engine — it is NOT re-implemented here.
 
 /**
- * Random-offset next zone (§4.5, PUBG-style): scale the boundary toward its
- * centroid by the shrink factor, then move the smaller shape to a RANDOMLY
- * selected position fully inside the current boundary — NEVER concentric.
- * Draws within 10 m of the current centre are discarded and re-drawn (up to
- * 50 attempts); fallbacks: 8 compass-direction offsets, then the concentric
- * scaled copy only as a last resort.
+ * Random-offset next zone (§4.5, PUBG-style): the engine scales the
+ * boundary toward its centroid by the shrink factor, then moves the
+ * smaller shape to a RANDOMLY selected position fully inside the current
+ * boundary — NEVER concentric. Returns the boundary unchanged until the
+ * shape closes (3+ points).
  */
 export function randomOffsetShrinkBoundary(boundary: GeoPolygon): GeoPolygon {
   if (boundary.length < 3) return boundary;
-  const centroid = polygonCentroid(boundary);
-  const scaled = scalePolygonToward(boundary, centroid, SHRINK_RADIUS_FACTOR);
-  const scaledCentroid = polygonCentroid(scaled);
-  // Max offset: the smaller shape must stay fully inside the old boundary.
-  // Approximate with the radius of the old boundary (widest vertex distance).
-  let maxOffsetM = 0;
-  for (const p of boundary) {
-    maxOffsetM = Math.max(maxOffsetM, haversineMeters(centroid, p));
-  }
-  maxOffsetM = Math.max(0, maxOffsetM * (1 - SHRINK_RADIUS_FACTOR));
-  const metresToDegLat = 180 / (6_371_000 * Math.PI); // matches the haversine R in @pakdam/shared — a built circle measures its nominal radius
-  for (let attempt = 0; attempt < 50; attempt++) {
-    const angle = Math.random() * 2 * Math.PI;
-    const distance = Math.sqrt(Math.random()) * maxOffsetM;
-    const dLat = Math.cos(angle) * distance * metresToDegLat;
-    const dLng =
-      (Math.sin(angle) * distance * metresToDegLat) /
-      Math.cos((centroid.lat * Math.PI) / 180);
-    const candidate = offsetPolygon(scaled, dLat, dLng);
-    const candidateCentroid = polygonCentroid(candidate);
-    if (haversineMeters(candidateCentroid, scaledCentroid) < 10) continue; // near-concentric — re-draw
-    if (polygonFullyInside(candidate, boundary)) return candidate;
-  }
-  // Fallback: 8 compass-direction deterministic offsets.
-  for (let k = 0; k < 8; k++) {
-    const angle = (k * Math.PI) / 4;
-    const dLat = Math.cos(angle) * maxOffsetM * 0.5 * metresToDegLat;
-    const dLng =
-      (Math.sin(angle) * maxOffsetM * 0.5 * metresToDegLat) /
-      Math.cos((centroid.lat * Math.PI) / 180);
-    const candidate = offsetPolygon(scaled, dLat, dLng);
-    if (polygonFullyInside(candidate, boundary)) return candidate;
-  }
-  return scaled; // last resort: concentric scaled copy
-}
-
-export function circlePolygon(
-  centre: GeoPoint,
-  radiusMeters: number,
-  points = 32,
-): GeoPolygon {
-  const out: GeoPolygon = [];
-  // Metres per degree of latitude matching the haversine R (6,371,000 m)
-  // in @pakdam/shared — see packages/engine/src/zone.ts. A 500 m circle
-  // built with 111,320 measured back as 499 m.
-  const metresPerDegLat = (6_371_000 * Math.PI) / 180;
-  const dLat = radiusMeters / metresPerDegLat;
-  const dLng = radiusMeters / (metresPerDegLat * Math.cos((centre.lat * Math.PI) / 180));
-  for (let i = 0; i < points; i++) {
-    const angle = (i * 2 * Math.PI) / points;
-    out.push({
-      lat: centre.lat + Math.sin(angle) * dLat,
-      lng: centre.lng + Math.cos(angle) * dLng,
-    });
-  }
-  return out;
+  return engineRandomOffsetShrinkBoundary(boundary).boundary;
 }
 
 // -- Room lifecycle -----------------------------------------------------------
@@ -435,7 +331,7 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
   return demo;
 }
 
-/** Fire one demo ping for a free player (coarse 150 m area around the zone centre — labelled simulated by the UI). Mutual: a Runner ping goes to Hunters, a Hunter ping goes to Runners. */
+/** Fire one demo ping for a free player (coarse 150 m area around the subject's ACTUAL fix — labelled simulated by the UI). Mutual: a Runner ping goes to Hunters, a Hunter ping goes to Runners. No fix = no ping (PROTOCOL-MAP §4.6): a ping must never invent a position, so a player who has never reported a fix simply does not ping. */
 export function fireDemoPing(
   demo: DemoRoom,
   subjectPlayerId: string,
@@ -443,19 +339,18 @@ export function fireDemoPing(
 ): Ping | null {
   const subject = demo.players.find((p) => p.playerId === subjectPlayerId);
   if (!subject || (subject.matchRole !== 'runner' && subject.matchRole !== 'hunter')) return null;
-  const boundary = demo.room.config.zone.boundary;
-  const centre =
-    boundary.length >= 3 ? polygonCentroid(boundary) : { lat: 23.36, lng: 85.33 };
+  const fix = latestFixes.get(subjectPlayerId);
+  if (!fix) return null;
   const ping: Ping = {
     pingId: newId(),
     roomId: demo.room.roomId,
     subjectPlayerId,
     recipientRole: subject.matchRole === 'runner' ? 'hunters' : 'runners',
-    uncertainty: { centre, radiusMeters: PING_AREA_RADIUS_M },
+    uncertainty: { centre: { lat: fix.lat, lng: fix.lng }, radiusMeters: PING_AREA_RADIUS_M },
     ageSeconds: 0,
     qualityAtPing: null,
     createdAt: new Date(nowMs).toISOString(),
-    expiresAt: new Date(nowMs + 300_000).toISOString(),
+    expiresAt: new Date(nowMs + PENDING_PING_TTL_SECONDS * 1000).toISOString(),
   };
   // Pings stay until the next ping replaces them — replace, never timer-remove.
   demo.pings = demo.pings.filter((p) => p.subjectPlayerId !== subjectPlayerId);
@@ -908,6 +803,12 @@ function completeMatch(demo: DemoRoom, nowMs: number): void {
   demo.room.version += 1;
   latestFixes.clear();
   saveRoom(demo);
+}
+
+/** Host ends the round early (demo): completes the match now with the mode-aware outcome. No-op once terminal. */
+export function endDemoMatch(demo: DemoRoom): void {
+  if (TERMINAL_PHASES.includes(demo.room.phase)) return;
+  completeMatch(demo, Date.now());
 }
 
 // -- P0-2: catch auto-select + name-only picker -------------------------------

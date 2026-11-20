@@ -72,14 +72,46 @@ AS $$
 $$;
 
 -- Backstop (HNT-068): the event log must never carry raw coordinates.
--- Rejects any insert whose payload carries a top-level lat / lng /
--- latitude / longitude key.
+-- Rejects any insert whose payload carries a lat / lng / latitude /
+-- longitude key AT ANY DEPTH (objects and arrays, recursively) — the
+-- original top-level-only check let nested coordinates through
+-- (e.g. {"ping": {"centre": {"lat": …, "lng": …}}}).
+CREATE OR REPLACE FUNCTION payload_has_coordinate_key(p_payload jsonb)
+RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_stack jsonb[] := ARRAY[p_payload];
+    v_current jsonb;
+    v_value jsonb;
+BEGIN
+    WHILE array_length(v_stack, 1) > 0 LOOP
+        v_current := v_stack[array_length(v_stack, 1)];
+        v_stack := v_stack[1:array_length(v_stack, 1) - 1];
+        IF jsonb_typeof(v_current) = 'object' THEN
+            IF v_current ?| ARRAY['lat', 'lng', 'latitude', 'longitude'] THEN
+                RETURN TRUE;
+            END IF;
+            FOR v_value IN SELECT value FROM jsonb_each(v_current) LOOP
+                v_stack := array_append(v_stack, v_value);
+            END LOOP;
+        ELSIF jsonb_typeof(v_current) = 'array' THEN
+            FOR v_value IN SELECT value FROM jsonb_array_elements(v_current) LOOP
+                v_stack := array_append(v_stack, v_value);
+            END LOOP;
+        END IF;
+    END LOOP;
+    RETURN FALSE;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION reject_coordinate_payload()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    IF NEW.payload ?| ARRAY['lat', 'lng', 'latitude', 'longitude'] THEN
+    IF payload_has_coordinate_key(NEW.payload) THEN
         RAISE EXCEPTION 'room_events payload must not contain raw coordinates';
     END IF;
     RETURN NEW;

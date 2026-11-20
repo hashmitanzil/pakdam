@@ -46,6 +46,24 @@ test.describe('smoke', () => {
     await expect(page).toHaveURL(/\/create\/mode/);
   });
 
+  test('mode select needs the on-site confirmation before a mode card creates a room', async ({
+    page,
+  }) => {
+    // hostOnSiteConfirmed is a real gate — the server rejects configs
+    // without it, so the mode card must do nothing until the host ticks
+    // "I'm at the play location".
+    await page.goto('/create/mode');
+    await page.getByLabel('Your codename').fill('Ana');
+    await page.getByRole('button', { name: /Classic/ }).click();
+    await expect(
+      page.getByText("Confirm you're at the play location — the host must be on site to create a game."),
+    ).toBeVisible();
+    await expect(page).toHaveURL(/\/create\/mode/);
+    await page.getByRole('checkbox', { name: /I'm at the play location/ }).click();
+    await page.getByRole('button', { name: /Classic/ }).click();
+    await page.waitForURL(/\/room\/[^/]+\/setup/);
+  });
+
   test('a short code on Home is rejected in one line', async ({ page }) => {
     await page.goto('/');
     await page.getByLabel('Room code').fill('ABC');

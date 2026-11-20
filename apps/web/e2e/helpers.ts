@@ -87,6 +87,9 @@ export async function createHostSetupRoom(
   await page.getByRole('button', { name: /HOST A GAME/ }).click();
   await expect(page.getByRole('heading', { name: 'Pick a mode' })).toBeVisible();
   await page.getByLabel('Your codename').fill(hostName);
+  // The host must confirm they are at the play location — the mode card
+  // does nothing until the on-site checkbox is ticked.
+  await page.getByRole('checkbox', { name: /I'm at the play location/ }).click();
   await page.getByRole('button', { name: mode }).click();
   await page.waitForURL(/\/room\/[^/]+\/setup/);
   await expect(page.getByRole('heading', { name: 'Create lobby' })).toBeVisible();

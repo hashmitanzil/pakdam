@@ -40,19 +40,35 @@ export type PauseResult =
 
 /**
  * Start a safety pause. Records `pausedAt` + `pausedFrom`; the clock
- * freezes. A pause from an already-paused phase is a no-op success.
+ * freezes. A pause from an already-paused phase is an idempotent no-op:
+ * when the caller passes the existing pause state it is returned
+ * unchanged (same `pausedFrom`, same `pausedAt` — never re-stamped, never
+ * hard-coded to 'ACTIVE'); without it the call is rejected, because the
+ * existing state is the only honest answer. Callers (the DO's
+ * `doSafetyPause`) must pass the stored `pausedFrom`/`pausedAt` and must
+ * not overwrite them when already paused.
  */
 export function pauseMatch(
   phase: MatchPhase,
   byPlayerId: string,
   nowMs: number,
+  existing?: { pausedFrom: MatchPhase; pausedAt: string } | null,
 ): PauseResult & { pausedBy: string } {
   if (phase === 'SAFETY_PAUSED') {
+    if (existing !== undefined && existing !== null) {
+      return {
+        ok: true,
+        phase: 'SAFETY_PAUSED',
+        pausedFrom: existing.pausedFrom,
+        pausedAt: existing.pausedAt,
+        pausedBy: byPlayerId,
+      };
+    }
     return {
-      ok: true,
-      phase: 'SAFETY_PAUSED',
-      pausedFrom: 'ACTIVE',
-      pausedAt: new Date(nowMs).toISOString(),
+      ok: false,
+      code: 'INVALID_STATE',
+      reason:
+        'The match is already paused — pass the existing pausedFrom/pausedAt to confirm the pause instead of starting a new one.',
       pausedBy: byPlayerId,
     };
   }
@@ -147,9 +163,12 @@ export function safetyStateAfterPause(
   };
 }
 
-/** Build the snapshot safety state after a resume (SOS stays as it was). */
+/** Build the snapshot safety state after a resume (SOS clears with the pause — see below). */
 export function safetyStateAfterResume(previous: SafetyState): SafetyState {
-  return { ...previous, paused: false, pausedBy: null, pausedAt: null };
+  // SOS clears when the safety pause is resolved/resumed: an SOS that
+  // latched forever would keep alerting the host after the danger passed.
+  // The DO's `doSafetyResume` calls `clearSos` on this same state.
+  return clearSos({ ...previous, paused: false, pausedBy: null, pausedAt: null });
 }
 
 /**

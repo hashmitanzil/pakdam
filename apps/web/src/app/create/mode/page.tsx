@@ -33,11 +33,19 @@ export default function ModeSelectPage() {
   const [codename, setCodename] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState<MatchMode | null>(null);
+  // The host MUST confirm they are at the play location — the server
+  // rejects configs without `hostOnSiteConfirmed`, so this is a real
+  // gate, never silently set true.
+  const [onSite, setOnSite] = useState(false);
 
   const pick = async (mode: MatchMode): Promise<void> => {
     const name = codename.trim();
     if (!isValidDisplayName(name)) {
       setError('Enter a codename between 1 and 30 characters.');
+      return;
+    }
+    if (!onSite) {
+      setError("Confirm you're at the play location — the host must be on site to create a game.");
       return;
     }
     setError(null);
@@ -50,7 +58,7 @@ export default function ModeSelectPage() {
         ...DEFAULT_ROOM_CONFIG,
         mode,
         durationSeconds: 1800,
-        hostOnSiteConfirmed: true,
+        hostOnSiteConfirmed: onSite,
         zone: {
           boundary: circlePolygon({ lat: 23.36, lng: 85.33 }, 500),
           shrinkPhases: [],
@@ -106,6 +114,32 @@ export default function ModeSelectPage() {
         />
       </label>
       {error ? <p className="mt-2 text-[13px] text-[#EF4444]">{error}</p> : null}
+
+      <button
+        type="button"
+        role="checkbox"
+        aria-checked={onSite}
+        onClick={() => {
+          setOnSite((v) => !v);
+          setError(null);
+        }}
+        className="mt-4 flex w-full items-start gap-3 rounded-[16px] border border-[#26262B] bg-[#141416] p-4 text-left"
+      >
+        <span
+          aria-hidden
+          className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-[6px] border text-[13px] font-bold ${
+            onSite ? 'border-[#EF4444] bg-[#EF4444] text-white' : 'border-[#26262B] bg-[#1E1E22] text-transparent'
+          }`}
+        >
+          ✓
+        </span>
+        <span>
+          <span className="block text-[15px] font-bold text-white">I&apos;m at the play location</span>
+          <span className="mt-0.5 block text-[13px] text-[#A1A1AA]">
+            The host must be on site — the game can&apos;t be created without this.
+          </span>
+        </span>
+      </button>
 
       <div className="mt-4 flex flex-col gap-3">
         {MODES.map(({ mode, title, line }) => (

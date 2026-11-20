@@ -23,10 +23,11 @@ jobs:
           node-version: 22
           cache: pnpm
 
-      # NOTE: plain `pnpm install` until pnpm-lock.yaml is committed; then
-      # switch this to `pnpm install --frozen-lockfile`.
+      # pnpm-lock.yaml IS committed — install frozen so CI fails loudly
+      # when package.json and the lockfile drift apart, instead of
+      # silently resolving a different tree.
       - name: Install dependencies
-        run: pnpm install
+        run: pnpm install --frozen-lockfile
 
       - name: Typecheck (all workspaces)
         run: pnpm typecheck
@@ -34,6 +35,15 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      # Playwright browsers for the web e2e suite (root `pnpm test` runs
+      # it via `pakdam-web test:e2e`; Chromium cannot launch in the
+      # sandbox VM, so the e2e leg is CI-only until a local runner exists).
+      - name: Install Playwright browsers
+        run: pnpm --filter pakdam-web exec playwright install --with-deps chromium
+
+      # Runs the real test suite and FAILS if any workspace has no test
+      # script or no tests — `pnpm -r run test` used to exit 0 with zero
+      # tests executed, which hid the gap. See root package.json `test`.
       - name: Unit tests
         run: pnpm test
 
@@ -44,4 +54,4 @@ jobs:
           NEXT_PUBLIC_SUPABASE_URL: https://placeholder.supabase.co
           NEXT_PUBLIC_SUPABASE_ANON_KEY: placeholder
           NEXT_PUBLIC_SITE_URL: http://localhost:3000
-          NEXT_PUBLIC_OLA_MAPS_API_KEY: placeholder
+NEXT_PUBLIC_OLA_MAPS_API_KEY: <redacted>

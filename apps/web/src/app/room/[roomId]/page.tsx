@@ -28,6 +28,7 @@ import type { PlayerView, Room, RoomConfig } from '@pakdam/shared';
 import { MIN_PLAYERS } from '@pakdam/shared';
 import { PakdamSocket } from '../../../lib/websocket';
 import type { WsSnapshotPayload } from '../../../lib/websocket';
+import { isFixSendableToServer, watchLocation } from '../../../lib/geolocation';
 import { liveErrorMessage } from '../../../lib/live-client';
 import {
   canStartLiveMatch,
@@ -188,6 +189,23 @@ export default function LobbyPage() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
+
+  // -- Lobby fix stream (P1-7): the server start gate requires every
+  //    active player to have a fix ≤ 120 s old, and the lobby is the only
+  //    place that can supply one — the play page's watcher starts too
+  //    late (after start). Stream fixes while live in the lobby, exactly
+  //    like the play page does; the server keeps only the latest fix per
+  //    seat (30 s TTL) and never persists coordinates. Demo mode skips it.
+  useEffect(() => {
+    if (!isLive || !session) return;
+    const handle = watchLocation((fix) => {
+      if (!isFixSendableToServer(fix)) return;
+      socketRef.current?.sendLocationUpdate(fix);
+    });
+    return () => handle?.stop();
+    // The watcher is created once per seat.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId, isLive, session?.playerId]);
 
   // -- Config edits (host only, via the Settings sheet). Normalised so a
   //    'selected' team always carries exactly hunterCount picks (the
@@ -362,7 +380,9 @@ export default function LobbyPage() {
   const leave = (): void => {
     if (!window.confirm('Leave this room? You can rejoin with the room code.')) return;
     if (isLive) {
-      socketRef.current?.close('left from the lobby');
+      // P0-1: leave the room properly — `leave()` sends `leave`, then
+      // closes. A plain `close()` here would only suspend the seat.
+      socketRef.current?.leave();
     } else {
       const demo = getRoom(roomId);
       if (demo && session) leaveRoom(demo, session.playerId);
@@ -487,18 +507,16 @@ export default function LobbyPage() {
         </button>
       </header>
 
-      {isLive && conn !== 'connected' ? (
+      {isLive && conn === 'reconnect-failed' ? (
         <p className="mt-3 text-[13px] text-[#F59E0B]" role="status">
           Not connected — your readiness was not sent. Wait for the reconnect, then tap again.
-          {conn === 'reconnect-failed' ? (
-            <button
-              type="button"
-              onClick={retryConnection}
-              className="ml-2 font-semibold text-[#EF4444]"
-            >
-              Retry
-            </button>
-          ) : null}
+          <button
+            type="button"
+            onClick={retryConnection}
+            className="ml-2 font-semibold text-[#EF4444]"
+          >
+            Retry
+          </button>
         </p>
       ) : null}
       {notice ? (
