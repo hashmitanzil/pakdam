@@ -572,6 +572,7 @@ export default function SetupPage() {
                 locateNonce={locateNonce}
                 locating={locating}
                 onLocate={onLocate}
+                height={280}
               />
             </div>
             {gpsNote ? <p className="mt-2 text-[13px] text-[#A1A1AA]">{gpsNote}</p> : null}

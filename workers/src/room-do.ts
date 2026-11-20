@@ -87,9 +87,11 @@ import {
   confirmCatch,
   confirmedTags,
   disputeCatch,
+  dueHunterIds,
   dueRunnerIds,
   emptyOutsideZoneState,
   expireCatchIfOverdue,
+  freeHunterIds,
   freeRunnerIds,
   isCatchExpired,
   isDuplicateCommand,
@@ -147,7 +149,7 @@ export interface RoomDoState {
   serverSeq: number;
   /** Redacted game events, cap 500 (coordinates stripped). */
   gameEventLog: GameEvent[];
-  /** Last DELIVERED ping per Runner (timestamps only, no coordinates). */
+  /** Last DELIVERED ping per player (timestamps only, no coordinates). */
   lastPingAtMs: Record<string, number | null>;
   paused: boolean;
   pausedBy: string | null;
@@ -405,6 +407,12 @@ export class RoomStore {
       .map((p) => p.playerId);
   }
 
+  runnerPlayerIds(): string[] {
+    return this.state.players
+      .filter((p) => p.matchRole === 'runner' && p.leftAt === null)
+      .map((p) => p.playerId);
+  }
+
   /** Recipients for a catch event: the parties + the host only (role secrecy). */
   catchRecipients(c: CatchEvent): string[] {
     const ids = new Set([c.hunterPlayerId, c.runnerPlayerId, this.room.hostPlayerId]);
@@ -462,6 +470,10 @@ export class RoomStore {
       catches: this.state.catches,
       safetyState: this.safetyState(),
       missedAnnouncements: this.missedAnnouncements(viewerId),
+      // Teammates' latest live fixes (memory only) — buildSnapshot keeps
+      // only the viewer's teammates, never an opponent, and none at all
+      // for a caught Runner.
+      fixes: this.mem.latestFix,
     });
   }
 
@@ -1648,12 +1660,17 @@ export class RoomStore {
   }
 
   /**
-   * Pending pings for a Hunter who just (re)connected. Pings are
-   * Hunters-only by construction, so every pending ping goes to every
-   * connected Hunter; the caller acknowledges delivery per ping.
+   * Pending pings for a player who just (re)connected. Pings are mutual
+   * and role-scoped: a Hunter re-receives pending Runner pings
+   * (recipientRole 'hunters'), a Runner re-receives pending Hunter pings
+   * (recipientRole 'runners'). A player never receives a ping that reveals
+   * their own team. The caller acknowledges delivery per ping.
    */
-  pendingPingsForHunter(_hunterId: string, _nowMs: number): Ping[] {
-    return [...this.mem.pendingPings];
+  pendingPingsFor(playerId: string, _nowMs: number): Ping[] {
+    const me = this.player(playerId);
+    if (!me || me.matchRole === null) return [];
+    const role: 'hunters' | 'runners' = me.matchRole === 'hunter' ? 'hunters' : 'runners';
+    return this.mem.pendingPings.filter((p) => p.recipientRole === role);
   }
 
   // -- alarm tick ---------------------------------------------------------------
@@ -1677,24 +1694,24 @@ export class RoomStore {
     }
     const pingsBefore = this.mem.pendingPings;
     this.mem.pendingPings = purgeExpiredPings(this.mem.pendingPings, nowMs);
-    // The declared `ping.expired` type exists so hunters learn a pending
-    // ping died undelivered; emit one per expired ping to all hunters.
+    // The declared `ping.expired` type exists so recipients learn a pending
+    // ping died undelivered; emit one per expired ping to that ping's
+    // recipient role only (Runner pings to Hunters, Hunter pings to Runners).
     const expiredPings = pingsBefore.filter((p) => !this.mem.pendingPings.includes(p));
     if (expiredPings.length > 0) {
-      const hunterIds = this.activePlayers()
-        .filter((p) => p.matchRole === 'hunter')
-        .map((p) => p.playerId);
-      if (hunterIds.length > 0) {
-        for (const p of expiredPings) {
-          events.push(
-            this.emit(
-              'ping.expired',
-              { pingId: p.pingId, subjectPlayerId: p.subjectPlayerId, expiresAt: p.expiresAt },
-              hunterIds,
-              nowMs,
-            ),
-          );
-        }
+      const hunterIds = this.hunterPlayerIds();
+      const runnerIds = this.runnerPlayerIds();
+      for (const p of expiredPings) {
+        const recipients = p.recipientRole === 'hunters' ? hunterIds : runnerIds;
+        if (recipients.length === 0) continue;
+        events.push(
+          this.emit(
+            'ping.expired',
+            { pingId: p.pingId, subjectPlayerId: p.subjectPlayerId, expiresAt: p.expiresAt },
+            recipients,
+            nowMs,
+          ),
+        );
       }
     }
     this.mem.idempotency = purgeIdempotency(this.mem.idempotency, nowMs);
@@ -1839,6 +1856,7 @@ export class RoomStore {
           pingId: newId(),
           roomId: this.room.roomId,
           subjectPlayerId: runnerId,
+          recipientRole: 'hunters',
           fix,
           qualityAtPing: runner?.locationQuality ?? null,
           nowMs,
@@ -1853,6 +1871,45 @@ export class RoomStore {
             'LOCATION_PING_SENT',
             runnerId,
             { pingId: ping.pingId, subjectPlayerId: runnerId },
+            nowMs,
+          ),
+        );
+      }
+      // Mutual pings: one per free Hunter per interval, same rules — the
+      // Hunter ping goes to Runners, so both sides learn the other's
+      // location when it fires. Same interval, same 150 m area, same
+      // ACTIVE-only / play-zone-ON rules; no fix = no ping.
+      const freeHunters = freeHunterIds(this.state.players);
+      const dueHunters = dueHunterIds({
+        freeHunterIds: freeHunters.filter((id) => !pendingSubjects.has(id)),
+        fixes: this.mem.latestFix,
+        lastPingAtMs: this.state.lastPingAtMs,
+        startedAtMs,
+        intervalSeconds: this.room.config.pingIntervalSeconds,
+        nowMs,
+      });
+      for (const hunterId of dueHunters) {
+        const hunter = this.player(hunterId);
+        const fix = this.mem.latestFix[hunterId] ?? null;
+        const ping = buildPing({
+          pingId: newId(),
+          roomId: this.room.roomId,
+          subjectPlayerId: hunterId,
+          recipientRole: 'runners',
+          fix,
+          qualityAtPing: hunter?.locationQuality ?? null,
+          nowMs,
+        });
+        if (!ping) continue; // No fix = no ping, never an invented position.
+        this.mem.pendingPings.push(ping);
+        events.push(
+          this.emit('ping', { ping }, this.runnerPlayerIds(), nowMs),
+        );
+        persist.push(
+          this.logGameEvent(
+            'LOCATION_PING_SENT',
+            hunterId,
+            { pingId: ping.pingId, subjectPlayerId: hunterId },
             nowMs,
           ),
         );

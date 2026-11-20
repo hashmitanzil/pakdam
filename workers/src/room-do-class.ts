@@ -622,11 +622,13 @@ export class RoomDO implements DurableObject {
         nowMs,
       );
       await this.deliver([welcome, snapshot, ...resumed.events], nowMs);
-      // A reconnected Hunter re-receives pending (undelivered) pings;
-      // delivered pings are never re-sent (a reconnect loses earlier pings).
+      // A reconnected player re-receives pending (undelivered) pings
+      // addressed to their role — a Hunter re-receives Runner pings, a
+      // Runner re-receives Hunter pings. Delivered pings are never re-sent
+      // (a reconnect loses earlier pings).
       const me = this.store.player(playerId);
-      if (me?.matchRole === 'hunter') {
-        for (const ping of this.store.pendingPingsForHunter(playerId, nowMs)) {
+      if (me) {
+        for (const ping of this.store.pendingPingsFor(playerId, nowMs)) {
           const ev = this.store.emit('ping', { ping }, [playerId], nowMs);
           await this.deliver([ev], nowMs);
         }

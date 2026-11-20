@@ -6,21 +6,28 @@
  *
  * - own team, live: a green dot with the name and the last-fix freshness
  *   (`Last fix 0:20 ago`, `Location unknown`, `Suspended`).
- * - other team, ping-only: a white-ringed dot with the name and the ping
- *   age (`TEO · 0:20 ago`). Pings stay until the next ping replaces them.
+ * - other team, ping-only: a dot with the name and the ping age
+ *   (`TEO · 0:20 ago`). Pings stay until the next ping replaces them.
+ *   Ping dots are coloured by the SUBJECT's team: green for a Runner
+ *   subject, red for a Hunter subject.
  * - me: a red dot labelled `YOU`.
  *
- * The play page decides which dots a role may see: runners never receive
- * hunter dots, and hunters never receive a runner's live position — only
- * pings. This component only renders what it is given.
+ * The play page decides which dots a role may see: each side receives
+ * only the opposing team's ping dots, never the other team's live
+ * position — only pings. A spectator sees both teams' ping dots and no
+ * live dots at all. This component only renders what it is given.
  */
 'use client';
 
 export interface PlayerDot {
   playerId: string;
   displayName: string;
-  /** 'me' | 'teammate' (own team, live) | 'ping' (other team, ping-only). */
-  tone: 'me' | 'teammate' | 'ping';
+  /**
+   * 'me' | 'teammate' (own team, live) | 'ping-runner' (other team,
+   * ping-only, subject is a Runner) | 'ping-hunter' (other team,
+   * ping-only, subject is a Hunter).
+   */
+  tone: 'me' | 'teammate' | 'ping-runner' | 'ping-hunter';
   /** Age / freshness label, e.g. `0:20 ago` or `Last fix 0:20 ago`. */
   label: string;
   suspended?: boolean;
@@ -34,7 +41,8 @@ function dotColor(tone: PlayerDot['tone'], suspended?: boolean): string {
   if (suspended) return 'bg-[#A1A1AA]';
   if (tone === 'me') return 'bg-[#EF4444]';
   if (tone === 'teammate') return 'bg-[#22C55E]';
-  return 'bg-white ring-2 ring-[#EF4444]';
+  if (tone === 'ping-runner') return 'bg-[#22C55E]';
+  return 'bg-[#EF4444]';
 }
 
 export function PlayerDots({ dots }: PlayerDotsProps) {

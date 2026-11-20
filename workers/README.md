@@ -63,7 +63,7 @@ request/confirm/dispute, safety SOS, leave. No leaderboard route exists.
 - **Messages:** 22 client → server types, 34 server → client types
   (frozen contract v2.1). Direct messages go only to the sender;
   `voice.signal` and `radio` are team-only (lobby = whole lobby); `ping`
-  is Hunters-only; `reveal` goes to the whole room; catch events go to the
+  is role-scoped (a Runner ping to Hunters, a Hunter ping to Runners); `reveal` goes to the whole room; catch events go to the
   parties + the host only (role secrecy); everything else broadcasts.
 - **Suspension:** tab hidden / phone locked / socket closed = suspended
   ("location unknown"); the timer keeps running and a pending catch cannot
@@ -75,7 +75,8 @@ request/confirm/dispute, safety SOS, leave. No leaderboard route exists.
 In order: purge stale fixes → HEAD_START → ACTIVE → match end (never while
 paused) → outside-zone ejection (30 s countdown, frozen on poor GPS) →
 zone shrink (random offset, never concentric) → scheduled pings (ACTIVE
-only, coarse 150 m areas, Hunters only, stay until the next ping).
+only, coarse 150 m areas, mutual (Runner pings to Hunters, Hunter pings
+to Runners), stay until the next ping).
 
 ## Deploy
 

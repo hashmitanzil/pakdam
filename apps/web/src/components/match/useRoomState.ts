@@ -65,6 +65,15 @@ export interface RoomStateData {
   /** Confirmed / disputed catches: from live `catch.*` events, and rebuilt from the snapshot's `decidedCatches` on every snapshot (incl. first paint) so they survive a reload. */
   sessionCatches: CatchView[];
   locationStatus: Record<string, 'known' | 'unknown'>;
+  /**
+   * The viewer's teammates (same team, not left) and their latest live
+   * fixes, keyed by playerId — from the snapshot in live mode. Teammates
+   * only, never an opponent; empty for a caught Runner (they lose the
+   * live teammate view). In demo mode the ids come from the demo room and
+   * the fixes are empty (the demo tracks no teammate positions).
+   */
+  teammateIds: string[];
+  teammateFixes: Record<string, LocationFix>;
   /** Delivered pings, kept until the next ping replaces them — never timer-removed. */
   pings: Ping[];
   radioMessages: RadioMessage[];
@@ -132,6 +141,8 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   const [activeCatches, setActiveCatches] = useState<CatchView[]>([]);
   const [sessionCatches, setSessionCatches] = useState<CatchView[]>([]);
   const [locationStatus, setLocationStatus] = useState<Record<string, 'known' | 'unknown'>>({});
+  const [teammateIds, setTeammateIds] = useState<string[]>([]);
+  const [teammateFixes, setTeammateFixes] = useState<Record<string, LocationFix>>({});
   const [pings, setPings] = useState<Ping[]>([]);
   const [radioMessages, setRadioMessages] = useState<RadioMessage[]>([]);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
@@ -155,6 +166,10 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     setSafetyState(snapshot.safetyState);
     setActiveCatches(snapshot.activeCatches);
     setLocationStatus(snapshot.locationStatus);
+    // Teammates' live view (teammates only, never an opponent; empty for
+    // a caught Runner). `??` tolerates a server that predates these fields.
+    setTeammateIds(snapshot.teammateIds ?? []);
+    setTeammateFixes(snapshot.teammateFixes ?? {});
     setAnnouncements(snapshot.missedAnnouncements);
     // Decided catches (confirmed / disputed) are carried in the snapshot so
     // the after-tagged screen and auto-spectator state survive a reload:
@@ -197,6 +212,25 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         .map(toCatchView),
     );
     setPings(next.pings);
+    // Demo teammates: same team as me, not me, not left. The demo tracks
+    // no teammate positions (only the local player's fix is recorded), so
+    // the live map markers stay empty in demo — the chips still show via
+    // the ids, exactly as before.
+    const me = next.players.find((p) => p.playerId === myPlayerIdRef.current);
+    const myTeam = me?.team ?? null;
+    setTeammateIds(
+      myTeam === null
+        ? []
+        : next.players
+            .filter(
+              (p) =>
+                p.playerId !== myPlayerIdRef.current &&
+                p.team === myTeam &&
+                p.leftAt === null,
+            )
+            .map((p) => p.playerId),
+    );
+    setTeammateFixes({});
     setLocationStatus(
       Object.fromEntries(
         next.players.map((p) => [
@@ -431,6 +465,8 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     activeCatches,
     sessionCatches,
     locationStatus,
+    teammateIds,
+    teammateFixes,
     pings,
     radioMessages,
     announcements,

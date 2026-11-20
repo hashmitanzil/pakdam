@@ -82,8 +82,8 @@ export function RulesControls({ config, isHost, onChange }: SetupControlsProps) 
           onChange={(v) => set({ pingIntervalSeconds: v })}
         />,
         zoneOff || pingsOff
-          ? 'No pings. Hunters only see runners who leave the zone.'
-          : 'How often hunters see where runners are.',
+          ? 'No pings. Neither side sees the other — hunters only see runners who leave the zone.'
+          : 'How often both sides see where the other team is.',
       )}
       <div className="mt-4 flex items-center justify-between gap-3">
         <div>

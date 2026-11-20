@@ -21,6 +21,7 @@ import {
   OUTSIDE_ZONE_RETURN_SECONDS,
   type LocationFix,
   type MatchPhase,
+  type Ping,
   type VoiceRadioStatus,
 } from '@pakdam/shared';
 import {
@@ -85,6 +86,8 @@ export default function PlayPage({
     phase,
     safetyState,
     sessionCatches,
+    teammateIds,
+    teammateFixes,
     pings,
     radioMessages,
     announcements,
@@ -378,56 +381,84 @@ export default function PlayPage({
             : nowMs,
         );
 
-  // Dots: own team live (demo knows teams; live role secrecy hides them),
-  // other team ping-only for hunters. Runners never see hunters.
+  // Pings are mutual and role-scoped: the server only delivers pings
+  // addressed to my role (Runner pings to Hunters, Hunter pings to
+  // Runners), and the client filters by recipientRole too — so in demo
+  // mode, where the local store holds every ping, each side still only
+  // sees the opposing team. No role yet (roles not drawn) = no pings.
+  // Spectators are the exception: a spectating (caught) Runner sees BOTH
+  // teams, but only via pings — never live dots.
+  const myPingRole: 'hunters' | 'runners' | null = isHunter
+    ? 'hunters'
+    : isRunner
+      ? 'runners'
+      : null;
+  const visiblePings: Ping[] = useMemo(
+    () =>
+      isSpectator
+        ? pings
+        : myPingRole === null
+          ? []
+          : pings.filter((p) => p.recipientRole === myPingRole),
+    [pings, myPingRole, isSpectator],
+  );
+
+  // Dots: teammates LIVE (runners see fellow runners, hunters see fellow
+  // hunters — the server sends only my own team's fixes, never an
+  // opponent's), opponents ping-only and mutual. A caught Runner loses
+  // the live teammate view entirely, and a spectator sees ping dots only
+  // (both teams), no live dots for anyone. Ping dots are coloured by the
+  // SUBJECT's team: green for a Runner subject, red for a Hunter subject
+  // (a ping addressed to Hunters is about a Runner, and vice versa).
   const dots: PlayerDot[] = useMemo(() => {
     const out: PlayerDot[] = [];
-    const myLastFixMs = myPlayer?.lastFixAt ? new Date(myPlayer.lastFixAt).getTime() : null;
-    out.push({
-      playerId: myPlayerId,
-      displayName: 'YOU',
-      tone: 'me',
-      label:
-        myPlayer?.connectionState === 'suspended'
-          ? 'Suspended'
-          : myLastFixMs === null
-            ? 'Location never reported'
-            : ageLabelFromTimestamp(myLastFixMs, nowMs),
-      suspended: myPlayer?.connectionState === 'suspended',
-    });
-    if (mode === 'demo') {
-      for (const p of players) {
-        if (p.playerId === myPlayerId || p.team !== myTeam || p.team === null) continue;
-        if (p.leftAt !== null) continue;
-        const lastFixMs = p.lastFixAt ? new Date(p.lastFixAt).getTime() : null;
-        out.push({
-          playerId: p.playerId,
-          displayName: p.displayName,
-          tone: 'teammate',
-          label:
-            lastFixMs === null
+    if (!isSpectator) {
+      const myLastFixMs = myPlayer?.lastFixAt ? new Date(myPlayer.lastFixAt).getTime() : null;
+      out.push({
+        playerId: myPlayerId,
+        displayName: 'YOU',
+        tone: 'me',
+        label:
+          myPlayer?.connectionState === 'suspended'
+            ? 'Suspended'
+            : myLastFixMs === null
               ? 'Location never reported'
-              : ageLabelFromTimestamp(lastFixMs, nowMs),
-          suspended: p.connectionState === 'suspended',
-        });
+              : ageLabelFromTimestamp(myLastFixMs, nowMs),
+        suspended: myPlayer?.connectionState === 'suspended',
+      });
+      // Live teammates — never when I am caught (a tagged Runner loses
+      // the live teammate view) and never while spectating.
+      if (!amCaught) {
+        for (const teammateId of teammateIds) {
+          const p = players.find((pl) => pl.playerId === teammateId);
+          if (!p || p.leftAt !== null) continue;
+          const lastFixMs = p.lastFixAt ? new Date(p.lastFixAt).getTime() : null;
+          out.push({
+            playerId: p.playerId,
+            displayName: p.displayName,
+            tone: 'teammate',
+            label:
+              lastFixMs === null
+                ? 'Location never reported'
+                : ageLabelFromTimestamp(lastFixMs, nowMs),
+            suspended: p.connectionState === 'suspended',
+          });
+        }
       }
     }
-    if (isHunter) {
-      for (const ping of pings) {
-        const subject = players.find((p) => p.playerId === ping.subjectPlayerId);
-        if (!subject) continue;
-        out.push({
-          playerId: `ping-${ping.pingId}`,
-          displayName: subject.displayName,
-          tone: 'ping',
-          label: ageLabelFromTimestamp(new Date(ping.createdAt).getTime(), nowMs),
-        });
-      }
+    for (const ping of visiblePings) {
+      const subject = players.find((p) => p.playerId === ping.subjectPlayerId);
+      if (!subject) continue;
+      out.push({
+        playerId: `ping-${ping.pingId}`,
+        displayName: subject.displayName,
+        tone: ping.recipientRole === 'hunters' ? 'ping-runner' : 'ping-hunter',
+        label: ageLabelFromTimestamp(new Date(ping.createdAt).getTime(), nowMs),
+      });
     }
     return out;
-  }, [players, myPlayer, myPlayerId, myTeam, mode, isHunter, pings, nowMs]);
+  }, [players, myPlayer, myPlayerId, teammateIds, visiblePings, nowMs, amCaught, isSpectator]);
 
-  const visiblePings = isHunter ? pings : [];
   const myLastFixMs = myPlayer?.lastFixAt ? new Date(myPlayer.lastFixAt).getTime() : null;
   const isSuspended = myPlayer?.connectionState === 'suspended';
 
@@ -652,6 +683,9 @@ export default function PlayPage({
             pings={visiblePings}
             noGoAreas={room.config.noGoAreas}
             myFix={myFix}
+            // Teammates' live positions (green dots). A spectator sees no
+            // live dots, so nothing is passed while spectating.
+            teammateFixes={isSpectator ? {} : teammateFixes}
           />
           <PlayerDots dots={dots} />
           <div className="absolute bottom-3 right-3 z-10 flex flex-col items-center gap-3">
@@ -782,7 +816,7 @@ export default function PlayPage({
             <p className="max-w-[320px] text-[17px] leading-snug">
               {reveal === 'hunter'
                 ? `Find and tag all ${runnersTotal} runners in ${formatDurationShort(room.config.durationSeconds)}. They get a ${formatDurationShort(room.config.headStartSeconds)} head start.`
-                : 'Outlast the clock. Hunters see you only when you ping.'}
+                : 'Outlast the clock. You see each other only when you ping.'}
             </p>
             {teammates.length > 0 ? (
               <p className="text-[14px] text-white/85">

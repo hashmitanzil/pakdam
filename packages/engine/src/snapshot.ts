@@ -1,14 +1,24 @@
 /**
  * Pakdam engine — snapshot building with ROLE SECRECY.
  *
- * A snapshot is the whole truth the UI renders — and it NEVER carries raw
- * coordinates, pending pings, or token hashes. Pings arrive only as `ping`
- * events after connect; a reconnect loses earlier pings.
+ * A snapshot is the whole truth the UI renders — and it NEVER carries an
+ * opponent's coordinates, pending pings, or token hashes. Pings arrive
+ * only as `ping` events after connect; a reconnect loses earlier pings.
  *
  * Role secrecy: each player sees only their OWN role/team; every other
  * seat's role is `null` (the Hunter's catch picker shows names only;
  * caught/survivor lists come from `room.result` only). The reconnect-token
  * hash is stripped for every seat, including the viewer's own.
+ *
+ * The one exception to "no coordinates": `teammateFixes` carries the
+ * viewer's OWN teammates' latest live fixes (teammates see each other
+ * live). Opponents are never in it — they are ping-only. A caught Runner
+ * (Classic, confirmed catch, still a Runner) gets an empty teammate view:
+ * once tagged, they can no longer see the untagged runners' live
+ * locations, and as a spectator they see both teams only via pings.
+ * (Infection flips a tagged Runner to Hunter, so they are a Hunter, not
+ * a caught spectator — this exclusion only applies while the viewer is
+ * still a Runner.)
  *
  * `activeCatches` holds pending catches only, recipient-filtered to the
  * parties + the host. Decided catches (confirmed / disputed) appear in
@@ -19,6 +29,7 @@
 import type {
   CatchEvent,
   CatchView,
+  LocationFix,
   Player,
   PlayerView,
   Room,
@@ -89,9 +100,50 @@ export function decidedCatchesFor(
 }
 
 /**
+ * The viewer's live teammate view: the teammate playerIds and their
+ * latest fixes. Teammates only — never an opponent, never the viewer.
+ * A caught Runner (still a Runner, with a confirmed catch against them)
+ * gets an empty view: once tagged they lose the live teammate view
+ * entirely. A viewer with no team gets an empty view. A teammate
+ * without a fix is in `teammateIds` but not in `teammateFixes`.
+ */
+export function teammateViewFor(
+  viewerPlayerId: string,
+  players: readonly Player[],
+  fixes: Readonly<Record<string, LocationFix | null>>,
+  catches: readonly CatchEvent[],
+): { teammateIds: string[]; teammateFixes: Record<string, LocationFix> } {
+  const viewer = players.find((p) => p.playerId === viewerPlayerId);
+  const team = viewer?.team ?? null;
+  if (team === null) return { teammateIds: [], teammateFixes: {} };
+  // Caught Runner (Classic): a confirmed catch against a viewer who is
+  // still a Runner. Infection flips a tagged Runner to Hunter, so a
+  // flipped player has team 'hunters' here and is unaffected.
+  const isCaughtRunner =
+    team === 'runners' &&
+    catches.some(
+      (c) => c.state === 'confirmed' && c.runnerPlayerId === viewerPlayerId,
+    );
+  if (isCaughtRunner) return { teammateIds: [], teammateFixes: {} };
+  const teammateIds = players
+    .filter(
+      (p) =>
+        p.playerId !== viewerPlayerId && p.team === team && p.leftAt === null,
+    )
+    .map((p) => p.playerId);
+  const teammateFixes: Record<string, LocationFix> = {};
+  for (const id of teammateIds) {
+    const fix = fixes[id];
+    if (fix !== undefined && fix !== null) teammateFixes[id] = fix;
+  }
+  return { teammateIds, teammateFixes };
+}
+
+/**
  * Build the authorised snapshot for one viewer. The caller supplies the
  * server-held state; this function applies the privacy rules and nothing
- * else. No coordinates, no pending pings, no token hashes — ever.
+ * else. No opponent coordinates, no pending pings, no token hashes — ever.
+ * (Teammates' coordinates ARE carried, in `teammateFixes` — see above.)
  */
 export function buildSnapshot(input: {
   room: Room;
@@ -103,7 +155,15 @@ export function buildSnapshot(input: {
   catches: readonly CatchEvent[];
   safetyState: WsSnapshotPayload['safetyState'];
   missedAnnouncements: WsSnapshotPayload['missedAnnouncements'];
+  /** Latest live fix per player (server-held, memory only). */
+  fixes: Readonly<Record<string, LocationFix | null>>;
 }): WsSnapshotPayload {
+  const teammates = teammateViewFor(
+    input.viewerPlayerId,
+    input.players,
+    input.fixes,
+    input.catches,
+  );
   return {
     room: input.room,
     players: playersViewFor(input.viewerPlayerId, input.players),
@@ -121,6 +181,8 @@ export function buildSnapshot(input: {
       input.viewerIsHost,
       input.catches,
     ),
+    teammateIds: teammates.teammateIds,
+    teammateFixes: teammates.teammateFixes,
     safetyState: input.safetyState,
     missedAnnouncements: input.missedAnnouncements,
   };

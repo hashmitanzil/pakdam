@@ -54,7 +54,18 @@ const nextConfig: NextConfig = {
       "base-uri 'self'",
       "form-action 'self'",
       "frame-ancestors 'none'",
-      "worker-src 'self'",
+      // MapLibre GL JS runs its tile parsing in a Web Worker that it builds
+      // from a Blob URL (installed maplibre-gl 5.24.1 sets its worker URL
+      // via URL.createObjectURL(new Blob(...))). A CSP of `worker-src
+      // 'self'` alone BLOCKS that worker, so the map never renders — this
+      // is the regression that broke the map after the v4 CSP landed (the
+      // map worked in the morning with no CSP at all). MapLibre's own docs
+      // require `worker-src blob:` (and `child-src blob:` as the fallback
+      // for browsers that use child-src for workers). Allowing `blob:`
+      // here only lets same-origin scripts create workers from blob URLs —
+      // no new code can run — so the security intent of the CSP is kept.
+      "worker-src 'self' blob:",
+      "child-src 'self' blob:",
       "manifest-src 'self'",
     ].join('; ');
     return [

@@ -330,15 +330,17 @@ export interface Room {
 // ---------------------------------------------------------------------------
 
 /**
- * A ping is a coarse area, never an exact pin. Centre = the Runner's latest
- * server-held fix, radius 150 m (OPEN), Hunters only. No fix = no ping,
- * never an invented position. A sector ping has no centre: text only.
+ * A ping is a coarse area, never an exact pin. Centre = the subject's latest
+ * server-held fix, radius 150 m (OPEN), mutual: a ping for a Runner goes to
+ * Hunters, and a ping for a Hunter goes to Runners — both sides learn the
+ * other's location when it fires. No fix = no ping, never an invented
+ * position. A sector ping has no centre: text only.
  */
 export interface Ping {
   pingId: string;
   roomId: string;
   subjectPlayerId: string;
-  recipientRole: 'hunters';
+  recipientRole: 'hunters' | 'runners';
   uncertainty: { centre: GeoPoint; radiusMeters: number } | { sector: string };
   ageSeconds: number;
   qualityAtPing: LocationQuality | null;
@@ -497,6 +499,21 @@ export interface WsSnapshotPayload {
    * still sees "You were tagged by X" and stays a spectator.
    */
   decidedCatches: CatchView[];
+  /**
+   * The viewer's teammates (same team, not left): their playerIds.
+   * Teammates only — never an opponent. Empty when the viewer has no
+   * team, or when the viewer is a caught Runner (a tagged Runner loses
+   * the live teammate view entirely).
+   */
+  teammateIds: string[];
+  /**
+   * The viewer's teammates' latest live fixes, keyed by playerId.
+   * Teammates only — never an opponent's position, never the viewer's
+   * own fix (the client has its own GPS). Only teammates WITH a fix
+   * appear here; a teammate without a fix is still in `teammateIds`.
+   * Empty when the viewer is a caught Runner.
+   */
+  teammateFixes: Record<string, LocationFix>;
   safetyState: SafetyState;
   missedAnnouncements: Announcement[];
 }

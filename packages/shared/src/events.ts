@@ -15,7 +15,9 @@
  * Broadcast scoping (server-side, must be preserved): direct messages
  * (`welcome`, `snapshot`, `error`, `heartbeat.ack`, `auth.refreshed`,
  * `ticket.renewal-required`) go only to the sender; `voice.signal` and
- * `radio` are team-only (lobby = whole lobby); `ping` is Hunters-only;
+ * `radio` are team-only (lobby = whole lobby); `ping` is role-scoped — it
+ * goes only to the ping's recipient role (a Runner ping to Hunters, a
+ * Hunter ping to Runners), so each side sees only the opposing team;
  * `reveal` goes to the whole room; everything else broadcasts to the room.
  */
 import type {
@@ -443,8 +445,8 @@ export const WS_TEAM_ONLY_SERVER_TYPES: readonly WsServerMessageType[] = [
   'radio',
 ] as const;
 
-/** Server→client types sent Hunters-only. */
-export const WS_HUNTERS_ONLY_SERVER_TYPES: readonly WsServerMessageType[] = ['ping'] as const;
+/** Server→client types sent only to the ping's recipient role (a Runner ping to Hunters, a Hunter ping to Runners). */
+export const WS_ROLE_SCOPED_SERVER_TYPES: readonly WsServerMessageType[] = ['ping'] as const;
 
 // ---------------------------------------------------------------------------
 // Game events (audit log) — 10 types

@@ -1,16 +1,18 @@
 /**
  * Pakdam engine — pings.
  *
- * A ping is a coarse area, never an exact pin: centre = the Runner's latest
- * server-held fix, radius 150 m, Hunters only. No fix = no ping, never an
- * invented position.
+ * A ping is a coarse area, never an exact pin: centre = the subject's latest
+ * server-held fix, radius 150 m, mutual — a ping for a Runner goes to
+ * Hunters, and a ping for a Hunter goes to Runners, so both sides learn the
+ * other's location when it fires. No fix = no ping, never an invented
+ * position.
  *
  * Schedule: ACTIVE phase only, play zone ON, `pingIntervalSeconds > 0`;
- * one ping per free Runner per interval; the first ping lands one interval
+ * one ping per free player per interval; the first ping lands one interval
  * after match start (`lastPingAtMs` defaults to `startedAt`).
  *
  * Display rule (founder decision): once a ping IS delivered and shown, it
- * stays on the Hunter's map until the next ping replaces it — the client
+ * stays on the recipient's map until the next ping replaces it — the client
  * never removes a shown ping on a timer. The pending-ping TTL governs
  * UNDELIVERED pings only.
  */
@@ -49,14 +51,17 @@ export function nextPingAtMs(
 }
 
 /**
- * Build one ping for a free Runner from their latest server-held fix.
- * Returns null when there is no fix — never an invented position.
- * `pingId` is supplied by the caller (a fresh id per ping).
+ * Build one ping for a free player (a Runner or a Hunter) from their latest
+ * server-held fix. Returns null when there is no fix — never an invented
+ * position. `pingId` is supplied by the caller (a fresh id per ping).
+ * `recipientRole` is the opposing team: a Runner ping goes to 'hunters',
+ * a Hunter ping goes to 'runners'.
  */
 export function buildPing(input: {
   pingId: string;
   roomId: string;
   subjectPlayerId: string;
+  recipientRole: 'hunters' | 'runners';
   fix: LocationFix | null;
   qualityAtPing: LocationQuality | null;
   nowMs: number;
@@ -68,7 +73,7 @@ export function buildPing(input: {
     pingId: input.pingId,
     roomId: input.roomId,
     subjectPlayerId: input.subjectPlayerId,
-    recipientRole: 'hunters',
+    recipientRole: input.recipientRole,
     uncertainty: { centre, radiusMeters: PING_AREA_RADIUS_M },
     ageSeconds: 0,
     qualityAtPing: input.qualityAtPing,
@@ -100,7 +105,7 @@ export function purgeExpiredPings(
 }
 
 /**
- * Replace a delivered ping for one Runner with the fresh one. A delivered
+ * Replace a delivered ping for one player with the fresh one. A delivered
  * ping stays until the next ping replaces it — it is never removed on a
  * timer, and a snapshot cycle never carries pending pings (a recovered room
  * re-computes them).
@@ -125,6 +130,22 @@ export function withAge(ping: Ping, nowMs: number): Ping {
   return { ...ping, ageSeconds: pingAgeSeconds(ping, nowMs) };
 }
 
+/** Shared due-check: free players with a fix whose interval has elapsed. */
+function dueSubjectIds(input: {
+  freePlayerIds: readonly string[];
+  fixes: Readonly<Record<string, LocationFix | null>>;
+  lastPingAtMs: Readonly<Record<string, number | null>>;
+  startedAtMs: number;
+  intervalSeconds: number;
+  nowMs: number;
+}): string[] {
+  return input.freePlayerIds.filter((id) => {
+    if (input.fixes[id] === undefined || input.fixes[id] === null) return false;
+    const last = input.lastPingAtMs[id] ?? null;
+    return isPingDue(last, input.startedAtMs, input.intervalSeconds, input.nowMs);
+  });
+}
+
 /**
  * Which free Runners are due a ping right now? One ping per free Runner per
  * interval; Runners with no fix are skipped (no ping, never invented).
@@ -137,9 +158,21 @@ export function dueRunnerIds(input: {
   intervalSeconds: number;
   nowMs: number;
 }): string[] {
-  return input.freeRunnerIds.filter((id) => {
-    if (input.fixes[id] === undefined || input.fixes[id] === null) return false;
-    const last = input.lastPingAtMs[id] ?? null;
-    return isPingDue(last, input.startedAtMs, input.intervalSeconds, input.nowMs);
-  });
+  return dueSubjectIds({ ...input, freePlayerIds: input.freeRunnerIds });
+}
+
+/**
+ * Which free Hunters are due a ping right now? Mirror of `dueRunnerIds`:
+ * one ping per free Hunter per interval; Hunters with no fix are skipped
+ * (no ping, never invented). A Hunter ping goes to Runners.
+ */
+export function dueHunterIds(input: {
+  freeHunterIds: readonly string[];
+  fixes: Readonly<Record<string, LocationFix | null>>;
+  lastPingAtMs: Readonly<Record<string, number | null>>;
+  startedAtMs: number;
+  intervalSeconds: number;
+  nowMs: number;
+}): string[] {
+  return dueSubjectIds({ ...input, freePlayerIds: input.freeHunterIds });
 }

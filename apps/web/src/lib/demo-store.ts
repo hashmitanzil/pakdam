@@ -56,7 +56,7 @@ export interface DemoRoom {
   room: Room;
   players: Player[];
   catches: CatchEvent[];
-  /** Last DELIVERED ping per Runner (timestamps only, no coordinates). */
+  /** Last DELIVERED ping per player (timestamps only, no coordinates). */
   lastPingAtMs: Record<string, number>;
   /** Delivered pings, kept until the next ping replaces them (§4.6). */
   pings: Ping[];
@@ -383,6 +383,7 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
   }
 
   // Scheduled pings, ACTIVE only, play zone on, interval > 0 — AUTO-FIRE.
+  // Mutual: free Runners ping to Hunters, free Hunters ping to Runners.
   if (
     room.phase === 'ACTIVE' &&
     room.config.playZoneEnabled &&
@@ -396,6 +397,14 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
       const last = demo.lastPingAtMs[runner.playerId] ?? new Date(room.startedAt).getTime();
       if (nowMs - last >= intervalMs) {
         fireDemoPing(demo, runner.playerId, nowMs);
+      }
+    }
+    for (const hunter of demo.players.filter(
+      (p) => p.matchRole === 'hunter' && p.leftAt === null && p.ejectedAt === null,
+    )) {
+      const last = demo.lastPingAtMs[hunter.playerId] ?? new Date(room.startedAt).getTime();
+      if (nowMs - last >= intervalMs) {
+        fireDemoPing(demo, hunter.playerId, nowMs);
       }
     }
   }
@@ -426,22 +435,22 @@ export function tickDemoRoom(demo: DemoRoom, nowMs: number = Date.now()): DemoRo
   return demo;
 }
 
-/** Fire one demo ping for a free Runner (coarse 150 m area around the zone centre — labelled simulated by the UI). */
+/** Fire one demo ping for a free player (coarse 150 m area around the zone centre — labelled simulated by the UI). Mutual: a Runner ping goes to Hunters, a Hunter ping goes to Runners. */
 export function fireDemoPing(
   demo: DemoRoom,
-  runnerPlayerId: string,
+  subjectPlayerId: string,
   nowMs: number = Date.now(),
 ): Ping | null {
-  const runner = demo.players.find((p) => p.playerId === runnerPlayerId);
-  if (!runner || runner.matchRole !== 'runner') return null;
+  const subject = demo.players.find((p) => p.playerId === subjectPlayerId);
+  if (!subject || (subject.matchRole !== 'runner' && subject.matchRole !== 'hunter')) return null;
   const boundary = demo.room.config.zone.boundary;
   const centre =
     boundary.length >= 3 ? polygonCentroid(boundary) : { lat: 23.36, lng: 85.33 };
   const ping: Ping = {
     pingId: newId(),
     roomId: demo.room.roomId,
-    subjectPlayerId: runnerPlayerId,
-    recipientRole: 'hunters',
+    subjectPlayerId,
+    recipientRole: subject.matchRole === 'runner' ? 'hunters' : 'runners',
     uncertainty: { centre, radiusMeters: PING_AREA_RADIUS_M },
     ageSeconds: 0,
     qualityAtPing: null,
@@ -449,9 +458,9 @@ export function fireDemoPing(
     expiresAt: new Date(nowMs + 300_000).toISOString(),
   };
   // Pings stay until the next ping replaces them — replace, never timer-remove.
-  demo.pings = demo.pings.filter((p) => p.subjectPlayerId !== runnerPlayerId);
+  demo.pings = demo.pings.filter((p) => p.subjectPlayerId !== subjectPlayerId);
   demo.pings.push(ping);
-  demo.lastPingAtMs[runnerPlayerId] = nowMs;
+  demo.lastPingAtMs[subjectPlayerId] = nowMs;
   return ping;
 }
 

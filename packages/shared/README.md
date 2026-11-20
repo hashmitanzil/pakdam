@@ -135,7 +135,7 @@ OPEN — measure in the field before any public pilot:
 - `PlayerView` — what a seat sees: hash stripped, other seats' roles `null`.
 - `MatchResult` — outcome + duration + caught/surviving Runner ids (no routes, no trails).
 - `Room` — a room: ids, code, host, phase, version, config, timestamps, result.
-- `Ping` — a coarse ping area (150 m), Hunters only; no fix = no ping.
+- `Ping` — a coarse ping area (150 m), mutual (Runner pings to Hunters, Hunter pings to Runners); no fix = no ping.
 - `CatchState` — `requested | awaiting-confirmation | confirmed | disputed | rejected | expired`.
 - `CatchGpsEvidence` — `present | absent | stale` (supporting evidence only).
 - `CatchEvent` — a catch as the server stores it (server-only `qrTokenHash`).
@@ -221,7 +221,7 @@ Server → client (34 enumerated types; see the note at the top of this README):
 - `isWsServerMessageType` — guard: is this string a known server→client type?
 - `WS_DIRECT_SERVER_TYPES` — server types sent only to the sender.
 - `WS_TEAM_ONLY_SERVER_TYPES` — server types relayed team-only (`voice.signal`, `radio`).
-- `WS_HUNTERS_ONLY_SERVER_TYPES` — server types sent Hunters-only (`ping`).
+- `WS_ROLE_SCOPED_SERVER_TYPES` — server types sent only to the ping's recipient role (`ping`).
 
 Game events (audit log, 10 types):
 

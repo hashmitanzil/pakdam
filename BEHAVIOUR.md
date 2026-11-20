@@ -33,10 +33,15 @@ no leaderboard, no points store — the match, its catches and its result are th
   screen; at 0 they are ejected. Poor GPS freezes the countdown (counted seconds stay); back inside clears it.
   Ejection is never undone by rejoining, and an ejected Runner counts as out for win purposes but is recorded as
   "ejected", not "caught".
-- **Pings stay until the next ping, with age.** In ACTIVE phase only, one coarse 150 m area per free Runner per
-  ping interval, to Hunters only. A delivered ping is never removed on a timer — it stays until the next ping
-  replaces it, showing its age (e.g. `0:20 ago`). No fix = no ping, never an invented position. Runners never see
-  Hunters; Hunters never see a Runner's live position, only pings.
+- **Teammates live, opponents ping-only.** Teammates see each other LIVE — runners see fellow runners and
+  hunters see fellow hunters, exact positions on the map, continuously. Opponents are seen ONLY via pings, never
+  live. A caught Runner (Classic) loses the live teammate view entirely; as a spectator they see BOTH teams only
+  via pings, never live dots.
+- **Pings stay until the next ping, with age.** In ACTIVE phase only, one coarse 150 m area per free player per
+  ping interval, mutual — a Runner ping goes to Hunters and a Hunter ping goes to Runners, so both sides learn
+  the other's location when it fires. A delivered ping is never removed on a timer — it stays until the next ping
+  replaces it, showing its age (e.g. `0:20 ago`). No fix = no ping, never an invented position. Ping dots are
+  coloured by the subject's team: GREEN for a Runner, RED for a Hunter.
 - **Catch flow — tag → QR → runner confirms → manual fallback, NO catch code.** Hunter tags in person; Runner
   shows their QR (`SHOW MY QR`); Hunter scans it; Runner confirms on their own phone (`YES, I WAS TAGGED` /
   `NO — DISPUTE`). If the camera fails, manual fallback: Hunter picks the Runner from a name list, Runner confirms
@@ -108,7 +113,8 @@ and protocol version must be 1.
 `safety.resumed`, `sos.raised`; match — `match.started`, `match.completed`, `match.cancelled`.
 
 **Broadcast scoping:** direct messages (`welcome`, `snapshot`, `error`, `heartbeat.ack`, `auth.*`) go only to the
-sender; `voice.signal` and `radio` are team-only (lobby = whole lobby); `ping` is Hunters-only; `reveal` goes to
+sender; `voice.signal` and `radio` are team-only (lobby = whole lobby); `ping` is role-scoped — a Runner ping
+goes to Hunters, a Hunter ping goes to Runners; `reveal` goes to
 the whole room; everything else broadcasts to the room. A snapshot is the whole truth — most events just trigger
 a fresh one.
 

@@ -51,6 +51,20 @@ export function freeRunnerIds(
     .map((p) => p.playerId);
 }
 
+/** A Hunter is free (still in play) when they are a Hunter, not ejected, not left. Hunters are never caught. */
+export function isHunterFree(player: ModePlayer): boolean {
+  return (
+    player.matchRole === 'hunter' &&
+    player.ejectedAt === null &&
+    player.leftAt === null
+  );
+}
+
+/** Free (still in play) Hunter ids. */
+export function freeHunterIds(players: readonly ModePlayer[]): string[] {
+  return players.filter((p) => isHunterFree(p)).map((p) => p.playerId);
+}
+
 /**
  * Resolve the mode outcome. `timeExpired` does not change the outcome:
  * all Runners caught/ejected → Hunters win, else a surviving Runner →

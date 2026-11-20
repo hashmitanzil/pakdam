@@ -36,6 +36,12 @@ export interface PlayMapProps {
   noGoAreas: GeoPolygon[];
   /** My own fix (mine to show); null when unknown. */
   myFix: LocationFix | null;
+  /**
+   * Teammates' latest live fixes, keyed by playerId. Teammates only —
+   * the caller must never pass an opponent's position. Empty for a
+   * spectator (no live dots) and in demo (no teammate positions tracked).
+   */
+  teammateFixes: Record<string, LocationFix>;
 }
 
 type MapState = 'loading' | 'ready' | 'no-key' | 'unavailable';
@@ -79,7 +85,7 @@ function ensureLayer(map: MapLibreMapLike, layer: Record<string, unknown>): void
   }
 }
 
-export function PlayMap({ zoneBoundary, nextZoneBoundary, pings, noGoAreas, myFix }: PlayMapProps) {
+export function PlayMap({ zoneBoundary, nextZoneBoundary, pings, noGoAreas, myFix, teammateFixes }: PlayMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMapLike | null>(null);
   const [mapState, setMapState] = useState<MapState>('loading');
@@ -215,7 +221,32 @@ export function PlayMap({ zoneBoundary, nextZoneBoundary, pings, noGoAreas, myFi
           : [],
       ),
     );
-  }, [mapReady, zoneBoundary, nextZoneBoundary, pings, noGoAreas, myFix]);
+
+    // Teammates' live positions (green dots, same size/stroke as the me
+    // dot). Teammates only — the caller never passes an opponent here,
+    // and a spectator passes an empty map, so no live dots render then.
+    ensureSource(map, 'pakdam-teammates');
+    ensureLayer(map, {
+      id: 'pakdam-teammate-dot',
+      type: 'circle',
+      source: 'pakdam-teammates',
+      paint: {
+        'circle-color': '#22C55E',
+        'circle-radius': 8,
+        'circle-stroke-width': 2,
+        'circle-stroke-color': '#FFFFFF',
+      },
+    });
+    map.getSource('pakdam-teammates')?.setData(
+      collection(
+        Object.values(teammateFixes).map((fix) => ({
+          type: 'Feature',
+          properties: {},
+          geometry: { type: 'Point', coordinates: [fix.lng, fix.lat] },
+        })),
+      ),
+    );
+  }, [mapReady, zoneBoundary, nextZoneBoundary, pings, noGoAreas, myFix, teammateFixes]);
 
   const recentre = () => {
     const map = mapRef.current;

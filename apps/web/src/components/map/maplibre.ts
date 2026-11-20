@@ -68,8 +68,17 @@ export interface OlaTransformRequest {
 }
 
 /**
- * Appends `api_key` to EVERY api.olamaps.io request (style, tiles, sprites,
+ * Appends `api_key` to EVERY Ola Maps request (style, tiles, sprites,
  * glyphs). Requests to any other host pass through untouched.
+ *
+ * Host gotcha (this is why the map never loaded): Ola's style JSON
+ * references `app.olamaps.io` for some resources (tiles / sprites /
+ * glyphs), not `api.olamaps.io`. The Ola SDK's `getTransformRequest`
+ * rewrites `app.olamaps.io` to `api.olamaps.io` before appending the
+ * key — without that rewrite, those requests go out with NO api_key,
+ * Ola answers 401, MapLibre fires 'error', and the map shows
+ * "Map couldn't load". So this matches the SDK exactly: normalise the
+ * host first, then append the key to every olamaps.io request.
  */
 export function olaTransformRequest(
   url: string,
@@ -77,14 +86,23 @@ export function olaTransformRequest(
 ): OlaTransformRequest {
   try {
     const parsed = new URL(url);
-    if (parsed.hostname === 'api.olamaps.io' && !parsed.searchParams.has('api_key')) {
-      parsed.searchParams.set('api_key', getOlaApiKey());
-      return { url: parsed.toString(), resourceType };
+    if (
+      parsed.hostname !== 'api.olamaps.io' &&
+      parsed.hostname !== 'app.olamaps.io'
+    ) {
+      return { url, resourceType };
     }
+    if (parsed.hostname === 'app.olamaps.io') {
+      parsed.hostname = 'api.olamaps.io';
+    }
+    if (!parsed.searchParams.has('api_key')) {
+      parsed.searchParams.set('api_key', getOlaApiKey());
+    }
+    return { url: parsed.toString(), resourceType };
   } catch {
     // Non-URL (relative) requests pass through untouched.
+    return { url, resourceType };
   }
-  return { url, resourceType };
 }
 
 /** Minimal structural surface of the MapLibre Map the helpers need. */

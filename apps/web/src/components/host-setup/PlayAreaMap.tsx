@@ -63,6 +63,8 @@ export interface PlayAreaMapProps {
   locating?: boolean;
   /** Called when the target button is tapped. */
   onLocate?: () => void;
+  /** Fixed map height in px (280 on the create screen). */
+  height?: number;
 }
 
 const ZONE_FILL_ID = 'pakdam-zone-fill';
@@ -172,6 +174,7 @@ export function PlayAreaMap({
   locateNonce = 0,
   locating = false,
   onLocate,
+  height = 280,
 }: PlayAreaMapProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMapLike | null>(null);
@@ -461,7 +464,7 @@ export function PlayAreaMap({
     return (
       <div
         className="flex w-full items-center justify-center rounded-[16px] border border-[#26262B] bg-[#141416] px-4 text-center text-[13px] text-[#A1A1AA]"
-        style={{ aspectRatio: '3 / 4' }}
+        style={{ height }}
         role="status"
       >
         Map needs an Ola Maps key — set NEXT_PUBLIC_OLA_MAPS_API_KEY.
@@ -473,7 +476,7 @@ export function PlayAreaMap({
     return (
       <div
         className="flex w-full flex-col items-center justify-center gap-2 rounded-[16px] border border-[#26262B] bg-[#141416] px-4 text-center"
-        style={{ aspectRatio: '3 / 4' }}
+        style={{ height }}
         role="alert"
       >
         <p className="text-[15px] font-bold text-white">Map load failed</p>
@@ -488,7 +491,7 @@ export function PlayAreaMap({
         <div
           ref={containerRef}
           className="w-full overflow-hidden rounded-[16px] border border-[#26262B] bg-[#141416]"
-          style={{ aspectRatio: '3 / 4' }}
+          style={{ height }}
           aria-label="Play zone map"
         />
         <button
