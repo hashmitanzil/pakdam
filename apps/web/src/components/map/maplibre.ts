@@ -233,6 +233,30 @@ export interface MapLibreMapLike {
     bounds: [[number, number], [number, number]],
     options?: { padding?: number; duration?: number },
   ): void;
+  /**
+   * The camera that would fit the bounds at the map's CURRENT viewport
+   * size, or undefined when the viewport cannot fit them. Real MapLibre
+   * returns undefined (warn only, no throw) when the transform is
+   * smaller than the padding — e.g. a map constructed in a 0-size
+   * container whose transform was never resized — and fitBounds then
+   * silently does nothing. Callers (tryFitZone) must check this BEFORE
+   * trusting a fitBounds call: a silent no-op must never consume the
+   * one fit. (v26 — see play-map-logic.ts tryFitZone.)
+   *
+   * v26 fix round (Diya 4 — verified against installed maplibre-gl
+   * 5.24.1, `cameraForBoxAndBearing`): undefined is returned ONLY
+   * when the available size is strictly NEGATIVE (scaleX/scaleY < 0).
+   * At EXACTLY zero available size (an 80 px container with 40 px
+   * padding) it returns a camera with zoom −∞ (`scaleZoom(0)`), and
+   * fitBounds flies there instead of no-op-ing. Callers must ALSO
+   * reject a non-finite camera — see `cameraCanFitBounds`.
+   */
+  cameraForBounds(
+    bounds: [[number, number], [number, number]],
+    options?: { padding?: number },
+  ):
+    | { center: { lng: number; lat: number }; zoom: number; bearing: number }
+    | undefined;
   addSource(id: string, source: Record<string, unknown>): void;
   getSource(id: string): { setData(data: unknown): void } | undefined;
   addLayer(layer: Record<string, unknown>): void;

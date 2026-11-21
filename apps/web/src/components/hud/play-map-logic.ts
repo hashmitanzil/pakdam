@@ -22,6 +22,33 @@
  * (an rAF throw is an uncaught window error, not an error-boundary
  * crash — the zone effect's fit catch is the load-bearing guard).
  *
+ * v26 FIX (Meera — the play map was STILL blank after v25, founder
+ * screenshot 2026-11-21 ~21:30 IST, pill "Zone not in view — camera
+ * fit failed — ready"): the v25 pill lied in three ways, and the fit
+ * could be silently consumed without ever landing —
+ *  - the fit branch appended `mapDetail` verbatim, and `mapDetail` is
+ *    'ready' after load, so a merely-DEFERRED fit read as a failed fit
+ *    with a stale reason; the fit branch now uses the fit's OWN reason
+ *    and never touches `mapDetail`;
+ *  - a fit flag outranked tile errors, so a tile failure was invisible
+ *    whenever the (false-alarm) fit flag was set; the pill now shows
+ *    BOTH, and a merely-pending fit is its own honest text;
+ *  - `fitBounds` can silently do NOTHING (installed maplibre-gl 5.x:
+ *    `cameraForBounds` returns undefined — warn only, no throw — when
+ *    the viewport cannot fit the bounds, e.g. a stale zero-size
+ *    transform, and `fitBounds` then returns without moving the
+ *    camera), and v25 marked the fit consumed on any non-throwing
+ *    return. `tryFitZone` now pre-checks `cameraForBounds` and reports
+ *    'cannot-fit' WITHOUT consuming the fit;
+ *  - deferred fits ('hidden' / 'no-boundary' / 'cannot-fit') were
+ *    never retried — only throws were. They now share the same bounded
+ *    retry budget (see `fitRetryDelayForOutcome`);
+ *  - the 0-height check returned early on a 0-height CONTAINER, so
+ *    the founder's exact 526.4×0 case could never surface;
+ *    `diagnoseMapAreaHeight` distinguishes hidden-by-design (the
+ *    wrapper is `display:none` on the Radio / More tab) from a real
+ *    0-height container while the map tab is visible.
+ *
  * No React, no DOM, no I/O. Type-only imports are erased by Node's type
  * stripping; the only runtime import is `circlePolygon` from
  * @pakdam/engine (already a PlayMap dependency).
@@ -40,12 +67,24 @@ export type MapState = 'loading' | 'ready' | 'no-key' | 'unavailable' | 'error';
  * words that merely contain "key" (turkey=, donkey=) untouched.
  * The key itself is NEXT_PUBLIC by design (hygiene, not a secret
  * compromise), but a verbatim key in a pill is still a leak.
+ *
+ * v26 fix round (Zara 1–2, defence in depth — not reachable from
+ * current error sources, whose URLs are single-encoded query-form):
+ *  - double-encoded `api_key%253D<value>` (a URL encoded twice);
+ *  - the hyphen form `api-key=<value>`;
+ *  - the JSON-colon form `"api_key":"<value>"` (a serialised error
+ *    object), matched by KEY_JSON_RE below.
  */
 const KEY_PARAM_RE =
-  /(api_?key(?:%3D|=)|(?:^|[?&"'\s])key=)[^&\s"']*/gi;
+  /(api[-_]?key(?:%253D|%3D|=)|(?:^|[?&"'\s])key=)[^&\s"']*/gi;
+
+/** `"api_key":"<value>"` / `"api-key":"<value>"` / `"key":"<value>"` — a JSON-colon key value. */
+const KEY_JSON_RE = /("(?:api[-_]?key|key)"\s*:\s*")[^"]*/gi;
 
 function redactKeyValues(text: string): string {
-  return text.replace(KEY_PARAM_RE, (_match, key: string) => `${key}…`);
+  return text
+    .replace(KEY_JSON_RE, '$1…')
+    .replace(KEY_PARAM_RE, (_match, key: string) => `${key}…`);
 }
 
 /**
@@ -173,6 +212,16 @@ export interface OtherResourceProblem {
  * error and is labelled as what it is). Order is deliberate: a map
  * area with no height paints nothing at all, so it outranks the
  * camera, which outranks the tiles.
+ *
+ * v26 FIX ROUND: the fit part uses a COLON before the reason
+ * (`camera fit failed: <reason>`) instead of a third ` — ` — the
+ * reason itself contains ` — ` (Arjun 5: separator-ambiguous), so a
+ * dash there made the pill unreadable as "part — part — part".
+ * A zero-WIDTH area is its own pill text (Diya 6): a 0-wide container
+ * on the visible tab is a defect, not hidden-by-design, and it must
+ * not read "Map ready" either. Zero height still outranks zero width
+ * (D9: a 0-height area paints nothing at all, so it outranks the
+ * camera, which outranks the tiles).
  */
 export function pillTextForState(
   mapState: MapState,
@@ -184,20 +233,37 @@ export function pillTextForState(
   fitFailed = false,
   zeroHeight = false,
   otherResource: OtherResourceProblem | null = null,
+  fitReason: string | null = null,
+  fitPending = false,
+  zeroWidth = false,
 ): string {
   if (mapState === 'ready' && zeroHeight) {
     return 'Map area has no height — try Retry';
   }
-  if (mapState === 'ready' && fitFailed) {
-    return `Zone not in view — camera fit failed${mapDetail ? ` — ${mapDetail}` : ''}`;
+  if (mapState === 'ready' && zeroWidth) {
+    return 'Map area has no width — try Retry';
   }
-  if (mapState === 'ready' && tileErrorCount > 0) {
-    return `Map tiles failing — ${tileErrorCount} tile error${tileErrorCount === 1 ? '' : 's'}${tileDetail ? ` — ${tileDetail}` : ''}`;
+  if (mapState === 'ready') {
+    const parts: string[] = [];
+    if (fitFailed) {
+      parts.push(
+        `Zone not in view — camera fit failed: ${fitReason ?? 'camera could not fit the zone'}`,
+      );
+    }
+    if (tileErrorCount > 0) {
+      parts.push(
+        `Map tiles failing — ${tileErrorCount} tile error${tileErrorCount === 1 ? '' : 's'}${tileDetail ? ` — ${tileDetail}` : ''}`,
+      );
+    }
+    if (otherResource) {
+      parts.push(`Map ${otherResource.label} failing — ${otherResource.detail ?? 'resource failed'}`);
+    }
+    if (fitPending) {
+      parts.push('Camera moving to the zone…');
+    }
+    if (parts.length > 0) return parts.join(' · ');
+    return 'Map ready';
   }
-  if (mapState === 'ready' && otherResource) {
-    return `Map ${otherResource.label} failing — ${otherResource.detail ?? 'resource failed'}`;
-  }
-  if (mapState === 'ready') return 'Map ready';
   if (mapState === 'loading') {
     return `Map loading — ${mapDetail ?? 'creating map…'}${
       slowLoad ? ' · still trying…' : ''
@@ -361,7 +427,53 @@ export type FitOutcome =
   // the caller can surface it (and must NOT auto-retry it: the same
   // boundary would fail the same way). A camera stuck at the Ranchi
   // default is the break, never a fallback the map "paints at".
-  | 'non-finite-bounds';
+  | 'non-finite-bounds'
+  // v26: the map's viewport cannot fit the bounds right now — the
+  // camera computation itself returns nothing (see tryFitZone). A
+  // DEFERRED outcome, like 'hidden': the fit never ran, the one fit
+  // is not consumed, and the caller retries it (bounded) once the
+  // viewport is real — a resize, a tab return, a new boundary. It is
+  // NOT a failure: no reason is recorded and the pill reads pending,
+  // never "fit failed".
+  | 'cannot-fit';
+
+/**
+ * Whether the map's viewport can actually fit `bbox` right now: the
+ * camera computation succeeded AND the camera it returned is usable.
+ *
+ * v26 fix round (Diya 4 — the exactly-80 px edge, verified against
+ * installed maplibre-gl 5.24.1, `cameraForBoxAndBearing`):
+ * `cameraForBounds` returns undefined ONLY when the available size is
+ * strictly NEGATIVE (`scaleX < 0 || scaleY < 0` — the transform is
+ * smaller than the padding). At EXACTLY zero available size (an
+ * 80 px container with 40 px padding on each side) it returns a
+ * camera with `zoom = scaleZoom(0) = log2(0) = -Infinity` — and
+ * `fitBounds` then flies the camera to zoom −∞ (via `_fitInternal`
+ * → `flyTo`/`easeTo` with that camera), it does NOT no-op. A
+ * non-finite zoom (or centre) is therefore treated exactly like
+ * undefined: 'cannot-fit', never a `fitBounds` call. The fake models
+ * this edge (`fake-map.mjs`: strict `< 0` → undefined, `== 0` →
+ * the −∞ camera) so the guard is tested, not assumed.
+ */
+export function cameraCanFitBounds(
+  map: MapLibreMapLike,
+  bbox: [[number, number], [number, number]],
+  padding = 40,
+): boolean {
+  let camera;
+  try {
+    camera = map.cameraForBounds(bbox, { padding });
+  } catch {
+    return false;
+  }
+  if (camera === undefined) return false;
+  return (
+    Number.isFinite(camera.zoom) &&
+    Number.isFinite(camera.center.lng) &&
+    Number.isFinite(camera.center.lat) &&
+    Number.isFinite(camera.bearing)
+  );
+}
 
 /**
  * Fit the whole zone in view, once, on first load with a valid boundary.
@@ -375,6 +487,27 @@ export type FitOutcome =
  * `fitBounds`) — the play map was the only one with the
  * mark-before-call ordering. A throw still propagates to the caller:
  * the tab-return handler catches it; the zone effect catches it too.
+ *
+ * v26 FIX: "returns without throwing" is NOT enough — installed
+ * maplibre-gl 5.x `fitBounds` can silently do NOTHING: it calls
+ * `cameraForBounds`, which returns undefined (warn only, no throw)
+ * when the viewport cannot fit the bounds — the transform is smaller
+ * than the padding, which is exactly a stale zero-size transform
+ * (a map constructed while hidden, before any `resize()` updated it).
+ * `fitBounds` then returns the map unchanged, the camera never leaves
+ * the Ranchi default, and v25 marked the fit consumed forever. So
+ * this function pre-checks `cameraForBounds` with the SAME padding
+ * `fitBounds` will use: undefined means 'cannot-fit' — the fit never
+ * ran, the flag stays false, and the caller retries it once the
+ * viewport is real. `fitBounds` is only called when the camera
+ * computation succeeded, so a non-throwing return really did move
+ * the camera (duration 0 applies synchronously in this MapLibre
+ * build: `_ease` with duration 0 runs the frame at k=1 at once).
+ *
+ * v26 fix round (Diya 4): the pre-check is `cameraCanFitBounds`, not
+ * a bare `=== undefined` — at exactly-80 px the camera is DEFINED
+ * with zoom −∞ (see above), and calling `fitBounds` with it would
+ * fly the camera to zoom −∞.
  */
 export function tryFitZone(
   fittedRef: FitFlag,
@@ -387,9 +520,39 @@ export function tryFitZone(
   if (!hasSize) return 'hidden';
   const bbox = boundaryBBox(boundary);
   if (!bbox.flat().every(Number.isFinite)) return 'non-finite-bounds';
+  if (!cameraCanFitBounds(map, bbox, 40)) return 'cannot-fit';
   map.fitBounds(bbox, { padding: 40, duration: 0 });
   fittedRef.current = true;
   return 'fitted';
+}
+
+/**
+ * Setup-map fit (PlayAreaMap, A3 — Diya 3): fit the boundary if the
+ * viewport can actually fit it, WITHOUT consuming the caller's fit
+ * marker on a silent no-op. Returns true only when `fitBounds` ran
+ * against a computable, finite camera; the caller assigns
+ * `lastFittedRadiusRef` only then, so a zero-size / exactly-80 px
+ * viewport leaves the fit unconsumed for the next radius change.
+ * A throwing `fitBounds` is also a non-landing fit (false, no throw
+ * escapes): the setup map has no pill and no retry loop, and a throw
+ * out of its zone effect would reach the error boundary — strictly
+ * worse than an unconsumed fit.
+ */
+export function tryFitSetupZone(
+  map: MapLibreMapLike,
+  boundary: GeoPolygon,
+  hasSize: boolean,
+): boolean {
+  if (!hasSize || boundary.length < 3) return false;
+  const bbox = boundaryBBox(boundary);
+  if (!bbox.flat().every(Number.isFinite)) return false;
+  if (!cameraCanFitBounds(map, bbox, 40)) return false;
+  try {
+    map.fitBounds(bbox, { padding: 40, duration: 500 });
+  } catch {
+    return false;
+  }
+  return true;
 }
 
 /** How many automatic fit retries a failed first fit gets, before giving up to manual Retry / tab return. */
@@ -406,6 +569,204 @@ export const FIT_RETRY_DELAY_MS = 2000;
  */
 export function nextFitRetryDelayMs(retriesUsed: number): number | null {
   return retriesUsed < MAX_FIT_RETRIES ? FIT_RETRY_DELAY_MS : null;
+}
+
+/**
+ * Which fit outcomes get an automatic timer retry, and which never do.
+ *
+ * v26: v25 only retried a THROWING fit (the zone effect's catch). A
+ * DEFERRED fit — 'hidden' (no size yet), 'cannot-fit' (the viewport
+ * cannot fit the bounds yet) — was dropped silently, so a fit that
+ * never ran had no way back except a tab switch. Deferred fits now
+ * share the SAME bounded budget as a throwing fit: retried until one
+ * lands or the budget is spent, never forever. 'fitted' /
+ * 'already-fitted' need no retry; 'non-finite-bounds' would fail the
+ * same way every time; 'no-boundary' has nothing to fit (a boundary
+ * arriving re-runs the effect on its own).
+ */
+export type FitRetryTrigger = FitOutcome | 'threw';
+
+export function fitRetryDelayForOutcome(
+  outcome: FitRetryTrigger,
+  retriesUsed: number,
+): number | null {
+  if (outcome === 'hidden' || outcome === 'cannot-fit' || outcome === 'threw') {
+    return nextFitRetryDelayMs(retriesUsed);
+  }
+  return null;
+}
+
+/**
+ * The fit-retry budget (v26 fix round).
+ *
+ * Two SEPARATE counters (Diya 5 — A2): deferrals ('hidden' /
+ * 'cannot-fit') and real failures ('threw') are different failure
+ * modes with different causes, so they do NOT share one budget. One
+ * shared budget starved a later real throw of all timer retries:
+ * a map loading on the Radio tab burned 3 deferrals over 6 s, the
+ * player returned to the Map tab, the first fit threw, and
+ * `scheduleFitRetry('threw')` returned null — zero timer retries
+ * for the real failure. With separate budgets each mode gets its
+ * own MAX_FIT_RETRIES (3); the hard total is 6, still bounded, and
+ * no reset-on-tab-return loophole is needed (a reset on every return
+ * would let rapid Map↔Radio toggling mint unlimited attempts).
+ * A counter is incremented when its timer actually FIRES, never when
+ * scheduled (Diya 7a — A5ii): an effect re-run clears the pending
+ * timer in cleanup, and a scheduled-but-cancelled retry must not
+ * burn budget. StrictMode's dev double-invoke used to burn 2 of 3
+ * on first mount; production was spared StrictMode but not
+ * cleanup-burn.
+ */
+export interface FitRetryBudget {
+  /** Deferred-fit timers that actually fired ('hidden' / 'cannot-fit'). */
+  deferredFired: number;
+  /** Throwing-fit timers that actually fired ('threw'). */
+  threwFired: number;
+}
+
+export function createFitRetryBudget(): FitRetryBudget {
+  return { deferredFired: 0, threwFired: 0 };
+}
+
+/** Fresh budget in place (a manual Retry / a new boundary starts over). */
+export function resetFitRetryBudget(budget: FitRetryBudget): void {
+  budget.deferredFired = 0;
+  budget.threwFired = 0;
+}
+
+/** Delay (ms) before the next automatic fit retry under a split budget, or null when that mode's budget is spent. */
+export function fitRetryDelayForBudget(
+  outcome: FitRetryTrigger,
+  budget: FitRetryBudget,
+): number | null {
+  if (outcome === 'hidden' || outcome === 'cannot-fit') {
+    return nextFitRetryDelayMs(budget.deferredFired);
+  }
+  if (outcome === 'threw') {
+    return nextFitRetryDelayMs(budget.threwFired);
+  }
+  return null;
+}
+
+/**
+ * Schedule one bounded fit retry. Returns the timer handle, or null
+ * when that mode's budget is spent (the caller escalates — see
+ * `fitEscalationReason`). The attempt is counted when the timer
+ * FIRES, not when scheduled: cancelling the timer (effect cleanup /
+ * StrictMode double-invoke / a new boundary) burns nothing. The
+ * `schedule` parameter exists for tests (a synchronous fake proves
+ * the fire-vs-schedule accounting without waiting 2 s); production
+ * passes the real `setTimeout`.
+ */
+export function scheduleFitRetryTimer(
+  budget: FitRetryBudget,
+  outcome: FitRetryTrigger,
+  onFire: () => void,
+  schedule: (fn: () => void, ms: number) => ReturnType<typeof setTimeout> = setTimeout,
+): ReturnType<typeof setTimeout> | null {
+  const delay = fitRetryDelayForBudget(outcome, budget);
+  if (delay === null) return null;
+  return schedule(() => {
+    if (outcome === 'threw') budget.threwFired += 1;
+    else budget.deferredFired += 1;
+    onFire();
+  }, delay);
+}
+
+/**
+ * Outcome → action mapping (Diya 7a — A5i). The zone effect and the
+ * tab-return effect both decide through this, so the mapping is
+ * tested once and cannot drift between the two call sites.
+ *  - 'fitted' / 'already-fitted' → landed (clear any reason);
+ *  - 'non-finite-bounds' → record the failure, never retry (the same
+ *    boundary would fail the same way);
+ *  - 'hidden' / 'cannot-fit' → timer-retry (a deferral, not a failure
+ *    — no reason is recorded);
+ *  - 'threw' → record the throw's own detail AND timer-retry it;
+ *  - 'no-boundary' → nothing (a boundary arriving re-runs the effect).
+ */
+export type FitOutcomeAction =
+  | { action: 'landed' }
+  | { action: 'record-failure'; reason: string }
+  | { action: 'retry'; outcome: 'hidden' | 'cannot-fit' | 'threw'; reason: string | null }
+  | { action: 'none' };
+
+/** The reason recorded for a non-finite boundary (shared by both call sites). */
+export const NON_FINITE_BOUNDS_REASON =
+  'zone boundary is not finite — camera cannot fit it';
+
+export function fitOutcomeAction(
+  outcome: FitOutcome | 'threw',
+  throwDetail: string | null = null,
+): FitOutcomeAction {
+  switch (outcome) {
+    case 'fitted':
+    case 'already-fitted':
+      return { action: 'landed' };
+    case 'non-finite-bounds':
+      return { action: 'record-failure', reason: NON_FINITE_BOUNDS_REASON };
+    case 'hidden':
+    case 'cannot-fit':
+      return { action: 'retry', outcome, reason: null };
+    case 'threw':
+      return {
+        action: 'retry',
+        outcome: 'threw',
+        reason: throwDetail ?? 'camera could not fit the zone',
+      };
+    case 'no-boundary':
+      return { action: 'none' };
+  }
+}
+
+/**
+ * The reason recorded when a DEFERRED fit's budget is spent (B1 —
+ * Diya 1). A permanently-pending fit never escalates on its own in
+ * v26: after 3 timer attempts `fitRetryDelayForOutcome` returns null
+ * and nothing re-arms it, so the pill read "Camera moving to the
+ * zone…" forever with no Retry. Now the caller escalates pending →
+ * failed with this reason the moment the timer returns null, so the
+ * pill names the failure and offers Retry. Escalation is at BUDGET
+ * exhaustion, not on a wall clock: the budget is the existing, tested
+ * bound (3 attempts / 6 s), a wall-clock timer would need a second
+ * clock and would fire even while retries are still usefully pending,
+ * and the escalation reuses the exact condition the timer loop
+ * already computes (schedule returns null) — no new timer, no drift.
+ * A later size-return / tab-return still attempts the fit and clears
+ * the reason if it lands, so escalation is not terminal.
+ */
+export function fitEscalationReason(outcome: 'hidden' | 'cannot-fit'): string {
+  return outcome === 'hidden'
+    ? `camera could not fit the zone after ${MAX_FIT_RETRIES} attempts — the map area never gained size`
+    : `camera could not fit the zone after ${MAX_FIT_RETRIES} attempts — the viewport cannot fit the zone`;
+}
+
+/**
+ * Whether a new boundary is a MATERIAL change from the previous one
+ * (Diya 8 — D8). The zone boundary is stabilised by `useStableByJson`
+ * (play/page.tsx), so per-render identity churn does NOT reset the
+ * budget — but a server snapshot re-serialising with float jitter
+ * would mint a fresh identity (and a fresh 3 retries) per snapshot
+ * indefinitely. A change is material only when the vertex count
+ * differs or any vertex moved by more than `toleranceDeg` (1e-6° ≈
+ * 11 cm: JSON round-trip jitter is ~1e-15°, a real shrink moves
+ * vertices ~1e-3°). Jitter keeps the old budget AND the old reason.
+ */
+export function boundaryChangedMaterially(
+  prev: GeoPolygon | null,
+  next: GeoPolygon,
+  toleranceDeg = 1e-6,
+): boolean {
+  if (prev === null) return true;
+  if (prev.length !== next.length) return true;
+  for (let i = 0; i < next.length; i++) {
+    const p = prev[i]!;
+    const n = next[i]!;
+    if (Math.abs(p.lng - n.lng) > toleranceDeg || Math.abs(p.lat - n.lat) > toleranceDeg) {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**
@@ -512,32 +873,57 @@ export function syncSource(
  * handler's catches keep a failed fit / resize / repaint from escaping
  * as an uncaught error and keep the repaint running; they are not the
  * thing that stopped the full-page crash. Both guards stay.
+ *
+ * v26: the result now reports WHAT happened, so the caller can tell a
+ * real failure from a deferral instead of guessing from the flag:
+ * `fitOutcome` is the tryFitZone outcome (null when hidden — no
+ * attempt was made), and `fitError` carries the real detail when the
+ * fit THREW (a throw is a real failure, not a silent deferral).
+ * 'hidden' / 'no-boundary' / 'cannot-fit' are DEFERRED, never failures
+ * — the caller must NOT set a fit-failure flag for them. (v25's
+ * caller did exactly that: it set the flag whenever the fit had not
+ * landed yet, which is how the founder's screenshot read "camera fit
+ * failed — ready" for a fit that had never been attempted.)
  */
+export interface MapTabReturnResult {
+  /** 'resized' when the container had size and resize+fit+repaint ran; 'hidden' when the container had no size and nothing ran. */
+  status: 'resized' | 'hidden';
+  /** The zone-fit outcome of the tab-return attempt, or null when hidden (no attempt was made). */
+  fitOutcome: FitOutcome | null;
+  /** The real detail when the fit threw, or null. */
+  fitError: string | null;
+}
+
 export function handleMapTabReturn(
   map: MapLibreMapLike,
   boundary: GeoPolygon,
   fittedRef: FitFlag,
   hasSize: boolean,
-): 'resized' | 'hidden' {
-  if (!hasSize) return 'hidden';
+): MapTabReturnResult {
+  if (!hasSize) return { status: 'hidden', fitOutcome: null, fitError: null };
   try {
     map.resize();
   } catch {
     // Resize on a removed / dead-GL map: nothing to resize. The fit
     // and repaint below still run — a failed resize must not skip them.
   }
+  let fitOutcome: FitOutcome | null = null;
+  let fitError: string | null = null;
   try {
-    tryFitZone(fittedRef, map, boundary, true);
-  } catch {
+    fitOutcome = tryFitZone(fittedRef, map, boundary, true);
+  } catch (err) {
     // Failed first fit: fitted stays false (retry on the next return
-    // or the zone effect's timer), repaint still runs below.
+    // or the zone effect's timer), repaint still runs below. The
+    // detail is REPORTED (v26) instead of swallowed: a throw is a
+    // real failure and the pill must name it.
+    fitError = unknownErrorDetail(err);
   }
   try {
     map.triggerRepaint();
   } catch {
     // Repaint on a dead map: nothing to paint.
   }
-  return 'resized';
+  return { status: 'resized', fitOutcome, fitError };
 }
 
 /** One frame of the zone-shrink interpolation: `start` → `end` at progress `p` (0..1). */
@@ -652,9 +1038,9 @@ export interface AreaRect {
  * AND the canvas (when one exists yet) has height. The founder's live
  * measurement was a 526.4×0 rect — width real, height ZERO — and the
  * pill still said "Map ready". Either rect at 0 height means no paint.
- * (Width is not checked: a 0-width area is the hidden-tab state, which
- * the container-size rules already handle; height is the failure the
- * field evidence showed.)
+ * (Height only, by name: width is diagnosed by
+ * `diagnoseMapAreaHeight`, which reports a 0-width container as
+ * 'container-zero-size' — v26 fix round, Diya 6.)
  */
 export function mapAreaHasHeight(
   containerRect: AreaRect,
@@ -663,6 +1049,150 @@ export function mapAreaHasHeight(
   if (containerRect.height <= 0) return false;
   if (canvasRect !== null && canvasRect.height <= 0) return false;
   return true;
+}
+
+/** What the map area's measured rects mean (v26). */
+export type MapAreaHeightDiagnosis =
+  /** The area can paint (container has height, canvas has height when one exists). */
+  | 'ok'
+  /** The whole map slot is 0-height because its wrapper is `display:none`
+   *  (the player is on the Radio / More tab) — 0-height BY DESIGN, not
+   *  a defect. The flag is left alone. */
+  | 'hidden-by-design'
+  /** The map tab is VISIBLE (the outer slot has height) but the map
+   *  container itself is 0-height — a REAL defect: nothing can paint.
+   *  This is the founder's exact 526.4×0 measurement, which v25 could
+   *  never surface: it returned early on a 0-height container. */
+  | 'container-zero-height'
+  /** The container has height but the canvas inside it does not — a
+   *  real defect (a canvas that never gained size). */
+  | 'canvas-zero-height'
+  /** v26 fix round (Diya 6): the map tab is VISIBLE and the container
+   *  has height, but its WIDTH is 0 — a real defect, not hidden-by-
+   *  design. v26's height-only check read this as 'ok': a 0×420
+   *  container paints nothing, `tryFitZone` returns 'hidden' forever,
+   *  and (before B1) the pill was pending forever with no Retry. */
+  | 'container-zero-size'
+  /** The container has size but the canvas inside it has no width — a
+   *  real defect, like 'canvas-zero-height'. */
+  | 'canvas-zero-size';
+
+/**
+ * Diagnose the map area from three measured rects. The OUTER rect is
+ * the PlayMap slot itself (`min-h-[320px]`, so it is ≥ 320 px tall
+ * whenever the map tab is visible and 0 only while the wrapper is
+ * `display:none`); it is what separates "hidden by design" from "the
+ * visible map has no height". The container rect is the absolute
+ * inset-0 div the map is built in; the canvas rect is the MapLibre
+ * canvas inside it (null before one exists — pre-load is not a height
+ * failure). Width IS checked (v26 fix round, Diya 6): hidden-by-design
+ * is only the `display:none` case — the outer rect is all-zero under
+ * a `display:none` ancestor, which is sound in this tree (PlayMap
+ * measures the outer slot with `getBoundingClientRect`); a container
+ * with height > 0 but width == 0 on the visible tab is a defect and
+ * is reported distinctly as 'container-zero-size' (or
+ * 'canvas-zero-size' for the canvas).
+ */
+export function diagnoseMapAreaHeight(
+  outerRect: AreaRect,
+  containerRect: AreaRect,
+  canvasRect: AreaRect | null,
+): MapAreaHeightDiagnosis {
+  if (outerRect.height <= 0) return 'hidden-by-design';
+  if (containerRect.height <= 0) return 'container-zero-height';
+  if (containerRect.width <= 0) return 'container-zero-size';
+  if (canvasRect !== null && canvasRect.height <= 0) return 'canvas-zero-height';
+  if (canvasRect !== null && canvasRect.width <= 0) return 'canvas-zero-size';
+  return 'ok';
+}
+
+// ---------------------------------------------------------------------------
+// View bounds (Diya 4 — A1ii): is the zone still in view after a resize?
+// ---------------------------------------------------------------------------
+
+/** Web-Mercator tile size (px) at zoom 0 — the world is 512·2^zoom px wide. */
+const MERCATOR_TILE_PX = 512;
+
+/** Project [lng, lat] to world pixel coordinates at `zoom`. */
+function projectToWorld(lng: number, lat: number, zoom: number): [number, number] {
+  const scale = MERCATOR_TILE_PX * Math.pow(2, zoom);
+  const x = ((lng + 180) / 360) * scale;
+  const latRad = (lat * Math.PI) / 180;
+  const y = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * scale;
+  return [x, y];
+}
+
+/** Unproject world pixel coordinates at `zoom` back to [lng, lat]. */
+function unprojectFromWorld(x: number, y: number, zoom: number): [number, number] {
+  const scale = MERCATOR_TILE_PX * Math.pow(2, zoom);
+  const lng = (x / scale) * 360 - 180;
+  const lat = (Math.atan(Math.sinh(Math.PI * (1 - (2 * y) / scale))) * 180) / Math.PI;
+  return [lng, lat];
+}
+
+/**
+ * The [[minLng, minLat], [maxLng, maxLat]] the camera currently shows,
+ * from its centre + zoom + the container size in px. Pure Web-Mercator
+ * (same projection MapLibre uses): at zoom z one world pixel is one
+ * screen pixel, so the visible span is centre ± half the size.
+ */
+export function viewBounds(
+  centre: { lng: number; lat: number },
+  zoom: number,
+  widthPx: number,
+  heightPx: number,
+): [[number, number], [number, number]] {
+  const [cx, cy] = projectToWorld(centre.lng, centre.lat, zoom);
+  const [minLng, maxLat] = unprojectFromWorld(cx - widthPx / 2, cy - heightPx / 2, zoom);
+  const [maxLng, minLat] = unprojectFromWorld(cx + widthPx / 2, cy + heightPx / 2, zoom);
+  return [
+    [minLng, minLat],
+    [maxLng, maxLat],
+  ];
+}
+
+/**
+ * True when the whole zone bbox is inside the camera's current view.
+ * A non-finite bbox is never "in view" (the fit attempt must run and
+ * record the real failure instead of being skipped).
+ */
+export function zoneBboxInView(
+  map: Pick<MapLibreMapLike, 'getCenter' | 'getZoom'>,
+  boundary: GeoPolygon,
+  widthPx: number,
+  heightPx: number,
+): boolean {
+  const bbox = boundaryBBox(boundary);
+  if (!bbox.flat().every(Number.isFinite)) return false;
+  const view = viewBounds(map.getCenter(), map.getZoom(), widthPx, heightPx);
+  return (
+    bbox[0][0] >= view[0][0] &&
+    bbox[0][1] >= view[0][1] &&
+    bbox[1][0] <= view[1][0] &&
+    bbox[1][1] <= view[1][1]
+  );
+}
+
+/**
+ * Whether a container-size change is MATERIAL (Diya 4 — A1ii). The fit
+ * landed at one size; the container may not be final when the zone
+ * effect runs (layout settling, overlay dismiss, keyboard, rotation),
+ * and a fit computed for a transient size can leave the zone out of
+ * view at the final size — while a later RO `resize()` updates the
+ * transform but never re-fits. Threshold: ≥ 120 px or ≥ 25% in either
+ * dimension (a rotation / keyboard changes hundreds of px; small
+ * layout jitter is tens of px and a few percent). The caller re-fits
+ * only when the change is material AND the zone bbox is out of view
+ * (see `zoneBboxInView`), once per size — free panning is never
+ * fought in general, and shrinks never re-fit.
+ */
+export function isMaterialSizeChange(prev: AreaRect, next: AreaRect): boolean {
+  const dw = Math.abs(next.width - prev.width);
+  const dh = Math.abs(next.height - prev.height);
+  if (dw >= 120 || dh >= 120) return true;
+  if (prev.width > 0 && dw / prev.width >= 0.25) return true;
+  if (prev.height > 0 && dh / prev.height >= 0.25) return true;
+  return false;
 }
 
 /** Cooldown after a Retry tap, during which both Retry buttons stay disabled. */

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 
 register('../resolve-hooks.mjs', import.meta.url);
 
-const { RoomStore, emptyMemory, HOST_RECONNECT_GRACE_MS } = await import('../src/room-do.ts');
+const { RoomStore, emptyMemory } = await import('../src/room-do.ts');
 const sharedNs = await import('@pakdam/shared');
 const { DEFAULT_ROOM_CONFIG } = sharedNs;
 

@@ -11,6 +11,26 @@
  * map, and a NaN camera is a broken camera. So:
  *  - `fitBounds` with any non-finite bound THROWS (a NaN camera never
  *    paints the zone; the test must see the failure, not a silent NaN).
+ *  - `fitBounds` when the viewport cannot fit the bounds is a SILENT
+ *    NO-OP, exactly like real MapLibre: `cameraForBounds` returns
+ *    undefined (warn only, no throw) when the transform is smaller
+ *    than the padding, and `fitBounds` then returns without moving
+ *    the camera. The fake models this via `cameraForBounds` (undefined
+ *    when containerWidth/Height minus padding < 0 — strict, like the
+ *    installed maplibre-gl 5.24.1 `cameraForBoxAndBearing`, which
+ *    returns undefined only for scaleX/scaleY < 0) so a test can
+ *    prove `tryFitZone` does NOT consume the one fit on a stale
+ *    zero-size transform (v26). The container size on the fake is
+ *    fixed at construction — a test "resizes" it by assigning
+ *    `map.containerWidth` / `map.containerHeight` directly.
+ *  - At EXACTLY zero available size (an 80 px container with 40 px
+ *    padding — v26 fix round, Diya 4), real `cameraForBounds` does
+ *    NOT return undefined: it returns a camera with zoom −∞
+ *    (`scaleZoom(0) = log2(0)`), and `fitBounds` flies the camera
+ *    there. The fake models that too (`cameraForBounds` returns the
+ *    −∞ camera, `fitBounds` applies it), so a test can prove the
+ *    production guard (`cameraCanFitBounds`) rejects it BEFORE any
+ *    `fitBounds` call.
  *  - `getSource` / a source's `setData` THROW after `remove()` (a rAF
  *    frame landing after removal must be caught by the production code,
  *    not by the fake being lenient).
@@ -36,6 +56,17 @@
  *    MapLibre's camera path early-outs once the style is gone. The
  *    fake does not model that; no test asserts camera state on a
  *    removed map.
+ *  - `resize()` does NOT change `containerWidth`/`containerHeight`:
+ *    real MapLibre re-reads the container size on resize, but the
+ *    fake has no DOM — a test assigns the dimensions directly to
+ *    model a container gaining size. (Arjun advisory 4: this
+ *    deviation is documented here, not hidden. It means the fake
+ *    cannot model "real-size container, stale zero-size transform";
+ *    the production mitigation — an explicit synchronous `map.resize()`
+ *    before the fit, verified against installed maplibre-gl 5.24.1:
+ *    `Map.resize` → `_resizeInternal` → `_resizeTransform` →
+ *    `transform.resize`, all synchronous, unthrottled — stays
+ *    React-only and is verified by code reading, not by this fake.)
  */
 
 export class FakeMapLibreMap {
@@ -144,6 +175,40 @@ export class FakeMapLibreMap {
     if (options.bearing !== undefined) this.bearing = options.bearing;
   }
 
+  /**
+   * The camera that would fit the bounds at the CURRENT viewport size,
+   * or undefined when the viewport cannot fit them — the real
+   * MapLibre `cameraForBounds` returns undefined (warn only) when the
+   * available size after padding is < 0, i.e. the transform is
+   * smaller than the padding (a stale zero-size transform). The
+   * caller must check this before trusting a fitBounds call.
+   *
+   * v26 fix round (Diya 4): strict `< 0`, like the installed
+   * maplibre-gl 5.24.1 — at EXACTLY 0 available size (an 80 px
+   * container with 40 px padding) the real code returns a camera
+   * with zoom −∞ (`scaleZoom(0) = log2(0)`), NOT undefined, and
+   * `fitBounds` flies there. The fake returns that −∞ camera here
+   * so the production guard (`cameraCanFitBounds`) is tested.
+   */
+  cameraForBounds(bounds, options = {}) {
+    const [[minLng, minLat], [maxLng, maxLat]] = bounds;
+    const padding = typeof options.padding === 'number' ? options.padding : 0;
+    const availableWidth = this.containerWidth - padding * 2;
+    const availableHeight = this.containerHeight - padding * 2;
+    if (availableWidth < 0 || availableHeight < 0) return undefined;
+    const centre = { lng: (minLng + maxLng) / 2, lat: (minLat + maxLat) / 2 };
+    if (availableWidth === 0 || availableHeight === 0) {
+      return { center: centre, zoom: -Infinity, bearing: 0 };
+    }
+    const spanLng = Math.max(maxLng - minLng, 1e-9);
+    const zoom = Math.min(19, Math.max(3, 14 - Math.log2(spanLng / 0.01)));
+    return {
+      center: centre,
+      zoom,
+      bearing: 0,
+    };
+  }
+
   fitBounds(bounds, options = {}) {
     this.record('fitBounds', { bounds, options });
     this.fitBoundsCount += 1;
@@ -158,10 +223,20 @@ export class FakeMapLibreMap {
       this.failFitBoundsRemaining -= 1;
       throw new Error('FakeMap fitBounds: injected failure (first fit throws)');
     }
-    this.centre = [(minLng + maxLng) / 2, (minLat + maxLat) / 2];
-    // Street-level zoom for a small span, world-level for a huge one.
-    const spanLng = Math.max(maxLng - minLng, 1e-9);
-    this.zoom = Math.min(19, Math.max(3, 14 - Math.log2(spanLng / 0.01)));
+    // Real MapLibre: cameraForBounds returns undefined when the
+    // viewport cannot fit the bounds, and fitBounds then silently does
+    // NOTHING (no throw, no camera move). A caller that marks the fit
+    // consumed on any non-throwing return has lost its one fit.
+    // At exactly-0 available size the camera is DEFINED with zoom −∞
+    // and real fitBounds APPLIES it (flyTo with zoom −∞) — the fake
+    // applies it too, so a test can prove the production guard never
+    // lets a fitBounds call happen there.
+    const camera = this.cameraForBounds(bounds, options);
+    if (camera === undefined) {
+      return;
+    }
+    this.centre = [camera.center.lng, camera.center.lat];
+    this.zoom = camera.zoom;
   }
 
   addSource(id, spec) {

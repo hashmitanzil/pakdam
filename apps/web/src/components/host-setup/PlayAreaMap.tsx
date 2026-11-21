@@ -37,6 +37,7 @@ import {
   drawPointsToBoundary,
   DRAW_MAX_POINTS,
 } from './drawPoints';
+import { tryFitSetupZone } from '../hud/play-map-logic';
 
 export interface ZoneDraft {
   centre: GeoPoint;
@@ -132,23 +133,10 @@ function mapErrorDetail(event: unknown): string | null {
   return parts.length > 0 ? parts.join(' — ') : null;
 }
 
-/** [[minLng, minLat], [maxLng, maxLat]] of a boundary, for fitBounds. */
-function boundaryBBox(polygon: GeoPolygon): [[number, number], [number, number]] {
-  let minLng = Infinity;
-  let minLat = Infinity;
-  let maxLng = -Infinity;
-  let maxLat = -Infinity;
-  for (const p of polygon) {
-    minLng = Math.min(minLng, p.lng);
-    maxLng = Math.max(maxLng, p.lng);
-    minLat = Math.min(minLat, p.lat);
-    maxLat = Math.max(maxLat, p.lat);
-  }
-  return [
-    [minLng, minLat],
-    [maxLng, maxLat],
-  ];
-}
+// NOTE (v26 fix round, A3): the local boundaryBBox helper lived here
+// for the radius fit — the fit now goes through `tryFitSetupZone`
+// (play-map-logic.ts), which computes the bbox itself, so the local
+// copy is removed rather than left unused.
 
 function ensureZoneLayers(map: MapLibreMapLike): void {
   if (!map.getLayer(ZONE_FILL_ID)) {
@@ -256,6 +244,7 @@ export const PlayAreaMap = memo(function PlayAreaMap({
     let cancelled = false;
     let map: MapLibreMapLike | null = null;
     let observer: ResizeObserver | null = null;
+    let waitObserver: ResizeObserver | null = null;
     // Captured for the cleanup below (the ref itself never changes
     // identity, but the rule wants the value copied into the effect).
     const markers = markersRef.current;
@@ -269,6 +258,30 @@ export const PlayAreaMap = memo(function PlayAreaMap({
     void (async () => {
       const container = containerRef.current;
       if (!container) return;
+      // v26 fix round (Diya 3 — A3): NEVER construct the map in a
+      // 0-size container — `new Map` there leaves a 'ready' map with
+      // a stale zero-size transform, and the radius fit below would
+      // silently no-op. Same zero-size wait as PlayMap: wait for the
+      // container to gain size first. (The setup map is always
+      // visible at fixed 280 px height in practice, so reaching zero
+      // size is hard — but the invariant must hold in code.)
+      if (!containerHasSize(container)) {
+        await new Promise<void>((resolve) => {
+          waitObserver = new ResizeObserver(() => {
+            if (containerHasSize(container)) {
+              waitObserver?.disconnect();
+              waitObserver = null;
+              resolve();
+            }
+          });
+          waitObserver.observe(container);
+        });
+        if (cancelled) return;
+        // The 12 s load timer above can fire while waiting for size —
+        // clear a stale timeout error so it never covers a map that
+        // then loads fine.
+        setMapError(null);
+      }
       const created = await createOlaMap({
         container,
         center: [OLA_MAP_INITIAL_CENTRE[0], OLA_MAP_INITIAL_CENTRE[1]],
@@ -354,6 +367,7 @@ export const PlayAreaMap = memo(function PlayAreaMap({
       cancelled = true;
       clearTimeout(loadTimer);
       observer?.disconnect();
+      waitObserver?.disconnect();
       for (const m of markers.values()) m.remove();
       markers.clear();
       dotMarkerRef.current?.remove();
@@ -400,9 +414,25 @@ export const PlayAreaMap = memo(function PlayAreaMap({
     // ResizeObserver on the container owns that now.
     if (draggingRef.current) return;
     if (radiusMeters !== lastFittedRadiusRef.current && boundary.length >= 3) {
-      map.fitBounds(boundaryBBox(boundary), { padding: 40, duration: 500 });
-      lastFittedRadiusRef.current = radiusMeters;
-      lastFlownRef.current = { lng: centre.lng, lat: centre.lat };
+      // v26 fix round (Diya 3 — A3): the UNGUARDED fitBounds that used
+      // to sit here is the exact v25 bug class — a silent no-op in a
+      // 0-size / exactly-80 px viewport, with lastFittedRadiusRef
+      // assigned immediately after, consuming that radius's fit
+      // forever. `tryFitSetupZone` fits only when the viewport can
+      // actually fit the boundary (size + finite camera), and the
+      // radius is consumed ONLY when the fit landed — a skipped fit
+      // retries on the next radius / loaded change.
+      const container = containerRef.current;
+      if (
+        tryFitSetupZone(
+          map,
+          boundary,
+          container !== null && containerHasSize(container),
+        )
+      ) {
+        lastFittedRadiusRef.current = radiusMeters;
+        lastFlownRef.current = { lng: centre.lng, lat: centre.lat };
+      }
     } else if (
       shouldRefly(lastFlownRef.current, { ...centre, accuracyMeters: 0 }, null)
     ) {

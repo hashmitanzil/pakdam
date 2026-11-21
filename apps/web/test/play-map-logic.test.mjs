@@ -15,6 +15,8 @@ const {
   mapErrorDetail,
   unknownErrorDetail,
   tryFitZone,
+  tryFitSetupZone,
+  cameraCanFitBounds,
   safeSetSourceData,
   syncSource,
   ensureMapSource,
@@ -30,7 +32,20 @@ const {
   nextFitRetryDelayMs,
   MAX_FIT_RETRIES,
   FIT_RETRY_DELAY_MS,
+  fitRetryDelayForOutcome,
+  fitRetryDelayForBudget,
+  createFitRetryBudget,
+  resetFitRetryBudget,
+  scheduleFitRetryTimer,
+  fitOutcomeAction,
+  fitEscalationReason,
+  NON_FINITE_BOUNDS_REASON,
+  boundaryChangedMaterially,
+  viewBounds,
+  zoneBboxInView,
+  isMaterialSizeChange,
   mapAreaHasHeight,
+  diagnoseMapAreaHeight,
   retryDisabled,
   RETRY_COOLDOWN_MS,
 } = await import('../src/components/hud/play-map-logic.ts');
@@ -329,7 +344,8 @@ test('rippleFrame: future-dated createdAt (clock skew) stops at the 3 s wall-clo
 test('handleMapTabReturn: hidden container (0-size, still on Radio) → no resize/fit/repaint, no throw, fit not consumed', () => {
   const map = new FakeMapLibreMap();
   const fitted = { current: false };
-  assert.equal(handleMapTabReturn(map, REAL_BOUNDARY, fitted, false), 'hidden');
+  const result = handleMapTabReturn(map, REAL_BOUNDARY, fitted, false);
+  assert.deepEqual(result, { status: 'hidden', fitOutcome: null, fitError: null });
   assert.equal(map.resizeCount, 0);
   assert.equal(map.fitBoundsCount, 0);
   assert.equal(map.repaintCount, 0);
@@ -339,7 +355,8 @@ test('handleMapTabReturn: hidden container (0-size, still on Radio) → no resiz
 test('handleMapTabReturn: happy path resizes, fits, then repaints — in that order — and the camera lands on the zone', () => {
   const map = new FakeMapLibreMap();
   const fitted = { current: false };
-  assert.equal(handleMapTabReturn(map, REAL_BOUNDARY, fitted, true), 'resized');
+  const result = handleMapTabReturn(map, REAL_BOUNDARY, fitted, true);
+  assert.deepEqual(result, { status: 'resized', fitOutcome: 'fitted', fitError: null });
   assert.deepEqual(
     map.calls.map((c) => c.method),
     ['resize', 'fitBounds', 'triggerRepaint'],
@@ -357,10 +374,21 @@ test('REPRODUCTION (fails pre-fix — passes after the fix): Radio → Map must 
   // failure, leave fitted false, still triggerRepaint. A tab return
   // must never crash the app — the founder's Radio → Map crash was
   // exactly this path (1 of 2 attempts).
-  assert.doesNotThrow(() => handleMapTabReturn(map, REAL_BOUNDARY, fitted, true));
+  // v26: the failure is REPORTED (fitError carries the real detail),
+  // not swallowed — the caller can name it in the pill.
+  let first;
+  assert.doesNotThrow(() => {
+    first = handleMapTabReturn(map, REAL_BOUNDARY, fitted, true);
+  });
+  assert.equal(first.status, 'resized');
+  assert.equal(first.fitOutcome, null, 'no outcome: the fit threw');
+  assert.match(first.fitError, /injected failure/);
   assert.equal(map.repaintCount, 1, 'repaint still runs so the canvas paints at its real size');
   assert.equal(fitted.current, false, 'failed fit does not consume the one fit');
-  assert.equal(handleMapTabReturn(map, REAL_BOUNDARY, fitted, true), 'resized');
+  const second = handleMapTabReturn(map, REAL_BOUNDARY, fitted, true);
+  assert.equal(second.status, 'resized');
+  assert.equal(second.fitOutcome, 'fitted');
+  assert.equal(second.fitError, null);
   assertCameraAtZone(map);
 });
 
@@ -609,7 +637,7 @@ test('FIX ROUND (Diya F6): handleMapTabReturn on a removed map never throws — 
   assert.doesNotThrow(() => {
     result = handleMapTabReturn(map, REAL_BOUNDARY, fitted, true);
   });
-  assert.equal(result, 'resized');
+  assert.equal(result.status, 'resized');
 });
 
 test('FIX ROUND (Zara 4): Retry is disabled while loading and for 2 s after a tap', () => {
@@ -624,3 +652,583 @@ test('FIX ROUND (Zara 4): Retry is disabled while loading and for 2 s after a ta
   );
   assert.equal(retryDisabled('error', 10_000, 10_000 - RETRY_COOLDOWN_MS - 1), false);
 });
+
+// ---------------------------------------------------------------------------
+// v26 FIX (Meera): the play map was STILL blank after v25 — founder
+// screenshot 2026-11-21 ~21:30 IST, live room 73928e83, pill
+// "Zone not in view — camera fit failed — ready" on a uniformly dark
+// canvas (no tiles, no zone, no dot). Kabir exonerated the server:
+// the snapshot boundary is current, finite, >= 3 points (281 m after
+// 2 shrinks), so the failure is in the fit/camera path and/or tile
+// loading on the client. The holes, all verified against the
+// installed maplibre-gl 5.x build:
+//  - fitBounds can silently do NOTHING: cameraForBounds returns
+//    undefined (warn only, no throw) when the viewport cannot fit
+//    the bounds — a stale zero-size transform — and fitBounds then
+//    returns without moving the camera. v25 marked the fit consumed
+//    on any non-throwing return.
+//  - a deferred fit ('hidden' / 'cannot-fit') was never retried.
+//  - the pill appended the stale 'ready' mapDetail to the fit flag,
+//    and the fit flag outranked tile errors, hiding them.
+//  - the 0-height check returned early on a 0-height container, so
+//    the founder's exact 526.4×0 case could never surface.
+// ---------------------------------------------------------------------------
+
+test('v26 REPRODUCTION (fails pre-fix — passes after the fix): a fitBounds against a stale zero-size viewport silently does nothing in real MapLibre — and tryFitZone must NOT consume the one fit for it', () => {
+  // The fake models the installed maplibre-gl 5.x behaviour exactly:
+  // cameraForBounds returns undefined when the viewport cannot fit
+  // the bounds (transform smaller than the padding), and fitBounds
+  // then returns without moving the camera and without throwing.
+  const map = new FakeMapLibreMap({ containerWidth: 0, containerHeight: 0 });
+  assert.equal(map.cameraForBounds(boundaryBBox(REAL_BOUNDARY), { padding: 40 }), undefined);
+  map.fitBounds(boundaryBBox(REAL_BOUNDARY), { padding: 40, duration: 0 });
+  assertCameraAtRanchiDefault(map, 'silent no-op fit');
+  // FIX contract (play-map-logic.ts tryFitZone): the cameraForBounds
+  // pre-check reports 'cannot-fit' WITHOUT consuming the one fit.
+  const fitted = { current: false };
+  assert.equal(tryFitZone(fitted, map, REAL_BOUNDARY, true), 'cannot-fit');
+  assert.equal(fitted.current, false, 'the one fit is not consumed by a no-op');
+  assert.equal(map.fitBoundsCount, 1, 'fitBounds was called once above (directly) and never by tryFitZone');
+  // The container gains size (a resize / tab return syncs the
+  // transform) and the SAME fit attempt lands — no Retry needed.
+  map.containerWidth = 660;
+  map.containerHeight = 525;
+  assert.notEqual(map.cameraForBounds(boundaryBBox(REAL_BOUNDARY), { padding: 40 }), undefined);
+  assert.equal(tryFitZone(fitted, map, REAL_BOUNDARY, true), 'fitted');
+  assertCameraAtZone(map);
+});
+
+test('v26: tryFitZone on a viewport too small for the padding (e.g. 60 px tall) is a deferral, not a failure — and a real-size viewport fits', () => {
+  const tiny = new FakeMapLibreMap({ containerWidth: 526, containerHeight: 60 });
+  const fitted = { current: false };
+  assert.equal(tryFitZone(fitted, tiny, REAL_BOUNDARY, true), 'cannot-fit');
+  assert.equal(fitted.current, false);
+  assert.equal(tiny.fitBoundsCount, 0, 'fitBounds is never called when the camera cannot be computed');
+  const roomy = new FakeMapLibreMap({ containerWidth: 526, containerHeight: 420 });
+  assert.equal(tryFitZone(fitted, roomy, REAL_BOUNDARY, true), 'fitted');
+  assertCameraAtZone(roomy);
+});
+
+test('v26: deferred fits share the bounded retry budget with throwing fits — landed / non-finite / no-boundary never retry', () => {
+  // The component's zone effect drives this: on a deferred outcome
+  // it asks fitRetryDelayForOutcome for the delay, bumps its retry
+  // nonce, and the effect re-runs tryFitZone. A permanently-hidden
+  // container stops after the budget is spent — it must not spin.
+  for (const outcome of ['hidden', 'cannot-fit', 'threw']) {
+    assert.equal(fitRetryDelayForOutcome(outcome, 0), FIT_RETRY_DELAY_MS, `${outcome}: retries while budget remains`);
+    assert.equal(fitRetryDelayForOutcome(outcome, MAX_FIT_RETRIES - 1), FIT_RETRY_DELAY_MS);
+    assert.equal(fitRetryDelayForOutcome(outcome, MAX_FIT_RETRIES), null, `${outcome}: budget spent, stop`);
+  }
+  for (const outcome of ['fitted', 'already-fitted', 'non-finite-bounds', 'no-boundary']) {
+    assert.equal(fitRetryDelayForOutcome(outcome, 0), null, `${outcome}: never retried`);
+  }
+  // And the loop itself: a hidden container that gains size on the
+  // third attempt lands within budget.
+  const map = new FakeMapLibreMap({ containerWidth: 0, containerHeight: 0 });
+  const fitted = { current: false };
+  let retriesUsed = 0;
+  let outcome = tryFitZone(fitted, map, REAL_BOUNDARY, true);
+  assert.equal(outcome, 'cannot-fit');
+  while (outcome !== 'fitted') {
+    const delay = fitRetryDelayForOutcome(outcome, retriesUsed);
+    assert.notEqual(delay, null, 'budget must cover the retries this map needs');
+    retriesUsed += 1;
+    if (retriesUsed === 2) {
+      map.containerWidth = 660;
+      map.containerHeight = 525;
+    }
+    outcome = tryFitZone(fitted, map, REAL_BOUNDARY, true);
+  }
+  assert.equal(retriesUsed, 2, 'two bounded retries, then the fit landed');
+  assertCameraAtZone(map);
+});
+
+test('v26: handleMapTabReturn reports a cannot-fit instead of consuming the fit — a later return with a real viewport lands it', () => {
+  const map = new FakeMapLibreMap({ containerWidth: 0, containerHeight: 0 });
+  const fitted = { current: false };
+  // hasSize=true (the container HAS size — the transform is stale,
+  // e.g. constructed while hidden and never resized): resize runs,
+  // the fit cannot be computed, the repaint still runs.
+  const first = handleMapTabReturn(map, REAL_BOUNDARY, fitted, true);
+  assert.equal(first.status, 'resized');
+  assert.equal(first.fitOutcome, 'cannot-fit');
+  assert.equal(first.fitError, null, 'a deferral is not a failure — no reason is recorded');
+  assert.equal(fitted.current, false);
+  assert.equal(map.repaintCount, 1);
+  map.containerWidth = 660;
+  map.containerHeight = 525;
+  const second = handleMapTabReturn(map, REAL_BOUNDARY, fitted, true);
+  assert.equal(second.fitOutcome, 'fitted');
+  assertCameraAtZone(map);
+});
+
+test('v26: the fit pill uses the fit’s OWN reason — never the stale mapDetail — and a fit failure never hides a tile failure', () => {
+  // The founder's exact screenshot pill: fit flag set, mapDetail
+  // 'ready' (set on load). v25 appended mapDetail verbatim:
+  // "Zone not in view — camera fit failed — ready". v26: the fit
+  // branch never reads mapDetail.
+  const stale = pillTextForState('ready', 'ready', false, null, 0, null, true, false, null, 'FakeMap fitBounds: injected failure (first fit throws)');
+  assert.equal(
+    stale,
+    'Zone not in view — camera fit failed: FakeMap fitBounds: injected failure (first fit throws)',
+  );
+  assert.doesNotMatch(stale, /— ready$/);
+  // A real failure AND tile errors are BOTH visible, joined.
+  const both = pillTextForState(
+    'ready', 'ready', false, null, 2, 'HTTP 401 — tile failed',
+    true, false, null, 'zone boundary is not finite — camera cannot fit it',
+  );
+  assert.match(both, /camera fit failed: zone boundary is not finite/);
+  assert.match(both, /Map tiles failing — 2 tile errors — HTTP 401/);
+  // A fit failure with no reason falls back to plain words — never
+  // to a stale detail.
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, true),
+    'Zone not in view — camera fit failed: camera could not fit the zone',
+  );
+  // Tiles alone are unchanged.
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 2, 'HTTP 401 — tile failed'),
+    'Map tiles failing — 2 tile errors — HTTP 401 — tile failed',
+  );
+});
+
+test('v26: a merely-pending fit reads pending — not failed, not "Map ready" — and combines honestly with tile errors', () => {
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, true),
+    'Camera moving to the zone…',
+  );
+  const pendingTiles = pillTextForState(
+    'ready', 'ready', false, null, 1, 'HTTP 500 — tile failed',
+    false, false, null, null, true,
+  );
+  assert.match(pendingTiles, /Map tiles failing — 1 tile error — HTTP 500/);
+  assert.match(pendingTiles, /Camera moving to the zone…/);
+  // Not pending, not failed, no tile errors: the healthy pill.
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, false),
+    'Map ready',
+  );
+});
+
+test('v26: diagnoseMapAreaHeight tells hidden-by-design apart from a real 0-height container — the founder’s exact 526.4×0 case', () => {
+  // The founder's probe: a 526.4×0 rect while the pill said "Map
+  // ready". v25 returned early on a 0-height container, so this
+  // could never surface. The outer slot (min-h-[320px]) is the
+  // witness: 0-height only while the wrapper is display:none.
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 526.4, height: 0 }, null),
+    'container-zero-height',
+    'visible tab (outer 420 tall) + 0-height container = a real defect',
+  );
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 0 }, { width: 526.4, height: 0 }, null),
+    'hidden-by-design',
+    'outer 0-height (Radio / More tab, wrapper display:none) = by design, not a defect',
+  );
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 526.4, height: 400 }, { width: 526.4, height: 0 }),
+    'canvas-zero-height',
+    'container fine + 0-height canvas = a real defect',
+  );
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 526.4, height: 400 }, { width: 526.4, height: 400 }),
+    'ok',
+  );
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 526.4, height: 400 }, null),
+    'ok',
+    'no canvas yet (pre-load) is not a height failure',
+  );
+  // And the 0-height pill text is unchanged for both container and
+  // canvas cases, with Retry offered by the component.
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true),
+    'Map area has no height — try Retry',
+  );
+});
+
+// ---------------------------------------------------------------------------
+// v26 FIX ROUND (Diya / Zara / Arjun review of the v26 fix).
+//
+// B1: a permanently-pending fit never escalated, and the pill offered
+// no Retry for it. B2: a manual Retry did not reset the fit-retry
+// budget. A1: the exactly-80 px edge + the transient-size race. A2: a
+// 'hidden' deferral could starve a later real throw of all timer
+// retries. A3: PlayAreaMap's unguarded fitBounds. A4: the height-only
+// diagnosis. A5: the outcome→action mapping + fire-vs-schedule
+// accounting. A6: the nonce bump killing a mid-flight shrink
+// animation (React-only — verified by code reading, see the note at
+// the end of this section). A7: sanitiser hardening. D8: the
+// material-change guard. D10: the zero-height detail clobbering a load
+// failure. Arjun 5: the separator-ambiguous pill.
+//
+// What Node CANNOT test here (React-only, stated, not papered over):
+//  - the Retry BUTTON being present while pending (the JSX condition
+//    in PlayMap.tsx now includes `fitPending` — verified by reading
+//    the condition, not by a test);
+//  - the manual-Retry reset actually running on a tap (the
+//    `resetFitRetryBudget` calls in `retryMap` / `startCreation` —
+//    the reset itself is tested below, the call sites by reading);
+//  - the shrink animation surviving a nonce bump (A6 — the fit effect
+//    no longer lists the animation effect's deps; verified by
+//    reading the two effects' dependency arrays: the zone effect is
+//    [mapReady, zoneBoundary], the fit effect is [mapReady,
+//    zoneBoundary, fitRetryNonce]).
+// ---------------------------------------------------------------------------
+
+test('v26 FIX ROUND (A7 — Zara 1–2): the sanitisers redact the double-encoded, JSON-colon and hyphen key forms', () => {
+  const cases = [
+    // Double-encoded: api_key%253D<value> (a URL encoded twice).
+    'GET https://api.olamaps.io/tiles?api_key%253Dabc123secret failed',
+    // JSON-colon: "api_key":"<value>" (a serialised error object).
+    '{"error":{"message":"GET https://api.olamaps.io/tiles","api_key":"abc123secret"}}',
+    '{"api_key": "abc123secret"}',
+    // Hyphen form: api-key=<value>.
+    'GET https://api.olamaps.io/tiles?api-key=abc123secret failed',
+    // The v25 forms still redact (no regression).
+    'GET https://api.olamaps.io/tiles?api_key%3Dabc123secret failed',
+    'GET https://api.olamaps.io/tiles?apiKey=abc123secret failed',
+    'GET https://api.olamaps.io/tiles?key=abc123secret failed',
+  ];
+  for (const message of cases) {
+    const detail = mapErrorDetail({ error: { status: 401, message } });
+    assert.doesNotMatch(detail, /abc123secret/, message);
+    assert.match(detail, /…/, message);
+  }
+  for (const message of cases) {
+    assert.doesNotMatch(unknownErrorDetail(new Error(message)), /abc123secret/, message);
+  }
+  // Words that merely contain "key" are still untouched.
+  const innocent = mapErrorDetail({ error: { message: 'turkey=leg day failed' } });
+  assert.match(innocent, /turkey=leg/);
+  // A JSON object whose key is NOT an api key is untouched.
+  const otherJson = mapErrorDetail({ error: { message: '{"id":"abc123secret"}' } });
+  assert.match(otherJson, /abc123secret/);
+});
+
+test('v26 FIX ROUND (A1i — Diya 4): at exactly 80 px the real cameraForBounds returns a −∞-zoom camera — tryFitZone must treat it as cannot-fit, never call fitBounds', () => {
+  // The fake models the installed maplibre-gl 5.24.1 exactly: strict
+  // < 0 → undefined; == 0 → the −∞ camera. (80 px − 40 px padding × 2 = 0.)
+  const edge = new FakeMapLibreMap({ containerWidth: 80, containerHeight: 420 });
+  const camera = edge.cameraForBounds(boundaryBBox(REAL_BOUNDARY), { padding: 40 });
+  assert.notEqual(camera, undefined, 'at exactly 0 available width the camera is DEFINED');
+  assert.equal(camera.zoom, -Infinity, 'zoom is scaleZoom(0) = log2(0) = −∞');
+  // A direct fitBounds there is the real break: the camera flies to −∞.
+  edge.fitBounds(boundaryBBox(REAL_BOUNDARY), { padding: 40, duration: 0 });
+  assert.equal(edge.camera().zoom, -Infinity, 'real fitBounds applies the −∞ camera — the break');
+  // FIX contract (play-map-logic.ts cameraCanFitBounds / tryFitZone):
+  // the guard rejects the −∞ camera BEFORE any fitBounds call.
+  const guarded = new FakeMapLibreMap({ containerWidth: 80, containerHeight: 420 });
+  assert.equal(cameraCanFitBounds(guarded, boundaryBBox(REAL_BOUNDARY), 40), false);
+  const fitted = { current: false };
+  assert.equal(tryFitZone(fitted, guarded, REAL_BOUNDARY, true), 'cannot-fit');
+  assert.equal(guarded.fitBoundsCount, 0, 'fitBounds is never called with a −∞ camera');
+  assert.equal(fitted.current, false, 'the one fit is not consumed');
+  assert.ok(Number.isFinite(guarded.camera().zoom), 'the camera is still at its finite default');
+  // Same edge on the height axis (420 × 80).
+  const edgeH = new FakeMapLibreMap({ containerWidth: 420, containerHeight: 80 });
+  assert.equal(cameraCanFitBounds(edgeH, boundaryBBox(REAL_BOUNDARY), 40), false);
+  assert.equal(tryFitZone(fitted, edgeH, REAL_BOUNDARY, true), 'cannot-fit');
+  assert.equal(edgeH.fitBoundsCount, 0);
+  // And the guard still passes a real viewport / still rejects the < 0 cases.
+  const roomy = new FakeMapLibreMap({ containerWidth: 660, containerHeight: 525 });
+  assert.equal(cameraCanFitBounds(roomy, boundaryBBox(REAL_BOUNDARY), 40), true);
+  const zero = new FakeMapLibreMap({ containerWidth: 0, containerHeight: 0 });
+  assert.equal(cameraCanFitBounds(zero, boundaryBBox(REAL_BOUNDARY), 40), false);
+  const tiny = new FakeMapLibreMap({ containerWidth: 526, containerHeight: 60 });
+  assert.equal(cameraCanFitBounds(tiny, boundaryBBox(REAL_BOUNDARY), 40), false);
+  // A non-finite bbox is not fittable either.
+  const nanBbox = [[Number.NaN, 0], [1, 1]];
+  assert.equal(cameraCanFitBounds(roomy, nanBbox, 40), false);
+});
+
+test('v26 FIX ROUND (A1ii — Diya 4): view bounds + zone-in-view + material-size change', () => {
+  // viewBounds is centred on the camera centre at any zoom. (The
+  // latitude midpoint in DEGREES is not exactly the centre latitude —
+  // Mercator is non-linear in latitude, so a pixel-symmetric view
+  // spans ~4e-7° asymmetrically in degrees at this zoom. The centre
+  // check below therefore uses the pixel centre, and the midpoint
+  // check allows that curvature.)
+  const view = viewBounds(PATNA, 14, 660, 525);
+  const [[minLng, minLat], [maxLng, maxLat]] = view;
+  assert.ok(Math.abs((minLng + maxLng) / 2 - PATNA.lng) < 1e-9, 'view is centred on the camera lng');
+  assert.ok(Math.abs((minLat + maxLat) / 2 - PATNA.lat) < 1e-6, 'view is centred on the camera lat (within Mercator curvature)');
+  // At zoom 14, 660 px ≈ 0.028° lng; 525 px ≈ 0.020° lat at Patna.
+  assert.ok(maxLng - minLng > 0.025 && maxLng - minLng < 0.032, `lng span ${maxLng - minLng}`);
+  assert.ok(maxLat - minLat > 0.018 && maxLat - minLat < 0.023, `lat span ${maxLat - minLat}`);
+  // A fitted 500 m Patna zone is in view; the Ranchi default is not.
+  const map = new FakeMapLibreMap();
+  assert.equal(zoneBboxInView(map, REAL_BOUNDARY, 660, 525), false, 'Ranchi default does not show Patna');
+  const fitted = { current: false };
+  assert.equal(tryFitZone(fitted, map, REAL_BOUNDARY, true), 'fitted');
+  assert.equal(zoneBboxInView(map, REAL_BOUNDARY, 660, 525), true, 'after the fit the whole zone is in view');
+  // A much smaller viewport at the same camera loses the zone.
+  assert.equal(zoneBboxInView(map, REAL_BOUNDARY, 100, 80), false, 'a 100×80 view cannot hold the 500 m zone');
+  // Material-size thresholds: ≥ 120 px or ≥ 25% in either dimension.
+  assert.equal(isMaterialSizeChange({ width: 660, height: 525 }, { width: 660, height: 400 }), true, '125 px height change is material');
+  assert.equal(isMaterialSizeChange({ width: 660, height: 525 }, { width: 700, height: 525 }), false, '40 px / 6% is layout jitter, not material');
+  assert.equal(isMaterialSizeChange({ width: 660, height: 525 }, { width: 500, height: 525 }), true, '160 px width change is material');
+  assert.equal(isMaterialSizeChange({ width: 100, height: 100 }, { width: 130, height: 100 }), true, '30% on a small container is material');
+  assert.equal(isMaterialSizeChange({ width: 100, height: 100 }, { width: 120, height: 100 }), false, '20% on a small container is not');
+  assert.equal(isMaterialSizeChange({ width: 660, height: 525 }, { width: 660, height: 525 }), false);
+});
+
+test('v26 FIX ROUND (A2 — Diya 5): separate budgets — 3× hidden must NOT starve a later real throw of all timer retries', () => {
+  // The scenario: map loads on the Radio tab → zone effect 'hidden' →
+  // timer retries ×3 over 6 s → budget spent; player returns to the
+  // Map tab, first fit throws → the throw must still have timer
+  // retries. A synchronous fake scheduler proves the accounting
+  // without waiting 2 s per retry (the real setTimeout is the default
+  // in production).
+  const syncSchedule = (fn) => {
+    fn();
+    return 1;
+  };
+  const budget = createFitRetryBudget();
+  let fired = 0;
+  for (let i = 0; i < MAX_FIT_RETRIES; i++) {
+    const timer = scheduleFitRetryTimer(budget, 'hidden', () => {
+      fired += 1;
+    }, syncSchedule);
+    assert.notEqual(timer, null, `deferral retry ${i + 1} is scheduled`);
+  }
+  assert.equal(fired, MAX_FIT_RETRIES, '3 deferral timers fired');
+  assert.equal(budget.deferredFired, MAX_FIT_RETRIES);
+  assert.equal(budget.threwFired, 0, 'deferrals never touched the throw budget');
+  // The deferral budget is spent — but the throw budget is fresh.
+  assert.equal(scheduleFitRetryTimer(budget, 'hidden', () => {}, syncSchedule), null);
+  assert.equal(fitRetryDelayForBudget('hidden', budget), null);
+  assert.notEqual(fitRetryDelayForBudget('threw', budget), null, 'a real throw still has timer retries');
+  const throwTimer = scheduleFitRetryTimer(budget, 'threw', () => {
+    fired += 1;
+  }, syncSchedule);
+  assert.notEqual(throwTimer, null, 'the throw retry is scheduled');
+  assert.equal(budget.threwFired, 1);
+  assert.equal(fired, MAX_FIT_RETRIES + 1);
+  // 'cannot-fit' shares the DEFERRAL budget with 'hidden'.
+  const budget2 = createFitRetryBudget();
+  for (let i = 0; i < MAX_FIT_RETRIES; i++) {
+    assert.notEqual(scheduleFitRetryTimer(budget2, 'cannot-fit', () => {}, syncSchedule), null);
+  }
+  assert.equal(scheduleFitRetryTimer(budget2, 'hidden', () => {}, syncSchedule), null, 'hidden shares the spent deferral budget');
+  assert.notEqual(scheduleFitRetryTimer(budget2, 'threw', () => {}, syncSchedule), null);
+});
+
+test('v26 FIX ROUND (A5ii — Diya 7a): the attempt is counted when the timer FIRES, not when scheduled — a cancelled timer burns nothing', () => {
+  const budget = createFitRetryBudget();
+  let fired = 0;
+  // Scheduled but never fired (effect cleanup / StrictMode
+  // double-invoke): no increment, budget intact.
+  const pending = scheduleFitRetryTimer(budget, 'hidden', () => {
+    fired += 1;
+  }, () => 99);
+  assert.notEqual(pending, null, 'scheduled');
+  assert.equal(budget.deferredFired, 0, 'nothing fired yet — nothing counted');
+  assert.equal(fired, 0);
+  // The same budget still schedules (the cancelled attempt did not
+  // consume one of the 3), and firing counts exactly once.
+  const syncSchedule = (fn) => {
+    fn();
+    return 1;
+  };
+  assert.notEqual(scheduleFitRetryTimer(budget, 'hidden', () => {
+    fired += 1;
+  }, syncSchedule), null);
+  assert.equal(budget.deferredFired, 1);
+  assert.equal(fired, 1);
+  // resetFitRetryBudget (the manual-Retry / new-boundary reset, B2/D8)
+  // zeroes both counters in place.
+  resetFitRetryBudget(budget);
+  assert.deepEqual(budget, { deferredFired: 0, threwFired: 0 });
+});
+
+test('v26 FIX ROUND (A5i — Diya 7a): fitOutcomeAction maps all 7 outcomes + threw', () => {
+  assert.deepEqual(fitOutcomeAction('fitted'), { action: 'landed' });
+  assert.deepEqual(fitOutcomeAction('already-fitted'), { action: 'landed' });
+  assert.deepEqual(fitOutcomeAction('non-finite-bounds'), {
+    action: 'record-failure',
+    reason: NON_FINITE_BOUNDS_REASON,
+  });
+  assert.equal(NON_FINITE_BOUNDS_REASON, 'zone boundary is not finite — camera cannot fit it');
+  assert.deepEqual(fitOutcomeAction('hidden'), { action: 'retry', outcome: 'hidden', reason: null });
+  assert.deepEqual(fitOutcomeAction('cannot-fit'), { action: 'retry', outcome: 'cannot-fit', reason: null });
+  assert.deepEqual(fitOutcomeAction('threw', 'FakeMap fitBounds: injected failure'), {
+    action: 'retry',
+    outcome: 'threw',
+    reason: 'FakeMap fitBounds: injected failure',
+  });
+  assert.deepEqual(fitOutcomeAction('threw'), {
+    action: 'retry',
+    outcome: 'threw',
+    reason: 'camera could not fit the zone',
+  });
+  assert.deepEqual(fitOutcomeAction('no-boundary'), { action: 'none' });
+  // The mapping agrees with the retry-delay table: only hidden /
+  // cannot-fit / threw ever schedule a timer.
+  for (const outcome of ['fitted', 'already-fitted', 'non-finite-bounds', 'no-boundary']) {
+    assert.equal(fitRetryDelayForOutcome(outcome, 0), null, `${outcome}: never retried`);
+  }
+  for (const outcome of ['hidden', 'cannot-fit', 'threw']) {
+    assert.equal(fitRetryDelayForOutcome(outcome, 0), FIT_RETRY_DELAY_MS, `${outcome}: retried`);
+  }
+});
+
+test('v26 FIX ROUND (B1 — Diya 1): a spent deferred budget escalates pending → failed with a reason', () => {
+  // The exact scenario: container 0 px wide × 420 px tall (width-0
+  // is invisible to the height-only diagnosis) → tryFitZone returns
+  // 'hidden' → timer retries ×3 over 6 s → budget spent → the pill
+  // must read failed-with-a-reason, not "Camera moving to the zone…"
+  // forever. The escalation reason is a pure function of the outcome;
+  // the component sets it the moment the timer returns null.
+  const hiddenReason = fitEscalationReason('hidden');
+  assert.equal(hiddenReason, 'camera could not fit the zone after 3 attempts — the map area never gained size');
+  const cannotFitReason = fitEscalationReason('cannot-fit');
+  assert.equal(cannotFitReason, 'camera could not fit the zone after 3 attempts — the viewport cannot fit the zone');
+  // The pill with that reason is a failure pill (with Retry offered by
+  // the component — the JSX condition now includes fitPending too, so
+  // Retry is present even BEFORE escalation; verified by reading the
+  // condition in PlayMap.tsx, not by this test).
+  const pill = pillTextForState('ready', 'ready', false, null, 0, null, true, false, null, hiddenReason);
+  assert.equal(pill, `Zone not in view — camera fit failed: ${hiddenReason}`);
+  // And the budget-spent state that triggers it, driven end to end
+  // through the real timer helper with a synchronous scheduler:
+  const budget = createFitRetryBudget();
+  const syncSchedule = (fn) => {
+    fn();
+    return 1;
+  };
+  let outcome = 'hidden';
+  for (let i = 0; i < MAX_FIT_RETRIES; i++) {
+    assert.notEqual(scheduleFitRetryTimer(budget, outcome, () => {}, syncSchedule), null);
+  }
+  assert.equal(scheduleFitRetryTimer(budget, outcome, () => {}, syncSchedule), null, 'budget spent — the caller escalates');
+  // The same width-0 container via the height diagnosis: 0×420 is a
+  // zero-SIZE defect (A4), not 'ok' — see the A4 test below.
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 0, height: 420 }, null),
+    'container-zero-size',
+  );
+});
+
+test('v26 FIX ROUND (A3 — Diya 3): a zero-size setup-map fit does not consume the fit', () => {
+  // tryFitSetupZone is the exact production function PlayAreaMap's
+  // zone effect calls; lastFittedRadiusRef is assigned only when it
+  // returns true (verified by reading PlayAreaMap.tsx:403).
+  const map = new FakeMapLibreMap({ containerWidth: 0, containerHeight: 0 });
+  assert.equal(tryFitSetupZone(map, REAL_BOUNDARY, false), false, 'no size → no fit');
+  assert.equal(map.fitBoundsCount, 0);
+  assert.equal(tryFitSetupZone(map, REAL_BOUNDARY, true), false, 'hasSize lies but the viewport is 0-size → no fit');
+  assert.equal(map.fitBoundsCount, 0, 'fitBounds never called on a silent no-op viewport');
+  // Exactly-80 px: the −∞ camera — no fit, no consumption.
+  const edge = new FakeMapLibreMap({ containerWidth: 80, containerHeight: 420 });
+  assert.equal(tryFitSetupZone(edge, REAL_BOUNDARY, true), false);
+  assert.equal(edge.fitBoundsCount, 0);
+  assert.ok(Number.isFinite(edge.camera().zoom), 'the camera was not flown to −∞');
+  // A real viewport fits, with the animated 500 ms fit.
+  const roomy = new FakeMapLibreMap({ containerWidth: 660, containerHeight: 525 });
+  assert.equal(tryFitSetupZone(roomy, REAL_BOUNDARY, true), true);
+  assert.equal(roomy.fitBoundsCount, 1);
+  assert.deepEqual(roomy.callsOf('fitBounds')[0].options, { padding: 40, duration: 500 });
+  const cam = roomy.camera();
+  assert.ok(Math.abs(cam.centre[0] - PATNA.lng) < 0.001);
+  assert.ok(Math.abs(cam.centre[1] - PATNA.lat) < 0.001);
+  // A throwing fitBounds does not escape and does not land.
+  const throwing = new FakeMapLibreMap();
+  throwing.failFitBoundsTimes(1);
+  assert.equal(tryFitSetupZone(throwing, REAL_BOUNDARY, true), false);
+  assert.equal(throwing.fitBoundsCount, 1);
+  // <3-point and non-finite boundaries never fit.
+  assert.equal(tryFitSetupZone(roomy, [], true), false);
+  const asArrays = REAL_BOUNDARY.map((p) => [p.lng, p.lat]);
+  assert.equal(tryFitSetupZone(roomy, asArrays, true), false);
+});
+
+test('v26 FIX ROUND (A4 — Diya 6): diagnoseMapAreaHeight checks width too — the exact 0×420 case', () => {
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 0, height: 420 }, null),
+    'container-zero-size',
+    'visible tab + 0-width container = a real defect, not ok',
+  );
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 526.4, height: 400 }, { width: 0, height: 400 }),
+    'canvas-zero-size',
+    'container fine + 0-width canvas = a real defect',
+  );
+  // The height cases are unchanged.
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 526.4, height: 0 }, null),
+    'container-zero-height',
+  );
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 0 }, { width: 526.4, height: 0 }, null),
+    'hidden-by-design',
+    'outer 0-height (Radio / More tab, wrapper display:none) = by design',
+  );
+  assert.equal(
+    diagnoseMapAreaHeight({ width: 526.4, height: 420 }, { width: 526.4, height: 400 }, { width: 526.4, height: 400 }),
+    'ok',
+  );
+  // The zero-width pill text, and height still outranks width.
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, false, true),
+    'Map area has no width — try Retry',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true, null, null, false, true),
+    'Map area has no height — try Retry',
+    'both dimensions zero on a visible tab reads as the height defect',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true),
+    'Map area has no height — try Retry',
+  );
+});
+
+test('v26 FIX ROUND (D8 — Diya 8): the budget resets only on a MATERIAL boundary change — float jitter grants nothing', () => {
+  const shrink = circlePolygon(PATNA, 375, 64);
+  assert.equal(boundaryChangedMaterially(null, REAL_BOUNDARY), true, 'first boundary is a change');
+  assert.equal(boundaryChangedMaterially(REAL_BOUNDARY, REAL_BOUNDARY), false, 'identical boundary is not a change');
+  // A snapshot re-serialised with float jitter (each coord + 1e-9°):
+  // a fresh identity, but NOT a material change.
+  const jittered = REAL_BOUNDARY.map((p) => ({ lng: p.lng + 1e-9, lat: p.lat - 1e-9 }));
+  assert.equal(boundaryChangedMaterially(REAL_BOUNDARY, jittered), false, 'jitter must not mint a fresh budget');
+  // A real shrink moves vertices ~1e-3° — material.
+  assert.equal(boundaryChangedMaterially(REAL_BOUNDARY, shrink), true, 'a shrink is material');
+  // A vertex-count change is material.
+  assert.equal(boundaryChangedMaterially(REAL_BOUNDARY, REAL_BOUNDARY.slice(0, 32)), true);
+  // A sub-tolerance move is not; a 2e-6° move is.
+  const tinyMove = REAL_BOUNDARY.map((p, i) => (i === 0 ? { lng: p.lng + 5e-7, lat: p.lat } : p));
+  assert.equal(boundaryChangedMaterially(REAL_BOUNDARY, tinyMove), false);
+  const smallMove = REAL_BOUNDARY.map((p, i) => (i === 0 ? { lng: p.lng + 2e-6, lat: p.lat } : p));
+  assert.equal(boundaryChangedMaterially(REAL_BOUNDARY, smallMove), true);
+});
+
+test('v26 FIX ROUND (Arjun 5): the combined pill is separator-unambiguous — the fit reason follows a colon, not a third dash', () => {
+  // A fit reason that itself contains ' — ' (the escalation reason)
+  // plus tile errors: the outer structure splits on ' · ' and the fit
+  // part on ': ' — there is exactly one colon-delimited reason.
+  const reason = fitEscalationReason('cannot-fit');
+  const pill = pillTextForState(
+    'ready', 'ready', false, null, 2, 'HTTP 401 — tile failed',
+    true, false, null, reason,
+  );
+  assert.equal(
+    pill,
+    'Zone not in view — camera fit failed: camera could not fit the zone after 3 attempts — the viewport cannot fit the zone · Map tiles failing — 2 tile errors — HTTP 401 — tile failed',
+  );
+  assert.equal(pill.split(' · ').length, 2, 'two parts, joined once');
+  assert.ok(pill.split(' · ')[0].startsWith('Zone not in view — camera fit failed: '));
+});
+
+// NOTE (A6 — Diya 7b, React-only): the nonce bump killing a mid-flight
+// shrink animation cannot be exercised under Node — there is no React
+// here. The fix is structural: the fit attempt lives in its own
+// effect (deps [mapReady, zoneBoundary, fitRetryNonce]) and the zone
+// overlay + shrink-animation effect lists only [mapReady,
+// zoneBoundary], so a fit-retry timer firing mid-shrink re-runs the
+// fit effect only — its cleanup never cancels the animation's rAF.
+// Verified by reading PlayMap.tsx: the string 'fitRetryNonce' appears
+// in the fit effect's dependency array and NOWHERE in the zone
+// effect's. The founder's live check (a shrink landing while a fit
+// retry is pending) is the verdict for the animation itself.

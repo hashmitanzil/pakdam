@@ -37,7 +37,11 @@ const REAL_BOUNDARY = circlePolygon(PATNA, 500, 64);
 // ---------------------------------------------------------------------------
 test('FIXED (Diya-1): a failed first fit surfaces in the pill — never "Map ready" while the camera never reached the zone', () => {
   const fitFailureDetail = 'Invalid LngLat object: (NaN, 25.5)';
-  const pill = pillTextForState('ready', fitFailureDetail, false, null, 0, null, true);
+  // v26: the fit branch uses the fit's OWN reason (10th arg), never
+  // the stale mapDetail — the v25 call passed the detail as mapDetail
+  // and the pill appended it verbatim, so a deferred fit with
+  // mapDetail 'ready' read "camera fit failed — ready".
+  const pill = pillTextForState('ready', 'ready', false, null, 0, null, true, false, null, fitFailureDetail);
   assert.notEqual(pill, 'Map ready');
   assert.match(pill, /not in view|fit failed/i);
   assert.match(pill, /NaN/);
