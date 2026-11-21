@@ -76,7 +76,6 @@ function makeStore() {
     paused: false,
     pausedBy: null,
     pausedFrom: null,
-    sosActive: false,
     eventLog: [],
     shrinkIndexApplied: 0,
     tickets: [],
@@ -84,13 +83,17 @@ function makeStore() {
     idempotentReplies: [],
     pendingPings: [],
     pendingPingRecipients: {},
-    pendingShrink: null,
   };
   const store = new RoomStore(state, emptyMemory());
   return store;
 }
 
-/** Fresh fixes for every seat at `nowMs` (the tick purges fixes older than 30 s). */
+/** Fresh fixes for every seat at `nowMs` (the tick purges fixes older than 30 s).
+ * Stamps `lastFixAt` too — that is what `location.update` does in
+ * production, and the v18 missing-fix ejection reads the server receipt
+ * time (`lastFixAt`), not the fix's device timestamp. A harness that
+ * writes `mem.latestFix` without stamping `lastFixAt` would (correctly,
+ * by that rule) see the seat as silent for 30 s+ and eject it. */
 function freshFixes(store, nowMs) {
   for (const p of store.state.players) {
     store.mem.latestFix[p.playerId] = {
@@ -99,6 +102,7 @@ function freshFixes(store, nowMs) {
       accuracyMeters: 10,
       timestampMs: nowMs,
     };
+    p.lastFixAt = new Date(nowMs).toISOString();
   }
 }
 
@@ -132,7 +136,7 @@ test('alarmTick: no ping the instant ACTIVE begins; first ping one interval afte
   }
 });
 
-test('reveal.send: rejected during HEAD_START, accepted once ACTIVE', async () => {
+test('reveal.send: removed in v18 — rejected in HEAD_START and in ACTIVE (no hold-to-reveal)', async () => {
   const store = makeStore();
   const fix = (nowMs, lat) => ({ lat, lng: 85.33, accuracyMeters: 10, timestampMs: nowMs });
   const headStart = await store.handleWsMessage(
@@ -141,10 +145,10 @@ test('reveal.send: rejected during HEAD_START, accepted once ACTIVE', async () =
     T0 + 60_000,
   );
   assert.equal(headStart.events.some((e) => e.type === 'reveal'), false);
-  const err = headStart.events.find((e) => e.type === 'error');
-  assert.ok(err, 'expected an error event during HEAD_START');
-  assert.equal(err.payload['code'], 'INVALID_STATE');
-  assert.match(String(err.payload['message']), /head start/);
+  const headErr = headStart.events.find((e) => e.type === 'error');
+  assert.ok(headErr, 'expected an error event during HEAD_START');
+  assert.equal(headErr.payload['code'], 'VALIDATION_FAILED');
+  assert.match(String(headErr.payload['message']), /Unknown message type: reveal\.send/);
 
   freshFixes(store, T0 + HEAD_START_MS);
   store.alarmTick(T0 + HEAD_START_MS);
@@ -154,7 +158,11 @@ test('reveal.send: rejected during HEAD_START, accepted once ACTIVE', async () =
     { type: 'reveal.send', payload: { fix: fix(T0 + HEAD_START_MS, 23.351) } },
     T0 + HEAD_START_MS,
   );
-  assert.equal(active.events.some((e) => e.type === 'reveal'), true);
+  assert.equal(active.events.some((e) => e.type === 'reveal'), false);
+  const activeErr = active.events.find((e) => e.type === 'error');
+  assert.ok(activeErr, 'expected an error event once ACTIVE too');
+  assert.equal(activeErr.payload['code'], 'VALIDATION_FAILED');
+  assert.match(String(activeErr.payload['message']), /Unknown message type: reveal\.send/);
 });
 
 test('pendingPingsFor: nothing is delivered during HEAD_START', () => {

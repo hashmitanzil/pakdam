@@ -153,6 +153,25 @@ test.describe('live HUD (demo)', () => {
     await expect(sheet.getByText('Safety pause')).toBeVisible();
     await expect(sheet.getByText('Pauses the match for everyone and freezes the clock.')).toBeVisible();
     await expect(sheet.getByRole('button', { name: 'Leave game' })).toBeVisible();
+    // Item 2: "Sound & vibration" section — haptics on by default, cue
+    // sounds off by default; both persist in localStorage.
+    await expect(sheet.getByText('Sound & vibration', { exact: true })).toBeVisible();
+    const haptics = sheet.getByRole('switch', { name: 'Vibration (Android only)', exact: true });
+    const sounds = sheet.getByRole('switch', { name: 'Cue sounds', exact: true });
+    await expect(haptics).toBeVisible();
+    await expect(sounds).toBeVisible();
+    await expect(haptics).toHaveAttribute('aria-checked', 'true');
+    await expect(sounds).toHaveAttribute('aria-checked', 'false');
+    await sounds.click();
+    await expect(sounds).toHaveAttribute('aria-checked', 'true');
+    expect(await guest.evaluate(() => window.localStorage.getItem('pakdam-cues-sounds'))).toBe(
+      'on',
+    );
+    await haptics.click();
+    await expect(haptics).toHaveAttribute('aria-checked', 'false');
+    expect(await guest.evaluate(() => window.localStorage.getItem('pakdam-cues-haptics'))).toBe(
+      'off',
+    );
   });
 
   test('safety pause freezes the clock and resume returns to live play', async ({ context }) => {
@@ -196,7 +215,7 @@ test.describe('live HUD (demo)', () => {
     await expect(hostPage.getByText(/Suspended — location unknown/)).toBeHidden();
   });
 
-  test('catch buttons are one per role: hunter gets CATCH BY QR, runner gets Got Tagged', async ({
+  test('catch buttons are one per role: hunter gets Tag a runner, runner gets Got Tagged', async ({
     context,
   }) => {
     const { hostPage, guestPages, roles } = await startDemoMatch(context);
@@ -206,14 +225,14 @@ test.describe('live HUD (demo)', () => {
       const page = allPages[i]!;
       const role = roles.get(names[i]!);
       if (role === 'hunter') {
-        await expect(page.getByRole('button', { name: 'CATCH BY QR' })).toBeVisible();
+        await expect(page.getByRole('button', { name: 'Tag a runner', exact: true })).toBeVisible();
         await expect(page.getByRole('button', { name: 'Got Tagged' })).toBeHidden();
       } else {
         // No "SHOW MY QR" button exists on the play screen — the
         // runner's button is "Got Tagged", which opens /catch where the
-        // QR itself is shown.
+        // QR itself is shown automatically.
         await expect(page.getByRole('button', { name: 'Got Tagged' })).toBeVisible();
-        await expect(page.getByRole('button', { name: 'CATCH BY QR' })).toBeHidden();
+        await expect(page.getByRole('button', { name: 'Tag a runner', exact: true })).toBeHidden();
       }
     }
   });

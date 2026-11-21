@@ -102,6 +102,17 @@ function toGeoJsonCollection(polygons: GeoPolygon[]): {
 }
 
 /**
+ * True when the map container has a real (non-zero) size — same guard
+ * as PlayMap (v18 zero-size rule, A11): `resize()` is NEVER called at
+ * 0-size, or the canvas can stay blank when the container gains size.
+ * Latent here (the setup map is always visible in practice), added for
+ * defence in depth.
+ */
+function containerHasSize(container: HTMLElement): boolean {
+  return container.clientWidth > 0 && container.clientHeight > 0;
+}
+
+/**
  * Short, safe detail from a MapLibre error event (status + message).
  * The message can contain the request URL — including the Ola api_key
  * as a query parameter — so any `api_key=…` value is stripped before
@@ -275,7 +286,10 @@ export const PlayAreaMap = memo(function PlayAreaMap({
       maplibreRef.current = await import('maplibre-gl');
       // B16: resize ONLY when the container's size changes — the old
       // code called map.resize() on every centre/radius/draw change.
-      observer = new ResizeObserver(() => created.resize());
+      // A11: never resize at zero size (same guard as PlayMap).
+      observer = new ResizeObserver(() => {
+        if (containerHasSize(container)) created.resize();
+      });
       observer.observe(container);
       // B16: a camera move must never fight the user's drag.
       created.on('dragstart', () => {
@@ -290,7 +304,8 @@ export const PlayAreaMap = memo(function PlayAreaMap({
         ensureZoneLayers(created);
         loadedRef.current = true;
         setLoaded(true);
-        created.resize();
+        // A11: resize only at a real size, same guard as PlayMap.
+        if (containerHasSize(container)) created.resize();
       });
       created.on('error', (event: unknown) => {
         if (cancelled) return;

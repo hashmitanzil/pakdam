@@ -11,8 +11,8 @@
  * (or `{ error, issues }` for a bad body, 400).
  *
  * Deliberately NO REST routes (404 by design — WS only): catch
- * request/confirm/dispute, safety SOS, leave. Do not add REST twins.
- * No leaderboard route exists.
+ * request/confirm/self-confirm/dispute, safety pause/resume (WS), leave.
+ * Do not add REST twins. No leaderboard route exists.
  */
 import {
   isValidDisplayName,
@@ -52,6 +52,19 @@ export function isUuid(value: string): boolean {
  * The Worker entry skips its pre-handler limit for seat routes; each
  * handler below checks this limiter AFTER parsing the credential and
  * BEFORE calling the DO.
+ *
+ * EXCEPTION (v18 fix round, F5): the replay route passes an explicit
+ * `bucketKey` of room + playerId instead of the token hash. A limit
+ * keyed by the presented host-token hash gives every guessed host
+ * token a fresh bucket, so it cannot throttle credential guessing at
+ * all. Keying by room + seat still bounds the host's own replay rate
+ * (5/min) while a guessing attacker shares one bucket per seat.
+ * v23 fix round 1 (S5): the lifecycle route gets the same F5
+ * treatment — its old token-hash key let every garbage hostToken mint
+ * a fresh 10/min bucket and load DO state unboundedly. Other
+ * host-token routes (start / config / remove-player /
+ * regenerate-code / resolve / host/token / host/transfer) keep the
+ * token-hash key in this round — recorded as a known follow-up.
  */
 const seatLimiter = new HttpRateLimiter();
 
@@ -59,8 +72,9 @@ async function checkSeatLimit(
   routeKey: string,
   roomId: string,
   tokenHash: string,
+  bucketKey: string = seatKey(roomId, tokenHash),
 ): Promise<Response | null> {
-  const check = seatLimiter.check(routeKey, seatKey(roomId, tokenHash));
+  const check = seatLimiter.check(routeKey, bucketKey);
   if (check.allowed) return null;
   const res = err('Too many tries — slow down.', 429);
   const headers = new Headers(res.headers);
@@ -506,6 +520,36 @@ export async function handleGetState(
   return json({ ok: true, ...stripDoEnvelope(state) });
 }
 
+/** POST /v1/rooms/:id/replay — v18: host resets a FINISHED room to LOBBY (same room/code, fresh game). */
+export async function handleReplay(
+  req: Request,
+  ctx: HttpContext,
+  roomId: string,
+): Promise<Response> {
+  const parsed = await parseBody(req);
+  if (!parsed.ok) return parsed.response;
+  const body = parsed.body;
+  const playerId = asString(body['playerId']);
+  const rawHost = asString(body['hostToken']);
+  if (!playerId) return err('playerId is required.', 400);
+  if (!isUuid(playerId)) return badUuid('playerId');
+  if (!rawHost) return err('hostToken is required.', 400);
+  const hostTokenHash = await hashHostToken(rawHost);
+  // F5: keyed by room + playerId, NOT by the presented host-token hash
+  // — otherwise every guessed host token gets a fresh rate-limit
+  // bucket and the limit cannot throttle credential guessing. (Host
+  // tokens are 128-bit so guessing is infeasible anyway; this is
+  // defence-in-depth. The DO still verifies the token.)
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/replay', roomId, hostTokenHash, seatKey(roomId, playerId));
+  if (limited) return limited;
+  const replayed = await callDo(ctx.env, roomId, 'replay', {
+    playerId,
+    hostTokenHash,
+  });
+  if (!replayed.ok) return doError(replayed);
+  return json({ ok: true, ...stripDoEnvelope(replayed) });
+}
+
 /** POST /v1/rooms/:id/start — host starts the match (host token; 409 if gate unmet). */
 export async function handleStart(
   req: Request,
@@ -808,15 +852,17 @@ export async function handleLifecycle(
   if (!rawHost && !rawReconnect) {
     return err('hostToken or reconnectToken is required.', 400);
   }
-  // Seat limit, keyed by whichever credential is presented (P1-14):
-  // host token first, else the reconnect token.
+  // Seat limit, keyed by room + seat (v23 fix round 1, S5 — the F5
+  // treatment, same as replay): keying by the presented host-token
+  // hash gives every guessed host token a fresh bucket, so it cannot
+  // throttle credential guessing at all, and each spam call loads DO
+  // state unboundedly. Keying by room + playerId still bounds the
+  // caller's own rate (10/min/seat) while a guessing attacker shares
+  // one bucket per seat. The DO still verifies the token.
   const hostTokenHash = rawHost ? await hashHostToken(rawHost) : null;
   const reconnectTokenHash = rawReconnect ? await hashReconnectToken(rawReconnect) : null;
-  const limitHash = hostTokenHash ?? reconnectTokenHash;
-  if (limitHash !== null) {
-    const limited = await checkSeatLimit('POST /v1/rooms/:id/lifecycle', roomId, limitHash);
-    if (limited) return limited;
-  }
+  const limited = await checkSeatLimit('POST /v1/rooms/:id/lifecycle', roomId, hostTokenHash ?? reconnectTokenHash ?? '', seatKey(roomId, playerId));
+  if (limited) return limited;
   const done = await callDo(ctx.env, roomId, 'lifecycle', {
     action,
     playerId,

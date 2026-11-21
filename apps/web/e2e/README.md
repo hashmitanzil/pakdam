@@ -67,29 +67,34 @@ Map specs skip cleanly when no key is configured — the VM has none:
 | --- | --- | --- |
 | `helpers.ts` | — | Room create/join, 3-player lobby, ready + start, role reveal, demo-store reads, force-end, overflow / target / no-Forge checks |
 | `smoke.spec.ts` | 9 | Home, HOST A GAME → mode select, /join screen, codename required, code errors, no console errors |
-| `join-lobby.spec.ts` | 12 | Join by code, lobby-is-setup, COPY, I'm ready, start gate (<3 / not-all-ready / all-ready), F2 guest auto-navigate, remove, Leave; + 2 live |
+| `join-lobby.spec.ts` | 14 | Join by code, lobby-is-setup, COPY, I'm ready, start gate (<3 / not-all-ready / all-ready), F2 guest auto-navigate, remove, Leave; + 2 live |
 | `host-setup.spec.ts` | 11 | Mode change, steppers, shrink toggle/stepper, Play zone OFF, Balance/Random/ping-history, guest read-only sheet (v15) |
 | `live-hud.spec.ts` | 10 | Role reveal, status strip, head start lines, bottom tabs, radio, PTT (absent in demo), safety pause, suspended banner, per-role catch buttons |
-| `catch-nav.spec.ts` | 13 | Name-only picker, claim card, scanner, manual fallback, no catch code, `?runner=` auto-select, `?scan=1` shows the picker, runner confirm, no dispute, P0-1 resume |
-| `catch-results.spec.ts` | 4 | Runners Win / Hunters Win, one-line stats, max-6 timeline, START A FRESH GAME, new code |
+| `catch-nav.spec.ts` | 10 | Name-only picker, claim card, scanner, manual fallback, no catch code, `?runner=` auto-select, `?scan=1` shows the picker, runner confirm, no dispute, P0-1 resume |
+| `catch-results.spec.ts` | 5 | Runners Win / Hunters Win, one-line stats, max-6 timeline, START A FRESH GAME, new code |
+| `host-rules.spec.ts` | 7 | v23 host rules: host cancel deletes the room (demo lobby + play, live lobby + play, reopen-after-deletion, dead code) and host-disconnect succession (live: earliest joiner becomes host and can start; simultaneous disconnect goes to the next-earliest) |
+| `host-cancel-room-deleted.spec.ts` | 6 | v23 host cancel (demo-only, Meera): cancel control host-only + confirm sheet, host + joiner land home with the message (lobby + play), reopen-after-deletion, new host gets controls without reload and can start, joining a deleted code is refused |
+| `welcome-screen.spec.ts` | 6 | Welcome screen, wordmark one-line at 320px, reduced motion |
 | `session-restore.spec.ts` | 6 | Reload in lobby/play, guest reload, sessionStorage key, no-seat state; + 1 live |
-| `outside-zone.spec.ts` | 4 | Banner + countdown, back-inside clears, poor GPS freezes, 30 s ejection (demo) |
+| `outside-zone.spec.ts` | 5 | Banner + countdown, back-inside clears, poor GPS freezes, 30 s ejection, no-fix 30 s ejection (v18 missing-fix rule, demo) |
 | `mobile-layout.spec.ts` | 5 | 360px baseline, ≥48px targets, bottom tabs reachable, 130% zoom proxy (277px) |
 | `responsive.spec.ts` | 6 | 320 / 360 / 768 / 1280px, no overflow, tabs reachable |
 | `brutal-phone.spec.ts` | 2 | Full phone-viewport E2E (create → results), phone HUD basics |
 | `map-tiles.spec.ts` | 6 | No-key banners (3) + with-key canvas / Draw taps (3) |
-| `map-accuracy.spec.ts` | 6 | 500 m → 211 m default (~42% Auto final size), 100 m minimum, no 1 km cap, always-Auto final size, next zone hidden, ±50 m GPS rule |
+| `map-accuracy.spec.ts` | 6 | 500 m → 211 m default (~42% Auto final size), 100 m minimum, no 1 km cap, always-Auto final size, next zone never shown (no preview, v18), ±50 m GPS rule |
 | `no-forge-office.spec.ts` | 3 | No Forge/Hermes/office text on any screen |
 
-Total: **99 tests** (93 demo + 3 live + 3 with-key; the live and with-key
-tests skip unless their environment is configured).
+Total: **117 tests** in 17 files, per `npx playwright test --list`
+(2026-11-21). The demo / live / with-key split in the old total (97 + 7 + 3
+= 107) is stale — recount it from the specs before citing it; the live and
+with-key tests skip unless their environment is configured.
 
 ## Notes for the verifier
 
 - Do **not** run with screenshots or visual comparison — the suite is
   text-only by design (the founder's sessions are text-only).
-- The `outside-zone` ejection test and the GPS-rough test take 30–70 s
-  each; they carry their own `test.setTimeout`.
+- The `outside-zone` ejection tests (30 s outside, no fix for 30 s) and the
+  GPS-rough test take 30–70 s each; they carry their own `test.setTimeout`.
 - Two E2E-found defects from the earlier report are FIXED and their tests
   assert the fixed behaviour: `/catch?scan=1` with no open claim shows the
   name picker (`catch-nav.spec.ts`), and the "Shrinks every" stepper steps

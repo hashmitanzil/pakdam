@@ -18,16 +18,65 @@
  * works in three one-line cards.
  */
 import { useRouter } from 'next/navigation';
+import { useEffect, useState } from 'react';
 import { Button } from '../components/ui/Button';
+import { PakdamWordmark } from '../components/PakdamWordmark';
+import { WelcomeScreen } from '../components/WelcomeScreen';
+import { ROOM_DELETED_MESSAGE, takeRoomDeletedNotice } from '../lib/room-deleted';
 
 export default function HomePage() {
   const router = useRouter();
+  // Launch loading screen: shows on every home mount / reload
+  // (founder reference: ShadowHunt shows its loader on every reload).
+  // It unmounts itself via onDone once the real work settles or the
+  // 2.5 s cap fires — the home buttons are never blocked past that.
+  const [welcomeDone, setWelcomeDone] = useState(false);
+  // One-shot notice for a room deleted under this player (host cancel,
+  // founder decision 2026-11-21): the flag is consumed once, so a
+  // later reload of home does not re-show it.
+  const [roomDeletedNotice, setRoomDeletedNotice] = useState(false);
+  useEffect(() => {
+    if (takeRoomDeletedNotice()) setRoomDeletedNotice(true);
+  }, []);
+
+  // bfcache: a back/forward-cache restore preserves React state
+  // (welcomeDone=true) without a remount, so a browser-back return
+  // would otherwise skip the welcome screen. pageshow with
+  // event.persisted re-shows it on a bfcache restore.
+  useEffect(() => {
+    const onPageShow = (event: PageTransitionEvent) => {
+      if (event.persisted) setWelcomeDone(false);
+    };
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
+  }, []);
 
   return (
-    <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col px-4 pb-6 pt-6">
+    <>
+      {!welcomeDone && <WelcomeScreen onDone={() => setWelcomeDone(true)} />}
+      {/* While the welcome overlay is up the home content is inert:
+          the overlay blocks pointer events, but without inert Tab
+          could still reach HOST/JOIN behind it (focus ring invisible)
+          and Enter could navigate mid-load. inert removes the whole
+          <main> from the tab order and from assistive tech until the
+          overlay unmounts. */}
+      <main
+        inert={!welcomeDone}
+        className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col px-4 pb-6 pt-6"
+      >
       <header className="pakdam-anim-rise flex items-center justify-between">
-        <span className="pakdam-display text-[22px] text-white">Pakdam</span>
+        <PakdamWordmark />
       </header>
+
+      {roomDeletedNotice ? (
+        <p
+          className="mt-4 rounded-[14px] border border-[#26262B] bg-[#141416] px-4 py-3 text-[15px] text-white"
+          role="status"
+          aria-label={ROOM_DELETED_MESSAGE}
+        >
+          {ROOM_DELETED_MESSAGE}
+        </p>
+      ) : null}
 
       {/* Hero visual: radar rings + floating runner/hunter dots, layered
           for depth — a green glow low-left and a red glow high-right sit
@@ -174,6 +223,7 @@ export default function HomePage() {
       <p className="mt-auto pt-8 text-center text-[13px] text-[#A1A1AA]">
         Free · No download · 2–30 players · No account needed.
       </p>
-    </main>
+      </main>
+    </>
   );
 }

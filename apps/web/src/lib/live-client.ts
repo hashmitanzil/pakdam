@@ -332,11 +332,52 @@ async function getHostTokenForRoom(roomId: string): Promise<{ playerId: string; 
   return { playerId: session.playerId, hostToken };
 }
 
+export interface ReplayLiveRoomResponse {
+  ok: boolean;
+  phase: string;
+  roomCode: string;
+  playerCount: number;
+}
+
+/**
+ * POST /v1/rooms/:id/replay — v18: host resets a FINISHED room to LOBBY
+ * (same room/code, fresh game). Host-only server-side (403 for a
+ * non-host); 409 when the room is not finished. The server broadcasts
+ * `room.state` (`reason: "replay-reset"`) so every other client returns
+ * to the lobby; the caller navigates on the response itself.
+ */
+export async function replayLiveRoom(roomId: string): Promise<ReplayLiveRoomResponse> {
+  const send = async (): Promise<ReplayLiveRoomResponse> => {
+    const { playerId, hostToken } = await getHostTokenForRoom(roomId);
+    return postJson<ReplayLiveRoomResponse>(`/v1/rooms/${roomId}/replay`, {
+      playerId,
+      hostToken,
+    });
+  };
+  try {
+    return await send();
+  } catch (err) {
+    // Stale host token (rotated by the background mint): drop the dead
+    // token, mint once, retry once. A failed re-mint surfaces the
+    // original error, not the mint error.
+    if (err instanceof LiveHttpError && err.status === 403) {
+      try {
+        clearHostToken(roomId);
+        return await send();
+      } catch {
+        throw err;
+      }
+    }
+    throw err;
+  }
+}
+
 /**
  * POST /v1/rooms/:id/lifecycle { action: 'end' } — host ends the round
  * early (server-only REST lifecycle; pause/resume go over WS instead).
- * The match completes with the mode-aware outcome and the play screen
- * redirects to results.
+ * Host cancel DELETES the room (founder decision, 2026-11-21): the
+ * cancelling host goes home on success, and every other player follows
+ * via the `room.deleted` event or a 404 — nobody goes to results.
  */
 export async function endLiveMatch(roomId: string): Promise<{ ok: boolean }> {
   const send = async (): Promise<{ ok: boolean }> => {

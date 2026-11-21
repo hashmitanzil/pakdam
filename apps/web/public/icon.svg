@@ -1,6 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Pakdam">
   <rect width="512" height="512" rx="112" fill="#0A0A0B"/>
-  <rect x="24" y="24" width="464" height="464" rx="96" fill="none" stroke="#EF4444" stroke-width="16"/>
-  <path d="M176 384 V128 h104 a84 84 0 0 1 0 168 H176" fill="none" stroke="#EF4444" stroke-width="44" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="368" cy="360" r="26" fill="#FFFFFF"/>
+  <ellipse cx="256" cy="448" rx="118" ry="20" fill="none" stroke="#EF4444" stroke-width="14"/>
+  <path d="M256 48 C166 48 92 122 92 212 C92 308 256 456 256 456 C256 456 420 308 420 212 C420 122 346 48 256 48 Z" fill="#EF4444"/>
+  <circle cx="256" cy="212" r="92" fill="#0A0A0B"/>
+  <circle cx="256" cy="212" r="52" fill="#EF4444"/>
 </svg>

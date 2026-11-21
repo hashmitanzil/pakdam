@@ -9,15 +9,21 @@
  * roles, timers or ejection. Demo mode: the demo store ticks locally
  * (pings auto-fire, shrink uses the random-offset draw).
  *
- * Location honesty: only fixes accurate to ±50 m are ever sent. The
- * outside-zone countdown is display-only in live mode — the server
- * enforces ejection; in demo the page ejects at 0.
+ * Location honesty: a fix is SENT whenever it is within the server
+ * validity bound (±1000 m) — that stamps `lastFixAt` for liveness, so
+ * a poor-but-present GPS never ejects the player for "no location".
+ * Gameplay (zone, pings, catch proximity) only ever USES fixes
+ * accurate to ±50 m; that gate lives server-side. The outside-zone
+ * countdown is display-only in live mode — the server enforces
+ * ejection; in demo the page ejects at 0.
  */
 'use client';
 
 import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
+  LOCATION_FRESHNESS_SECONDS,
+  MAX_FIX_ACCURACY_METERS,
   OUTSIDE_ZONE_RETURN_SECONDS,
   ZONE_AUTO_CENTRE_MAX_ACCURACY_M,
   type GeoPolygon,
@@ -44,15 +50,17 @@ import { PTTButton } from '@/components/radio/PTTButton';
 import { SafetyControls } from '@/components/match/SafetyControls';
 import { BottomTabs, type BottomTabId } from '@/components/ui/BottomTabs';
 import { Sheet } from '@/components/ui/Sheet';
+import { Toggle } from '@/components/ui/Toggle';
 import { Button } from '@/components/ui/Button';
 import { formatSuspendedLabel, formatOutsideCountdown } from '@/components/match/freshness';
 import { formatDurationShort, ageLabelFromTimestamp, haversineMeters } from '@/lib/utils';
-import { watchLocation, isFixSendableToServer } from '@/lib/geolocation';
+import { watchLocation } from '@/lib/geolocation';
 import { requestWakeLock } from '@/lib/wake-lock';
 import { clearSession } from '@/lib/session-credentials';
+import { goHomeAfterRoomDeleted } from '@/lib/room-deleted';
 import {
+  deleteDemoRoom,
   ejectPlayer,
-  endDemoMatch,
   getRoom,
   leaveRoom,
   recordPlayerFix,
@@ -61,6 +69,17 @@ import {
   safetyResumeDemo,
 } from '@/lib/demo-store';
 import { VoiceRadio, type PttState, type VoiceSignal } from '@/lib/voice-radio';
+import {
+  DEFAULT_CUE_SETTINGS,
+  cuePingReceived,
+  cuePingTone,
+  cueTag,
+  cueTagTone,
+  cueZoneTone,
+  cueZoneWarning,
+  unlockCueAudio,
+  type CueSettings,
+} from '@/lib/cues';
 import type { PakdamSocket } from '@/lib/websocket';
 
 const TERMINAL: MatchPhase[] = ['COMPLETED', 'CANCELLED', 'ABANDONED', 'EXPIRED'];
@@ -123,33 +142,17 @@ export default function PlayPage({
     socketError,
     lastSocketError,
     demo,
+    hostGraceEndsAtMs,
     myPlayerId,
     myPlayer,
     loading,
     error,
+    roomDeleted,
     retryConnection,
     refreshDemo,
     sendRadio,
-    reveals,
-    sendReveal,
     leave,
   } = state;
-
-  /**
-   * `nextZonePreview` (P1-18: the DO's `zone.preview`, 30 s before a
-   * shrink) has not landed in the hook yet — read it through a defensive
-   * cast so this page compiles and picks it up the moment it does.
-   * `reveals` / `sendReveal` / `leave` are already on the hook and are
-   * destructured above.
-   */
-  const hookExtras = state as unknown as {
-    nextZonePreview?: {
-      boundary: GeoPolygon;
-      firesAtMs: number;
-      shrinkIndex: number;
-    } | null;
-  };
-  const nextZonePreview = hookExtras.nextZonePreview ?? null;
 
   const [tab, setTab] = useState<BottomTabId>('map');
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -167,13 +170,13 @@ export default function PlayPage({
   // A6: optimistic pause / end-round — the tap shows at once, the
   // server snapshot reconciles; a failed send rolls back (see below).
   const [pausedOverride, setPausedOverride] = useState<boolean | null>(null);
-  const [phaseOverride, setPhaseOverride] = useState<MatchPhase | null>(null);
   const [outsideSecondsLeft, setOutsideSecondsLeft] = useState<number | null>(null);
   const [radioUnread, setRadioUnread] = useState(0);
   const [leaveArmed, setLeaveArmed] = useState(false);
-  // Hold-to-reveal (P1-19): press-and-hold ~1 s, then sendReveal fires.
-  const [revealHolding, setRevealHolding] = useState(false);
-  const revealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // NOTE (founder decision, v18): hold-to-reveal is removed entirely —
+  // no 'Hold to reveal your position' button, no hold timer, no
+  // sendReveal. The role-reveal overlay (`reveal` state below) is a
+  // different feature and stays. Pings are unchanged.
 
   // Voice radio state (live only — demo has no signalling channel).
   const [voiceRadio, setVoiceRadio] = useState<VoiceRadio | null>(null);
@@ -181,6 +184,42 @@ export default function PlayPage({
   const [voiceDetail, setVoiceDetail] = useState<string | undefined>(undefined);
   const [pttState, setPttState] = useState<PttState>('idle');
   const [muted, setMuted] = useState(false);
+
+  // Haptics + cue sounds (separate from the voice-radio mute above).
+  // Vibration is Android-only by feature detection (see lib/cues.ts);
+  // cue sounds are off by default. Persisted per device.
+  const [cueSettings, setCueSettings] = useState<CueSettings>(() => {
+    if (typeof window === 'undefined') return DEFAULT_CUE_SETTINGS;
+    try {
+      return {
+        hapticsEnabled:
+          window.localStorage.getItem('pakdam-cues-haptics') !== 'off',
+        soundsEnabled:
+          window.localStorage.getItem('pakdam-cues-sounds') === 'on',
+      };
+    } catch {
+      return DEFAULT_CUE_SETTINGS;
+    }
+  });
+  const setCueSetting = useCallback((patch: Partial<CueSettings>) => {
+    unlockCueAudio();
+    setCueSettings((prev) => {
+      const next = { ...prev, ...patch };
+      try {
+        window.localStorage.setItem(
+          'pakdam-cues-haptics',
+          next.hapticsEnabled ? 'on' : 'off',
+        );
+        window.localStorage.setItem(
+          'pakdam-cues-sounds',
+          next.soundsEnabled ? 'on' : 'off',
+        );
+      } catch {
+        // Storage is best-effort.
+      }
+      return next;
+    });
+  }, []);
 
   const myRole = myPlayer?.matchRole ?? null;
   const myTeam = myPlayer?.team ?? null;
@@ -199,6 +238,8 @@ export default function PlayPage({
   // tick, so a throttled/backgrounded tick cannot under-count.
   const lastOutsideTickMsRef = useRef<number | null>(null);
   const outsideEjectedRef = useRef(false);
+  // Missing-fix ejection guard (demo only) — see the (4a) block below.
+  const missingFixEjectedRef = useRef(false);
   const seenRadioRef = useRef(0);
 
   // A6: an optimistic pause/resume stands only until the server
@@ -225,12 +266,6 @@ export default function PlayPage({
       setNotice(lastSocketError.message);
     }
   }, [lastSocketError, pausedOverride]);
-  // A6: same for the optimistic end-round phase.
-  useEffect(() => {
-    if (phaseOverride !== null && phase === phaseOverride) {
-      setPhaseOverride(null);
-    }
-  }, [phaseOverride, phase]);
 
   // B10: the map is kept mounted (hidden) across tabs, but a canvas
   // hidden with display:none reports zero size — resize explicitly
@@ -278,14 +313,6 @@ export default function PlayPage({
     };
   }, []);
 
-  // A hold-to-reveal timer must never fire after unmount.
-  useEffect(
-    () => () => {
-      if (revealTimerRef.current) clearTimeout(revealTimerRef.current);
-    },
-    [],
-  );
-
   // Role reveal, once per role (an Infection flip shows it again).
   useEffect(() => {
     if (!myRole) return;
@@ -304,17 +331,39 @@ export default function PlayPage({
     setMapResizeNonce((n) => n + 1);
   }, [reveal, roomId]);
 
-  // Terminal phase → results. Back to lobby if the match never started.
+  // Room deleted (founder decision, 2026-11-21): the host cancelled
+  // and the room is gone — every player still in it goes home with the
+  // one plain message. Declared BEFORE the terminal effect below, and
+  // the terminal effect bails out when this fires, so a host cancel
+  // never flashes the results screen on the way home.
   useEffect(() => {
-    if (!room) return;
+    if (!roomDeleted) return;
+    goHomeAfterRoomDeleted(router, roomId);
+  }, [roomDeleted, roomId, router]);
+
+  // Terminal phase → results. Back to lobby if the match never started.
+  // Bails out when the room was deleted: a host cancel deletes the
+  // room, so the players go home with the one plain message — never to
+  // results.
+  useEffect(() => {
+    if (roomDeleted || !room) return;
     if (TERMINAL.includes(room.phase)) {
       router.replace(`/room/${roomId}/results`);
     } else if (room.phase === 'LOBBY') {
       router.replace(`/room/${roomId}`);
     }
-  }, [room, roomId, router]);
+  }, [room, roomDeleted, roomId, router]);
 
-  // Location watch — foreground only; only ±50 m fixes are ever sent.
+  // Location watch — foreground only. B1 (v18 fix round): liveness is
+  // decoupled from usability — a fix is SENT whenever it is within the
+  // server validity bound (±1000 m, MAX_FIX_ACCURACY_METERS), so a
+  // poor-but-present GPS still stamps `lastFixAt` and the player is
+  // not ejected for "no location". Only fixes accurate to ±50 m are
+  // USABLE for gameplay (zone, pings, catch proximity) — that gate
+  // lives server-side. The notice copy says exactly that: a poor fix
+  // IS sent (to stay connected) but is too rough for the game to use.
+  // The outside-zone freeze below reads `myFixRef` (every fix,
+  // sendable or not) and is untouched by this change.
   useEffect(() => {
     if (!myPlayerId) return;
     const handle = watchLocation(
@@ -331,15 +380,24 @@ export default function PlayPage({
           lastShownFixRef.current = { fix, atMs: fix.timestampMs };
           setMyFix(fix);
         }
-        if (isFixSendableToServer(fix)) {
+        if (fix.accuracyMeters <= MAX_FIX_ACCURACY_METERS) {
           if (mode === 'live') {
             socketRef.current?.sendLocationUpdate(fix);
           } else {
             const current = getRoom(roomId);
             if (current) recordPlayerFix(current, myPlayerId, fix);
           }
-          setFixNotice(null);
+          if (fix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
+            setFixNotice(
+              'GPS is rough here — your location was sent to stay connected, but it is too rough for the game to use.',
+            );
+          } else {
+            setFixNotice(null);
+          }
         } else {
+          // Unreachable in practice — `validateFix` already rejects
+          // fixes worse than ±1000 m before they reach this callback —
+          // kept as defence in depth.
           setFixNotice('GPS is too rough here — your fix was not sent.');
         }
       },
@@ -367,11 +425,50 @@ export default function PlayPage({
     const elapsedMs = lastTick === null ? 1000 : Math.max(now - lastTick, 0);
     lastOutsideTickMsRef.current = now;
     if (phase !== 'ACTIVE' && phase !== 'HEAD_START') {
-      outsideSinceRef.current = null;
-      lastOutsideTickMsRef.current = null;
+      // F4: freeze the spell instead of resetting it — slide the spell
+      // start forward by the elapsed time, so the countdown (and its
+      // entry cue) resumes where the pause began instead of restarting
+      // at 30 and buzzing a second entry for the same spell.
+      if (outsideSinceRef.current !== null) {
+        outsideSinceRef.current += elapsedMs;
+      }
+      lastOutsideTickMsRef.current = now;
       outsideEjectedRef.current = false;
-      if (outsideSecondsLeft !== null) setOutsideSecondsLeft(null);
+      missingFixEjectedRef.current = false;
       return;
+    }
+    // (4a) Missing-fix ejection — demo only (live is server-enforced by
+    // the alarm tick). v18: no fix at all for ≥ 30 s ejects, the same
+    // 30 s as out-of-zone. Baseline is max(last fix, match start), so a
+    // player who never reported is ejected 30 s after the match starts,
+    // not instantly. "Last fix" is ANY fix this tab has seen — including
+    // a poor one the watcher never sent (myFixRef updates on every fix
+    // callback, sendable or not) plus the store's lastFixAt — so a
+    // poor-but-present fix NEVER ejects here; it only freezes the
+    // countdown below. This runs BEFORE the stale-fix freeze: the old
+    // code froze on a missing fix forever and never ejected. A safety
+    // pause never ejects — this effect already returns early unless the
+    // phase is HEAD_START or ACTIVE.
+    if (mode === 'demo') {
+      const startedAtMs = room?.startedAt ? Date.parse(room.startedAt) : null;
+      if (startedAtMs !== null && !missingFixEjectedRef.current) {
+        const lastFixMs = myPlayer?.lastFixAt ? Date.parse(myPlayer.lastFixAt) : null;
+        const lastSeenMs = Math.max(
+          myFixRef.current?.timestampMs ?? Number.NEGATIVE_INFINITY,
+          lastFixMs ?? Number.NEGATIVE_INFINITY,
+          startedAtMs,
+        );
+        if (now - lastSeenMs >= LOCATION_FRESHNESS_SECONDS * 1000) {
+          missingFixEjectedRef.current = true;
+          const current = getRoom(roomId);
+          if (current) {
+            ejectPlayer(current, myPlayerId);
+            refreshDemo();
+          }
+          setNotice('You were ejected — no location for 30 s.');
+          return;
+        }
+      }
     }
     const fix = myFixRef.current;
     const boundary = zoneBoundary;
@@ -380,6 +477,7 @@ export default function PlayPage({
       outsideSinceRef.current = null;
       lastOutsideTickMsRef.current = null;
       outsideEjectedRef.current = false;
+      missingFixEjectedRef.current = false;
       if (outsideSecondsLeft !== null) setOutsideSecondsLeft(null);
       return;
     }
@@ -476,7 +574,7 @@ export default function PlayPage({
   // A6: the displayed pause / phase is the optimistic override while
   // one stands, the server truth otherwise.
   const effectivePaused = pausedOverride ?? safetyState.paused;
-  const displayPhase = phaseOverride ?? phase;
+  const displayPhase = phase;
   const activePlayers = useMemo(
     () => players.filter((p) => p.leftAt === null),
     [players],
@@ -622,6 +720,146 @@ export default function PlayPage({
     [pings, myPingRole, isSpectator],
   );
 
+  // --- Haptics + audio cues (lib/cues.ts) ---------------------------------
+  // Ping received: cue once per new ping identity (keyed by pingId, so
+  // the 1 s clock tick and re-renders never re-fire it). A ping
+  // addressed to Hunters is about a Runner, and vice versa.
+  //
+  // F1: the first visible snapshot is SEEDED, never cued — mounting
+  // with live pings already on screen, an Infection flip (the other
+  // side's pings become visible), or flipping to spectate (ALL pings
+  // become visible) must not buzz a burst. The seed re-runs whenever
+  // the visibility scope changes (role / spectator), keyed by
+  // pingScopeKey below. createdAt is defence-in-depth on top: only
+  // pings created after the last priming cue. Dedup is by pingId, NOT
+  // by subject — the next scheduled ping for the same subject is a
+  // genuinely new pingId and must still cue. The seen-set is a ref, so
+  // it survives socket reconnects (the page stays mounted; the server
+  // never re-sends delivered pings, so the client must keep its own
+  // shown-ping state — Kabir-verified: pingIds are never re-minted).
+  // F3: the set is capped (oldest out first) so it cannot grow
+  // without bound over a long game.
+  const seenPingIdsRef = useRef<Set<string>>(new Set());
+  const pingCuePrimedRef = useRef(false);
+  const pingCueBaselineRef = useRef(0);
+  const pingScopeRef = useRef<string | null>(null);
+  const pingScopeKey = isSpectator ? 'spectator' : (myPingRole ?? 'none');
+  const cueSettingsRef = useRef(cueSettings);
+  cueSettingsRef.current = cueSettings;
+  useEffect(() => {
+    const seen = seenPingIdsRef.current;
+    const scopeChanged =
+      pingScopeRef.current !== null && pingScopeRef.current !== pingScopeKey;
+    if (!pingCuePrimedRef.current || scopeChanged) {
+      // First snapshot, or a role/spectator transition: seed silently.
+      for (const ping of visiblePings) seen.add(ping.pingId);
+      pingCueBaselineRef.current = Math.max(
+        pingCueBaselineRef.current,
+        ...visiblePings.map((p) => new Date(p.createdAt).getTime()),
+      );
+      pingScopeRef.current = pingScopeKey;
+      pingCuePrimedRef.current = true;
+    } else {
+      for (const ping of visiblePings) {
+        if (seen.has(ping.pingId)) continue;
+        seen.add(ping.pingId);
+        // Defence-in-depth: a ping created before the last priming
+        // (late delivery, scope change) never cues.
+        if (new Date(ping.createdAt).getTime() < pingCueBaselineRef.current) {
+          continue;
+        }
+        const kind = ping.recipientRole === 'hunters' ? 'runner' : 'hunter';
+        const settings = cueSettingsRef.current;
+        cuePingReceived(settings);
+        cuePingTone(kind, settings);
+      }
+    }
+    // F3: cap the seen-set at 200 (a 3-hour game holds ~100) —
+    // oldest entries out first (Sets iterate in insertion order).
+    while (seen.size > 200) {
+      const oldest = seen.values().next().value;
+      if (oldest === undefined) break;
+      seen.delete(oldest);
+    }
+  }, [visiblePings, pingScopeKey]);
+  // Zone warning: cue ONCE on entry (null → value) and once at ≤ 10 s —
+  // never on every 1 s tick. Resets when back inside the zone.
+  const prevOutsideRef = useRef<number | null>(null);
+  const zoneLowWarnedRef = useRef(false);
+  // F5: the entry cue waits out a 2 s re-entry grace — a GPS fix
+  // oscillating in/out must not buzz on every re-entry. The timer
+  // lives in a ref (not effect cleanup) so later countdown ticks do
+  // not cancel it; going back inside, or spectating, cancels it.
+  const zoneEntryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const prev = prevOutsideRef.current;
+    prevOutsideRef.current = outsideSecondsLeft;
+    // F4: a spectator is out of the game — no zone-warning buzzes for
+    // a match they can no longer play.
+    if (outsideSecondsLeft === null || isSpectator) {
+      zoneLowWarnedRef.current = false;
+      if (zoneEntryTimerRef.current !== null) {
+        clearTimeout(zoneEntryTimerRef.current);
+        zoneEntryTimerRef.current = null;
+      }
+      return;
+    }
+    const settings = cueSettingsRef.current;
+    if (prev === null) {
+      if (zoneEntryTimerRef.current !== null) {
+        clearTimeout(zoneEntryTimerRef.current);
+      }
+      zoneEntryTimerRef.current = setTimeout(() => {
+        zoneEntryTimerRef.current = null;
+        // Still outside (prevOutsideRef is only a value while outside)
+        // — buzz once for this spell.
+        if (prevOutsideRef.current !== null) {
+          const s = cueSettingsRef.current;
+          cueZoneWarning(s);
+          cueZoneTone(s);
+        }
+      }, 2000);
+      return;
+    }
+    if (outsideSecondsLeft <= 10 && !zoneLowWarnedRef.current) {
+      zoneLowWarnedRef.current = true;
+      cueZoneWarning(settings);
+      cueZoneTone(settings);
+    }
+  }, [outsideSecondsLeft, isSpectator]);
+  // Clear a pending entry-cue timer on unmount.
+  useEffect(
+    () => () => {
+      if (zoneEntryTimerRef.current !== null) {
+        clearTimeout(zoneEntryTimerRef.current);
+      }
+    },
+    [],
+  );
+  // Tag: cue on the false → true transition of amCaught only.
+  // F2: prevCaughtRef starts as null (unprimed) — mounting with
+  // amCaught already true (refresh after being tagged, back from
+  // results/catch, direct play URL while caught) primes it silently
+  // instead of buzzing a tag that never just happened.
+  const prevCaughtRef = useRef<boolean | null>(null);
+  useEffect(() => {
+    const was = prevCaughtRef.current;
+    prevCaughtRef.current = amCaught;
+    if (was === null) return;
+    if (amCaught && !was) {
+      const settings = cueSettingsRef.current;
+      cueTag(settings);
+      cueTagTone(settings);
+    }
+  }, [amCaught]);
+  // Resume the cue-audio context on the first tap anywhere (iOS
+  // autoplay policy) so the first cue tone is not blocked.
+  useEffect(() => {
+    const unlock = () => unlockCueAudio();
+    window.addEventListener('pointerdown', unlock, { once: true });
+    return () => window.removeEventListener('pointerdown', unlock);
+  }, []);
+
   // Dots: teammates LIVE (runners see fellow runners, hunters see fellow
   // hunters — the server sends only my own team's fixes, never an
   // opponent's), opponents ping-only and mutual. A caught Runner loses
@@ -684,6 +922,18 @@ export default function PlayPage({
 
   const myLastFixMs = myPlayer?.lastFixAt ? new Date(myPlayer.lastFixAt).getTime() : null;
   const isSuspended = myPlayer?.connectionState === 'suspended';
+  // v24 (D1): host-reconnect grace — the host is suspended and the
+  // server/demo says the grace is running, so the room is hostless
+  // until the host returns or the grace expires and the crown moves.
+  // Host-only controls (End the round, Resume the match) are gated on
+  // `isHost` from the snapshot, so no connected player can reach them
+  // while this holds. The suspended host themself never sees this line
+  // (they ARE the host); their own suspended banner shows instead.
+  const hostPlayer = players.find((p) => p.playerId === room?.hostPlayerId);
+  const hostGraceActive =
+    (hostGraceEndsAtMs ?? null) !== null &&
+    hostPlayer?.connectionState === 'suspended' &&
+    hostPlayer.playerId !== myPlayerId;
 
   const teammates = useMemo(
     () =>
@@ -709,12 +959,6 @@ export default function PlayPage({
           ]
         : [],
     [phase, room],
-  );
-  // Live reveals, filtered once — the old JSX filtered the list twice
-  // per render (once for the count, once for the names).
-  const liveReveals = useMemo(
-    () => reveals.filter((r) => r.expiresAtMs > nowMs),
-    [reveals, nowMs],
   );
   // Who paused the match — up here with the other memos, never after
   // the early returns below (hooks must run on every render).
@@ -782,52 +1026,30 @@ export default function PlayPage({
   }, [leaveArmed, mode, roomId, myPlayerId, leave, router]);
   const handleEndRound = useCallback(() => {
     if (!isHost) return;
+    // Host cancel (founder decision, 2026-11-21): the round ends AND
+    // the room is deleted — every player goes home with the one plain
+    // message, never to results. The cancelling host goes home on the
+    // accepted call; every other player follows via `room.deleted` /
+    // a 404 (see the roomDeleted effect above). There is no optimistic
+    // phase override any more: the old one flashed COMPLETED and the
+    // terminal effect then routed to results before the deletion
+    // landed. A failed call stays on the match and says so.
     if (mode === 'live') {
-      // A6: the round shows as ended at once (display phase override);
-      // the server snapshot reconciles, and the terminal redirect
-      // follows the real room phase. A failed POST rolls back.
-      setPhaseOverride('COMPLETED');
-      void endLiveMatch(roomId).catch(() => {
-        setPhaseOverride(null);
-        setNotice('Could not end the round — check your connection and try again.');
-      });
+      void endLiveMatch(roomId)
+        .then(() => goHomeAfterRoomDeleted(router, roomId))
+        .catch(() => {
+          setNotice('Could not end the round — check your connection and try again.');
+        });
       return;
     }
-    const current = getRoom(roomId);
-    if (current) {
-      endDemoMatch(current);
-      refreshDemo();
-    }
-  }, [isHost, mode, roomId, refreshDemo]);
+    deleteDemoRoom(roomId);
+    refreshDemo();
+    goHomeAfterRoomDeleted(router, roomId);
+  }, [isHost, mode, roomId, refreshDemo, router]);
   const handleEndRoundFromSheet = useCallback(() => {
     setTab('map');
     handleEndRound();
   }, [handleEndRound]);
-  // Hold-to-reveal (P1-19): press-and-hold ~1 s, then the reveal is sent.
-  // Releasing early cancels — a tap never reveals by accident. The hook
-  // sends my current fix (live only); a false return means no fresh fix
-  // or no connection, and the player is told so.
-  const startRevealHold = useCallback(() => {
-    if (revealTimerRef.current) return;
-    setRevealHolding(true);
-    revealTimerRef.current = setTimeout(() => {
-      revealTimerRef.current = null;
-      setRevealHolding(false);
-      const sent = sendReveal(myFixRef.current ?? undefined);
-      setNotice(
-        sent
-          ? 'Reveal sent — your position is shared briefly.'
-          : 'Reveal was not sent — make sure your location is on, then hold again.',
-      );
-    }, 1000);
-  }, [sendReveal]);
-  const cancelRevealHold = useCallback(() => {
-    if (revealTimerRef.current) {
-      clearTimeout(revealTimerRef.current);
-      revealTimerRef.current = null;
-    }
-    setRevealHolding(false);
-  }, []);
   const handleResumeSharing = useCallback(() => {
     if (mode !== 'demo') return;
     const current = getRoom(roomId);
@@ -904,6 +1126,12 @@ export default function PlayPage({
         nowMs={nowMs}
         isRunner={isRunner}
       />
+
+      {hostGraceActive ? (
+        <p className="rounded-2xl border border-[#26262B] bg-[#141416] p-3 text-[13px] text-[#F59E0B]" role="status">
+          Waiting for the host to reconnect…
+        </p>
+      ) : null}
 
       {isSpectator ? (
         <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3">
@@ -985,18 +1213,12 @@ export default function PlayPage({
       <div className={`relative h-[420px] shrink-0 ${tab === 'map' ? '' : 'hidden'}`}>
         <PlayMap
           zoneBoundary={zoneBoundary}
-          // Next-zone preview (P1-18): the DO's `zone.preview`, 30 s
-          // before the shrink — dashed ring + "Next zone in MM:SS".
-          // Null outside the preview window; the next zone is never guessed.
-          nextZoneBoundary={nextZonePreview?.boundary ?? null}
-          nextZoneFiresAtMs={nextZonePreview?.firesAtMs ?? null}
           pings={visiblePings}
           noGoAreas={noGoAreas}
           myFix={myFix}
           // Teammates' live positions (green dots). A spectator sees no
           // live dots, so nothing is passed while spectating.
           teammateFixes={isSpectator ? EMPTY_FIXES : stableTeammateFixes}
-          reveals={reveals}
           nowMs={mapNowMs}
           resizeNonce={mapResizeNonce}
         />
@@ -1035,7 +1257,7 @@ export default function PlayPage({
 
       {tab === 'map' && isHunter && !isSpectator ? (
         <Button variant="primary" onClick={goCatchQr}>
-          CATCH BY QR
+          Tag a runner
         </Button>
       ) : null}
       {tab === 'map' && isRunner && !isSpectator ? (
@@ -1046,38 +1268,6 @@ export default function PlayPage({
       {tab === 'map' && !isHunter && !isRunner ? (
         <p className="text-center text-[13px] text-[#A1A1AA]">
           Roles are drawn at the head start.
-        </p>
-      ) : null}
-
-      {/* Hold-to-reveal (P1-19): press-and-hold ~1 s to share your
-          position with everyone. Releasing early cancels — a tap never
-          reveals by accident. Live only: the hook's sendReveal has no
-          demo path (it returns false there), so the button stays hidden
-          in demo instead of always failing. ACTIVE only: a reveal is a
-          manual ping (150 m circle, whole room), so it must never fire
-          during the head start. */}
-      {tab === 'map' && mode === 'live' && myRole && !isSpectator && room?.phase === 'ACTIVE' ? (
-        <button
-          type="button"
-          aria-label="Hold to reveal your position"
-          onPointerDown={startRevealHold}
-          onPointerUp={cancelRevealHold}
-          onPointerLeave={cancelRevealHold}
-          onPointerCancel={cancelRevealHold}
-          onContextMenu={(e) => e.preventDefault()}
-          className={`flex h-12 w-full select-none items-center justify-center rounded-[14px] border text-[15px] font-bold text-white transition-colors ${
-            revealHolding ? 'border-[#F59E0B] bg-[#F59E0B]/30' : 'border-[#26262B] bg-[#141416]'
-          }`}
-        >
-          {revealHolding ? 'Keep holding to reveal…' : 'Hold to reveal your position'}
-        </button>
-      ) : null}
-
-      {/* Incoming reveals: someone shared their position — amber ring on
-          the map, named here. Expired reveals drop off on their own. */}
-      {tab === 'map' && liveReveals.length > 0 ? (
-        <p className="text-center text-[13px] text-[#F59E0B]">
-          {liveReveals.map((r) => r.displayName).join(', ')} revealed their position
         </p>
       ) : null}
 
@@ -1096,8 +1286,10 @@ export default function PlayPage({
       <Sheet open={tab === 'more'} onClose={closeMoreSheet} title="More">
         <div className="flex flex-col gap-4">
           {/* Host only: end the round early (POST …/lifecycle, host-only).
-              The match completes with the mode-aware outcome and the play
-              screen redirects to results. */}
+              Host cancel deletes the room (founder decision, 2026-11-21),
+              so every player goes home with the one plain message —
+              never to results. A match that ends on its own (time up /
+              all caught) still goes to results via the terminal effect. */}
           {isHost && (displayPhase === 'HEAD_START' || displayPhase === 'ACTIVE' || displayPhase === 'SAFETY_PAUSED') ? (
             <button
               type="button"
@@ -1141,6 +1333,41 @@ export default function PlayPage({
                 </li>
               ))}
             </ul>
+          </div>
+          {/* Sound & vibration — haptics + cue tones. Separate state
+              from the voice-radio mute: this mutes only cue sounds. */}
+          <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
+            <p className="text-[15px] font-bold text-white">Sound &amp; vibration</p>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[15px] font-semibold text-white">
+                  Vibration (Android only)
+                </p>
+                <p className="text-[13px] text-[#A1A1AA]">
+                  Buzz on pings, zone warnings and tags. Silent on devices
+                  without vibration support.
+                </p>
+              </div>
+              <Toggle
+                checked={cueSettings.hapticsEnabled}
+                onChange={(checked) => setCueSetting({ hapticsEnabled: checked })}
+                label="Vibration (Android only)"
+              />
+            </div>
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <div>
+                <p className="text-[15px] font-semibold text-white">Cue sounds</p>
+                <p className="text-[13px] text-[#A1A1AA]">
+                  Short tones for pings, zone warnings and tags. Off by
+                  default. This does not mute voice radio.
+                </p>
+              </div>
+              <Toggle
+                checked={cueSettings.soundsEnabled}
+                onChange={(checked) => setCueSetting({ soundsEnabled: checked })}
+                label="Cue sounds"
+              />
+            </div>
           </div>
           <SafetyControls
             phase={displayPhase}

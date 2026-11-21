@@ -210,11 +210,17 @@ export async function fetchCleanedOlaStyle(
 }
 export interface MapLibreMapLike {
   resize(): void;
+  /** Force a repaint — used after a hidden-then-shown resize so a 'ready' map actually paints (v18). */
+  triggerRepaint(): void;
   remove(): void;
   on(event: string, handler: (...args: unknown[]) => void): void;
   off(event: string, handler: (...args: unknown[]) => void): void;
   getCenter(): { lng: number; lat: number };
   getZoom(): number;
+  /** Current bearing in degrees (0 = north up); the compass lock seeds
+   *  its last-bearing from this when locking, so the first heading
+   *  event does not snap the map (PlayMap toggleCompass). */
+  getBearing(): number;
   flyTo(options: { center: [number, number]; zoom?: number; duration?: number }): void;
   easeTo(options: {
     center?: [number, number];

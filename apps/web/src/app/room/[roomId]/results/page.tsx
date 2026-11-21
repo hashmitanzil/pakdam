@@ -4,6 +4,12 @@
  * Red hero, one-line stats, max-6 timeline, START A FRESH GAME. No
  * rematch, no share cards, no leaderboards, no per-player stats grid.
  *
+ * Replay (v18): the host can send the same room/code back to the lobby
+ * ("Replay — back to the lobby", `POST /v1/rooms/:id/replay` live /
+ * `replayDemoRoom` demo). Non-hosts see a waiting line instead of a dead
+ * button, and every client returns to the lobby when the room resets
+ * (live `room.state` broadcast, demo 1 s poll).
+ *
  * Honesty rule: caught / surviving membership comes from `room.result`
  * only, never from roles. Per-tag entries come from `result.tags` (live
  * and demo) — each confirmed tag carries who tagged whom and when.
@@ -16,7 +22,9 @@ import { scoreMatch } from '@pakdam/engine';
 import { useRoomState } from '@/components/match/useRoomState';
 import { ResultsTimeline, type TimelineEvent } from '@/components/catch/ResultsTimeline';
 import { Button } from '@/components/ui/Button';
-import { fetchLiveResults } from '@/lib/live-client';
+import { fetchLiveResults, LiveHttpError, replayLiveRoom } from '@/lib/live-client';
+import { goHomeAfterRoomDeleted } from '@/lib/room-deleted';
+import { getRoom, replayDemoRoom } from '@/lib/demo-store';
 import { formatDurationShort } from '@/lib/utils';
 
 export default function ResultsPage({ params }: { params: Promise<{ roomId: string }> }) {
@@ -25,9 +33,63 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
 
   // The socket is closed after a match, so results also works from a plain
   // state fetch (live) or the demo store — the hook's first paint covers it.
-  const { mode, room, players, phase, loading, error, demo, session, retryConnection } = useRoomState(roomId);
+  const { mode, room, players, phase, loading, error, roomDeleted, demo, session, myPlayer, myPlayerId, retryConnection, refreshDemo } = useRoomState(roomId);
+
+  // Room deleted (founder decision, 2026-11-21): the host cancelled
+  // and the room is gone — home with the one plain message. Declared
+  // before the LOBBY effect below so a deletion never routes to the
+  // lobby of a dead room on the way home.
+  useEffect(() => {
+    if (!roomDeleted) return;
+    goHomeAfterRoomDeleted(router, roomId);
+  }, [roomDeleted, roomId, router]);
 
   const result = room?.result ?? null;
+  const isHost = myPlayer?.isHost ?? false;
+  const [replaying, setReplaying] = useState(false);
+  const [replayError, setReplayError] = useState<string | null>(null);
+
+  // Replay-reset: when the room returns to LOBBY, go back to the same
+  // lobby (same room, same code). Live arrives via the `room.state`
+  // broadcast (`reason: "replay-reset"`) + snapshot; demo via the 1 s
+  // poll. Guarded on loading/room: the hook's initial phase IS 'LOBBY'
+  // before the first snapshot lands, and that must not redirect.
+  useEffect(() => {
+    if (loading || !room || roomDeleted) return;
+    if (phase === 'LOBBY') {
+      router.replace(`/room/${roomId}`);
+    }
+  }, [loading, room, phase, roomDeleted, roomId, router]);
+
+  // Host-only replay (the server 403s a non-host; the demo store throws
+  // the same way). On success the host navigates at once; every other
+  // client follows via the effect above when the reset lands.
+  const handleReplay = async () => {
+    if (replaying) return;
+    setReplayError(null);
+    setReplaying(true);
+    try {
+      if (mode === 'live') {
+        await replayLiveRoom(roomId);
+      } else {
+        const current = getRoom(roomId);
+        if (!current) throw new Error('Game not found on this device.');
+        replayDemoRoom(current, myPlayerId);
+        refreshDemo();
+      }
+      router.replace(`/room/${roomId}`);
+    } catch (err) {
+      if (err instanceof LiveHttpError && err.status === 403) {
+        setReplayError('Only the host can replay the room.');
+      } else if (err instanceof Error) {
+        setReplayError(err.message);
+      } else {
+        setReplayError('Could not replay — try again.');
+      }
+    } finally {
+      setReplaying(false);
+    }
+  };
 
   // Scores (P1-27): live calls GET /v1/rooms/:id/results (the server
   // computes them); demo scores locally with the same engine rule.
@@ -298,6 +360,23 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
         <h2 className="mb-3 text-[18px] font-bold text-white">What happened</h2>
         <ResultsTimeline events={events} />
       </div>
+
+      {/* Replay — same room, same code, fresh game. Host-only: the
+          server 403s a non-host, so non-hosts get the waiting line
+          instead of a dead button, and return to the lobby when the host
+          replays (the LOBBY effect above). */}
+      {isHost ? (
+        <Button variant="primary" onClick={() => void handleReplay()} disabled={replaying}>
+          {replaying ? 'Replaying…' : 'Replay — back to the lobby'}
+        </Button>
+      ) : (
+        <p className="text-center text-[14px] text-[#A1A1AA]">
+          Only the host can replay — waiting for the host.
+        </p>
+      )}
+      {replayError ? (
+        <p className="text-center text-[14px] text-[#EF4444]">{replayError}</p>
+      ) : null}
 
       <Button variant="primary" onClick={() => router.push('/')}>
         START A FRESH GAME

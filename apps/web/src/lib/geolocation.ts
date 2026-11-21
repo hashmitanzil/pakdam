@@ -219,7 +219,14 @@ export async function getCurrentFix(): Promise<LocationFix> {
   throw new Error('GPS is too rough here — tap the map to place the zone.');
 }
 
-/** May this fix be sent at all? Same ±50 m rule as auto-centring. */
+/**
+ * May this fix be USED for gameplay (zone / auto-centre / catch
+ * proximity)? Same ±50 m rule as auto-centring. This is NOT the send
+ * gate any more (B1, v18 fix round): liveness sends go up to
+ * MAX_FIX_ACCURACY_METERS (±1000 m) — see the play page — so a
+ * poor-but-present GPS still stamps `lastFixAt`. The lobby still uses
+ * this as its fix-quality bar.
+ */
 export function isFixSendableToServer(fix: LocationFix): boolean {
   return isFixSendable(fix);
 }

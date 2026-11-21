@@ -30,6 +30,14 @@
  *   re-confirming a disputed catch is rejected server-side.
  * - QR token: 128-bit (32 hex chars) fresh token, hash =
  *   `sha256(catchId + ':' + raw)`, single-use + TTL, QR-only carriage.
+ * - Claim-less runner QR token (v18 follow-up): a Runner mints their own
+ *   token with NO claim open (`catch.runner-token`); hash =
+ *   `sha256('runner:' + runnerId + ':' + raw)`, same 128-bit / 120 s /
+ *   single-use / QR-only rules, one live token per Runner (re-mint
+ *   replaces the old one). A Hunter's scan (`catch.request` with
+ *   `qrToken`) resolves the Runner from the token and creates the claim;
+ *   the claim then carries the catchId-scoped hash of the same raw value,
+ *   so `catch.confirm` with the scanned token verifies unchanged.
  * - GPS evidence (`gpsEvidence`) is a plausibility record only
  *   ('present'/'absent'/'stale') — the physical-tag gate above is the
  *   separate, enforcing check in `confirmCatch` / `requestCatch`.
@@ -43,10 +51,12 @@ import {
   CATCH_TOKEN_TTL_SECONDS,
   IDEMPOTENCY_TTL_MS,
   STALE_FIX_MS,
+  ZONE_AUTO_CENTRE_MAX_ACCURACY_M,
   newCatchToken,
   catchTokenHash,
   isValidCatchToken,
   haversineMeters,
+  runnerTokenHash,
   CATCH_PROXIMITY_PLAUSIBILITY_M,
   type CatchEvent,
   type CatchGpsEvidence,
@@ -78,9 +88,9 @@ export function isCatchExpired(
   return nowMs - Date.parse(catchEvent.requestedAt) >= ttlSeconds * 1000;
 }
 
-/** Strip the server-only token hash for clients. */
+/** Strip the server-only token hashes for clients (F1: both hashes — `qrTokenHash` AND `previousQrTokenHash` — never leave the server). */
 export function toCatchView(catchEvent: CatchEvent): CatchView {
-  const { qrTokenHash: _qrTokenHash, ...view } = catchEvent;
+  const { qrTokenHash: _qrTokenHash, previousQrTokenHash: _previousQrTokenHash, ...view } = catchEvent;
   return view;
 }
 
@@ -160,6 +170,128 @@ export async function verifyCatchToken(
 }
 
 // ---------------------------------------------------------------------------
+// Claim-less runner QR token (v18 follow-up — founder catch flow)
+// ---------------------------------------------------------------------------
+
+/**
+ * A Runner's claim-less QR token, as the server stores it. Hash ONLY —
+ * the raw value is returned once to the Runner (inside the direct
+ * `catch.runner-token` reply) and is never stored, logged, or persisted.
+ * One live record per Runner: a re-mint replaces the previous record,
+ * so the old QR dies at once. `used` flips when a Hunter's scan creates
+ * (or binds to) a claim with it — a consumed token can never create a
+ * second claim. Expired records are pruned lazily by the DO; expiry is
+ * always decided by `expiresAtMs`, never by the prune.
+ */
+export interface RunnerQrToken {
+  runnerPlayerId: string;
+  /** sha256('runner:' + runnerId + ':' + raw) — see `runnerTokenHash`. */
+  tokenHash: string;
+  issuedAtMs: number;
+  expiresAtMs: number;
+  used: boolean;
+}
+
+/**
+ * Issue a fresh claim-less runner token: raw token (QR only) + its
+ * durable record (hash only). Same token rules as a claim token:
+ * 128-bit (32 uppercase hex), TTL `CATCH_TOKEN_TTL_SECONDS` (120 s),
+ * single-use, QR-only carriage. The record carries NO raw value — the
+ * caller returns `token` to the Runner once and stores only `record`.
+ */
+export async function issueRunnerQrToken(
+  runnerPlayerId: string,
+  nowMs: number,
+  ttlSeconds: number = CATCH_TOKEN_TTL_SECONDS,
+): Promise<{ token: string; record: RunnerQrToken }> {
+  const token = newCatchToken();
+  const tokenHash = await runnerTokenHash(runnerPlayerId, token);
+  return {
+    token,
+    record: {
+      runnerPlayerId,
+      tokenHash,
+      issuedAtMs: nowMs,
+      expiresAtMs: nowMs + ttlSeconds * 1000,
+      used: false,
+    },
+  };
+}
+
+/** Has this runner-token record expired? Expiry is enforced lazily on every operation. */
+export function isRunnerQrTokenExpired(record: RunnerQrToken, nowMs: number): boolean {
+  return nowMs >= record.expiresAtMs;
+}
+
+export type RunnerQrTokenStatus = 'valid' | 'expired' | 'used' | 'unknown';
+
+/**
+ * Resolve a raw token a Hunter scanned against every live runner-token
+ * record. The QR carries only the raw token, so the Runner is identified
+ * by re-hashing: for each record, sha256('runner:' + record.runnerId +
+ * ':' + raw) is compared with the stored hash. A hash match on an
+ * expired record answers 'expired' (not 'unknown' — the Runner's QR was
+ * real, just stale); a match on a consumed record answers 'used'; no
+ * match at all answers 'unknown'. Malformed tokens (not 32 uppercase
+ * hex) are 'unknown' without hashing.
+ */
+export async function resolveRunnerQrToken(
+  records: readonly RunnerQrToken[],
+  rawToken: string,
+  nowMs: number,
+): Promise<{ status: RunnerQrTokenStatus; record: RunnerQrToken | null }> {
+  if (!isValidCatchToken(rawToken)) return { status: 'unknown', record: null };
+  for (const record of records) {
+    const hash = await runnerTokenHash(record.runnerPlayerId, rawToken);
+    if (hash !== record.tokenHash) continue;
+    if (record.used) return { status: 'used', record };
+    if (isRunnerQrTokenExpired(record, nowMs)) return { status: 'expired', record };
+    return { status: 'valid', record };
+  }
+  return { status: 'unknown', record: null };
+}
+
+/**
+ * v18 fix round (A1) — resolve a scanned token against OPEN CLAIMS.
+ *
+ * After a name-claim the Runner displays the CLAIM QR (fetched via HTTP
+ * `/catch-token`), not a claim-less runner token — so `resolveRunnerQrToken`
+ * answers 'unknown' for it and the Hunter could never tag after a reload
+ * (the in-memory `scannedToken` was gone too). When the runner-token
+ * lookup misses, the DO tries this second lookup: a raw token that
+ * verifies against an open (pending, unexpired) claim's `qrTokenHash` —
+ * or its preserved `previousQrTokenHash` — resolves to that claim.
+ *
+ * The hash domains are NOT merged: a runner token still never verifies
+ * as a claim token except through this explicit dual lookup in
+ * `catch.request` (this helper only ever reads claim hashes). Expired
+ * claims do not resolve (the lazy sweep expires them and the Hunter's
+ * scan then opens a fresh claim instead). Returns the open claim, or
+ * null when no open claim's token matches.
+ */
+export async function resolveOpenClaimQrToken(
+  catches: readonly CatchEvent[],
+  rawToken: string,
+  nowMs: number,
+  ttlSeconds: number = CATCH_TOKEN_TTL_SECONDS,
+): Promise<CatchEvent | null> {
+  if (!isValidCatchToken(rawToken)) return null;
+  for (const c of catches) {
+    if (!isPendingCatch(c)) continue;
+    if (isCatchExpired(c, nowMs, ttlSeconds)) continue;
+    if (await verifyCatchToken(c.catchId, rawToken, c.qrTokenHash)) return c;
+    if (
+      c.previousQrTokenHash !== undefined &&
+      c.previousQrTokenHash !== null &&
+      (await verifyCatchToken(c.catchId, rawToken, c.previousQrTokenHash))
+    ) {
+      return c;
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // GPS evidence (supporting only — never proof, never a rejection on its own)
 // ---------------------------------------------------------------------------
 
@@ -211,6 +343,24 @@ export function checkCatchProximity(input: {
   if (
     input.nowMs - input.hunterFix.timestampMs > STALE_FIX_MS ||
     input.nowMs - input.runnerFix.timestampMs > STALE_FIX_MS
+  ) {
+    return {
+      ok: false,
+      code: 'STALE_LOCATION',
+      reason: 'Waiting for GPS — move closer and try again.',
+    };
+  }
+  // v18 fix round (B1) — liveness vs usability: a poor fix (accuracy
+  // worse than ±50 m, `ZONE_AUTO_CENTRE_MAX_ACCURACY_M`) still proves
+  // the phone is alive (it stamps `lastFixAt`, so the seat is not
+  // ejected for silence), but its position is far too coarse to judge
+  // a 100 m tag — the distance between two ±1000 m fixes says nothing
+  // about whether the phones are actually next to each other. A tag
+  // needs BOTH fixes accurate to ±50 m or better; otherwise the phones
+  // wait for a better lock, exactly like a missing fix.
+  if (
+    input.hunterFix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M ||
+    input.runnerFix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M
   ) {
     return {
       ok: false,

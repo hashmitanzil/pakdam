@@ -68,3 +68,49 @@ test('omitting activeAtMs keeps the old behaviour (head start of 0)', () => {
   assert.equal(isPingDue(null, STARTED_AT, INTERVAL, STARTED_AT + 60_000), true);
   assert.equal(nextPingAtMs(null, STARTED_AT, INTERVAL), STARTED_AT + 60_000);
 });
+
+// v18 fix round (B1): a ping is never centred on a poor fix — a ±100 m
+// fix would put a 150 m circle around a point that is itself ±100 m
+// wrong. The subject stays due and the ping fires when a usable fix
+// arrives (lastPingAtMs only advances on delivery).
+test('buildPing returns null for a poor fix; due lists skip poor-fix subjects (B1)', async () => {
+  const { buildPing, isFixUsableForPing } = await import('../src/pings.ts');
+  const poor = { lat: 23.35, lng: 85.33, accuracyMeters: 100, timestampMs: T0 };
+  const atLimit = { lat: 23.35, lng: 85.33, accuracyMeters: 50, timestampMs: T0 };
+  assert.equal(isFixUsableForPing(poor), false);
+  assert.equal(isFixUsableForPing(atLimit), true);
+  assert.equal(
+    buildPing({
+      pingId: 'p1',
+      roomId: 'room-1',
+      subjectPlayerId: 'r1',
+      recipientRole: 'hunters',
+      fix: poor,
+      qualityAtPing: 'poor',
+      nowMs: T0,
+    }),
+    null,
+  );
+  assert.notEqual(
+    buildPing({
+      pingId: 'p2',
+      roomId: 'room-1',
+      subjectPlayerId: 'r1',
+      recipientRole: 'hunters',
+      fix: atLimit,
+      qualityAtPing: 'fair',
+      nowMs: T0,
+    }),
+    null,
+  );
+  const base = {
+    lastPingAtMs: {},
+    startedAtMs: STARTED_AT,
+    intervalSeconds: INTERVAL,
+    nowMs: ACTIVE_AT + 60_000,
+    activeAtMs: ACTIVE_AT,
+  };
+  assert.deepEqual(dueRunnerIds({ ...base, freeRunnerIds: ['r1'], fixes: { r1: poor } }), []);
+  assert.deepEqual(dueHunterIds({ ...base, freeHunterIds: ['h1'], fixes: { h1: poor } }), []);
+  assert.deepEqual(dueRunnerIds({ ...base, freeRunnerIds: ['r1'], fixes: { r1: atLimit } }), ['r1']);
+});

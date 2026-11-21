@@ -1,27 +1,43 @@
 /**
- * Pakdam WS event catalogue — frozen contract v2.1.
+ * Pakdam WS event catalogue — frozen contract v2.1, as amended by v18
+ * and the v18 follow-up (claim-less runner QR token).
  *
- * 22 client→server message types, 35 server→client types.
+ * 22 client→server message types, 33 server→client types.
+ *
+ * v18 removals (founder decisions — do not re-add):
+ * - `safety.sos` / `sos.raised`: SOS removed entirely, server + shared.
+ * - `zone.preview`: NO next-zone preview at all — the next zone appears
+ *   suddenly at a random place, so the server never broadcasts a preview.
+ *   The shrink itself (timing, random offset, final 42%) is unchanged.
+ * - `reveal.send` (client→server) + the `reveal` server event: hold-to-
+ *   reveal was removed entirely in v18 (server handler, web UI, and now
+ *   this catalogue — Wave 2 removed the last shared types: `RevealArea`,
+ *   `RevealSendPayload`, `RevealEventPayload`). A stray `reveal.send`
+ *   now gets "Unknown message type" (VALIDATION_FAILED).
  *
  * NOTE — server count: the protocol map's header states 35 server→client
  * types and its §2.4 table enumerates 34 named types plus `zone.preview`
- * (added by the shrink-preview fix, P1-18) = 35. This file implements
- * all 35 exactly. If another type is ever identified, add it here and
- * bump the protocol version. Do not invent one to make the count match.
+ * (added by the shrink-preview fix, P1-18) = 35. v18 removes `zone.preview`,
+ * `sos.raised`, and `reveal`, so this file now implements 32. If another
+ * type is ever identified, add it here and bump the protocol version. Do
+ * not invent one to make the count match.
+ *
+ * v18 follow-up (claim-less runner QR token): `catch.runner-token` is
+ * added both ways — the Runner mints it (client→server, empty payload)
+ * and receives the raw token back (server→client, direct-only) — so the
+ * count is now 22 client / 33 server types.
  *
  * Broadcast scoping (server-side, must be preserved): direct messages
  * (`welcome`, `snapshot`, `error`, `heartbeat.ack`, `auth.refreshed`,
- * `ticket.renewal-required`) go only to the sender; `voice.signal` and
+ * `ticket.renewal-required`, `catch.runner-token`) go only to the sender; `voice.signal` and
  * `radio` are team-only (lobby = whole lobby); `ping` is role-scoped — it
  * goes only to the ping's recipient role (a Runner ping to Hunters, a
  * Hunter ping to Runners), so each side sees only the opposing team;
- * `reveal` goes to the whole room; `zone.preview` broadcasts to the room;
  * everything else broadcasts to the room.
  */
 import type {
   Announcement,
   CatchView,
-  GeoPoint,
   LocationFix,
   MapPin,
   MatchPhase,
@@ -30,7 +46,6 @@ import type {
   PlayerView,
   QuickSignal,
   RadioMessage,
-  RevealArea,
   Room,
   SuspensionReason,
   VoiceSignalKind,
@@ -62,12 +77,21 @@ export interface LocationUpdatePayload {
   fix: LocationFix;
 }
 
-export interface RevealSendPayload {
-  fix: LocationFix;
-}
-
 export interface CatchRequestPayload {
-  runnerId: string;
+  /**
+   * Name-claim path: the Runner to claim. Optional when `qrToken` is
+   * given — a Hunter who scanned a QR sends the token only and the
+   * server identifies the Runner from it. When both are given they
+   * must agree, or the request is rejected.
+   */
+  runnerId?: string;
+  /**
+   * Scan path: the raw token decoded from the Runner's QR. Either a
+   * claim-less runner token (creates the claim for that Runner) or —
+   * once a claim exists — the claim's own token. Never typed, never
+   * shown as text: QR-only carriage, same as every catch token.
+   */
+  qrToken?: string;
 }
 
 /** Runner confirms with the fetched QR token, or manually with no token. */
@@ -78,16 +102,54 @@ export interface CatchConfirmPayload {
   resolution?: 'manual-confirm';
 }
 
+/**
+ * v18 self-confirm (founder catch flow): the RUNNER names the Hunter who
+ * tagged them (`hunterId`) and the server completes the tag — no QR scan,
+ * no token, and NO confirmation needed from the Hunter. The server
+ * creates the claim if none is open for that Hunter + Runner, then
+ * confirms it in the same op, under the same physical-tag rule as every
+ * other confirm (both phones need a recent fix within 100 m). The
+ * QR-scan way (Hunter scans the Runner's QR, then taps Tag) still uses
+ * `catch.request` + `catch.confirm` and is unchanged.
+ */
+/**
+ * v18 follow-up — claim-less runner QR token (founder catch flow): the
+ * RUNNER mints their own QR token with NO claim open (`catch.runner-token`,
+ * empty payload) and shows the QR the moment they tap "Got Tagged". The
+ * token is tied to the Runner (their playerId), not to a claim: 128-bit,
+ * 120 s TTL, hash-only storage, single-use, QR-only carriage — the same
+ * token rules as a claim token, with the hash domain
+ * sha256('runner:' + runnerId + ':' + raw). One live token per Runner:
+ * re-minting REPLACES the old one at once (the server never stores the
+ * raw, so it cannot re-issue the same token). A Hunter who scans it
+ * sends `catch.request` with `{ qrToken }` (no runnerId needed); the
+ * server validates it, creates the claim for that Runner, and the Hunter
+ * then taps Tag → the existing `catch.confirm` with the same token
+ * (the physical 100 m gate still applies at confirm). Minting with an
+ * open claim is CONFLICT — the Runner shows that claim's QR instead
+ * (HTTP /catch-token, unchanged).
+ */
+export interface CatchSelfConfirmPayload {
+  hunterId: string;
+}
+
+export type CatchRunnerTokenPayload = EmptyPayload;
+
+/** Direct reply to a `catch.runner-token` mint: the raw token, once, to the Runner only. */
+export interface CatchRunnerTokenIssuedPayload {
+  token: string;
+  runnerId: string;
+  /** ISO-8601 expiry (mint + CATCH_TOKEN_TTL_SECONDS). */
+  expiresAt: string;
+  serverSeq: number;
+}
+
 export interface CatchDisputePayload {
   catchId: string;
   reason: string;
 }
 
 export interface SafetyPausePayload {
-  reason: string | null;
-}
-
-export interface SafetySosPayload {
   reason: string | null;
 }
 
@@ -144,13 +206,13 @@ export interface WsClientPayloads {
   'snapshot.request': SnapshotRequestPayload;
   'resync.request': ResyncRequestPayload;
   'location.update': LocationUpdatePayload;
-  'reveal.send': RevealSendPayload;
   'catch.request': CatchRequestPayload;
   'catch.confirm': CatchConfirmPayload;
+  'catch.self-confirm': CatchSelfConfirmPayload;
+  'catch.runner-token': CatchRunnerTokenPayload;
   'catch.dispute': CatchDisputePayload;
   'safety.pause': SafetyPausePayload;
   'safety.resume': EmptyPayload;
-  'safety.sos': SafetySosPayload;
   'ready.set': ReadySetPayload;
   'briefing.confirm': EmptyPayload;
   'radio.send': RadioSendPayload;
@@ -171,13 +233,13 @@ export const WS_CLIENT_TYPES: readonly WsClientMessageType[] = [
   'snapshot.request',
   'resync.request',
   'location.update',
-  'reveal.send',
   'catch.request',
   'catch.confirm',
+  'catch.self-confirm',
+  'catch.runner-token',
   'catch.dispute',
   'safety.pause',
   'safety.resume',
-  'safety.sos',
   'ready.set',
   'briefing.confirm',
   'radio.send',
@@ -195,7 +257,7 @@ export function isWsClientMessageType(value: string): value is WsClientMessageTy
 }
 
 // ---------------------------------------------------------------------------
-// Server → client (35 enumerated types; see note at the top of this file)
+// Server → client (33 enumerated types; see note at the top of this file)
 // ---------------------------------------------------------------------------
 
 export interface WelcomePayload {
@@ -252,21 +314,6 @@ export interface ZoneUpdatePayload {
   serverSeq: number;
 }
 
-/**
- * Shrink preview, broadcast 30 s before a shrink (PREVIEW_LEAD_SECONDS).
- * `boundary` is the next zone boundary the DO computed (the same boundary
- * it will apply when the shrink fires — the preview is the real next
- * zone, not a second draw); `firesAtMs` is the epoch ms the shrink
- * fires; `shrinkIndex` is 1-based (1, 2 or 3). The client draws the
- * dashed preview ring + "Next zone in MM:SS" and never guesses a
- * boundary of its own.
- */
-export interface ZonePreviewPayload {
-  boundary: GeoPoint[];
-  firesAtMs: number;
-  shrinkIndex: number;
-}
-
 export interface CatchEventPayload {
   catch: CatchView;
   serverSeq: number;
@@ -281,11 +328,6 @@ export interface SafetyPausedPayload {
 export interface SafetyResumedPayload {
   byPlayerId: string;
   reason: string | null;
-  serverSeq: number;
-}
-
-export interface SosRaisedPayload {
-  byPlayerId: string;
   serverSeq: number;
 }
 
@@ -306,11 +348,6 @@ export interface MatchCancelledPayload {
 
 export interface AnnouncementEventPayload {
   announcement: Announcement;
-  serverSeq: number;
-}
-
-export interface RevealEventPayload {
-  reveal: RevealArea;
   serverSeq: number;
 }
 
@@ -380,8 +417,6 @@ export interface WsServerPayloads {
   ping: PingEventPayload;
   'ping.expired': PingExpiredPayload;
   'zone.update': ZoneUpdatePayload;
-  'zone.preview': ZonePreviewPayload;
-  reveal: RevealEventPayload;
   pin: PinEventPayload;
   signal: SignalEventPayload;
   radio: RadioEventPayload;
@@ -392,12 +427,23 @@ export interface WsServerPayloads {
   'catch.disputed': CatchEventPayload;
   'catch.expired': CatchEventPayload;
   'catch.rejected': CatchEventPayload;
+  'catch.runner-token': CatchRunnerTokenIssuedPayload;
   'safety.paused': SafetyPausedPayload;
   'safety.resumed': SafetyResumedPayload;
-  'sos.raised': SosRaisedPayload;
   'match.started': MatchStartedPayload;
   'match.completed': MatchCompletedPayload;
   'match.cancelled': MatchCancelledPayload;
+  /**
+   * v23 fix round 1 (S12): `'room.deleted'` was emitted via a cast
+   * because the catalogue was frozen for v23 — the guard
+   * `isWsServerMessageType('room.deleted')` was false and no runtime
+   * check would have caught a typo'd server type. Unfrozen now: the
+   * signal carries the same `{ result }` payload as `match.cancelled`
+   * (the store emits exactly that), and the three casts are gone.
+   * The wire string is unchanged — the web client already matches the
+   * raw `'room.deleted'` string.
+   */
+  'room.deleted': MatchCancelledPayload;
 }
 
 export type WsServerMessageType = keyof WsServerPayloads;
@@ -420,8 +466,6 @@ export const WS_SERVER_TYPES: readonly WsServerMessageType[] = [
   'ping',
   'ping.expired',
   'zone.update',
-  'zone.preview',
-  'reveal',
   'pin',
   'signal',
   'radio',
@@ -432,12 +476,13 @@ export const WS_SERVER_TYPES: readonly WsServerMessageType[] = [
   'catch.disputed',
   'catch.expired',
   'catch.rejected',
+  'catch.runner-token',
   'safety.paused',
   'safety.resumed',
-  'sos.raised',
   'match.started',
   'match.completed',
   'match.cancelled',
+  'room.deleted',
 ] as const;
 
 /** Type guard: is this string a known server→client message type? */
@@ -453,6 +498,7 @@ export const WS_DIRECT_SERVER_TYPES: readonly WsServerMessageType[] = [
   'heartbeat.ack',
   'auth.refreshed',
   'ticket.renewal-required',
+  'catch.runner-token',
 ] as const;
 
 /** Server→client types relayed team-only (lobby scope = whole lobby). */

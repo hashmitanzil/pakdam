@@ -1,11 +1,15 @@
 /**
- * CatchQR — SHOW MY QR / CATCH BY QR (SCRAM-SPEC §9).
+ * CatchQR — the Runner's QR (show) / the Hunter's scanner (scan)
+ * (SCRAM-SPEC §9, v18 founder flow).
  *
  * The QR encodes only the raw one-time catch token. The token is never
  * shown as text and never typed — there is no catch code anywhere in
- * Pakdam. The scanner decodes camera frames with jsQR; when the camera
- * fails, the manual fallback (pick the Runner by name) takes over — no
- * code is ever spoken or typed.
+ * Pakdam. Show mode renders the Runner's QR automatically the moment a
+ * claim exists (no "SHOW MY QR" tap). Scan mode runs the Hunter's camera
+ * at the top of the catch screen; a decode is reported to the page,
+ * which holds the token until the Hunter taps Tag in the column below.
+ * When the camera fails, the manual fallback (pick the Runner by name)
+ * takes over — no code is ever spoken or typed.
  */
 'use client';
 
@@ -58,7 +62,8 @@ export function CatchQR({
   const onScanErrorRef = useRef(onScanError);
   onScanErrorRef.current = onScanError;
 
-  // SHOW MY QR — render the token as a QR image, nothing else.
+  // SHOW — render the token as a QR image, nothing else. The page
+  // renders this automatically once a claim exists — no extra tap.
   useEffect(() => {
     if (mode !== 'show' || !token) {
       setQrDataUrl(null);
@@ -77,7 +82,8 @@ export function CatchQR({
     };
   }, [mode, token]);
 
-  // CATCH BY QR — camera + jsQR frame decoding.
+  // SCAN — camera + jsQR frame decoding. The page holds the decoded
+  // token until the Hunter taps Tag below the camera.
   // B19: full-resolution frames every animation frame were the most
   // expensive per-frame work on the catch screen. Frames start
   // downscaled to ~640 px wide and decoded only every 3rd frame — jsQR

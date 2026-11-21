@@ -3,6 +3,13 @@
  * banner + countdown, back-inside clears it, poor GPS freezes it, 0 s
  * ejects (demo enforces; live is server-enforced). Demo-only.
  *
+ * v18 item 4: the match starts even if a player's GPS has not reported
+ * yet (no start-gate GPS refusal), and 30 s with NO fix at all also
+ * ejects — the missing-fix rule, same 30 s as out-of-zone. A
+ * poor-but-present fix still freezes the countdown; it never ejects.
+ * Demo enforces the missing-fix ejection via the play page, live via
+ * the server.
+ *
  * Geolocation is emulated: the zone sits on the Ranchi default
  * (23.36, 85.33); the far point (23.40, 85.40) is well outside the 500 m
  * zone. Text-only, no screenshots.
@@ -10,6 +17,8 @@
 import { test, expect } from '@playwright/test';
 import {
   LIVE,
+  HOST_NAME,
+  getDemoRoom,
   readyAll,
   setupThreePlayerLobby,
   startMatchAsHost,
@@ -88,6 +97,34 @@ test.describe('outside zone (demo)', () => {
     await expect(hostPage.getByText('You were ejected — you left the zone.')).toBeVisible({
       timeout: 60000,
     });
+    await context.close();
+  });
+
+  test('no fix for 30 s ejects the player (v18 missing-fix rule)', async ({ browser }) => {
+    test.setTimeout(120000);
+    // No geolocation at all: no fix is ever reported for any seat.
+    // v18 item 4(a): the match STARTS anyway — there is no GPS-freshness
+    // refusal at the gate. v18 item 4(b): 30 s with no fix at all ejects,
+    // following the out-of-zone rule. A poor-but-present fix still freezes
+    // the countdown instead (see 'poor GPS freezes the countdown at 0:30').
+    const context = await browser.newContext();
+    const { hostPage, guestPages, roomId } = await setupThreePlayerLobby(context);
+    await readyAll([hostPage, ...guestPages]);
+    await startMatchAsHost(hostPage);
+    await waitForPlay(hostPage);
+    await dismissRoleReveal(hostPage);
+    // The ejection is asserted as a store fact (ejectedAt), not copy: the
+    // notice wording for a missing-fix ejection is the app's choice, so
+    // this test does not assert on it.
+    await expect
+      .poll(
+        async () => {
+          const room = await getDemoRoom(hostPage, roomId);
+          return room?.players.find((p) => p.displayName === HOST_NAME)?.ejectedAt ?? null;
+        },
+        { timeout: 60000 },
+      )
+      .not.toBeNull();
     await context.close();
   });
 });

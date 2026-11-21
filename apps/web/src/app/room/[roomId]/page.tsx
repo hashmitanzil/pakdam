@@ -34,14 +34,18 @@ import {
   canStartLiveMatch,
   fetchLiveRoomState,
   getHostTokenLive,
+  readHostGraceEndsAtMs,
   regenerateLiveRoomCode,
   removeLivePlayer,
   snapshotToLiveRoomState,
   startLiveMatch,
   updateLiveRoomConfig,
 } from '../../../lib/live-room-client';
+import { endLiveMatch, LiveHttpError } from '../../../lib/live-client';
+import { goHomeAfterRoomDeleted } from '../../../lib/room-deleted';
 import {
   canStartDemoMatch,
+  deleteDemoRoom,
   demoRoomChangeKey,
   getRoom,
   leaveRoom,
@@ -68,6 +72,13 @@ import { effectiveHunterCount, formatRoomSummary } from '../../../components/hos
 interface LobbyState {
   room: Room;
   players: PlayerView[];
+  /**
+   * v24 (D1): epoch ms when the disconnected host's 30 s reconnect
+   * grace expires, null when no grace is running. Live: from the
+   * snapshot (tolerant read); demo: from the demo room. The client
+   * never computes the deadline itself.
+   */
+  hostGraceEndsAtMs: number | null;
 }
 
 export default function LobbyPage() {
@@ -87,11 +98,15 @@ export default function LobbyPage() {
   const [confirmState, setConfirmState] = useState<
     | { kind: 'leave' }
     | { kind: 'remove'; playerId: string; displayName: string }
+    | { kind: 'cancel-lobby' }
     | null
   >(null);
   // A6: Change code is a round-trip — the button shows it is working
   // instead of sitting dead until the new code lands.
   const [changingCode, setChangingCode] = useState(false);
+  // Host cancel is a round-trip too — the confirm button shows it is
+  // working instead of sitting dead until the room is deleted.
+  const [cancellingLobby, setCancellingLobby] = useState(false);
 
   const socketRef = useRef<PakdamSocket | null>(null);
   const lobbyRef = useRef<LobbyState | null>(null);
@@ -123,13 +138,13 @@ export default function LobbyPage() {
   const rollbackConfig = useCallback((): void => {
     if (session?.mode !== 'live') {
       const saved = getRoom(roomId);
-      if (saved) setLobby({ room: saved.room, players: saved.players });
+      if (saved) setLobby({ room: saved.room, players: saved.players, hostGraceEndsAtMs: saved.hostGraceEndsAtMs ?? null });
       return;
     }
     const currentSession = session;
     if (!currentSession) return;
     void fetchLiveRoomState(roomId, currentSession.playerId, currentSession.reconnectToken ?? '')
-      .then((state) => setLobby({ room: state.room, players: state.players }))
+      .then((state) => setLobby({ room: state.room, players: state.players, hostGraceEndsAtMs: readHostGraceEndsAtMs(state) }))
       .catch(() => undefined);
   }, [roomId, session]);
 
@@ -183,11 +198,33 @@ export default function LobbyPage() {
     router.push(`/room/${roomId}/play`);
   }, [roomId, router]);
 
+  // Room deleted (founder decision, 2026-11-21): the host cancelled and
+  // the room is gone — home with the one plain message, once. Every
+  // deletion path on this page (404 fetch, `room.deleted` event, a
+  // socket close that probes 404, a demo poll that finds the room gone)
+  // funnels through here.
+  const deletedRef = useRef(false);
+  const goHomeDeleted = useCallback(() => {
+    if (deletedRef.current) return;
+    deletedRef.current = true;
+    goHomeAfterRoomDeleted(router, roomId);
+  }, [roomId, router]);
+
   const isLive = session?.mode === 'live';
   const me = lobby?.players.find((p) => p.playerId === session?.playerId);
   const isHost = me?.isHost ?? session?.isHost ?? false;
   const config = lobby?.room.config ?? null;
   const activePlayers = (lobby?.players ?? []).filter((p) => p.leftAt === null);
+  // v24 (D1): host-reconnect grace — the host is suspended and the
+  // server/demo says the grace is running, so the room is hostless
+  // until the host returns or the grace expires and the crown moves.
+  // The suspended host themself never sees this line (they ARE the
+  // host); the roster row already shows them as Suspended.
+  const hostPlayer = lobby?.players.find((p) => p.playerId === lobby?.room.hostPlayerId);
+  const hostGraceActive =
+    (lobby?.hostGraceEndsAtMs ?? null) !== null &&
+    hostPlayer?.connectionState === 'suspended' &&
+    hostPlayer.playerId !== session?.playerId;
 
   // -- Load the seat, then live state / socket or demo polling (F2). ------
   useEffect(() => {
@@ -199,11 +236,18 @@ export default function LobbyPage() {
       void fetchLiveRoomState(roomId, found.playerId, found.reconnectToken ?? '')
         .then((state) => {
           if (cancelled) return;
-          setLobby({ room: state.room, players: state.players });
+          setLobby({ room: state.room, players: state.players, hostGraceEndsAtMs: readHostGraceEndsAtMs(state) });
           if (state.room.phase !== 'LOBBY') goPlay();
         })
         .catch((err: unknown) => {
           if (cancelled) return;
+          // 404 = the room is gone (host cancelled, server deleted it):
+          // a reload/reopen after deletion lands home with the one plain
+          // message, not on a stale lobby or an error screen.
+          if (err instanceof LiveHttpError && err.status === 404) {
+            goHomeDeleted();
+            return;
+          }
           setLoadError(err instanceof Error ? err.message : 'Game not found or ended.');
         });
       const socket = new PakdamSocket({
@@ -229,9 +273,9 @@ export default function LobbyPage() {
           const state = snapshotToLiveRoomState(snapshot);
           // Don't let a stale server echo clobber a config push in flight.
           if (pendingPushRef.current && lobbyRef.current) {
-            setLobby({ room: { ...state.room, config: lobbyRef.current.room.config }, players: state.players });
+            setLobby({ room: { ...state.room, config: lobbyRef.current.room.config }, players: state.players, hostGraceEndsAtMs: state.hostGraceEndsAtMs });
           } else {
-            setLobby({ room: state.room, players: state.players });
+            setLobby({ room: state.room, players: state.players, hostGraceEndsAtMs: state.hostGraceEndsAtMs });
           }
         },
         onServerMessage: (envelope) => {
@@ -247,12 +291,41 @@ export default function LobbyPage() {
           if (envelope.type === 'room.state') {
             socketRef.current?.requestSnapshot();
           }
+          // `host.transferred` also carries a `room.state`, but the
+          // snapshot is requested explicitly here too: the new host's
+          // controls (start, settings, cancel) must appear WITHOUT a
+          // reload, and this page must never depend on a second event
+          // to learn who the host is now.
+          if (envelope.type === 'host.transferred') {
+            socketRef.current?.requestSnapshot();
+          }
+          // `room.deleted` — the host cancelled and the server deleted
+          // the room. Not in the frozen @pakdam/shared catalogue, so it
+          // is matched on the raw string (see useRoomState for the same
+          // handling on the play / catch / results pages).
+          if ((envelope.type as string) === 'room.deleted') {
+            goHomeDeleted();
+          }
         },
         onStateChange: (state) => {
           setConn(state);
           // (Re)connected — refresh the roster from the server so a
           // reconnect never leaves a stale or empty player list.
           if (state === 'connected') socketRef.current?.requestSnapshot();
+          // A server-side close (or an exhausted reconnect) can mean the
+          // room was deleted out from under this client — the socket dies
+          // with the room, and no `room.deleted` event may arrive first.
+          // Probe the state fetch on every close: 404 = deleted (home
+          // with the one plain message); anything else keeps the old
+          // behaviour.
+          if ((state === 'closed' || state === 'reconnect-failed') && !cancelled) {
+            void fetchLiveRoomState(roomId, found.playerId, found.reconnectToken ?? '')
+              .then(() => undefined)
+              .catch((err: unknown) => {
+                if (cancelled) return;
+                if (err instanceof LiveHttpError && err.status === 404) goHomeDeleted();
+              });
+          }
         },
         onError: (error) => {
           // (a) A send that reached the server but was REJECTED (e.g.
@@ -296,11 +369,23 @@ export default function LobbyPage() {
     const demo = getRoom(roomId);
     if (demo) {
       lastDemoKeyRef.current = demoRoomChangeKey(demo);
-      setLobby({ room: demo.room, players: demo.players });
-    } else setLoadError('Game not found or ended.');
+      setLobby({ room: demo.room, players: demo.players, hostGraceEndsAtMs: demo.hostGraceEndsAtMs ?? null });
+    } else {
+      // A session for this room means the room existed when this seat
+      // was created — a missing room after a reload/reopen is a
+      // deletion (host cancel), so home with the one plain message,
+      // not an error screen.
+      goHomeDeleted();
+    }
     const timer = setInterval(() => {
       const current = pollDemoRoom(roomId);
-      if (!current) return;
+      if (!current) {
+        // A lobby that was alive and is now gone was deleted (the host
+        // cancelled in another tab) — home with the one plain message.
+        // A lobby never seen alive keeps the first-paint error above.
+        if (lobbyRef.current) goHomeDeleted();
+        return;
+      }
       if (current.room.phase !== 'LOBBY') {
         goPlay();
         return;
@@ -308,7 +393,7 @@ export default function LobbyPage() {
       const key = demoRoomChangeKey(current);
       if (key === lastDemoKeyRef.current) return;
       lastDemoKeyRef.current = key;
-      setLobby({ room: current.room, players: current.players });
+      setLobby({ room: current.room, players: current.players, hostGraceEndsAtMs: current.hostGraceEndsAtMs ?? null });
     }, 1000);
     return () => {
       clearInterval(timer);
@@ -335,13 +420,27 @@ export default function LobbyPage() {
 
   // A2: a host seat saved before join-time minting (or restored
   // without a host token) mints it now, in the background, so START is
-  // a single POST by the time the host taps it.
+  // a single POST by the time the host taps it. Gated on the DERIVED
+  // `isHost` (snapshot players), not the saved session: after a host
+  // transfer the new host's saved session still says non-host, and
+  // their first host action would otherwise pay the mint round-trip.
+  // Succession is by join order only — never gated on role or alive
+  // state — and neither is this mint.
   useEffect(() => {
-    if (!isLive || !session || !session.isHost || session.hostToken) return;
+    if (!isLive || !session || !isHost || session.hostToken) return;
     if (!session.reconnectToken) return;
+    // v24 (D1): only mint once a snapshot has confirmed I am host.
+    // Before the first snapshot `isHost` falls back to the saved
+    // session flag, and a stale flag (a former host, transferred away)
+    // would mint a host token for a seat that is no longer host. The
+    // server would reject it, but never asking is cleaner — and a
+    // returning host re-mints here the moment their snapshot lands
+    // (getHostTokenLive re-reads the stored seat, so a cached token is
+    // returned without a network round-trip on later snapshots).
+    if (!lobby) return;
     // getHostTokenLive caches the minted token in sessionStorage.
     void getHostTokenLive(roomId).catch(() => undefined);
-  }, [roomId, isLive, session]);
+  }, [roomId, isLive, session, isHost, lobby]);
 
   // -- Config edits (host only, via the Settings sheet). Normalised so a
   //    'selected' team always carries exactly hunterCount picks (the
@@ -443,18 +542,23 @@ export default function LobbyPage() {
     if (session.mode === 'live') {
       void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken ?? '')
         .then((state) => {
-          setLobby({ room: state.room, players: state.players });
+          setLobby({ room: state.room, players: state.players, hostGraceEndsAtMs: readHostGraceEndsAtMs(state) });
           if (state.room.phase !== 'LOBBY') goPlay();
         })
         .catch((err: unknown) => {
+          // 404 = the room is gone (host cancelled, server deleted it).
+          if (err instanceof LiveHttpError && err.status === 404) {
+            goHomeDeleted();
+            return;
+          }
           showNotice(err instanceof Error ? err.message : 'Could not reload the lobby — try again.');
         });
       void socketRef.current?.retry();
     } else {
       const demo = getRoom(roomId);
-      if (demo) setLobby({ room: demo.room, players: demo.players });
+      if (demo) setLobby({ room: demo.room, players: demo.players, hostGraceEndsAtMs: demo.hostGraceEndsAtMs ?? null });
     }
-  }, [goPlay, roomId, session, showNotice]);
+  }, [goPlay, goHomeDeleted, roomId, session, showNotice]);
 
   const toggleMyReady = (): void => {
     if (!me || !session) return;
@@ -464,7 +568,7 @@ export default function LobbyPage() {
         if (!demo) return;
         toggleReady(demo, me.playerId);
         const saved = getRoom(roomId);
-        if (saved) setLobby({ room: saved.room, players: saved.players });
+        if (saved) setLobby({ room: saved.room, players: saved.players, hostGraceEndsAtMs: saved.hostGraceEndsAtMs ?? null });
       } catch (err) {
         showNotice(err instanceof Error ? err.message : 'Could not send readiness.');
       }
@@ -567,6 +671,43 @@ export default function LobbyPage() {
     setConfirmState({ kind: 'leave' });
   };
 
+  // Host-only cancel (founder decision, 2026-11-21): the host cancels
+  // the lobby before start and the lobby is deleted. Host-only, with a
+  // confirm step — a stray tap must never delete the lobby. Live uses
+  // the same lifecycle 'end' call as the play page's "End the round";
+  // the server then deletes the room and every other player follows
+  // via `room.deleted` / a 404. Demo deletes the local room at once.
+  const cancelLobby = (): void => {
+    if (!isHost) return;
+    setConfirmState({ kind: 'cancel-lobby' });
+  };
+
+  const confirmCancelLobby = useCallback((): void => {
+    if (cancellingLobby) return;
+    setCancellingLobby(true);
+    const done = (): void => {
+      setCancellingLobby(false);
+      setConfirmState(null);
+    };
+    if (!isLive) {
+      deleteDemoRoom(roomId);
+      done();
+      goHomeDeleted();
+      return;
+    }
+    void endLiveMatch(roomId)
+      .then(() => {
+        done();
+        goHomeDeleted();
+      })
+      .catch((err: unknown) => {
+        done();
+        showNotice(
+          err instanceof Error ? err.message : 'Could not cancel the lobby — try again.',
+        );
+      });
+  }, [cancellingLobby, isLive, roomId, goHomeDeleted, showNotice]);
+
   const confirmLeave = useCallback((): void => {
     setConfirmState(null);
     if (isLive) {
@@ -594,7 +735,7 @@ export default function LobbyPage() {
       if (!demo) return;
       leaveRoom(demo, targetPlayerId);
       const saved = getRoom(roomId);
-      if (saved) setLobby({ room: saved.room, players: saved.players });
+      if (saved) setLobby({ room: saved.room, players: saved.players, hostGraceEndsAtMs: saved.hostGraceEndsAtMs ?? null });
       return;
     }
     // A6: the roster drops the player at once; a failed remove puts
@@ -819,6 +960,32 @@ export default function LobbyPage() {
           ) : null}
         </section>
 
+        {/* v24 (D1): host-reconnect grace — the host is suspended
+            and may be back within 30 s, so the room is hostless until
+            they return or the grace expires and the crown moves. The
+            roster row already shows the host as Suspended; this line
+            says what that means for the room. No countdown is shown —
+            the deadline is the server's, and the client never
+            computes it. */}
+        {hostGraceActive ? (
+          <p className="text-[13px] text-[#F59E0B]" role="status">
+            Waiting for the host to reconnect…
+          </p>
+        ) : null}
+
+        {/* Host only: cancel the lobby (founder decision, 2026-11-21).
+            Opens the confirm sheet below — a stray tap never deletes
+            the lobby. Joiners never see this control. */}
+        {isHost ? (
+          <button
+            type="button"
+            onClick={cancelLobby}
+            className="self-start text-[15px] font-semibold text-[#EF4444]"
+          >
+            Cancel lobby
+          </button>
+        ) : null}
+
         <button
           type="button"
           onClick={toggleMyReady}
@@ -870,17 +1037,41 @@ export default function LobbyPage() {
       <Sheet
         open={confirmState !== null}
         onClose={() => setConfirmState(null)}
-        title={confirmState?.kind === 'remove' ? 'Remove player?' : 'Leave room?'}
+        title={
+          confirmState?.kind === 'remove'
+            ? 'Remove player?'
+            : confirmState?.kind === 'cancel-lobby'
+              ? 'Cancel lobby?'
+              : 'Leave room?'
+        }
       >
         <div className="flex flex-col gap-4">
           <p className="text-[15px] text-[#A1A1AA]">
             {confirmState?.kind === 'remove'
               ? `Remove ${confirmState.displayName} from the lobby? They can rejoin with the room code.`
-              : 'Leave this room? You can rejoin with the room code.'}
+              : confirmState?.kind === 'cancel-lobby'
+                ? 'Cancel this lobby? The lobby will be deleted and every player goes back home.'
+                : 'Leave this room? You can rejoin with the room code.'}
           </p>
           <div className="flex gap-2">
-            <Button variant="primary" onClick={confirmState?.kind === 'remove' ? confirmRemove : confirmLeave}>
-              {confirmState?.kind === 'remove' ? 'Remove' : 'Leave room'}
+            <Button
+              variant="primary"
+              onClick={
+                confirmState?.kind === 'remove'
+                  ? confirmRemove
+                  : confirmState?.kind === 'cancel-lobby'
+                    ? confirmCancelLobby
+                    : confirmLeave
+              }
+              disabled={cancellingLobby}
+            >
+              {confirmState?.kind === 'remove'
+                ? 'Remove'
+                : confirmState?.kind === 'cancel-lobby'
+                  ? cancellingLobby
+                    ? 'Cancelling…'
+                    : 'Cancel lobby'
+                  : 'Leave room'}
             </Button>
             <Button variant="outline" onClick={() => setConfirmState(null)}>
               Cancel

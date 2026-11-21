@@ -151,9 +151,6 @@ export const SHRINK_RADIUS_FACTOR = 0.75;
 /** Shrinks per round: exactly 3, at duration/3, 2·duration/3, duration. */
 export const SHRINK_COUNT_PER_ROUND = 3;
 
-/** Shrink preview lead: the DO broadcasts the next zone this far ahead. */
-export const PREVIEW_LEAD_SECONDS = 30;
-
 /** Next-zone draws within 10 m of the current centre are discarded and re-drawn. */
 export const MIN_NEXT_ZONE_OFFSET_M = 10;
 
@@ -189,10 +186,6 @@ export const SCORING_CLEAN_SWEEP = 10;
 
 /** One sessionStorage key holds the whole live session (two separate tokens inside). */
 export const SESSION_STORAGE_KEY = 'pakdam.session.v1';
-
-/** SOS copy — exact string. SOS alerts the host; it is NOT emergency dispatch. */
-export const SOS_COPY =
-  'SOS alerts your host in this game. Pakdam is NOT an emergency service and does not call police or ambulance. If you are in danger, call your local emergency number.';
 
 /** Fixed string sent as the reason on `catch.dispute`. */
 export const CATCH_DISPUTE_REASON =
@@ -322,18 +315,28 @@ export const WS_MESSAGE_RATE_LIMITS: Readonly<Record<string, { readonly limit: n
     'location.update': { limit: 60, windowSeconds: 10 },
     'catch.request': { limit: 5, windowSeconds: 60 },
     'catch.confirm': { limit: 5, windowSeconds: 60 },
+    // v18 self-confirm: same budget as catch.confirm — one Runner
+    // self-confirming a tag is one tag decision, not a new channel.
+    'catch.self-confirm': { limit: 5, windowSeconds: 60 },
+    // v18 follow-up runner-token mint: same budget — one mint is one
+    // QR shown, and a re-mint (rotation) is legitimate only about
+    // once per TTL (120 s), so 5/min/seat cannot be a mint loop.
+    'catch.runner-token': { limit: 5, windowSeconds: 60 },
     'catch.dispute': { limit: 5, windowSeconds: 60 },
     'signal.send': { limit: 10, windowSeconds: 60 },
     'radio.send': { limit: 10, windowSeconds: 60 },
     'pin.place': { limit: 10, windowSeconds: 60 },
     'voice.signal': { limit: 600, windowSeconds: 60 },
     'announcement.send': { limit: 5, windowSeconds: 60 },
-    'reveal.send': { limit: 5, windowSeconds: 60 },
     'briefing.confirm': { limit: 5, windowSeconds: 60 },
     'ready.set': { limit: 10, windowSeconds: 60 },
     'safety.pause': { limit: 10, windowSeconds: 60 },
     'safety.resume': { limit: 10, windowSeconds: 60 },
-    'safety.sos': { limit: 10, windowSeconds: 60 },
+    // NOTE (v18): 'safety.sos' was REMOVED (founder decision — no SOS
+    // feature). 'reveal.send' was likewise removed with the hold-to-
+    // reveal UI in v18 Wave 2 (shared types deleted); a stray reveal
+    // from an old client is rejected as "Unknown message type" and falls
+    // under the default WS limit, not a dedicated entry.
     leave: { limit: 3, windowSeconds: 60 },
     'player.suspended': 'exempt',
   } as const;
@@ -383,6 +386,8 @@ export const HTTP_RATE_LIMITS: Readonly<Record<string, { readonly limit: number;
     'POST /v1/rooms/:id/host/token': { limit: 5, windowSeconds: 60, key: 'seat' },
     'POST /v1/rooms/:id/host/transfer': { limit: 5, windowSeconds: 60, key: 'seat' },
     'POST /v1/rooms/:id/catches/:cid/resolve': { limit: 10, windowSeconds: 60, key: 'seat' },
+    // v18 replay: host-only reset of a finished room to LOBBY.
+    'POST /v1/rooms/:id/replay': { limit: 5, windowSeconds: 60, key: 'seat' },
     'GET /v1/rooms/:id/results': { limit: 30, windowSeconds: 60, key: 'seat' },
     // The WS upgrade is keyed by ROOM, not client IP: 30 players on one
     // venue WiFi share one IP, and a per-IP cap would 429 the 6th player.

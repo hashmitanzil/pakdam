@@ -4,7 +4,10 @@
  * HARD RULE: ticket VALUES are never stored, never logged, never put in a URL
  * (except the single-use WS ticket in the handshake query string, the one
  * sanctioned exception). Only SHA-256 hashes are stored or compared.
- * The catch-token hash is sha256(catchId + ':' + raw).
+ * The catch-token hash is sha256(catchId + ':' + raw); the claim-less
+ * runner-QR-token hash is sha256('runner:' + runnerId + ':' + raw) — a
+ * different domain, so a runner token can never verify as a claim token
+ * (or vice versa) even if the raw values collided.
  *
  * Web Crypto (async) only — it exists in browsers, Cloudflare Workers and
  * Node 18+. There is no synchronous SHA-256 here by design: do not hand-roll
@@ -48,6 +51,18 @@ export async function hashWsTicket(rawTicket: string): Promise<string> {
  */
 export async function catchTokenHash(catchId: string, rawToken: string): Promise<string> {
   return sha256Hex(`${catchId}:${rawToken}`);
+}
+
+/**
+ * Claim-less runner-QR-token hash: sha256('runner:' + runnerId + ':' + raw).
+ * Tied to the RUNNER, not to a claim — this is what lets a Runner show a
+ * QR before any claim exists, and lets the server identify the Runner from
+ * a Hunter's scan. The 'runner:' domain keeps it distinct from the
+ * claim-token hash above: a raw value minted as a runner token verifies
+ * ONLY against a runner-token record, never against a claim.
+ */
+export async function runnerTokenHash(runnerId: string, rawToken: string): Promise<string> {
+  return sha256Hex(`runner:${runnerId}:${rawToken}`);
 }
 
 /** Is this string a lowercase SHA-256 hex digest (64 chars)? */

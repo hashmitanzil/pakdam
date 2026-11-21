@@ -323,15 +323,18 @@ export interface ShrinkDrawResult {
 /**
  * Draw the next zone: scale the boundary toward its centroid by the shrink
  * factor (75% of the radius), then move the smaller shape to a RANDOM
- * position fully inside the current boundary — NOT concentric. Offset drawn
- * uniformly over the disc the smaller shape can occupy; every candidate is
- * verified with `polygonFullyInside`; draws within 10 m of the current
- * centre are discarded and re-drawn. Up to 50 attempts, then fallbacks in
- * order: deterministic non-concentric offsets (8 compass directions) →
- * copies scaled toward a point just inside a convex vertex (saves concave
- * drawn shapes whose centroid sits outside) → progressively smaller
- * concentric copies → the concentric scaled copy itself only as a last
- * resort.
+ * position fully inside the current boundary — NOT concentric. The DO calls
+ * this at the moment a shrink fires (v18: there is NO next-zone preview —
+ * the founder removed `zone.preview`, so nothing is drawn or broadcast
+ * ahead of the shrink; the next zone appears suddenly at a random place).
+ * Offset drawn uniformly over the disc the smaller shape can occupy; every
+ * candidate is verified with `polygonFullyInside`; draws within 10 m of
+ * the current centre are discarded and re-drawn. Up to 50 attempts, then
+ * fallbacks in order: deterministic non-concentric offsets (8 compass
+ * directions) → copies scaled toward a point just inside a convex vertex
+ * (saves concave drawn shapes whose centroid sits outside) → progressively
+ * smaller concentric copies → the concentric scaled copy itself only as a
+ * last resort.
  */
 export function randomOffsetShrinkBoundary(
   boundary: GeoPolygon,
@@ -405,26 +408,6 @@ export function randomOffsetShrinkBoundary(
   return { boundary: scaled, method: 'concentric-last-resort', offsetMeters: 0 };
 }
 
-/**
- * Preview the NEXT zone boundary ahead of a shrink (P1-18). Same draw as
- * `randomOffsetShrinkBoundary` — the DO calls this PREVIEW_LEAD_SECONDS
- * (30 s) before the shrink, broadcasts it as the `zone.preview` event
- * (payload `{ boundary, firesAtMs, shrinkIndex }`), and the client draws
- * the dashed preview ring + "Next zone in MM:SS". The DO should STORE the
- * previewed boundary and apply that same boundary when the shrink fires,
- * so the preview is the real next zone — not a second, different draw.
- */
-export function previewShrinkBoundary(
-  boundary: GeoPolygon,
-  options: {
-    factor?: number;
-    random?: () => number;
-    maxAttempts?: number;
-  } = {},
-): ShrinkDrawResult {
-  return randomOffsetShrinkBoundary(boundary, options);
-}
-
 // ---------------------------------------------------------------------------
 // Outside-zone rule: 30 s, then ejection
 // ---------------------------------------------------------------------------
@@ -451,23 +434,20 @@ export interface OutsideZoneUpdate {
 
 /**
  * Advance one player's outside-zone countdown from a fresh fix.
- * - Inside: both counters clear.
+ * - Inside with a trustworthy fix: both counters clear.
  * - Outside with a trustworthy fix: the current segment accrues; at
  *   accumulated + current segment ≥ 30 s the player is ejected.
- * - Outside with poor accuracy: the countdown FREEZES — seconds already
- *   counted stay in `outsideAccumMs`, no new seconds accrue.
+ * - Poor accuracy (B1): the countdown FREEZES — seconds already counted
+ *   stay in `outsideAccumMs`, no new seconds accrue — WHICHEVER side of
+ *   the boundary the fix's centre falls on. A ±1000 m fix whose centre
+ *   happens to land inside must not clear accrued outside time any more
+ *   than one landing outside may accrue it: a poor fix is never used for
+ *   a zone decision, in either direction.
  */
 export function updateOutsideZone(
   state: OutsideZoneState,
   input: { inside: boolean; poorAccuracy: boolean; nowMs: number },
 ): OutsideZoneUpdate {
-  if (input.inside) {
-    return {
-      state: emptyOutsideZoneState(),
-      remainingSeconds: OUTSIDE_ZONE_RETURN_SECONDS,
-      shouldEject: false,
-    };
-  }
   if (input.poorAccuracy) {
     const frozen = state.outsideSinceMs === null
       ? { ...state }
@@ -477,6 +457,13 @@ export function updateOutsideZone(
       OUTSIDE_ZONE_RETURN_SECONDS - frozen.outsideAccumMs / 1000,
     );
     return { state: frozen, remainingSeconds: remaining, shouldEject: false };
+  }
+  if (input.inside) {
+    return {
+      state: emptyOutsideZoneState(),
+      remainingSeconds: OUTSIDE_ZONE_RETURN_SECONDS,
+      shouldEject: false,
+    };
   }
   const since = state.outsideSinceMs ?? input.nowMs;
   const totalMs = state.outsideAccumMs + (input.nowMs - since);

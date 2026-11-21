@@ -37,7 +37,7 @@ import type {
   WsServerEnvelope,
 } from '@pakdam/shared';
 import { PakdamSocket } from '@/lib/websocket';
-import { fetchLiveRoomState } from '@/lib/live-room-client';
+import { fetchLiveRoomState, LiveHttpError, readHostGraceEndsAtMs } from '@/lib/live-room-client';
 import { getSessionForRoom, type PakdamSession } from '@/lib/session-credentials';
 import {
   getRoom,
@@ -82,6 +82,14 @@ export interface RoomStateData {
   announcements: Announcement[];
   /** Live socket (null in demo mode). */
   socket: PakdamSocket | null;
+  /**
+   * v24 (D1): epoch ms when the disconnected host's 30 s reconnect
+   * grace expires, null when no grace is running. From the snapshot
+   * in live mode (tolerant read — an older server reads as null),
+   * from the demo room in demo mode. The client never computes the
+   * deadline itself.
+   */
+  hostGraceEndsAtMs: number | null;
   socketState: WsConnectionState;
   socketError: string | null;
   /**
@@ -92,31 +100,36 @@ export interface RoomStateData {
    * generic banners; this is the structured, per-envelope companion.
    */
   lastSocketError: { code: WsErrorCode; message: string; atMs: number } | null;
+  /**
+   * v18 follow-up — the direct `catch.runner-token` reply: the Runner's
+   * own claim-less QR token, once, to the Runner only. The catch page
+   * watches this to render the QR the moment the mint lands. The raw
+   * token is never stored beyond the screen.
+   */
+  lastRunnerToken: { token: string; runnerId: string; expiresAt: string; atMs: number } | null;
   /** Demo room (null in live mode). */
   demo: DemoRoom | null;
   myPlayerId: string;
   myPlayer: PlayerView | undefined;
   loading: boolean;
   error: string | null;
+  /**
+   * The room is gone — the host cancelled and the server deleted it
+   * (founder decision, 2026-11-21). Set from the `room.deleted` event,
+   * from a 404 on the state fetch, from a socket close that probes 404,
+   * or (demo) from a poll that finds the room deleted. Pages watch this
+   * and send the player home with the one plain message; it is never
+   * cleared by a later snapshot, because a deleted room never sends one.
+   */
+  roomDeleted: boolean;
   /** Manual retry after `reconnect-failed` (live) or a fresh poll (demo). */
   retryConnection: () => void;
   /** Re-read the demo store immediately (after a demo mutation). */
   refreshDemo: () => void;
   /** Send a team-radio text (live: over the socket; demo: local only). */
   sendRadio: (text: string, kind?: 'quick' | 'text') => boolean;
-  /**
-   * Live reveal areas (from `reveal` events): who revealed, where, the
-   * radius, and when the display expires. Rendered by the play page.
-   */
-  reveals: Array<{
-    playerId: string;
-    displayName: string;
-    centre: { lat: number; lng: number };
-    radiusMeters: number;
-    expiresAtMs: number;
-  }>;
-  /** Send a reveal of my current position (live only; needs a fresh fix). */
-  sendReveal: (fix?: LocationFix) => boolean;
+  // NOTE (founder decision, v18): hold-to-reveal is removed — no
+  // `reveals` state and no `sendReveal` on this hook. Pings are unchanged.
   /** Leave the room: sends `leave` over the socket, then closes it. */
   leave: () => void;
 }
@@ -125,7 +138,7 @@ const IDLE_SAFETY: SafetyState = {
   paused: false,
   pausedBy: null,
   pausedAt: null,
-  sosActive: false,
+  // v18: no `sosActive` — SOS was removed entirely (shared type agrees).
 };
 
 /** Stable empty identities — a fresh `[]` / `{}` literal per snapshot
@@ -155,7 +168,7 @@ function demoSafety(demo: DemoRoom): SafetyState {
     paused: demo.room.phase === 'SAFETY_PAUSED',
     pausedBy: null,
     pausedAt: demo.room.pausedAt,
-    sosActive: demo.sosActive,
+    // v18: no `sosActive` — SOS was removed entirely.
   };
 }
 
@@ -176,15 +189,6 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   const [pings, setPings] = useState<Ping[]>([]);
   const [radioMessages, setRadioMessages] = useState<RadioMessage[]>([]);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
-  const [reveals, setReveals] = useState<
-    Array<{
-      playerId: string;
-      displayName: string;
-      centre: { lat: number; lng: number };
-      radiusMeters: number;
-      expiresAtMs: number;
-    }>
-  >([]);
   const [socketState, setSocketState] = useState<WsConnectionState>('idle');
   const [socketError, setSocketError] = useState<string | null>(null);
   const [lastSocketError, setLastSocketError] = useState<{
@@ -192,9 +196,53 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     message: string;
     atMs: number;
   } | null>(null);
+  const [lastRunnerToken, setLastRunnerToken] = useState<{
+    token: string;
+    runnerId: string;
+    expiresAt: string;
+    atMs: number;
+  } | null>(null);
+  // v24 (D1): the host grace deadline, from the latest snapshot / demo poll.
+  const [hostGraceEndsAtMs, setHostGraceEndsAtMs] = useState<number | null>(null);
   const [demo, setDemo] = useState<DemoRoom | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [roomDeleted, setRoomDeleted] = useState(false);
+  // A demo room was seen alive at least once — only then does a later
+  // null poll mean "deleted" (a first paint with no demo room is just
+  // a bad id, and keeps the old "not found" error).
+  const hadDemoRoomRef = useRef(false);
+  // The socket-closed probe re-arms whenever it proves the room alive
+  // (a 200, or a non-404 failure such as a network blip) and whenever
+  // the socket reconnects — a transient close must never permanently
+  // disable the backstop, and a room deleted later, after a lost
+  // `room.deleted` event, must still be probed on the next close.
+  // (Fix round 1, W1/W2: the old once-per-mount guard let one blip
+  // silence every later probe.)
+  const deletedProbeRef = useRef(false);
+
+  /**
+   * The room is gone: latch it and stop showing "Loading…". The
+   * snapshot-derived state is cleared at the same time (W2): a deleted
+   * room must not keep rendering its last roster, room code, teammate
+   * fixes or zone from memory while the home navigation lands.
+   */
+  const markDeleted = useCallback(() => {
+    setRoomDeleted(true);
+    setLoading(false);
+    setRoom(null);
+    setPlayers([]);
+    setPhase('LOBBY');
+    setSafetyState(IDLE_SAFETY);
+    setActiveCatches([]);
+    setSessionCatches([]);
+    setLocationStatus({});
+    setTeammateIds([]);
+    setTeammateFixes({});
+    setPings([]);
+    setLastRunnerToken(null);
+    setHostGraceEndsAtMs(null);
+  }, []);
 
   const [socket, setSocket] = useState<PakdamSocket | null>(null);
   const socketRef = useRef<PakdamSocket | null>(null);
@@ -223,7 +271,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   // is tied to that send only while it is recent, so an unrelated error
   // (e.g. a safety 403) never pulls back a radio message.
   const lastRadioSendAtMsRef = useRef<number>(0);
-  // Player list for resolving a reveal sender's display name inside the
+  // Player list for resolving a sender's display name inside the
   // socket callback (created once per room/session, so state would be stale).
   const playersRef = useRef<PlayerView[]>([]);
   playersRef.current = players;
@@ -249,6 +297,10 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     setSafetyState(snapshot.safetyState);
     setActiveCatches(snapshot.activeCatches);
     setLocationStatus(snapshot.locationStatus);
+    // v24 (D1): the host grace deadline rides the snapshot (tolerant
+    // read — an older server reads as null, never a client-computed
+    // deadline).
+    setHostGraceEndsAtMs(readHostGraceEndsAtMs(snapshot));
     // Teammates' live view (teammates only, never an opponent; empty for
     // a caught Runner). `??` tolerates a server that predates these fields.
     setTeammateIds(snapshot.teammateIds ?? EMPTY_STRING_ARRAY);
@@ -309,10 +361,21 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
 
   const applyDemo = useCallback((next: DemoRoom | null) => {
     if (!next) {
-      setError('Game not found on this device.');
-      setLoading(false);
+      // A room that was alive and is now gone was deleted (host cancel
+      // in another tab, or the host's own cancel) — home, with the one
+      // plain message. A session for this room means the same thing on
+      // a first paint: the room existed when this seat was created, so
+      // a missing room after a reload/reopen is a deletion, not a bad
+      // id. Only a first paint with NO seat at all keeps the old error.
+      if (hadDemoRoomRef.current || session) {
+        markDeleted();
+      } else {
+        setError('Game not found on this device.');
+        setLoading(false);
+      }
       return;
     }
+    hadDemoRoomRef.current = true;
     // The demo poll runs every 1 s and re-parses localStorage, so `next`
     // is a fresh object every time even when nothing changed — without
     // this guard the poll re-rendered the whole play page (and rebuilt
@@ -328,6 +391,9 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     setRoom(next.room);
     setPlayers(next.players);
     setPhase(next.room.phase);
+    // v24 (D1): the demo grace deadline, set when the demo host
+    // suspends and cleared on resume / leave / replay / expiry.
+    setHostGraceEndsAtMs(next.hostGraceEndsAtMs ?? null);
     setSafetyState(demoSafety(next));
     const pending = next.catches.filter(
       (c) => c.state === 'requested' || c.state === 'awaiting-confirmation' || c.state === 'disputed',
@@ -377,7 +443,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       })),
     );
     setLoading(false);
-  }, []);
+  }, [markDeleted, session]);
 
   const refreshDemo = useCallback(() => {
     applyDemo(pollDemoRoom(roomId));
@@ -400,11 +466,18 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         // so apply it the same way as a socket snapshot.
         applySnapshot(state);
       })
-      .catch(() => {
-        if (!cancelled) {
-          setError('Could not load the room — check your connection and try again.');
-          setLoading(false);
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        // 404 = the room is gone (host cancelled and the server deleted
+        // it) — a reload/reopen after deletion lands home with the one
+        // plain message, not on a stale lobby or an error screen.
+        // Any other failure keeps the old retryable error.
+        if (err instanceof LiveHttpError && err.status === 404) {
+          markDeleted();
+          return;
         }
+        setError('Could not load the room — check your connection and try again.');
+        setLoading(false);
       });
 
     const socket = new PakdamSocket({
@@ -415,6 +488,19 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       },
       onServerMessage: (envelope: WsServerEnvelope) => {
         if (cancelled) return;
+        // `room.deleted` — the host cancelled and the server deleted the
+        // room (founder decision, 2026-11-21). It is NOT in the frozen
+        // @pakdam/shared catalogue (that package is out of scope for
+        // this change), so it is matched on the raw string before the
+        // typed switch below. The socket is closed at once: the room is
+        // gone, so no reconnect can ever succeed. The 404 probe below
+        // is the backstop if this event ever arrives under another name
+        // or not at all — deletion always makes the state fetch 404.
+        if ((envelope.type as string) === 'room.deleted') {
+          markDeleted();
+          socketRef.current?.close();
+          return;
+        }
         const payload = (envelope.payload ?? {}) as Record<string, unknown>;
         switch (envelope.type) {
           case 'ping': {
@@ -488,39 +574,6 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
             if (announcement) setAnnouncements((prev) => [...prev, announcement]);
             break;
           }
-          case 'reveal': {
-            // P1-19: a teammate's reveal — store it for the play page to
-            // render (centre + radius + display expiry). The sender's name
-            // is resolved from the roster at receipt time.
-            const reveal = payload['reveal'] as
-              | { revealId?: string; byPlayerId?: string; centre?: { lat: number; lng: number }; radiusMeters?: number; sentAt?: string }
-              | undefined;
-            if (!reveal || !reveal.byPlayerId || !reveal.centre) break;
-            // Extracted before the setState closure: narrowing does not
-            // survive into the updater function.
-            const revealerId = reveal.byPlayerId;
-            const revealCentre = reveal.centre;
-            const revealRadius = reveal.radiusMeters ?? 150;
-            const sender =
-              playersRef.current.find((p) => p.playerId === revealerId);
-            const sentAtMs = reveal.sentAt ? Date.parse(reveal.sentAt) : Date.now();
-            setReveals((prev) => [
-              // One live reveal per player; expired rings drop out.
-              ...prev.filter(
-                (r) => r.playerId !== revealerId && Date.now() < r.expiresAtMs,
-              ),
-              {
-                playerId: revealerId,
-                displayName: sender?.displayName ?? '',
-                centre: { lat: revealCentre.lat, lng: revealCentre.lng },
-                radiusMeters: revealRadius,
-                // Display TTL (60 s): the server defines no reveal TTL,
-                // so the client retires the ring after a minute.
-                expiresAtMs: sentAtMs + 60_000,
-              },
-            ]);
-            break;
-          }
           case 'catch.requested':
           case 'catch.confirmed':
           case 'catch.disputed':
@@ -546,13 +599,28 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
             });
             break;
           }
+          case 'catch.runner-token': {
+            // v18 follow-up — direct reply to the Runner's mint: the raw
+            // token, once, to the Runner only. The catch page renders
+            // the QR from this; the token is never stored beyond the
+            // screen. The envelope carries a fresh serverSeq (a direct
+            // message), so it passes the ordering check above.
+            const token = payload['token'] as string | undefined;
+            const runnerId = payload['runnerId'] as string | undefined;
+            const expiresAt = payload['expiresAt'] as string | undefined;
+            if (token && runnerId && expiresAt) {
+              setLastRunnerToken({ token, runnerId, expiresAt, atMs: Date.now() });
+            }
+            break;
+          }
+          // NOTE (founder decision, v18): SOS is removed — an `sos.raised`
+          // event, if the server still sends one, is ignored (no case here).
           case 'match.completed':
           case 'match.cancelled':
           case 'room.state':
           case 'zone.update':
           case 'safety.paused':
           case 'safety.resumed':
-          case 'sos.raised':
           case 'player.joined':
           case 'player.left':
           case 'player.removed':
@@ -579,6 +647,35 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
           setSocketError(detail ?? null);
         } else {
           setSocketError(null);
+        }
+        // A successful reconnect re-arms the backstop: a later close
+        // (after a later deletion) must probe again.
+        if (state === 'connected') {
+          deletedProbeRef.current = false;
+        }
+        // A server-side close (or an exhausted reconnect) can mean the
+        // room was deleted out from under this client — the socket dies
+        // with the room, and no `room.deleted` event may arrive first.
+        // Probe the state fetch: 404 = deleted (home with the one
+        // plain message); anything else (403 for a removed seat, a
+        // network failure) is NOT a deletion and re-arms the probe, so
+        // a transient blip never permanently disables the backstop.
+        if (
+          (state === 'closed' || state === 'reconnect-failed') &&
+          !deletedProbeRef.current &&
+          session.reconnectToken
+        ) {
+          deletedProbeRef.current = true;
+          void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken)
+            .then(() => {
+              // Room alive — re-arm so a later close probes again.
+              deletedProbeRef.current = false;
+            })
+            .catch((err: unknown) => {
+              if (cancelled) return;
+              if (err instanceof LiveHttpError && err.status === 404) markDeleted();
+              else deletedProbeRef.current = false;
+            });
         }
       },
       onError: (err: WsErrorPayload) => {
@@ -650,8 +747,24 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       return;
     }
     setSocketError(null);
+    // Manual Retry re-fetches state, not just the socket (W1): a room
+    // deleted while the socket was down is discovered here — 404 goes
+    // home with the one plain message, exactly like the lobby's Retry —
+    // and a live snapshot repopulates a stale roster. A non-404 failure
+    // keeps the player on the match with a retryable message.
+    if (session?.reconnectToken) {
+      void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken)
+        .then((state) => applySnapshot(state))
+        .catch((err: unknown) => {
+          if (err instanceof LiveHttpError && err.status === 404) {
+            markDeleted();
+            return;
+          }
+          setSocketError('Could not reload the room — try again.');
+        });
+    }
     void socketRef.current?.retry();
-  }, [mode, refreshDemo]);
+  }, [mode, refreshDemo, roomId, session, applySnapshot, markDeleted]);
 
   const sendRadio = useCallback(
     (text: string, kind: 'quick' | 'text' = 'text'): boolean => {
@@ -703,15 +816,6 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     [mode, roomId],
   );
 
-  const sendReveal = useCallback(
-    (fix?: LocationFix): boolean => {
-      if (mode === 'demo') return false;
-      if (!fix) return false;
-      return socketRef.current?.sendReveal(fix) ?? false;
-    },
-    [mode],
-  );
-
   /** Leave the room (P0-1): the socket sends `leave`, then closes. */
   const leave = useCallback((): void => {
     socketRef.current?.leave();
@@ -737,20 +841,21 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     pings,
     radioMessages,
     announcements,
-    reveals,
     socket,
     socketState,
     socketError,
     lastSocketError,
+    lastRunnerToken,
+    hostGraceEndsAtMs,
     demo,
     myPlayerId,
     myPlayer,
     loading,
     error,
+    roomDeleted,
     retryConnection,
     refreshDemo,
     sendRadio,
-    sendReveal,
     leave,
   };
 }

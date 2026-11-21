@@ -1,17 +1,18 @@
 /**
  * Pakdam engine — safety rules.
  *
- * Any player may pause the match; SOS is NOT emergency dispatch — the copy
- * must say so. Safety pause and SOS are one tap away on the play screen at
- * all times. A pause only blocks play, never deletes state: the clock
- * freezes, and resume returns to the phase paused from (never hard-codes
- * ACTIVE) with the deadlines shifted forward by the pause.
+ * Any player may pause the match; the host resumes. A pause only blocks
+ * play, never deletes state: the clock freezes, and resume returns to the
+ * phase paused from (never hard-codes ACTIVE) with the deadlines shifted
+ * forward by the pause.
+ *
+ * v18: SOS was REMOVED entirely (founder decision). There is no SOS
+ * state, no SOS copy, no SOS handler — do not re-add one. The safety
+ * pause / resume below is unchanged and STAYS.
  *
  * "I'm safe" check-in travels as an announcement; there is no command for it.
  */
-import { SOS_COPY, type MatchPhase, type SafetyState } from '@pakdam/shared';
-
-export { SOS_COPY };
+import { type MatchPhase, type SafetyState } from '@pakdam/shared';
 
 /**
  * Can a safety pause start from this phase? Allowed exactly where the state
@@ -163,32 +164,7 @@ export function safetyStateAfterPause(
   };
 }
 
-/** Build the snapshot safety state after a resume (SOS clears with the pause — see below). */
+/** Build the snapshot safety state after a resume. */
 export function safetyStateAfterResume(previous: SafetyState): SafetyState {
-  // SOS clears when the safety pause is resolved/resumed: an SOS that
-  // latched forever would keep alerting the host after the danger passed.
-  // The DO's `doSafetyResume` calls `clearSos` on this same state.
-  return clearSos({ ...previous, paused: false, pausedBy: null, pausedAt: null });
-}
-
-/**
- * Raise an SOS. ANY player may raise one (no host check on the sender —
- * the DO accepts `safety.sos` from any seat); SOS alerts the host only
- * (trusted-contact sharing is a later phase) and is NOT emergency dispatch
- * — `SOS_COPY` says so, and the UI must show it. The host sees who raised
- * it (`sos.raised` goes to the host + the raiser). Returns the updated
- * safety state; the caller broadcasts `sos.raised` to the room.
- */
-export function raiseSos(previous: SafetyState): SafetyState {
-  return { ...previous, sosActive: true };
-}
-
-/** Clear an SOS (host-acknowledged). */
-export function clearSos(previous: SafetyState): SafetyState {
-  return { ...previous, sosActive: false };
-}
-
-/** SOS recipients: host only. */
-export function sosRecipients(hostPlayerId: string): string[] {
-  return [hostPlayerId];
+  return { ...previous, paused: false, pausedBy: null, pausedAt: null };
 }

@@ -14,7 +14,8 @@ test.describe('smoke', () => {
 
   test('home loads with the headline, two actions and the footer line', async ({ page }) => {
     await page.goto('/');
-    await expect(page.getByText('Pakdam', { exact: true }).first()).toBeVisible();
+    // Home header logo is the lockup wordmark image now, not text.
+    await expect(page.getByAltText('Pakdam')).toBeVisible();
     await expect(page.getByText('Your city is the battlefield')).toBeVisible();
     await expect(page.getByRole('heading', { name: /You are the/ })).toBeVisible();
     await expect(page.getByText('Target.', { exact: true })).toBeVisible();

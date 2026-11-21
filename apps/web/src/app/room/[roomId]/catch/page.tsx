@@ -4,6 +4,25 @@
  * Tag → QR → runner confirms → manual fallback. NO catch code anywhere:
  * the token lives only inside the Runner's QR and is never shown or typed.
  *
+ * V18 founder flow — two ways to finish a tag:
+ * WAY 1 — QR scan. The Runner taps "Got Tagged" and the catch screen
+ * opens with their QR ALREADY SHOWING (no extra tap — it mints
+ * automatically with no claim open, via WS `catch.runner-token` live /
+ * the engine's `issueRunnerQrToken` in demo, and refreshes itself every
+ * 120 s; with an open claim the claim's QR shows instead). The Hunter
+ * taps "Tag a runner" and gets the CAMERA running at the top with a
+ * column BELOW it: they scan the Runner's QR (WS `catch.request` with
+ * the raw token, no runnerId), the claim lands, the scanned Runner
+ * appears in the column with a Tag button, and Tag confirms the tag
+ * ("✓ Catch confirmed"). The name picker lives in that same column as
+ * the manual fallback when the camera/scan cannot be used — pick a name
+ * → claim → the Runner confirms on their phone (Self confirm), no QR
+ * needed.
+ * WAY 2 — SELF CONFIRM. Below the QR, the Runner taps "Self confirm",
+ * picks the Hunter who tagged them from a sheet, taps OK — the tag
+ * completes right there via `catch.self-confirm` (live) / `selfConfirm-
+ * Catch` (demo). NO confirmation is needed from the Hunter.
+ *
  * Auto-select (`resolveEffectiveRunner` in demo; the same order in live):
  * `?runner=` param → my open claim → picker choice → my latest confirmed
  * catch → the name-only picker. Never a "No Runner selected" dead end.
@@ -19,25 +38,30 @@
  */
 'use client';
 
-import { use, useEffect, useRef, useState } from 'react';
+import { use, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useRoomState } from '@/components/match/useRoomState';
 import { CatchQR } from '@/components/catch/CatchQR';
 import { ClaimPicker } from '@/components/catch/ClaimPicker';
 import { Button } from '@/components/ui/Button';
+import { Sheet } from '@/components/ui/Sheet';
 import { fetchLiveCatchToken } from '@/lib/live-client';
 import { resolveLiveCatch } from '@/lib/live-room-client';
 import { getSessionForRoom } from '@/lib/session-credentials';
+import { goHomeAfterRoomDeleted } from '@/lib/room-deleted';
 import { formatClock } from '@/lib/utils';
 import {
   confirmCatch,
   getCatchRaw,
   getRoom,
   listCatchPickerNames,
+  mintRunnerQrToken,
   rejectCatch,
   requestCatch,
   resolveEffectiveRunner,
   resumePlayerOnCatchPageArrival,
+  scanRunnerQrToken,
+  selfConfirmCatch,
   verifyCatchScan,
 } from '@/lib/demo-store';
 
@@ -60,21 +84,35 @@ export default function CatchPage({
     activeCatches,
     sessionCatches,
     socket,
+    socketState,
     lastSocketError,
+    lastRunnerToken,
     demo,
     myPlayerId,
     myPlayer,
     loading,
     error,
+    roomDeleted,
     retryConnection,
     refreshDemo,
   } = useRoomState(roomId);
 
   const [pickerChoice, setPickerChoice] = useState<string | null>(null);
-  const [scanOpen, setScanOpen] = useState(() => query.scan === '1');
+  // Manual fallback: force the name picker into the column below the
+  // camera even while a claim is open (to pick a different Runner).
   const [manualMode, setManualMode] = useState(false);
   const [qrToken, setQrToken] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // The Hunter's scanned QR token, held until they tap Tag. A scan never
+  // confirms on its own — Tag is the confirm step (Way 1).
+  const [scannedToken, setScannedToken] = useState<string | null>(null);
+  // Live only: Tag was tapped with no open claim yet — the claim request
+  // is sent, and the held token confirms the moment the claim lands.
+  const [tagAfterClaim, setTagAfterClaim] = useState(false);
+  const tagTargetRef = useRef<string | null>(null);
+  // Self Confirm sheet (Way 2): which Hunter the Runner picked, if any.
+  const [selfConfirmOpen, setSelfConfirmOpen] = useState(false);
+  const [selfConfirmHunterId, setSelfConfirmHunterId] = useState<string | null>(null);
   // A4: "Confirming…" shows the instant Self confirm is tapped — the
   // done card renders on the server echo (live) or the store write
   // (demo); a failed confirm clears it and says so.
@@ -103,6 +141,22 @@ export default function CatchPage({
   // confirms (which re-arms the card).
   const [dismissedDoneCatchId, setDismissedDoneCatchId] = useState<string | null>(null);
   const [hostNote, setHostNote] = useState<string | null>(null);
+  // v18 auto-QR — the Runner's own claim-less token (no open claim):
+  // the raw token + its expiry, held only while this screen shows it.
+  // Never rendered as text, never stored beyond the screen.
+  const [mintedToken, setMintedToken] = useState<{ token: string; expiresAt: string } | null>(null);
+  // A mint that failed, in the server's plain words, with a retry.
+  const [mintFailed, setMintFailed] = useState<string | null>(null);
+  const [minting, setMinting] = useState(false);
+  const mintInFlightRef = useRef(false);
+  const pendingMintAtMsRef = useRef<number | null>(null);
+  // Countdown clock for the minted QR (1 s ticker while it shows).
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  // Hunter scan in flight: the raw token sent with `catch.request`,
+  // awaiting its claim (`catch.requested` live, demo poll) or an error.
+  // Also the one-scan-at-a-time guard — the camera keeps running and
+  // the Hunter can re-scan once this resolves.
+  const [pendingScanToken, setPendingScanToken] = useState<string | null>(null);
 
   const urlRunnerId = query.runner ?? null;
   const isHost = myPlayer?.isHost ?? false;
@@ -118,6 +172,28 @@ export default function CatchPage({
     // Once on arrival.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, demo?.room.roomId, myPlayerId]);
+
+  // Room deleted (founder decision, 2026-11-21): the host cancelled
+  // and the room is gone — home with the one plain message. Declared
+  // before the LOBBY effect below so a deletion never routes to the
+  // lobby of a dead room on the way home.
+  useEffect(() => {
+    if (!roomDeleted) return;
+    goHomeAfterRoomDeleted(router, roomId);
+  }, [roomDeleted, roomId, router]);
+
+  // A9 (v18 fix round): replay-reset — when the room returns to LOBBY
+  // (after a replay), go back to the lobby, like the results and play
+  // pages. Guarded on loading/room: the hook's initial phase IS 'LOBBY'
+  // before the first snapshot lands, and that must not redirect — without
+  // this, a client sitting on /catch at replay time was stranded on
+  // "Catches count once the match is live." with no way forward.
+  useEffect(() => {
+    if (loading || !room || roomDeleted) return;
+    if (phase === 'LOBBY') {
+      router.replace(`/room/${roomId}`);
+    }
+  }, [loading, room, phase, roomDeleted, roomId, router]);
 
   // The open claim involving me (as Runner or as Hunter).
   const openClaim =
@@ -160,13 +236,123 @@ export default function CatchPage({
       ? (sessionCatches.find((c) => c.catchId === doneCatchId) ?? null)
       : null) ?? (latestConfirmed && latestConfirmed.catchId !== dismissedDoneCatchId && !openClaim ? latestConfirmed : null);
 
+  // v18 auto-QR — the Runner mints their own claim-less token the moment
+  // the catch screen opens with no open claim (live: WS
+  // `catch.runner-token`, empty payload; demo: the engine's
+  // `issueRunnerQrToken` via the demo store). Every mint is fresh — a
+  // re-mint is always a new commandId (live) / a fresh issue (demo), so
+  // the old QR dies at once. The reply lands via `lastRunnerToken`
+  // (live) or the awaited return (demo).
+  const shouldMint =
+    isRunner && phase === 'ACTIVE' && !openClaim && !doneCatch && !isSuspended;
+  const openClaimRef = useRef(openClaim);
+  openClaimRef.current = openClaim;
+  const mintRunnerQr = useCallback(() => {
+    if (mintInFlightRef.current) return;
+    if (mode === 'live') {
+      if (socketState !== 'connected') return;
+      mintInFlightRef.current = true;
+      setMinting(true);
+      setMintFailed(null);
+      pendingMintAtMsRef.current = Date.now();
+      if (!socket?.requestRunnerToken()) {
+        mintInFlightRef.current = false;
+        setMinting(false);
+        pendingMintAtMsRef.current = null;
+        setMintFailed('Not connected — your QR was not sent. Wait for the reconnect, then try again.');
+      }
+      return;
+    }
+    const current = getRoom(roomId);
+    if (!current) {
+      setMintFailed('Game not found on this device.');
+      return;
+    }
+    mintInFlightRef.current = true;
+    setMinting(true);
+    setMintFailed(null);
+    void mintRunnerQrToken(current, myPlayerId)
+      .then((minted) => {
+        setMintedToken({ token: minted.token, expiresAt: minted.expiresAt });
+        refreshDemo();
+      })
+      .catch((err: unknown) => {
+        // An open claim raced in — the claim QR takes over (refresh so
+        // it appears at once; the claim effect below clears this
+        // message once the claim lands). Anything else shows the
+        // server's reason, with a retry.
+        if (err instanceof Error && err.message.startsWith('A Hunter has already claimed you')) {
+          refreshDemo();
+        }
+        setMintFailed(err instanceof Error ? err.message : 'Could not show your QR.');
+      })
+      .finally(() => {
+        mintInFlightRef.current = false;
+        setMinting(false);
+      });
+  }, [mode, myPlayerId, refreshDemo, roomId, socket, socketState]);
+
+  // Mint on arrival (and on re-mint after expiry) — once, when the
+  // conditions first hold. Live waits for the socket to be connected;
+  // a dead socket reports plainly instead of waiting forever.
+  useEffect(() => {
+    if (!shouldMint) return;
+    if (mintedToken || mintFailed || mintInFlightRef.current) return;
+    if (mode === 'live') {
+      if (socketState === 'connected') {
+        mintRunnerQr();
+      } else if (socketState === 'reconnect-failed' || socketState === 'closed') {
+        setMintFailed('Not connected — your QR was not sent. Wait for the reconnect, then try again.');
+      }
+      // 'connecting' / 'reconnecting' / 'idle': wait — the card says
+      // "Getting your QR…" until the socket lands.
+      return;
+    }
+    mintRunnerQr();
+  }, [shouldMint, mode, socketState, mintedToken, mintFailed, mintRunnerQr]);
+
+  // The mint reply (live): the direct `catch.runner-token` envelope —
+  // the raw token, once, to the Runner only. A reply that lands after a
+  // claim opened is discarded — the claim QR shows instead.
+  useEffect(() => {
+    if (!lastRunnerToken) return;
+    if (lastRunnerToken.runnerId !== myPlayerId) return;
+    pendingMintAtMsRef.current = null;
+    mintInFlightRef.current = false;
+    setMinting(false);
+    if (openClaimRef.current) return;
+    setMintFailed(null);
+    setMintedToken({ token: lastRunnerToken.token, expiresAt: lastRunnerToken.expiresAt });
+  }, [lastRunnerToken, myPlayerId]);
+
+  // 1 s ticker while a minted QR is on screen — the countdown, and the
+  // auto re-mint below when it hits zero.
+  useEffect(() => {
+    if (!mintedToken || openClaim) return;
+    const timer = window.setInterval(() => setNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [mintedToken, openClaim]);
+
+  // The minted QR expired: drop it — the mint effect above re-mints with
+  // a fresh token at once, so the Runner never sits on a dead QR.
+  useEffect(() => {
+    if (!mintedToken || openClaim || phase !== 'ACTIVE') return;
+    if (Date.parse(mintedToken.expiresAt) - nowMs > 0) return;
+    setMintedToken(null);
+  }, [mintedToken, openClaim, phase, nowMs]);
+
   // The Runner's QR token: live fetches it (once, over HTTPS); demo reads
-  // the in-memory raw token. Never stored beyond the screen.
+  // the in-memory raw token. Never stored beyond the screen. A claim
+  // being open drops the minted token — the claim's QR shows, never the
+  // minted one (the minted token may already be consumed by this claim),
+  // so a later claim-free moment re-mints fresh.
   useEffect(() => {
     if (!openClaim || openClaim.runnerPlayerId !== myPlayerId) {
       setQrToken(null);
       return;
     }
+    setMintedToken(null);
+    setMintFailed(null);
     if (mode === 'demo') {
       setQrToken(getCatchRaw(openClaim.catchId));
       return;
@@ -207,17 +393,37 @@ export default function CatchPage({
 
   const disputedCatches = activeCatches.filter((c) => c.state === 'disputed');
 
+  // Self Confirm candidates (Way 2): the Hunters in this game. Demo
+  // roles are visible locally, so the list is true Hunters. Live role
+  // secrecy hides every other seat's role (matchRole is null for anyone
+  // but me), so the live list is every active player but me by name —
+  // the server rejects a non-Hunter pick (FORBIDDEN, "That player is
+  // not a Hunter."). Classic excludes confirmed-caught Runners (they are
+  // out and cannot be Hunters); Infection does not (a flipped Runner IS
+  // a Hunter and can tag).
+  const selfConfirmCandidates = (() => {
+    const caughtIds = new Set(
+      sessionCatches.filter((c) => c.state === 'confirmed').map((c) => c.runnerPlayerId),
+    );
+    return players.filter((p) => {
+      if (p.playerId === myPlayerId || p.leftAt !== null || p.ejectedAt !== null) return false;
+      if (mode === 'demo') return p.matchRole === 'hunter';
+      if (room?.config.mode === 'classic' && caughtIds.has(p.playerId)) return false;
+      return true;
+    });
+  })();
+
   // -- Hunter: claim a Runner -----------------------------------------------
   const handleClaim = () => {
     const targetId = pickerChoice ?? effectiveRunnerId;
     if (!targetId) return;
     setNotice(null);
+    setManualMode(false);
     if (mode === 'live') {
       if (!socket?.requestCatch(targetId)) {
         setNotice('Not connected — the claim was not sent. Wait for the reconnect, then tap again.');
         return;
       }
-      setScanOpen(true);
       return;
     }
     const current = getRoom(roomId);
@@ -225,69 +431,207 @@ export default function CatchPage({
     try {
       requestCatch(current, myPlayerId, targetId, crypto.randomUUID());
       refreshDemo();
-      setScanOpen(true);
     } catch (err) {
       setNotice(err instanceof Error ? err.message : 'That player could not be claimed.');
     }
   };
 
-  // -- Hunter: scan the Runner's QR ------------------------------------------
+  // -- Hunter: scan the Runner's QR (Way 1) ----------------------------------
+  // A scan never confirms on its own — it holds the token until the
+  // Hunter taps Tag. Live the scan goes to the server (`catch.request`
+  // with the raw token, no runnerId): the server resolves the Runner
+  // from the token and creates the claim, which lands as
+  // `catch.requested` — the effect below then arms the Tag button with
+  // the held token. A failed scan arrives as an error envelope (see the
+  // effect on lastSocketError) and does NOT consume the token, so the
+  // Hunter can retry with the same QR. Demo resolves the token the same
+  // way (engine `resolveRunnerQrToken` via the demo store).
   const handleScan = (rawToken: string) => {
-    if (!openClaim) {
-      setNotice('No open claim — pick a Runner first.');
-      return;
-    }
+    // One scan at a time: a decode that lands while a scan is in flight
+    // is ignored — the camera keeps running and the Hunter can re-scan
+    // once the first one resolves (the loop re-reports after 3 s).
+    if (pendingScanToken) return;
     if (mode === 'live') {
-      if (!socket?.sendCatchConfirm(openClaim.catchId, rawToken)) {
-        setNotice('Not connected — the scan was not sent. Try again.');
+      if (!socket?.requestCatchByToken(rawToken)) {
+        setNotice('Not connected — the QR was not sent. Wait for the reconnect, then scan again.');
         return;
       }
-      // Confirmed state arrives over the socket; the done card renders from it.
-      // A server rejection arrives only as an error envelope — the effect
-      // on lastSocketError below shows the server's reason instead of
-      // leaving the scanner running silently with no feedback.
+      setPendingScanToken(rawToken);
       pendingScanAtMsRef.current = Date.now();
+      setNotice('Checking the QR…');
       return;
     }
-    // No client-side wrong-scan lockout: the WS `catch.confirm` 5/min/seat
-    // rate limit already bounds failed confirms (the old WRONG_SCAN_*
-    // calibration was deleted as dead). A wrong scan just says so and the
-    // scanner keeps running — re-scan in place (P1-28).
+    const current = getRoom(roomId);
+    if (!current) {
+      setNotice('Game not found on this device.');
+      return;
+    }
+    setPendingScanToken(rawToken);
+    void scanRunnerQrToken(current, myPlayerId, rawToken)
+      .then(() => {
+        // The claim lands on the next demo poll; the effect below arms
+        // the Tag button with the held token once it does.
+        refreshDemo();
+      })
+      .catch((err: unknown) => {
+        setPendingScanToken(null);
+        setNotice(
+          err instanceof Error ? err.message : "That QR didn't match — scan the Runner's QR again.",
+        );
+      });
+  };
+
+  // A scan's claim landed: arm the Tag button with the held token. The
+  // claim is the one the scan created (or bound to, on a same-Hunter
+  // re-request) — the Hunter taps Tag to confirm it.
+  useEffect(() => {
+    if (!pendingScanToken) return;
+    if (!openClaim || openClaim.hunterPlayerId !== myPlayerId) return;
+    const runnerName =
+      players.find((p) => p.playerId === openClaim.runnerPlayerId)?.displayName ?? 'the Runner';
+    setScannedToken(pendingScanToken);
+    setPendingScanToken(null);
+    setNotice(`QR scanned — tap Tag to confirm ${runnerName}.`);
+  }, [pendingScanToken, openClaim, myPlayerId, players]);
+
+  // -- Hunter: Tag — confirm the scanned Runner (Way 1) ----------------------
+  const handleTag = () => {
+    const targetId = openClaim?.runnerPlayerId ?? pickerChoice ?? effectiveRunnerId;
+    if (!targetId) {
+      setNotice('Pick a Runner below first.');
+      return;
+    }
+    if (!scannedToken) {
+      setNotice("Scan the Runner's QR first — point the camera at their QR.");
+      return;
+    }
+    const token = scannedToken;
+    setNotice(null);
+    if (mode === 'live') {
+      const claim =
+        activeCatches.find(
+          (c) =>
+            c.hunterPlayerId === myPlayerId &&
+            c.runnerPlayerId === targetId &&
+            (c.state === 'requested' || c.state === 'awaiting-confirmation'),
+        ) ?? null;
+      if (claim) {
+        if (!socket?.sendCatchConfirm(claim.catchId, token)) {
+          setNotice('Not connected — the tag was not sent. Try again.');
+          return;
+        }
+        // A server rejection arrives only as an error envelope — the
+        // effect on lastSocketError below shows the server's reason.
+        pendingScanAtMsRef.current = Date.now();
+        return;
+      }
+      // No claim yet: claim first, then confirm with the held token the
+      // moment the claim lands (see the effect below).
+      if (!socket?.requestCatch(targetId)) {
+        setNotice('Not connected — the claim was not sent. Wait for the reconnect, then tap again.');
+        return;
+      }
+      tagTargetRef.current = targetId;
+      setTagAfterClaim(true);
+      setNotice('Claim sent — confirming once the claim lands…');
+      return;
+    }
     const current = getRoom(roomId);
     if (!current) return;
-    if (!verifyCatchScan(openClaim.catchId, rawToken)) {
-      setNotice("That QR didn't match — try again.");
-      return;
-    }
     try {
-      const confirmed = confirmCatch(current, openClaim.catchId, myPlayerId, 'qr-scan');
+      let claim =
+        current.catches.find(
+          (c) =>
+            c.hunterPlayerId === myPlayerId &&
+            c.runnerPlayerId === targetId &&
+            (c.state === 'requested' || c.state === 'awaiting-confirmation'),
+        ) ?? null;
+      if (!claim) {
+        claim = requestCatch(current, myPlayerId, targetId, crypto.randomUUID()).catch;
+        refreshDemo();
+      }
+      // No client-side wrong-scan lockout: the WS `catch.confirm`
+      // 5/min/seat rate limit already bounds failed confirms. A wrong
+      // scan just says so and the scanner keeps running — re-scan in
+      // place (P1-28).
+      if (!verifyCatchScan(claim.catchId, token)) {
+        setNotice("That QR didn't match — try again.");
+        return;
+      }
+      const confirmed = confirmCatch(current, claim.catchId, myPlayerId, 'qr-scan');
       setDoneCatchId(confirmed.catchId);
       setDismissedDoneCatchId(null);
+      setScannedToken(null);
+      setTagAfterClaim(false);
       refreshDemo();
     } catch (err) {
       setNotice(err instanceof Error ? err.message : 'Could not confirm the tag.');
     }
   };
 
-  // -- Runner: confirm / dispute ----------------------------------------------
+  // Live only: Tag was tapped before a claim existed — confirm with the
+  // held token the moment the matching claim lands. The flag clears
+  // before sending, so a re-render never double-confirms.
+  useEffect(() => {
+    if (mode !== 'live' || !tagAfterClaim || !scannedToken) return;
+    if (
+      !openClaim ||
+      openClaim.hunterPlayerId !== myPlayerId ||
+      openClaim.runnerPlayerId !== tagTargetRef.current
+    ) {
+      return;
+    }
+    setTagAfterClaim(false);
+    if (!socket?.sendCatchConfirm(openClaim.catchId, scannedToken)) {
+      setNotice('Not connected — the tag was not sent. Try again.');
+      return;
+    }
+    pendingScanAtMsRef.current = Date.now();
+  }, [mode, tagAfterClaim, scannedToken, openClaim, socket, myPlayerId]);
+
+  // -- Runner: Self confirm (Way 2) -------------------------------------------
   // NO dispute button here on purpose (founder decision, 2026-11-19):
   // the Runner confirms with Self confirm; there is no "NO — DISPUTE"
   // action in the client. The server-side dispute handler stays
   // intentionally dormant — a disputed catch can still only arrive via
   // the host's resolve path, never from this screen.
-  const handleRunnerConfirm = () => {
-    if (!openClaim) {
-      setNotice('No open claim yet — ask the hunter to claim the tag first, then confirm here.');
+  //
+  // Self confirm needs NO open claim and NO Hunter confirmation: the
+  // Runner picks the Hunter who tagged them in the sheet and taps OK.
+  // Live sends `catch.self-confirm` { hunterId }; demo calls
+  // `selfConfirmCatch` (creates the claim + confirms it atomically).
+  const handleSelfConfirmOpen = () => {
+    if (isSuspended) {
+      setNotice("You're suspended — reconnect to confirm.");
       return;
     }
+    if (selfConfirmCandidates.length === 0) {
+      setNotice('No Hunters in this game yet.');
+      return;
+    }
+    setNotice(null);
+    setSelfConfirmHunterId(
+      openClaim &&
+        selfConfirmCandidates.some((p) => p.playerId === openClaim.hunterPlayerId)
+        ? openClaim.hunterPlayerId
+        : null,
+    );
+    setSelfConfirmOpen(true);
+  };
+
+  const handleSelfConfirmOk = () => {
+    const hunterId = selfConfirmHunterId;
+    if (!hunterId) return;
+    setSelfConfirmOpen(false);
     if (isSuspended) {
       setNotice("You're suspended — reconnect to confirm.");
       return;
     }
     if (confirming) return;
     setConfirming(true);
+    setNotice(null);
     if (mode === 'live') {
-      if (!socket?.sendCatchConfirm(openClaim.catchId, '', true)) {
+      if (!socket?.sendCatchSelfConfirm(hunterId)) {
         setConfirming(false);
         setNotice('Not connected — the confirmation was not sent. Wait for the reconnect, then tap again.');
         return;
@@ -313,7 +657,7 @@ export default function CatchPage({
       return;
     }
     try {
-      const confirmed = confirmCatch(current, openClaim.catchId, myPlayerId, 'manual-confirm');
+      const confirmed = selfConfirmCatch(current, myPlayerId, hunterId);
       setDoneCatchId(confirmed.catchId);
       setDismissedDoneCatchId(null);
       refreshDemo();
@@ -335,13 +679,25 @@ export default function CatchPage({
     if (doneCatch) pendingScanAtMsRef.current = null;
   }, [confirming, doneCatch, openClaim]);
 
-  // (b) A server rejection of the pending confirm/scan arrives only as
-  // an error envelope: clear the pending state and show the server's
+  // (b) A server rejection of the pending confirm/scan/mint arrives only
+  // as an error envelope: clear the pending state and show the server's
   // reason. Tied to the pending action by receipt time (within 15 s of
   // the send) so an unrelated error never surfaces as a catch failure.
   useEffect(() => {
     if (!lastSocketError) return;
-    const { atMs, message } = lastSocketError;
+    const { atMs, message, code } = lastSocketError;
+    const mintAt = pendingMintAtMsRef.current;
+    if (mintAt !== null && atMs >= mintAt && atMs - mintAt < 15_000) {
+      pendingMintAtMsRef.current = null;
+      mintInFlightRef.current = false;
+      setMinting(false);
+      // CONFLICT means a claim raced in — the claim QR takes over: pull
+      // a fresh snapshot so it appears at once. Either way the server's
+      // reason shows (the claim effect clears it once the claim lands).
+      if (code === 'CONFLICT') socket?.requestSnapshot();
+      setMintFailed(message);
+      return;
+    }
     const confirmAt = pendingConfirmAtMsRef.current;
     if (confirmAt !== null && atMs >= confirmAt && atMs - confirmAt < 15_000) {
       clearConfirmTimeout();
@@ -352,9 +708,10 @@ export default function CatchPage({
     const scanAt = pendingScanAtMsRef.current;
     if (scanAt !== null && atMs >= scanAt && atMs - scanAt < 15_000) {
       pendingScanAtMsRef.current = null;
+      setPendingScanToken(null);
       setNotice(message);
     }
-  }, [lastSocketError]);
+  }, [lastSocketError, socket]);
 
   // Never leave the confirm timeout running after unmount.
   useEffect(
@@ -438,6 +795,9 @@ export default function CatchPage({
     doneCatch.runnerPlayerId === myPlayerId &&
     room?.config.mode === 'classic';
 
+  // Hunter column: the Runner a scan/claim is about, if any.
+  const claimRunnerName = effectiveRunner?.displayName ?? 'The Runner';
+
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-4 px-4 pb-8 pt-3">
       <div className="flex items-center justify-between">
@@ -517,7 +877,10 @@ export default function CatchPage({
                 setDoneCatchId(null);
                 setDismissedDoneCatchId(doneCatch.catchId);
                 setPickerChoice(null);
-                setScanOpen(false);
+                setScannedToken(null);
+                setPendingScanToken(null);
+                setTagAfterClaim(false);
+                setManualMode(false);
               }}
               className="self-center text-[15px] font-semibold text-[#EF4444]"
             >
@@ -526,16 +889,15 @@ export default function CatchPage({
           ) : null}
         </div>
       ) : isRunner ? (
-        // Runner side (P1-20): "Got Tagged" opens the runner's own QR
-        // directly — claim or not, never a "No one has claimed a tag on
-        // you yet" dead end. With an open claim the QR is the runner's
-        // own catch token (fetched via getCatchToken) and Self confirm
-        // settles the tag. With NO open claim yet, the note + Self
-        // confirm still render and the QR appears here the moment the
-        // hunter claims the tag (the snapshot re-renders this branch) —
-        // the live catch-token endpoint mints a token per pending catch
-        // only, so no token exists to show before a claim lands.
-        // No dispute button — founder decision, see handleRunnerConfirm.
+        // Runner side (P1-20, v18 Way 1 + Way 2): "Got Tagged" opens the
+        // Runner's own QR directly — it mints AUTOMATICALLY the moment
+        // this screen opens with no claim (no "SHOW MY QR" tap ever)
+        // and refreshes itself every 120 s; with an open claim the
+        // claim's QR shows instead (HTTP /catch-token, unchanged).
+        // BELOW the QR sits Self confirm: pick the Hunter who tagged
+        // you + OK completes the tag with no Hunter confirmation and no
+        // QR at all. No dispute button — founder decision, see
+        // handleSelfConfirmOk.
         <div className="flex flex-col gap-4">
           {openClaim ? (
             <p className="text-[15px] text-white">
@@ -554,22 +916,45 @@ export default function CatchPage({
               onScan={() => undefined}
               onManualFallback={() => undefined}
             />
+          ) : mintedToken ? (
+            // The minted QR + its countdown — it refreshes itself on
+            // expiry (new token, old QR dead at once). The raw token is
+            // a QR only, never text.
+            <div className="flex flex-col gap-3">
+              <CatchQR
+                mode="show"
+                token={mintedToken.token}
+                runnerName={myPlayer?.displayName ?? 'You'}
+                onScan={() => undefined}
+                onManualFallback={() => undefined}
+              />
+              <p className="text-center text-[14px] text-[#A1A1AA]">
+                QR refreshes in {formatClock(Math.max(0, Date.parse(mintedToken.expiresAt) - nowMs))}
+              </p>
+            </div>
+          ) : mintFailed ? (
+            // A failed mint shows the server's reason in plain words —
+            // never a blank screen, never a generic error.
+            <div className="flex flex-col items-center gap-3 rounded-2xl border border-[#26262B] bg-[#141416] p-6 text-center">
+              <p className="text-[15px] font-bold text-white">{myPlayer?.displayName ?? 'You'}</p>
+              <p className="text-[14px] text-[#EF4444]">{mintFailed}</p>
+              <button
+                type="button"
+                onClick={() => {
+                  setMintFailed(null);
+                  mintRunnerQr();
+                }}
+                className="self-center text-[15px] font-semibold text-[#EF4444]"
+              >
+                Try again
+              </button>
+            </div>
           ) : (
             <div className="flex flex-col items-center gap-3 rounded-2xl border border-[#26262B] bg-[#141416] p-6 text-center">
               <p className="text-[15px] font-bold text-white">{myPlayer?.displayName ?? 'You'}</p>
               <p className="text-[14px] text-[#A1A1AA]">
-                Waiting for the hunter&apos;s claim — your QR appears here as soon as they claim the tag.
+                {minting ? 'Getting your QR…' : 'Waiting for connection…'}
               </p>
-              <button
-                type="button"
-                onClick={() => {
-                  if (mode === 'live') socket?.requestSnapshot();
-                  else refreshDemo();
-                }}
-                className="text-[15px] font-semibold text-[#EF4444]"
-              >
-                Check again
-              </button>
             </div>
           )}
           {isSuspended ? (
@@ -579,84 +964,96 @@ export default function CatchPage({
           ) : null}
           <button
             type="button"
-            onClick={handleRunnerConfirm}
+            onClick={handleSelfConfirmOpen}
             disabled={isSuspended || confirming}
             className="self-center text-[15px] font-semibold text-[#EF4444] disabled:opacity-40"
           >
             {confirming ? 'Confirming…' : 'Self confirm'}
           </button>
         </div>
-      ) : isHunter && openClaim && scanOpen && !manualMode ? (
-        // Hunter side: scan the Runner's QR.
+      ) : isHunter ? (
+        // Hunter side (v18 Way 1): the CAMERA runs at the top (scanning
+        // view) and BELOW it a small column. Scan the Runner's QR — the
+        // scanned Runner appears in the column with a Tag button; Tag
+        // confirms the tag. The name picker lives in that same column as
+        // the manual fallback when the camera/scan cannot be used (or no
+        // Runner is claimed yet): pick a name → claim → the Runner
+        // confirms on their phone, no QR needed.
         <div className="flex flex-col gap-3">
-          <p className="text-[15px] text-white">
-            {effectiveRunner?.displayName ?? 'The Runner'} · Tag them?
-          </p>
+          {openClaim ? (
+            <p className="text-[15px] text-white">
+              {claimRunnerName} · Tag them?
+            </p>
+          ) : (
+            <p className="text-[15px] text-white">Scan a Runner&apos;s QR</p>
+          )}
           <CatchQR
             mode="scan"
             token={null}
-            runnerName={effectiveRunner?.displayName ?? ''}
+            runnerName={claimRunnerName}
             onScan={handleScan}
             onManualFallback={() => setManualMode(true)}
           />
-          <button
-            type="button"
-            onClick={() => setScanOpen(false)}
-            className="self-center text-[15px] font-semibold text-[#A1A1AA]"
-          >
-            Cancel
-          </button>
-        </div>
-      ) : isHunter && openClaim ? (
-        // Hunter side: claim open, scanner closed or manual fallback — the
-        // Runner confirms on their phone; no QR needed.
-        <div className="flex flex-col gap-3 rounded-2xl border border-[#26262B] bg-[#141416] p-4">
-          <p className="text-[15px] font-bold text-white">
-            Claim open — {effectiveRunner?.displayName ?? 'the Runner'}
-          </p>
-          <p className="text-[14px] text-[#A1A1AA]">
-            The Runner confirms on their phone — no QR needed.
-          </p>
-          <Button variant="primary" onClick={() => { setManualMode(false); setScanOpen(true); }}>
-            Scan their QR
-          </Button>
-          <button
-            type="button"
-            onClick={() => router.push(`/room/${roomId}/play`)}
-            className="self-center text-[15px] font-semibold text-[#EF4444]"
-          >
-            Back to the map
-          </button>
-        </div>
-      ) : isHunter && scanOpen && !openClaim ? (
-        // ?scan=1 with no open claim: the picker is reachable from this
-        // entry point (was a "Waiting for the claim…" dead end). Pick a
-        // name → claim → the scanner opens.
-        <div className="flex flex-col gap-3">
-          <p className="text-[15px] text-white">Who did you tag?</p>
-          <ClaimPicker
-            names={pickerNames}
-            selectedId={pickerChoice ?? effectiveRunnerId}
-            onPick={(id) => {
-              setPickerChoice(id);
-              setManualMode(false);
-            }}
-            onAction={handleClaim}
-          />
-        </div>
-      ) : isHunter ? (
-        // Hunter side: pick the Runner by name (no roles, no codes).
-        <div className="flex flex-col gap-3">
-          <p className="text-[15px] text-white">Who did you tag?</p>
-          <ClaimPicker
-            names={pickerNames}
-            selectedId={pickerChoice ?? effectiveRunnerId}
-            onPick={(id) => {
-              setPickerChoice(id);
-              setManualMode(false);
-            }}
-            onAction={handleClaim}
-          />
+          {manualMode || !openClaim ? (
+            // Column: manual fallback / picker. `?scan=1` with no open
+            // claim lands here too (never a dead end).
+            <div className="flex flex-col gap-3">
+              <p className="text-[15px] text-white">Who did you tag?</p>
+              <ClaimPicker
+                names={pickerNames}
+                selectedId={pickerChoice ?? effectiveRunnerId}
+                onPick={(id) => {
+                  setPickerChoice(id);
+                }}
+                onAction={handleClaim}
+              />
+              {manualMode && openClaim ? (
+                <button
+                  type="button"
+                  onClick={() => setManualMode(false)}
+                  className="self-center text-[15px] font-semibold text-[#A1A1AA]"
+                >
+                  Back to the claim
+                </button>
+              ) : null}
+            </div>
+          ) : (
+            // Column: the claimed Runner, with Tag (enabled once their
+            // QR has been scanned). Without a scan the Runner confirms
+            // on their phone instead.
+            <div className="flex flex-col gap-3 rounded-2xl border border-[#26262B] bg-[#141416] p-4">
+              <p className="text-[15px] font-bold text-white">
+                Claim open — {claimRunnerName}
+              </p>
+              {scannedToken ? (
+                <p className="text-[14px] text-[#22C55E]">QR scanned — ready to tag.</p>
+              ) : (
+                <p className="text-[14px] text-[#A1A1AA]">
+                  The Runner confirms on their phone — no QR needed.
+                </p>
+              )}
+              <Button
+                variant="primary"
+                onClick={handleTag}
+                disabled={!scannedToken}
+              >
+                {scannedToken ? `Tag ${claimRunnerName}` : 'Scan their QR first'}
+              </Button>
+              <button
+                type="button"
+                onClick={() => {
+                  setPickerChoice(null);
+                  setScannedToken(null);
+                  setPendingScanToken(null);
+                  setTagAfterClaim(false);
+                  tagTargetRef.current = null;
+                }}
+                className="self-center text-[15px] font-semibold text-[#A1A1AA]"
+              >
+                Cancel
+              </button>
+            </div>
+          )}
         </div>
       ) : (
         <p className="rounded-2xl border border-[#26262B] bg-[#141416] p-4 text-[15px] text-[#A1A1AA]">
@@ -698,6 +1095,43 @@ export default function CatchPage({
           {hostNote ? <p className="text-[14px] text-[#A1A1AA]">{hostNote}</p> : null}
         </div>
       ) : null}
+
+      {/* Self Confirm sheet (Way 2): pick the Hunter who tagged you, then OK. */}
+      <Sheet open={selfConfirmOpen} onClose={() => setSelfConfirmOpen(false)} title="Who tagged you?">
+        <div className="flex flex-col gap-3">
+          <p className="text-[14px] text-[#A1A1AA]">
+            Pick the Hunter who tagged you, then tap OK. No confirmation is needed from them.
+          </p>
+          <div className="flex flex-col gap-2">
+            {selfConfirmCandidates.map((entry) => {
+              const isSelected = entry.playerId === selfConfirmHunterId;
+              return (
+                <button
+                  key={entry.playerId}
+                  type="button"
+                  aria-pressed={isSelected}
+                  onClick={() => setSelfConfirmHunterId(entry.playerId)}
+                  className={`flex min-h-[56px] items-center justify-between rounded-2xl border px-4 text-left text-[17px] font-bold ${
+                    isSelected
+                      ? 'border-[#EF4444] bg-[rgba(239,68,68,0.15)] text-white'
+                      : 'border-[#26262B] bg-[#141416] text-white'
+                  }`}
+                >
+                  <span>{entry.displayName}</span>
+                  {isSelected ? <span aria-hidden className="text-[#EF4444]">✓</span> : null}
+                </button>
+              );
+            })}
+          </div>
+          <Button
+            variant="primary"
+            onClick={handleSelfConfirmOk}
+            disabled={!selfConfirmHunterId}
+          >
+            OK
+          </Button>
+        </div>
+      </Sheet>
     </main>
   );
 }

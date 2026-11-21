@@ -1,7 +1,8 @@
 /**
  * map-accuracy.spec.ts — zone accuracy rules (BEHAVIOUR.md §2): radius
- * min 100 m, no maximum, Auto final size ≈ 42%, next zone hidden until
- * the shrink preview, and the ±50 m GPS rule. Demo-only. Text-only.
+ * min 100 m, no maximum, Auto final size ≈ 42%, the next zone is never
+ * shown (v18: no preview — it appears suddenly with no warning), and
+ * the ±50 m GPS rule. Demo-only. Text-only.
  * The zone is edited inline on the create screen (Zone size stepper
  * below the map); the summary strip that reflects it lives on the
  * lobby. There is no separate editor dialog.
@@ -66,13 +67,18 @@ test.describe('zone accuracy (demo)', () => {
     await expect(hostPage.getByText('Fixed — tap for Auto')).toBeHidden();
   });
 
-  test('the play HUD never shows the next zone (hidden until the shrink preview)', async ({
+  test('the play HUD never shows the next zone — there is no preview (v18)', async ({
     context,
   }) => {
     // Default 30-min round (roundShort: false): with the 10-min shrink
     // interval the first shrink is pending, so the HUD shows its countdown.
     // The shortened 10-min round would put the first shrink at round end
     // and the HUD correctly shows "no shrink left" instead.
+    // v18 item 1: the next-zone preview (dashed ring + "Next zone in"
+    // countdown) is gone — the next zone appears suddenly with no
+    // warning, so "Next zone" text never appears. The "Zone 500 m
+    // shrinks in" line below is the shrink timer, not the preview,
+    // and it stays.
     const { hostPage } = await startDemoMatch(context, { roundShort: false });
     await expect(hostPage.getByText(/Next zone/i)).toBeHidden();
     await expect(hostPage.getByText(/Zone 500 m shrinks in \d+:\d\d/)).toBeVisible();

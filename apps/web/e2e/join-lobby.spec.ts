@@ -90,6 +90,18 @@ test.describe('join + lobby (demo)', () => {
     await expect(hostPage.getByRole('button', { name: 'Copy', exact: true })).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Share code' })).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Settings' })).toBeVisible();
+    // Item 3: "Show QR" opens the invite-QR sheet (lobby only — this is
+    // the invite QR, not a catch code).
+    await expect(hostPage.getByRole('button', { name: 'Show QR', exact: true })).toBeVisible();
+    await hostPage.getByRole('button', { name: 'Show QR', exact: true }).click();
+    const qrSheet = hostPage.getByRole('dialog', { name: 'Join with QR' });
+    await expect(qrSheet).toBeVisible();
+    await expect(
+      qrSheet.getByRole('img', { name: `QR code to join with code ${code}` }),
+    ).toBeVisible();
+    await expect(qrSheet.getByText(code, { exact: true })).toBeVisible();
+    await qrSheet.getByRole('button', { name: 'Close sheet', exact: true }).click();
+    await expect(qrSheet).toBeHidden();
     // Summary strip: zone · hunters · ping interval · match length.
     await expect(hostPage.getByLabel('Game summary')).toContainText(
       '500m zone · 1 hunter · 3m pulse · 30m',
@@ -180,6 +192,9 @@ test.describe('join + lobby (demo)', () => {
   });
 
   test('start gate opens when all 3 players are ready', async ({ context }) => {
+    // v18 item 4(a): this runs in a context with no geolocation, so no
+    // seat ever reports a fix — and the gate still opens. There is no
+    // GPS-freshness refusal at the start gate.
     const { hostPage, guestPages } = await setupThreePlayerLobby(context);
     await readyAll([hostPage, ...guestPages]);
     await expect(hostPage.getByRole('button', { name: 'START GAME', exact: true })).toBeVisible();
@@ -235,9 +250,13 @@ test.describe('join + lobby (live)', () => {
     await expect(hostPage.getByText(GUEST_NAMES[0], { exact: true })).toBeVisible();
   });
 
-  test('live start gate: 3 players, all ready, host starts, guests reach /play', async ({
+  test('live start gate: match starts even with no GPS reported yet (v18: no GPS-freshness refusal)', async ({
     context,
   }) => {
+    // This context grants no geolocation, so no seat ever reports a fix.
+    // Under the old gate the DO refused start here ("Waiting for GPS …
+    // their location has not been reported in the last 2 minutes."); v18
+    // removes that refusal, so the match must start and guests reach /play.
     const { hostPage, guestPages } = await setupThreePlayerLobby(context);
     await readyAll([hostPage, ...guestPages]);
     await startMatchAsHost(hostPage);

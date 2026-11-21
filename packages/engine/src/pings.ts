@@ -28,6 +28,7 @@
 import {
   PENDING_PING_TTL_SECONDS,
   PING_AREA_RADIUS_M,
+  ZONE_AUTO_CENTRE_MAX_ACCURACY_M,
   type GeoPoint,
   type LocationFix,
   type LocationQuality,
@@ -66,11 +67,26 @@ export function nextPingAtMs(
 }
 
 /**
+ * Is this fix usable for gameplay? Liveness vs usability (v18 fix round,
+ * B1): a fix worse than ±50 m still proves the phone is alive, but its
+ * position is too coarse for any gameplay decision — a ping centred on
+ * it would be a 150 m circle around a point that is itself ±1000 m
+ * wrong. Only fixes accurate to ±50 m or better (`ZONE_AUTO_CENTRE_MAX_
+ * ACCURACY_M`) may anchor a ping.
+ */
+export function isFixUsableForPing(fix: LocationFix): boolean {
+  return fix.accuracyMeters <= ZONE_AUTO_CENTRE_MAX_ACCURACY_M;
+}
+
+/**
  * Build one ping for a free player (a Runner or a Hunter) from their latest
  * server-held fix. Returns null when there is no fix — never an invented
- * position. `pingId` is supplied by the caller (a fresh id per ping).
- * `recipientRole` is the opposing team: a Runner ping goes to 'hunters',
- * a Hunter ping goes to 'runners'.
+ * position. Also returns null when the fix is too poor to use (accuracy
+ * worse than ±50 m): the subject simply stays due and the ping fires when
+ * a usable fix arrives — `lastPingAtMs` only advances on delivery, so a
+ * skipped ping is deferred, never lost. `pingId` is supplied by the caller
+ * (a fresh id per ping). `recipientRole` is the opposing team: a Runner
+ * ping goes to 'hunters', a Hunter ping goes to 'runners'.
  */
 export function buildPing(input: {
   pingId: string;
@@ -82,6 +98,7 @@ export function buildPing(input: {
   nowMs: number;
 }): Ping | null {
   if (input.fix === null) return null;
+  if (!isFixUsableForPing(input.fix)) return null;
   const centre: GeoPoint = { lat: input.fix.lat, lng: input.fix.lng };
   const createdAt = new Date(input.nowMs).toISOString();
   return {
@@ -145,7 +162,7 @@ export function withAge(ping: Ping, nowMs: number): Ping {
   return { ...ping, ageSeconds: pingAgeSeconds(ping, nowMs) };
 }
 
-/** Shared due-check: free players with a fix whose interval has elapsed. */
+/** Shared due-check: free players with a USABLE fix whose interval has elapsed. A fix worse than ±50 m is not usable for a ping (B1) — the subject stays due until a good fix arrives. */
 function dueSubjectIds(input: {
   freePlayerIds: readonly string[];
   fixes: Readonly<Record<string, LocationFix | null>>;
@@ -157,7 +174,9 @@ function dueSubjectIds(input: {
   activeAtMs?: number;
 }): string[] {
   return input.freePlayerIds.filter((id) => {
-    if (input.fixes[id] === undefined || input.fixes[id] === null) return false;
+    const fix = input.fixes[id];
+    if (fix === undefined || fix === null) return false;
+    if (!isFixUsableForPing(fix)) return false;
     const last = input.lastPingAtMs[id] ?? null;
     return isPingDue(last, input.startedAtMs, input.intervalSeconds, input.nowMs, input.activeAtMs);
   });

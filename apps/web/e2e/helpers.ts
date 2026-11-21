@@ -31,6 +31,8 @@ export interface DemoPlayer {
   matchRole: string | null;
   team: string | null;
   isReady: boolean;
+  isHost: boolean;
+  connectionState: 'connected' | 'suspended' | 'disconnected';
   leftAt: string | null;
   ejectedAt: string | null;
 }
@@ -39,9 +41,11 @@ export interface DemoRoomData {
   room: {
     roomId: string;
     roomCode: string;
+    hostPlayerId: string;
     phase: string;
     endsAt: string | null;
     startedAt: string | null;
+    config: { mode: string; zone: { boundary: Array<{ lat: number; lng: number }> } };
   };
   players: DemoPlayer[];
   catches: unknown[];
@@ -291,6 +295,76 @@ export async function forceDemoMatchEnd(page: Page, roomId: string): Promise<voi
       if (!found) throw new Error(`demo room ${id} not found in localStorage`);
       found.room.endsAt = new Date(Date.now() - 1000).toISOString();
       window.localStorage.setItem(key, JSON.stringify(rooms));
+    },
+    { key: DEMO_ROOMS_KEY, roomId },
+  );
+}
+
+/**
+ * White-box demo helper: force one zone shrink on the next 1 s demo
+ * tick by moving `startedAt` back past one shrink interval. The 10-min
+ * demo round shrinks every 180 s (shrinkIntervalForDurationSeconds), so
+ * 181 s back fires exactly one shrink; `endsAt` is untouched, so the
+ * match stays live. Only valid for the default 10-min demo round — a
+ * longer round has a longer shrink interval. Demo-only; localStorage
+ * is the demo store.
+ */
+export async function forceDemoShrink(page: Page, roomId: string): Promise<void> {
+  await page.evaluate(
+    ({ key, roomId: id }) => {
+      const rooms = JSON.parse(window.localStorage.getItem(key) ?? '[]') as DemoRoomData[];
+      const found = rooms.find((r) => r.room.roomId === id);
+      if (!found) throw new Error(`demo room ${id} not found in localStorage`);
+      if (!found.room.startedAt) throw new Error(`demo room ${id} has not started`);
+      found.room.startedAt = new Date(Date.parse(found.room.startedAt) - 181_000).toISOString();
+      window.localStorage.setItem(key, JSON.stringify(rooms));
+    },
+    { key: DEMO_ROOMS_KEY, roomId },
+  );
+}
+
+/**
+ * White-box demo helper: move the host crown to another player — the
+ * demo mirror of the server's earliest-joiner succession when the host
+ * disconnects (`host.transferred`). Flips `room.hostPlayerId` and the
+ * players' `isHost` flags in localStorage; every open room page picks
+ * it up on its next 1 s poll, with NO reload. Demo-only; localStorage
+ * is the demo store.
+ */
+export async function transferDemoHost(
+  page: Page,
+  roomId: string,
+  displayName: string,
+): Promise<void> {
+  await page.evaluate(
+    ({ key, roomId: id, displayName: name }) => {
+      const rooms = JSON.parse(window.localStorage.getItem(key) ?? '[]') as DemoRoomData[];
+      const found = rooms.find((r) => r.room.roomId === id);
+      if (!found) throw new Error(`demo room ${id} not found in localStorage`);
+      const next = found.players.find((p) => p.displayName === name);
+      if (!next) throw new Error(`player ${name} not found in demo room ${id}`);
+      for (const p of found.players) p.isHost = p.playerId === next.playerId;
+      found.room.hostPlayerId = next.playerId;
+      window.localStorage.setItem(key, JSON.stringify(rooms));
+    },
+    { key: DEMO_ROOMS_KEY, roomId, displayName },
+  );
+}
+
+/**
+ * White-box demo helper: delete the demo room from localStorage — the
+ * demo mirror of the server deleting a live room after a host cancel.
+ * Open room pages see a null poll on the next 1 s tick; a reload after
+ * the delete hits the first-paint missing-room path. Demo-only.
+ */
+export async function deleteDemoRoomFromStore(page: Page, roomId: string): Promise<void> {
+  await page.evaluate(
+    ({ key, roomId: id }) => {
+      const rooms = JSON.parse(window.localStorage.getItem(key) ?? '[]') as DemoRoomData[];
+      window.localStorage.setItem(
+        key,
+        JSON.stringify(rooms.filter((r) => r.room.roomId !== id)),
+      );
     },
     { key: DEMO_ROOMS_KEY, roomId },
   );

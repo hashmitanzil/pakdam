@@ -31,6 +31,28 @@ export interface LiveRoomState {
   room: Room;
   players: PlayerView[];
   version: number;
+  /**
+   * v24 (D1): epoch ms when the disconnected host's 30 s reconnect
+   * grace expires, null when no grace is running. Read tolerantly
+   * (readHostGraceEndsAtMs) — the server adds this field alongside
+   * the grace (in parallel); an older server that does not send it
+   * reads as null. The client NEVER computes the deadline itself.
+   */
+  hostGraceEndsAtMs: number | null;
+}
+
+/**
+ * Tolerant read of `hostGraceEndsAtMs` off a snapshot-shaped value.
+ * Anything that is not a finite number — absent, null, a string, a
+ * stale shape — reads as null (no grace running). Deliberately NOT a
+ * change to @pakdam/shared: the snapshot type gains the field on the
+ * server side, and this reader keeps the client working with servers
+ * from before it.
+ */
+export function readHostGraceEndsAtMs(value: unknown): number | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const raw = (value as { hostGraceEndsAtMs?: unknown }).hostGraceEndsAtMs;
+  return typeof raw === 'number' && Number.isFinite(raw) ? raw : null;
 }
 
 /**
@@ -249,6 +271,7 @@ export function snapshotToLiveRoomState(snapshot: WsSnapshotPayload): LiveRoomSt
     room: snapshot.room,
     players: snapshot.players,
     version: snapshot.version,
+    hostGraceEndsAtMs: readHostGraceEndsAtMs(snapshot),
   };
 }
 

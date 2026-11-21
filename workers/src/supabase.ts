@@ -161,7 +161,7 @@ export async function persistCatchUpdate(
   });
 }
 
-/** SOS / pause / resume audit row. */
+/** Pause / resume audit row (v18: SOS removed — no 'sos' type is ever sent). */
 export async function persistSafetyEvent(
   env: SupabaseEnv,
   roomId: string,
@@ -299,18 +299,28 @@ export async function executePersistIntent(
  * player-upserts no longer pay N round trips in series. A failure in
  * one intent never fails the others, as before. Hashes are untouched
  * (SHA-256 is sub-ms; caching them would save nothing and risk reuse).
+ *
+ * v23 fix round 1 (S7): returns one boolean per intent, in order —
+ * `true` when that intent's write landed, `false` when it did not
+ * (helper returned false, or the call threw). Callers that merely
+ * audit (the normal `waitUntil` paths) still ignore the result; the
+ * host-cancel delete path MUST check it — a Supabase outage used to
+ * be swallowed here while the room was wiped, silently losing the
+ * CANCELLED audit record. This function never throws.
  */
 export async function executePersistIntents(
   env: SupabaseEnv,
   intents: readonly PersistIntent[],
-): Promise<void> {
-  await Promise.allSettled(
+): Promise<boolean[]> {
+  const results = await Promise.allSettled(
     intents.map(async (intent) => {
       try {
-        await executePersistIntent(env, intent);
+        return await executePersistIntent(env, intent);
       } catch {
         // Best-effort by design — the DO is the authority.
+        return false;
       }
     }),
   );
+  return results.map((r) => (r.status === 'fulfilled' ? r.value : false));
 }

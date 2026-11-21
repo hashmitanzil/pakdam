@@ -17,9 +17,10 @@
  * tab's socket is alive, and deleting one tab's session never breaks the
  * other. Durable game state is persisted after every mutation
  * (`room-state-v1`); the ticket registry, idempotency records + replies,
- * pending pings and the pending shrink preview persist with it (P1-5),
- * while memory-only state (fixes, rate windows, raw catch tokens) is
- * rebuilt empty after a wake, per the spec split.
+ * and pending pings persist with it (P1-5), while memory-only state
+ * (fixes, rate windows, raw catch tokens) is rebuilt empty after a wake,
+ * per the spec split. v18: there is no pending shrink preview to persist
+ * (the founder removed the next-zone preview entirely).
  *
  * SOCKET IDENTITY (P0-3): the socket's real identity is the tag set at
  * upgrade from the redeemed ticket. Every envelope's `playerId` is
@@ -146,6 +147,26 @@ export class RoomDO implements DurableObject {
    * finally runs.
    */
   private firstAlarmTickAfterWake = true;
+  /**
+   * v23 fix round 1 (S3/S7): a load-time wipe of a deleted room is
+   * attempted at most once per awake instance. The wipe re-runs the
+   * cancel persist first (the record must land before the room is
+   * destroyed); while Supabase is down the room stays CANCELLED +
+   * deleted in storage — still 404ing everything — and the next wake
+   * (a fresh instance) retries. Without the flag, every request to a
+   * deleted room would pay two Supabase round trips inside
+   * `blockConcurrencyWhile`.
+   */
+  private deletedWipeAttempted = false;
+
+  /**
+   * v24 — the `endsAtMs` a grace one-shot alarm is currently armed
+   * for, if any (memory only — the alarm itself lives in DO storage).
+   * `null` means no grace one-shot is pending. Reset whenever an
+   * alarm fires (`alarm()`), and cleared whenever the regular cadence
+   * is re-armed over it (`armAlarm()`).
+   */
+  private graceAlarmEndsAtMs: number | null = null;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -164,6 +185,18 @@ export class RoomDO implements DurableObject {
         // P1-5: tickets, idempotency + replies, pending pings and the
         // pending shrink preview survive the wake with the game state.
         this.store.restoreDurableMemory();
+        // v23 fix round 1 (S3): a restored room marked deleted is a
+        // host cancel whose wipe never finished — a crash/eviction
+        // after the cancel persist but before `deleteAll()`, or a
+        // live-path abort when the persist failed (S7). Never serve
+        // it: finish the wipe instead of waking to a live room. The
+        // wipe itself re-runs the cancel persist first and only
+        // destroys the room once the record has landed (see
+        // `finishDeletedRoomWipe`) — a crash must never silently
+        // destroy the room without its audit record.
+        if (this.store.state.deleted === true) {
+          await this.finishDeletedRoomWipe();
+        }
       }
       this.loaded = true;
     });
@@ -210,6 +243,48 @@ export class RoomDO implements DurableObject {
 
   private async armAlarm(): Promise<void> {
     const delay = this.alarmDelayMs();
+    // v24 — one-shot grace alarm (LOBBY and READY_CHECK): both phases
+    // tick every 30 s, so a tick-only grace check could transfer up
+    // to ~60 s after disconnect — the 30 s promise must hold in the
+    // lobby too (within a few seconds). While a grace is running in
+    // the lobby / ready-check, arm ONE alarm for the grace deadline
+    // itself instead of the regular 30 s tick: the tick that fires at
+    // the deadline expires the grace on time. `setAlarm` overwrites
+    // whatever was pending, so this replaces the regular tick — the
+    // tick at the deadline runs `alarmTick` (expiring the grace) and
+    // `armAlarm()` at its end re-arms the regular 30 s cadence. Live
+    // phases tick every 1 s, so they need no one-shot (tick expiry
+    // lands within a second); RESOLVING never expires a grace, so it
+    // gets none either. The one-shot must not stall live 1 s ticks: a
+    // phase change to live re-arms below (the delay changes),
+    // overwriting the one-shot with the 1 s cadence. If the grace is
+    // cancelled (host returns) while the one-shot is pending, the
+    // one-shot still fires once — a harmless tick (no grace to
+    // expire) — and the re-arm below restores the regular cadence.
+    // If the deadline is already past (DO woke after it), the alarm
+    // fires ASAP.
+    if (delay === 30_000 && this.store !== null && (this.store.room.phase === 'LOBBY' || this.store.room.phase === 'READY_CHECK')) {
+      const endsAt = this.store.hostGraceEndsAtMs();
+      if (endsAt !== null) {
+        if (this.graceAlarmEndsAtMs !== endsAt) {
+          await this.ctx.storage.setAlarm(Math.max(endsAt, Date.now()));
+          this.graceAlarmEndsAtMs = endsAt;
+          this.lastAlarmDelayMs = 30_000;
+        }
+        return;
+      }
+      // No grace running, but a grace one-shot may still be pending
+      // (grace cancelled after it was armed): force a regular re-arm
+      // below, which overwrites the stale one-shot.
+      if (this.graceAlarmEndsAtMs !== null) {
+        this.graceAlarmEndsAtMs = null;
+        this.lastAlarmDelayMs = undefined;
+      }
+    } else if (this.graceAlarmEndsAtMs !== null && delay !== this.lastAlarmDelayMs) {
+      // Away from the lobby cadence (e.g. lobby -> live): the regular
+      // re-arm below overwrites the one-shot, so drop the tracking.
+      this.graceAlarmEndsAtMs = null;
+    }
     // Phase 3 #1/#5: skip re-arming when the delay is unchanged — the
     // already-set alarm fires at the same time anyway. Only a phase
     // change (1 s live <-> 30 s lobby) or a terminal phase re-arms.
@@ -342,28 +417,21 @@ export class RoomDO implements DurableObject {
   }
 
   /**
-   * Best-effort invite-code release: when the room reaches a terminal
-   * phase (EXPIRED / ABANDONED / CANCELLED / COMPLETED) the code dies so
-   * it can be reused. Called after every mutation path; a no-op while
-   * the room is still live. Failures are swallowed — the room is already
-   * terminal, and a stale code only fails closed at join time.
+   * One raw call to the code-registry DO. Returns `{ ok, status }` —
+   * `ok` is the HTTP outcome, so callers can tell a CONFLICT (the
+   * code belongs to another room) from a transport failure (status
+   * 0). Never throws.
    */
-  private async maybeUnregisterCode(): Promise<void> {
-    if (!this.store) return;
-    const phase = this.store.room.phase;
-    if (
-      phase !== 'EXPIRED' &&
-      phase !== 'ABANDONED' &&
-      phase !== 'CANCELLED' &&
-      phase !== 'COMPLETED'
-    ) {
-      return;
-    }
+  private async registryCall(
+    op: 'register' | 'unregister',
+    code: string,
+    roomId: string,
+  ): Promise<{ ok: boolean; status: number }> {
     try {
       const stub = this.env.CODE_REGISTRY_DO.get(
         this.env.CODE_REGISTRY_DO.idFromName('pakdam-code-registry'),
       );
-      await stub.fetch('http://code-registry/op', {
+      const res = await stub.fetch('http://code-registry/op', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -371,12 +439,248 @@ export class RoomDO implements DurableObject {
             ? { 'x-pakdam-op-secret': this.env.DO_OP_SECRET }
             : {}),
         },
-        body: JSON.stringify({
-          op: 'unregister',
-          code: this.store.room.roomCode,
-          roomId: this.store.room.roomId,
-        }),
+        body: JSON.stringify({ op, code, roomId }),
       });
+      return { ok: res.ok, status: res.status };
+    } catch {
+      return { ok: false, status: 0 };
+    }
+  }
+
+  /**
+   * Best-effort invite-code release: when the room reaches a terminal
+   * phase (EXPIRED / ABANDONED / CANCELLED / COMPLETED) the code dies so
+   * it can be reused. Called after every mutation path; a no-op while
+   * the room is still live.
+   *
+   * v23 fix round 1 (S11): a failed unregister used to be swallowed
+   * silently, burning that code permanently (the registry has no
+   * TTL/expiry). Now it retries ONCE and, if it still fails, logs
+   * the failure and returns false instead of pretending the code was
+   * freed. A stale code only fails closed at join time (the lookup
+   * resolves to a roomId whose DO is empty → 404), but the burn is
+   * now visible in logs instead of silent. Returns true when the
+   * code was released (or there was nothing to release).
+   */
+  private async maybeUnregisterCode(): Promise<boolean> {
+    if (!this.store) return true;
+    const phase = this.store.room.phase;
+    if (
+      phase !== 'EXPIRED' &&
+      phase !== 'ABANDONED' &&
+      phase !== 'CANCELLED' &&
+      phase !== 'COMPLETED'
+    ) {
+      return true;
+    }
+    const code = this.store.room.roomCode;
+    const roomId = this.store.room.roomId;
+    let attempt = await this.registryCall('unregister', code, roomId);
+    if (!attempt.ok) {
+      attempt = await this.registryCall('unregister', code, roomId);
+    }
+    if (!attempt.ok) {
+      console.error(
+        `[pakdam] unregister of invite code ${code} for room ${roomId} failed after retry (status ${attempt.status}) — the code stays registered and cannot be reused until it is released.`,
+      );
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Rule 1 — host cancel deletes the room (founder decision
+   * 2026-11-21). Called ONLY from the `lifecycle` / `end` op, after
+   * `cancelMatch` has run (phase CANCELLED, result built, store
+   * marked deleted, `room.deleted` signal emitted, match-result +
+   * room-upsert persist). The order is load-bearing:
+   *  0. `save()` FIRST — CANCELLED + `deleted=true` to DO storage
+   *     (S3), so a crash/eviction after this point wakes to a
+   *     deleted room (`load()` finishes the wipe) instead of a live
+   *     one.
+   *  1. Translate the `room.deleted` SIGNAL into the delivered
+   *     stream, minted fresh here so the serverSeqs are monotonic:
+   *     `match.cancelled` (with the result) FIRST, then the literal
+   *     `room.deleted` signal itself, then the `room.state` notice
+   *     (reason `'room-deleted'`) LAST. The store deliberately emits
+   *     NO `match.cancelled` (v23 store contract); the class
+   *     synthesises it from the signal's result payload. The
+   *     store's signal event object is consumed, never delivered.
+   *  2. Deliver the stream to live sockets while the store exists.
+   *  3. AWAIT the Supabase persist (match-result PATCH + room-upsert)
+   *     so the cancel record lands BEFORE the DO state is destroyed.
+   *     The normal path fires persist via `waitUntil`; deletion must
+   *     not race it. (S7) A failed intent gets ONE bounded retry;
+   *     if it still fails the wipe ABORTS here — the room stays
+   *     CANCELLED + `deleted=true` in storage and this returns
+   *     `false`, so the lifecycle response reports `deleted:false`.
+   *     The room already 404s everything; the next wake finishes
+   *     the wipe once the record lands (see `load()`).
+   *  4. Unregister the invite code (phase is CANCELLED, so
+   *     `maybeUnregisterCode` runs) — the code is freed for reuse.
+   *  5. Close every socket (1000, 'room deleted'): no reconnect, the
+   *     room is gone and the client goes home.
+   *  6. Wipe the Durable Object storage EXPLICITLY (session keys +
+   *     state key, S9 — no `deleteAll()`, which could wipe a
+   *     same-roomId create interleaving after the store was nulled)
+   *     + delete the alarm, and drop the in-memory store/sessions.
+   *     Any later op on this room id loads nothing and answers
+   *     ROOM_NOT_FOUND (join-by-code already 404s at the registry,
+   *     which no longer has the code). No `save()` runs after this —
+   *     there is nothing left to save.
+   *
+   * Runs inside `blockConcurrencyWhile` (S4): no concurrent op can
+   * interleave the delete sequence and mint credentials on the
+   * deleted store, and no concurrent `afterMutation` `save()` can
+   * re-persist state after the wipe.
+   *
+   * Supabase rows are NOT deleted: `match-result` is a PATCH to the
+   * `rooms` row itself, so deleting the row would erase the cancel
+   * record. The `rooms` row (phase CANCELLED + result) and the
+   * `players` rows stay as the audit record. Nothing reads them for
+   * live play — the DO is the authority and results travel in the
+   * delivered `match.cancelled` event. Deletion mechanics: DO storage
+   * wiped explicitly (session keys + state key, S9 — no `deleteAll`)
+   * + code-registry unregister + sockets closed; Supabase kept
+   * (marked CANCELLED with the result).
+   *
+   * Lobby cancel deletes the lobby too: LOBBY → CANCELLED is a legal
+   * edge (`MATCH_PHASE_TRANSITIONS`), so `cancelMatch` runs unchanged
+   * from the lobby and this method deletes the room the same way.
+   */
+  private async deleteRoomAfterHostCancel(
+    events: OutboundEvent[],
+    persist: PersistIntent[],
+    nowMs: number,
+  ): Promise<boolean> {
+    if (!this.store) return false;
+    const signal = events.find((e) => e.type === 'room.deleted');
+    if (!signal) {
+      // Defensive only: `cancelMatch` always emits the signal. If it
+      // ever did not, fall back to the normal mutation path rather
+      // than deleting a room nobody was told about.
+      await this.afterMutation(events, persist);
+      return false;
+    }
+    // v23 fix round 1 (S3): persist CANCELLED + `deleted=true` to DO
+    // storage BEFORE anything is delivered — a crash/eviction after
+    // this point wakes to a deleted room (`load()` finishes the wipe)
+    // instead of resurrecting the room LIVE.
+    await this.save();
+    const result = signal.payload['result'] as unknown;
+    const recipients = this.store.allPlayerIds();
+    const stream: OutboundEvent[] = [
+      this.store.emit('match.cancelled', { result }, recipients, nowMs),
+      this.store.emit(
+        'room.deleted',
+        { result },
+        recipients,
+        nowMs,
+      ),
+      this.store.roomDeletedNotice(nowMs),
+    ];
+    await this.deliver(stream, nowMs);
+    // Awaited, not waitUntil: the cancel record must land first.
+    // v23 fix round 1 (S7): the persist is no longer fire-and-forget
+    // here — `executePersistIntents` reports per-intent outcomes.
+    // A failed intent gets ONE bounded retry; if it still fails, the
+    // wipe ABORTS (the room stays CANCELLED + `deleted=true` in DO
+    // storage — it already 404s everything — and the next wake
+    // finishes the wipe once the record lands, see `load()`). The
+    // caller reports `deleted:false` so the lifecycle caller knows
+    // the delete did not complete. Never silently wipe without the
+    // audit record.
+    const outcomes = await executePersistIntents(this.env as SupabaseEnv, persist);
+    if (outcomes.some((ok) => !ok)) {
+      const failed = persist.filter((_, i) => !outcomes[i]);
+      const retry = await executePersistIntents(this.env as SupabaseEnv, failed);
+      if (retry.some((ok) => !ok)) {
+        console.error(
+          `[pakdam] cancel persist for room ${this.store.room.roomId} failed after retry — aborting the wipe; the room stays CANCELLED + deleted in DO storage until the record lands.`,
+        );
+        return false;
+      }
+    }
+    await this.maybeUnregisterCode();
+    for (const playerId of recipients) {
+      for (const ws of this.ctx.getWebSockets(playerId)) {
+        try {
+          ws.close(1000, 'room deleted');
+        } catch {
+          // Already gone.
+        }
+      }
+    }
+    this.sessions.clear();
+    await this.wipeRoomStorage();
+    this.store = null;
+    this.lastAlarmDelayMs = null;
+    return true;
+  }
+
+  /**
+   * v23 fix round 1 (S3/S7) — finish the wipe of a deleted room that
+   * woke from storage (see `load()`). The cancel audit record must
+   * land in Supabase BEFORE the room is destroyed: the persist is
+   * re-run from the restored room (match-result + room-upsert are
+   * idempotent replays of the same values) and the wipe only proceeds
+   * when every intent reports success. A failure leaves the room
+   * CANCELLED + deleted in storage — still 404ing everything — and
+   * the next wake retries. At most one attempt per awake instance
+   * (see `deletedWipeAttempted`).
+   */
+  private async finishDeletedRoomWipe(): Promise<void> {
+    if (!this.store) return;
+    if (this.deletedWipeAttempted) return;
+    this.deletedWipeAttempted = true;
+    const room = this.store.room;
+    const persist: PersistIntent[] = [
+      { kind: 'match-result', room },
+      { kind: 'room-upsert', room },
+    ];
+    const outcomes = await executePersistIntents(this.env as SupabaseEnv, persist);
+    if (outcomes.some((ok) => !ok)) {
+      console.error(
+        `[pakdam] load-time wipe of deleted room ${room.roomId} aborted: the cancel audit record did not land — the room stays CANCELLED + deleted in DO storage and the next wake retries.`,
+      );
+      return;
+    }
+    await this.maybeUnregisterCode();
+    this.sessions.clear();
+    await this.wipeRoomStorage();
+    this.store = null;
+    this.lastAlarmDelayMs = null;
+  }
+
+  /**
+   * v23 fix round 1 (S9) — destroy exactly the keys RoomDO owns:
+   * every `session:*` record plus the state key, plus the alarm.
+   * There is deliberately NO `deleteAll()` here: the old code nulled
+   * the in-memory store and then bulk-wiped, so a `create` for the
+   * same roomId interleaving in that window succeeded in memory and
+   * was then wiped by the in-flight `deleteAll()`. Explicit keys
+   * cannot clobber a room created after them, and RoomDO stores
+   * nothing else (tickets / idempotency / pings live inside the
+   * state key). If a key delete throws, the in-memory store is
+   * already nulled so this instance still answers ROOM_NOT_FOUND,
+   * and a restored deleted room re-runs this wipe on the next wake.
+   */
+  private async wipeRoomStorage(): Promise<void> {
+    const sessions = await this.ctx.storage.list({ prefix: 'session:' });
+    for (const key of sessions.keys()) {
+      try {
+        await this.ctx.storage.delete(key);
+      } catch {
+        // Best effort per key; the state key below is the load-bearing one.
+      }
+    }
+    try {
+      await this.ctx.storage.delete(STATE_KEY);
+    } catch {
+      // Best effort only (see the doc comment above).
+    }
+    try {
+      await this.ctx.storage.deleteAlarm();
     } catch {
       // Best effort only.
     }
@@ -523,12 +827,15 @@ export class RoomDO implements DurableObject {
       case 'room-exists': {
         // P1-15: intake validation — does this room exist at all? No
         // credential needed; a room id is a random UUID, not a secret.
-        return json({ ok: true, exists: true });
+        // v23 fix round 1 (S10): a deleted room does not exist.
+        return json({ ok: true, exists: store.state.deleted !== true });
       }
       case 'check-member': {
         // P1-15: is this playerId an active seat in the room? No
         // credential — membership existence only, no state is revealed.
+        // v23 fix round 1 (S10): a deleted room has no members.
         if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
+        if (store.state.deleted === true) return json({ ok: true, member: false });
         const seat = store.player(playerId);
         return json({ ok: true, member: seat !== undefined && seat.leftAt === null });
       }
@@ -583,6 +890,46 @@ export class RoomDO implements DurableObject {
         if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
         const r = store.startMatch({ playerId, hostTokenHash, nowMs });
         if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        await this.afterMutation(r.events, r.persist);
+        return json({ ok: true, ...r.value });
+      }
+      case 'replay': {
+        // v18: host-only reset of a finished room to LOBBY (same room /
+        // code, fresh game). Terminal phases only — see
+        // `RoomStore.replayMatch`.
+        if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
+        // v23 fix round 1 (S1): the invite code was unregistered when
+        // the room reached its terminal phase, so a replayed lobby
+        // would be unjoinable by code and unstartable until the old
+        // host rejoined. Re-register the code BEFORE resetting —
+        // register-then-replay (mirrors create): the registry is the
+        // single owner, so once registered no other room can take
+        // this code, and a replay that then fails rolls the
+        // registration back. The host check runs first so a failed
+        // host check never squats a code. (The deleted check first:
+        // a deleted room refuses with 404, exactly as `replayMatch`
+        // itself would — the host check below also refuses deleted
+        // rooms, but as 403.)
+        if (store.state.deleted === true) {
+          return json({ ok: false, error: 'This room has been deleted.', code: 'ROOM_NOT_FOUND', status: 404 }, 404);
+        }
+        if (!store.verifyHost(playerId, hostTokenHash)) {
+          return json({ ok: false, error: 'Only the host can replay the room.', code: 'FORBIDDEN' }, 403);
+        }
+        const code = store.room.roomCode;
+        const roomId = store.room.roomId;
+        const reg = await this.registryCall('register', code, roomId);
+        if (!reg.ok) {
+          return json(
+            { ok: false, error: 'That invite code was reused by another room — the room cannot be replayed on it.', code: 'CONFLICT', status: 409 },
+            409,
+          );
+        }
+        const r = store.replayMatch({ playerId, hostTokenHash, nowMs });
+        if (!r.ok) {
+          await this.registryCall('unregister', code, roomId);
+          return json({ ok: false, error: r.error, code: r.code }, r.status);
+        }
         await this.afterMutation(r.events, r.persist);
         return json({ ok: true, ...r.value });
       }
@@ -672,6 +1019,29 @@ export class RoomDO implements DurableObject {
           nowMs,
         });
         if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        if (action === 'end') {
+          // Rule 1 (founder decision 2026-11-21): a host cancel deletes
+          // the room — no rejoin, no lobby page, no stale state, code
+          // freed. `cancelMatch` already ran inside `lifecycleOp`
+          // (host-only: a non-host gets 403 there) and emitted the
+          // `room.deleted` signal; the delete routine translates it
+          // into the delivered stream (`match.cancelled` →
+          // `room.deleted` → `room.state` room-deleted), persists the
+          // cancel record, then wipes the room.
+          // v23 fix round 1 (S4): the whole end → delete sequence runs
+          // inside `blockConcurrencyWhile` — no concurrent /op can
+          // interleave it, mint credentials on the deleted store, or
+          // re-persist state after the wipe via `afterMutation`.
+          // (S7) The delete reports whether the wipe completed: when
+          // the cancel persist failed after its retry, the room stays
+          // CANCELLED + deleted in storage and `deleted:false` tells
+          // the caller the delete did not complete.
+          let deleted = false;
+          await this.ctx.blockConcurrencyWhile(async () => {
+            deleted = await this.deleteRoomAfterHostCancel(r.events, r.persist, nowMs);
+          });
+          return json({ ok: true, ...r.value, deleted });
+        }
         await this.afterMutation(r.events, r.persist);
         return json({ ok: true, ...r.value });
       }
@@ -748,6 +1118,13 @@ export class RoomDO implements DurableObject {
    */
   private async handleUpgrade(req: Request): Promise<Response> {
     if (!this.store) {
+      return json({ ok: false, error: 'Room not found.', code: 'ROOM_NOT_FOUND', status: 404 }, 404);
+    }
+    // v23 fix round 1 (S4): a deleted room takes no new sockets — a
+    // ticket minted before the delete must not open a socket after it.
+    // (A restored deleted room is normally already wiped by `load()`;
+    // this covers the in-flight delete window.)
+    if (this.store.state.deleted === true) {
       return json({ ok: false, error: 'Room not found.', code: 'ROOM_NOT_FOUND', status: 404 }, 404);
     }
     const ticketHash = req.headers.get('x-pakdam-ticket-hash');
@@ -1037,6 +1414,11 @@ export class RoomDO implements DurableObject {
     const sessions = await this.listSessions();
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
+    // v23 fix round 1 (S6): one batch id for the whole sweep — the
+    // same-batch amend in `succeedHostAfterDisconnect` only ever
+    // rewrites a transfer from THIS sweep. A later close sweep gets a
+    // fresh id, so it can never amend this sweep's delivered transfer.
+    const batchId = newId();
     for (const session of sessions) {
       const seat = this.store.player(session.playerId);
       if (!seat || seat.leftAt !== null) {
@@ -1048,7 +1430,14 @@ export class RoomDO implements DurableObject {
       await this.deleteSession(session.playerId, session.sessionId);
       // Suspend only when NO socket remains for the whole seat.
       if (this.ctx.getWebSockets(session.playerId).length > 0) continue;
-      const r = this.store.suspendSeat(session.playerId, 'network-lost', nowMs);
+      // v23 Rule 2 (v24: grace-deferred): the host grace starts INSIDE
+      // `suspendSeat` for the 'network-lost' reason (see the store) —
+      // the sweep itself only suspends. No transfer happens here: the
+      // transfer happens at grace expiry (`expireHostGrace`, from
+      // `alarmTick`) if the host has not returned. Batching is
+      // automatic: every seat in this sweep is suspended first (same
+      // `nowMs`).
+      const r = this.store.suspendSeat(session.playerId, 'network-lost', nowMs, batchId);
       events.push(...r.events);
       persist.push(...r.persist);
     }
@@ -1069,13 +1458,24 @@ export class RoomDO implements DurableObject {
     // The alarm fired, so nothing is pending: force the re-arm at the end
     // (armAlarm dedups on the delay, so this reset is what re-arms).
     this.lastAlarmDelayMs = undefined;
+    // v24: the fired alarm was the pending one — grace one-shot
+    // included — so no one-shot is pending anymore. `armAlarm()` at
+    // the end re-arms whatever is needed (a still-running grace gets
+    // a fresh one-shot at its deadline).
+    this.graceAlarmEndsAtMs = null;
     // Phase 4 (s) — consume the first-tick-after-wake grace (see the
     // field): a live socket at tick time proves the seat is alive far
     // better than the stale stored heartbeat timestamp does.
     const firstTickAfterWake = this.firstAlarmTickAfterWake;
     this.firstAlarmTickAfterWake = false;
     const nowMs = Date.now();
-    const tick = this.store.alarmTick(nowMs);
+    // v18 fix round (A3/F4): the first tick after a wake skips the
+    // missing-fix ejection (step (4a)) once — durable `lastFixAt` can
+    // be > 30 s old for a whole live roster after a DO eviction, and
+    // the first tick would otherwise mass-eject players whose phones
+    // are alive and about to report. The heartbeat grace above uses
+    // the same flag for the same reason.
+    const tick = this.store.alarmTick(nowMs, { firstTickAfterWake });
     await this.deliver(tick.events, nowMs);
     if (tick.persist.length > 0) {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, tick.persist));
@@ -1086,6 +1486,24 @@ export class RoomDO implements DurableObject {
     // while awake the cache IS the live session set (Phase 3 #5).
     const sessions = await this.sessionsForHeartbeatCheck();
     let sessionDirty = false;
+    // v23 fix round 1 (S2): heartbeat-timeout suspends are COLLECTED
+    // across the whole tick and delivered ONCE after the loop — never
+    // per-session inside it. The loop used to `deliver()` each
+    // `suspendSeat` result immediately, so the first transfer
+    // (H→P2) was already on the wire before the second suspend ran,
+    // and the same-batch amend rewrote an object `deliver()` had
+    // already serialised with JSON.stringify — changing nothing.
+    // Collect-then-deliver (mirroring `suspendClosedSeats`) is what
+    // makes the amend real. What else the loop delivers per-session:
+    // only `maybeWarnRenewal` — a DIRECT `ticket.renewal-required`
+    // to one seat about its own ticket, never a `host.transferred`,
+    // never broadcast — so batching the suspend stream cannot change
+    // it, and a warning arriving ahead of the suspend broadcast is
+    // harmless (the broadcast's `room.state` triggers a snapshot
+    // re-fetch anyway).
+    const suspendEvents: OutboundEvent[] = [];
+    const suspendPersist: PersistIntent[] = [];
+    const batchId = newId();
     for (const session of sessions) {
       if (!session.helloDone) continue;
       const missed = Math.floor((nowMs - session.lastHeartbeatAtMs) / HEARTBEAT_INTERVAL_MS);
@@ -1120,11 +1538,17 @@ export class RoomDO implements DurableObject {
         }
         await this.deleteSession(session.playerId, session.sessionId);
         if (this.ctx.getWebSockets(session.playerId).length > 0) continue;
-        const r = this.store.suspendSeat(session.playerId, 'heartbeat-timeout', nowMs);
-        await this.deliver(r.events, nowMs);
-        if (r.persist.length > 0) {
-          this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, r.persist));
-        }
+        // v23 Rule 2 (v24: grace-deferred): the host grace starts
+        // INSIDE `suspendSeat` for the 'heartbeat-timeout' reason (see
+        // the store). The first-tick-after-wake grace above already
+        // spared live seats; a seat reaching this line is genuinely
+        // dead. No transfer happens here: the transfer happens at
+        // grace expiry (`expireHostGrace`, from `alarmTick`) if the
+        // host has not returned. (S2: collected, delivered once after
+        // the loop — the suspend broadcast still goes out once.)
+        const r = this.store.suspendSeat(session.playerId, 'heartbeat-timeout', nowMs, batchId);
+        suspendEvents.push(...r.events);
+        suspendPersist.push(...r.persist);
         sessionDirty = true;
         continue;
       }
@@ -1136,6 +1560,15 @@ export class RoomDO implements DurableObject {
         sessionDirty = true;
       }
       await this.maybeWarnRenewal(session, nowMs);
+    }
+
+    // v23 fix round 1 (S2): the collected heartbeat-timeout suspend
+    // stream goes out ONCE, after the whole tick's suspends ran — so
+    // a same-batch amend names the final host on the wire, exactly
+    // once per batch.
+    if (suspendEvents.length > 0) await this.deliver(suspendEvents, nowMs);
+    if (suspendPersist.length > 0) {
+      this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, suspendPersist));
     }
 
     // Skip the save when the tick produced nothing durable: no events, no

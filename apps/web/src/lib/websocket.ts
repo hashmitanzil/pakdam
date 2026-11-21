@@ -248,10 +248,6 @@ export class PakdamSocket {
     return this.sendCommand('location.update', { fix });
   }
 
-  sendReveal(fix: LocationFix): boolean {
-    return this.sendCommand('reveal.send', { fix });
-  }
-
   /**
    * "I'm ready" — one tap, one message. The server folds
    * briefing.confirm into ready.set (Phase 3 #6), so no second message
@@ -286,13 +282,47 @@ export class PakdamSocket {
     return this.sendCommand('announcement.send', { text });
   }
 
-  /** "I'm safe" check-in travels as an announcement — there is no check-in command. */
-  sendCheckIn(text = "I'm safe"): boolean {
-    return this.sendAnnouncement(text);
-  }
+  // NOTE (founder decision, v18): SOS is removed from the web entirely —
+  // `safetySos()` and the "I'm safe" check-in (`sendCheckIn()`, which was
+  // just an announcement wrapper) are deleted. The safety PAUSE stays.
+  // The radio quick chip 'I'm safe for now' is a live radio signal, not
+  // SOS, and is untouched (see `QUICK_SIGNALS` + RadioStrip).
 
   requestCatch(runnerId: string): boolean {
     return this.sendCommand('catch.request', { runnerId });
+  }
+
+  /**
+   * v18 follow-up — Runner mints their own claim-less QR token
+   * (`catch.runner-token`, empty payload). The raw token comes back in
+   * the direct `catch.runner-token` reply, once, to the Runner only.
+   * A fresh commandId re-mints (the old QR dies at once); a retry of the
+   * same mint reuses the same id so the server returns the cached reply
+   * with the same token (idempotency). Omit the id for a fresh mint —
+   * `sendCommand` mints one.
+   */
+  requestRunnerToken(commandId?: string): boolean {
+    return this.sendCommand('catch.runner-token', {}, commandId);
+  }
+
+  /**
+   * v18 follow-up — Hunter scans a Runner's QR: the raw token resolves
+   * the Runner server-side, so no runnerId is needed. A failed scan
+   * (proximity / not-catchable) does NOT consume the token — the Hunter
+   * can retry with the same QR until its 120 s TTL runs out.
+   */
+  requestCatchByToken(qrToken: string): boolean {
+    return this.sendCommand('catch.request', { qrToken });
+  }
+
+  /**
+   * v18 runner Self Confirm: the Runner names the Hunter who tagged them
+   * (`hunterId`) — no QR, no token, no Hunter confirmation needed. The
+   * server creates the claim if none is open for that Hunter + Runner,
+   * then confirms it in one atomic op.
+   */
+  sendCatchSelfConfirm(hunterId: string): boolean {
+    return this.sendCommand('catch.self-confirm', { hunterId });
   }
 
   /** Runner confirms with the QR token (or manual confirm with no token). */
@@ -319,10 +349,6 @@ export class PakdamSocket {
 
   safetyResume(): boolean {
     return this.sendCommand('safety.resume', {});
-  }
-
-  safetySos(reason: string | null = null): boolean {
-    return this.sendCommand('safety.sos', { reason });
   }
 
   /** Best-effort suspension notice (exempt from WS rate limits). */

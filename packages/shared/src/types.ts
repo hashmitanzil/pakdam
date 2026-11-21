@@ -166,8 +166,10 @@ export interface ZoneConfig {
   /**
    * RESERVED / UNUSED: pre-computed shrink-phase boundaries from the old
    * build. Nothing reads them — the server re-draws the real boundary per
-   * shrink (`randomOffsetShrinkBoundary`) and previews it via
-   * `zone.preview`. Kept in the type only because stored configs and the
+   * shrink (`randomOffsetShrinkBoundary`) at the moment the shrink fires.
+   * There is NO next-zone preview (founder decision, v18): the next zone
+   * appears suddenly at a random place, so nothing previews a boundary
+   * ahead of time. Kept in the type only because stored configs and the
    * create page still carry an (empty) array; validators check its shape
    * but no code may treat it as the shrink schedule. Do not revive it.
    */
@@ -334,7 +336,7 @@ export interface Room {
 }
 
 // ---------------------------------------------------------------------------
-// Pings, catches, safety, radio, reveals, pins
+// Pings, catches, safety, radio, pins
 // ---------------------------------------------------------------------------
 
 /**
@@ -377,6 +379,14 @@ export interface CatchEvent {
   state: CatchState;
   /** Server only — SHA-256 of the one-time QR token. Never sent to clients. */
   qrTokenHash: string | null;
+  /**
+   * Server only — the previous token's hash, kept when the raw token was
+   * lost (e.g. DO hibernation) and a fresh one was minted, or when a
+   * scanned runner token was bound to an already-open claim. The old QR
+   * stays valid until it expires or is confirmed. Never sent to clients
+   * (stripped in CatchView alongside `qrTokenHash`).
+   */
+  previousQrTokenHash?: string | null;
   requestedAt: string;
   confirmedAt: string | null;
   disputedAt: string | null;
@@ -385,25 +395,23 @@ export interface CatchEvent {
 }
 
 /** A catch as clients see it. `activeCatches` in a snapshot holds pending catches only. */
-export type CatchView = Omit<CatchEvent, 'qrTokenHash'>;
+export type CatchView = Omit<CatchEvent, 'qrTokenHash' | 'previousQrTokenHash'>;
 
-/** Safety-event kinds (audit log). */
+/** Safety-event kinds (audit log). v18: 'sos' REMOVED — the founder removed SOS entirely. */
 export type SafetyEventType =
   | 'briefing-confirmed'
   | 'safety-pause'
   | 'safety-resume'
-  | 'sos'
   | 'leave'
   | 'stop-sharing'
   | 'report'
   | 'block';
 
-/** Safety state riding the snapshot. `pausedFrom` lives server-side (resume returns there). */
+/** Safety state riding the snapshot. `pausedFrom` lives server-side (resume returns there). v18: no `sosActive` — SOS was removed entirely. */
 export interface SafetyState {
   paused: boolean;
   pausedBy: string | null;
   pausedAt: string | null;
-  sosActive: boolean;
 }
 
 /** A team-radio message. `senderName` is the server-known display name, never a client claim. */
@@ -446,16 +454,6 @@ export const QUICK_SIGNALS: Readonly<Record<'lobby' | 'hunters' | 'runners', rea
 export interface QuickSignal {
   code: string;
   fromPlayerId: string;
-  sentAt: string;
-}
-
-/** A hold-to-reveal coarse area (150 m), shared with the whole room. */
-export interface RevealArea {
-  revealId: string;
-  roomId: string;
-  byPlayerId: string;
-  centre: GeoPoint;
-  radiusMeters: 150;
   sentAt: string;
 }
 
@@ -524,6 +522,14 @@ export interface WsSnapshotPayload {
   teammateFixes: Record<string, LocationFix>;
   safetyState: SafetyState;
   missedAnnouncements: Announcement[];
+  /**
+   * v24 — host reconnect grace deadline (epoch ms): the moment the
+   * suspended host's 30 s grace expires and host transfers if they
+   * have not returned. Null when no grace is running. The client
+   * reads the deadline from here, never the server constant
+   * (`HOST_RECONNECT_GRACE_MS` stays server-only).
+   */
+  hostGraceEndsAtMs: number | null;
 }
 
 /** Client → server envelope. Retries reuse the same `commandId`; the DO drops repeats for 10 min. */

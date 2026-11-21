@@ -3,7 +3,7 @@
  *
  * One dark card, two rows: time left / next ping, then zone shrink /
  * runners left with a thin progress bar. The next-zone size and location
- * stay hidden until the shrink preview — this strip never shows them.
+ * are never shown — there is no advance preview (founder decision, v18).
  * During head start, hunters see the waiting line instead of a timer.
  */
 'use client';

@@ -65,9 +65,9 @@ test.describe('mobile layout — 360px (demo)', () => {
     expect(box).not.toBeNull();
     expect(box!.y + box!.height).toBeLessThanOrEqual(800);
     expect(box!.height).toBeGreaterThanOrEqual(48);
-    const catchButton = hostPage.getByRole('button', { name: /CATCH BY QR|Got Tagged/ });
+    const catchButton = hostPage.getByRole('button', { name: /Tag a runner|Got Tagged/ });
     await expect(catchButton).toBeVisible();
-    await expectButtonHeight(hostPage, /CATCH BY QR|Got Tagged/, 48);
+    await expectButtonHeight(hostPage, /Tag a runner|Got Tagged/, 48);
   });
 
   test('130% zoom proxy (277px CSS width): home and lobby do not overflow', async ({

@@ -7,6 +7,7 @@
  * `moduleResolution: "bundler"`), and `@pakdam/shared` resolves to
  * `src/index.ts`. This hook rewrites, for test files only:
  *  - `@pakdam/shared` -> the shared package's `src/index.ts`
+ *  - `@pakdam/engine` -> the engine package's `src/index.ts`
  *  - a relative `./x` / `../x` -> `./x.ts` / `../x.ts` when that file
  *    exists (extensionless, bundler-style)
  *  - a relative `./x.js` / `../x.js` -> `./x.ts` / `../x.ts` when that
@@ -23,9 +24,17 @@ const SHARED_INDEX_URL = new URL(
   import.meta.url,
 ).href;
 
+const ENGINE_INDEX_URL = new URL(
+  '../../../packages/engine/src/index.ts',
+  import.meta.url,
+).href;
+
 export async function resolve(specifier, context, nextResolve) {
   if (specifier === '@pakdam/shared') {
     return { url: SHARED_INDEX_URL, shortCircuit: true };
+  }
+  if (specifier === '@pakdam/engine') {
+    return { url: ENGINE_INDEX_URL, shortCircuit: true };
   }
   if (specifier.startsWith('./') || specifier.startsWith('../')) {
     try {

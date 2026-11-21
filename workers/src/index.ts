@@ -27,6 +27,7 @@ import {
   handleLookupByCode,
   handleRegenerateCode,
   handleRemovePlayer,
+  handleReplay,
   handleReports,
   handleResolveCatch,
   handleResults,
@@ -208,6 +209,12 @@ const ROUTES: Route[] = [
   },
   {
     method: 'POST',
+    rateKey: 'POST /v1/rooms/:id/replay',
+    match: seg('/v1/rooms/:id/replay'),
+    handler: (req, ctx, p) => handleReplay(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'POST',
     rateKey: 'POST /v1/rooms/:id/start',
     match: seg('/v1/rooms/:id/start'),
     handler: (req, ctx, p) => handleStart(req, ctx, p['id'] as string),
@@ -325,6 +332,7 @@ export default {
         const isSeatRoute =
           route.rateKey.includes('/ws-ticket') ||
           route.rateKey.includes('/start') ||
+          route.rateKey.includes('/replay') ||
           route.rateKey.includes('/config') ||
           route.rateKey.includes('/remove-player') ||
           route.rateKey.includes('/regenerate-code') ||

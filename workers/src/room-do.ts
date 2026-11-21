@@ -12,21 +12,47 @@
  * - Durable (survives hibernation): room, players (incl. token hashes,
  *   never sent), catches (incl. qrTokenHash, server only), host-token
  *   hashes, serverSeq, redacted game-event log (cap 500), lastPingAtMs,
- *   pause/SOS state, lightweight event log, shrinkIndexApplied, the WS
+ *   pause state, lightweight event log, shrinkIndexApplied, the WS
  *   ticket registry (hashes only), idempotency records + cached replies,
- *   pending pings (+ per-recipient delivery state), and the pending
- *   shrink preview boundary. A wake must not invalidate a minted ticket,
- *   lose a retry's reply, or drop a ping that was never delivered (P1-5).
+ *   pending pings (+ per-recipient delivery state), and the claim-less
+ *   runner QR token records (hashes only — a Runner's QR survives a
+ *   wake, since the raw value is never stored anywhere). A wake must not
+ *   invalidate a minted ticket, lose a retry's reply, or drop a ping that
+ *   was never delivered (P1-5).
  * - Memory only (never persisted): latest fixes (purged after 30 s —
  *   the LOCATION_FRESHNESS_SECONDS window — and at match end),
  *   outside-zone countdowns, WS rate-limit windows, raw catch tokens,
  *   announcements. Never persisted, ever: raw coordinates, raw tokens
  *   of any kind, WS ticket values.
  *
- * Server caps (P2): safety pause / SOS / leave `reason` ≤ 500 chars;
+ * Server caps (P2): safety pause / leave `reason` ≤ 500 chars;
  * voice.signal `candidate` ≤ 8 KB (same as SDP); bug/grievance
  * deviceInfo / appVersion / complainantRef ≤ 500 chars (enforced in
  * http.ts); HTTP + DO /op bodies ≤ 1 MB (413 above).
+ *
+ * v18 removals (founder decisions — do not re-add):
+ * - NO next-zone preview: the server never broadcasts `zone.preview` and
+ *   stores no pending shrink boundary; a shrink draws its boundary fresh
+ *   at fire time via `randomOffsetShrinkBoundary`. Shrink timing, random
+ *   offset and the final 42% are unchanged.
+ * - SOS removed entirely (server + shared): no `safety.sos` handler, no
+ *   `sosActive`, no SOS copy. The safety PAUSE / resume STAYS.
+ * - Hold-to-reveal removed: no `reveal.send` handler. The shared
+ *   `reveal` event type is kept for the web builder's parallel removal.
+ * - Start gate REMOVED: a match starts even if a player's GPS has not
+ *   reported yet. Instead, a player with NO fix at all for 30 s during
+ *   ACTIVE is EJECTED (see `alarmTick` step (4a)). A poor-but-present
+ *   fix still freezes the outside-zone countdown; only a COMPLETELY
+ *   missing fix ejects. (4a) runs in ACTIVE only, never HEAD_START
+ *   (A4 — the head start is for acquiring GPS), never ejects a
+ *   SUSPENDED seat (A3/F4 — suspension is not departure, and ejection
+ *   is terminal), and is skipped once on the first tick after a DO wake
+ *   (A3/F4 — durable `lastFixAt` can be stale for a live roster). The
+ *   silence baseline is the moment ACTIVE began, so a never-reported
+ *   player is ejected 30 s into ACTIVE. A4 + the suspended exemption
+ *   are JUDGMENT CALLS against the founder's rule as written (eject any
+ *   seat silent for 30 s) — implemented as the safer default, flagged
+ *   for the founder to override.
  *
  * Physical tags (founder decision, P1-11): a tag confirms only when the
  * Hunter and the Runner both have a recent fix within
@@ -56,7 +82,6 @@ import {
   MAX_PLAYERS,
   MIN_PLAYERS,
   OUTSIDE_ZONE_RETURN_SECONDS,
-  PREVIEW_LEAD_SECONDS,
   QUICK_SIGNALS,
   RADIO_MAX_CHARS,
   RENEWAL_WARNING_MS,
@@ -65,6 +90,7 @@ import {
   WS_MESSAGE_RATE_LIMIT_DEFAULT,
   WS_TICKET_TTL_MS,
   classifyAccuracy,
+  catchTokenHash,
   hashHostToken,
   hashReconnectToken,
   helloHasCredential,
@@ -80,7 +106,6 @@ import {
   type CatchView,
   type GameEvent,
   type GeoPoint,
-  type GeoPolygon,
   type LocationFix,
   type LocationQuality,
   type MatchPhase,
@@ -89,7 +114,6 @@ import {
   type Player,
   type PlayerView,
   type RadioMessage,
-  type RevealArea,
   type Room,
   type RoomConfig,
   type SafetyState,
@@ -113,26 +137,27 @@ import {
   freeHunterIds,
   freeRunnerIds,
   isCatchExpired,
+  isCatchableRunner,
   isDuplicateCommand,
   isPendingCatch,
   isTerminalPhase,
   issueCatchToken,
+  issueRunnerQrToken,
   maybeCompleteOnWin,
   openCatchForRunner,
   pauseMatch,
-  previewShrinkBoundary,
-  purgeIdempotency,
   purgeExpiredPings,
-  raiseSos,
+  purgeIdempotency,
   randomOffsetShrinkBoundary,
   recordSuspension,
   rememberCommand,
   requestCatch,
   resolveCatch,
   resolveModeOutcome,
+  resolveOpenClaimQrToken,
+  resolveRunnerQrToken,
   resumeMatch,
   resumeSuspendedPlayer,
-  safetyStateAfterResume,
   scoreMatch,
   shrinkIndexAt,
   toCatchView,
@@ -143,6 +168,7 @@ import {
   isPointInZone,
   type IdempotencyRecord,
   type OutsideZoneState,
+  type RunnerQrToken,
 } from '@pakdam/engine';
 import type { PersistIntent } from './supabase.js';
 
@@ -176,7 +202,6 @@ export interface RoomDoState {
   paused: boolean;
   pausedBy: string | null;
   pausedFrom: MatchPhase | null;
-  sosActive: boolean;
   eventLog: Array<{ seq: number; type: string; actorId: string | null; at: string }>;
   /** How many scheduled shrinks have already been drawn. */
   shrinkIndexApplied: number;
@@ -198,21 +223,58 @@ export interface RoomDoState {
   /** Pending (undelivered) pings, durable (P1-5): re-delivered on hello. */
   pendingPings: Ping[];
   /**
+   * Claim-less runner QR token records, durable (v18 follow-up):
+   * hashes only, never raw values — one live record per Runner. A
+   * Runner mints theirs with `catch.runner-token` before any claim
+   * exists; a Hunter's scan resolves the Runner from the hash and the
+   * record is consumed when the claim is created (or bound to it).
+   * Expired records are pruned lazily by the mint/scan ops; expiry is
+   * always decided by `expiresAtMs`, never by the prune.
+   */
+  runnerQrTokens: RunnerQrToken[];
+  /**
    * Per-ping recipients still awaiting delivery: pingId -> playerIds.
    * A ping leaves `pendingPings` only when every recipient has received
    * it (per-recipient ack); an offline Hunter still gets it on reconnect.
    */
   pendingPingRecipients: Record<string, string[]>;
+  // v18: NO pending shrink preview. The founder removed the next-zone
+  // preview entirely — a shrink draws its boundary fresh at fire time,
+  // so there is no stored preview boundary to persist or restore.
   /**
-   * The previewed next-zone boundary (P1-18): drawn PREVIEW_LEAD_SECONDS
-   * before the shrink and applied verbatim when the shrink fires, so the
-   * preview is the real next zone — never a second, different draw.
+   * v18 fix round (B2) — the ORIGINAL configured zone boundary, snapshotted
+   * at `startMatch`. Shrinks mutate `config.zone.boundary` in place, so
+   * without this snapshot a replay would start the "fresh" game on the
+   * already-shrunk zone (~42% of the original). `replayMatch` restores
+   * the boundary from here. Null until the first match starts (older
+   * durable writes lack it — `restoreState` fills null).
    */
-  pendingShrink: {
-    boundary: GeoPolygon;
-    firesAtMs: number;
-    shrinkIndex: number;
-  } | null;
+  originalZoneBoundary?: GeoPoint[] | null;
+  /**
+   * v23 Rule 1 — host cancel deleted the room. Set by `cancelMatch`
+   * (host `lifecycleOp('end')` only). While set, the room is gone:
+   * snapshot / results / replay / lifecycle / host-token checks all
+   * refuse with 404 ROOM_NOT_FOUND (`isDeleted()`). A terminal phase
+   * alone does NOT imply this — a naturally completed room (COMPLETED)
+   * and an emptied room (EXPIRED / ABANDONED / CANCELLED via
+   * `leaveSeat`) keep serving snapshots and replay. Optional: older
+   * durable writes lack it — `restoreState` fills false; test-built
+   * states that omit it read as `undefined` (falsy) until set.
+   */
+  deleted?: boolean;
+  /**
+   * v24 — host reconnect grace (founder decision D1, 2026-11-21).
+   * Set when the HOST suspends with an actually-gone reason
+   * (`'network-lost'` / `'heartbeat-timeout'`): `{ hostPlayerId,
+   * endsAtMs }` with `endsAtMs = suspendMs + HOST_RECONNECT_GRACE_MS`.
+   * Durable (NOT mem): it must survive a DO eviction/wake, so the
+   * deadline is still honoured after hibernation. Null when no grace
+   * is running. Optional: older durable writes / test-built states
+   * lack it — `restoreState` fills null and the constructor defaults
+   * it. Only ever one grace at a time (one host); a second
+   * actually-gone reason while suspended never restarts it.
+   */
+  hostGrace?: { hostPlayerId: string; endsAtMs: number } | null;
 }
 
 /** Memory-only state — rebuilt empty after hibernation, never persisted. */
@@ -270,23 +332,65 @@ export interface RoomMemory {
    * so identical content inside the window is dropped as a duplicate.
    */
   recentRadio: Map<string, number>;
+  /**
+   * v23 Rule 2 — the last host-succession transfer emitted by
+   * `succeedHostAfterDisconnect`, if any, in THIS awake instance.
+   *
+   * v23 fix round 1 (S6): the amend is keyed by a BATCH TOKEN, not by
+   * `nowMs`. Simultaneous disconnects share one batch (the class
+   * sweep and one alarm tick each pass a single `batchId` for the
+   * whole batch); when the seat that JUST received host drops in the
+   * same batch, the succession AMENDS this event (new host rewritten)
+   * instead of emitting a second transfer — exactly one
+   * `host.transferred` per simultaneous disconnect, naming the final
+   * host. Two genuinely separate disconnects that happen to share a
+   * `Date.now()` millisecond get DIFFERENT batch ids (each caller
+   * mints its own, and a lone call gets a fresh one), so the second
+   * one can never amend the first's already-delivered transfer.
+   *
+   * The amend may ONLY rewrite an event that has not been delivered
+   * yet — that is the caller's contract: every caller that passes a
+   * `batchId` must deliver the batch's events only after the batch
+   * completes (`suspendClosedSeats` and the alarm loop both collect
+   * then deliver once; the WS handler never passes a batchId, so one
+   * message can never amend another's transfer). Memory only:
+   * rebuilt empty on wake, so a stale batch can never leak across
+   * hibernation. Null when no succession has happened yet.
+   */
+  lastSuccession: { batchId: string; event: OutboundEvent } | null;
 }
 
-/** Start gate: a fix counts as fresh for 120 s at start time (P1-7). */
-export const START_GPS_FRESHNESS_MS = 120_000;
+/** No GPS start gate (v18): the founder removed the P1-7 check that
+ * required every active player to have a fix ≤ 120 s old before the
+ * match could start. A match starts even if a player's GPS has not
+ * reported yet; the backstop is the missing-fix ejection in `alarmTick`
+ * step (4a) — no fix at all for 30 s during a live phase ejects.
+ * (The old `START_GPS_FRESHNESS_MS = 120_000` constant is deleted.) */
 
 /**
  * Player-row persist throttle (Phase 3 #2): a location.update emits a
  * Supabase player-upsert at most once per 30 s per seat (or sooner when
- * something durable actually changed — quality, role, connection). 30 s
- * is far inside the 120 s start-gate window, and the live in-memory fix
- * is the gate's primary source anyway; the durable lastFixAt is only
- * the hibernate/wake fallback.
+ * something durable actually changed — quality, role, connection). The
+ * live in-memory fix is the primary source for freshness; the durable
+ * lastFixAt is only the hibernate/wake fallback.
  */
 export const PLAYER_PERSIST_INTERVAL_MS = 30_000;
 
 /** GPS fix throttle (Phase 3 #2): at most ~1 accepted fix/s/seat. */
 export const GPS_FIX_MIN_INTERVAL_MS = 1_000;
+
+/**
+ * v24 — host reconnect grace (founder decision D1, 2026-11-21): a host
+ * who ACTUALLY disconnects (`'network-lost'` / `'heartbeat-timeout'`)
+ * keeps host for this long. If they resume inside the window the grace
+ * is cancelled and no transfer ever happens; if the deadline passes
+ * with the host still suspended, host transfers to the earliest-joined
+ * connected player (the v23 rule, unchanged). Voluntary leave has NO
+ * grace — `leaveSeat` transfers immediately, as before. The client
+ * never reads this constant: it reads the deadline from the snapshot
+ * (`hostGraceEndsAtMs`), so this stays a server-only calibration.
+ */
+export const HOST_RECONNECT_GRACE_MS = 30_000;
 
 /**
  * Radio content-dedupe window (Phase 4 (r)): same sender + same kind +
@@ -300,7 +404,7 @@ export const RADIO_DEDUPE_WINDOW_MS = 5_000;
 /** Idle-lobby expiry: a LOBBY older than 24 h transitions to EXPIRED. */
 export const LOBBY_EXPIRY_MS = 24 * 60 * 60 * 1000;
 
-/** Free-text caps (P2): safety pause / SOS / leave `reason`. */
+/** Free-text caps (P2): safety pause / leave `reason`. */
 export const REASON_MAX_CHARS = 500;
 
 /** Voice ICE candidate cap (P2): 8 KB, same as the SDP cap. */
@@ -384,6 +488,7 @@ export function emptyMemory(): RoomMemory {
     lastPlayerPersistAtMs: {},
     lastFixAcceptedAtMs: {},
     recentRadio: new Map(),
+    lastSuccession: null,
   };
 }
 
@@ -400,7 +505,6 @@ export function durableSnapshot(state: RoomDoState): RoomDoState {
     paused: state.paused,
     pausedBy: state.pausedBy,
     pausedFrom: state.pausedFrom,
-    sosActive: state.sosActive,
     eventLog: state.eventLog,
     shrinkIndexApplied: state.shrinkIndexApplied,
     tickets: state.tickets,
@@ -408,7 +512,10 @@ export function durableSnapshot(state: RoomDoState): RoomDoState {
     idempotentReplies: state.idempotentReplies,
     pendingPings: state.pendingPings,
     pendingPingRecipients: state.pendingPingRecipients,
-    pendingShrink: state.pendingShrink,
+    runnerQrTokens: state.runnerQrTokens,
+    originalZoneBoundary: state.originalZoneBoundary ?? null,
+    deleted: state.deleted ?? false,
+    hostGrace: state.hostGrace ?? null,
   };
 }
 
@@ -428,7 +535,6 @@ export function restoreState(raw: unknown): RoomDoState | null {
     paused: s.paused ?? false,
     pausedBy: s.pausedBy ?? null,
     pausedFrom: s.pausedFrom ?? null,
-    sosActive: s.sosActive ?? false,
     eventLog: s.eventLog ?? [],
     shrinkIndexApplied: s.shrinkIndexApplied ?? 0,
     // P1-5 fields: older durable writes lack them — empty is the honest
@@ -438,7 +544,18 @@ export function restoreState(raw: unknown): RoomDoState | null {
     idempotentReplies: s.idempotentReplies ?? [],
     pendingPings: s.pendingPings ?? [],
     pendingPingRecipients: s.pendingPingRecipients ?? {},
-    pendingShrink: s.pendingShrink ?? null,
+    // v18 follow-up: older durable writes lack runner-token records —
+    // empty is the honest default (no Runner had minted one yet).
+    runnerQrTokens: s.runnerQrTokens ?? [],
+    // v18 fix round (B2): older durable writes lack the snapshot —
+    // null means "no match has started yet", same as a fresh room.
+    originalZoneBoundary: s.originalZoneBoundary ?? null,
+    // v23 Rule 1: older durable writes lack the flag — false means
+    // the room was never host-cancel-deleted, same as a fresh room.
+    deleted: s.deleted ?? false,
+    // v24: older durable writes lack the grace — null means no grace
+    // was running, same as a fresh room.
+    hostGrace: s.hostGrace ?? null,
   };
 }
 
@@ -458,6 +575,11 @@ export class RoomStore {
   constructor(state: RoomDoState, mem: RoomMemory = emptyMemory()) {
     this.state = state;
     this.mem = mem;
+    // Older durable writes / test-built states lack the runner-token
+    // records — default to empty rather than crashing on undefined.
+    this.state.runnerQrTokens ??= [];
+    // v24: same for the host grace — null means no grace is running.
+    this.state.hostGrace ??= null;
   }
 
   /**
@@ -501,9 +623,9 @@ export class RoomStore {
    * engine (re-confirm → CONFLICT, re-request → open claim, ready.set
    * → idempotent assignment, pause/resume/leave/dispute/
    * briefing.confirm likewise). That guard does NOT cover the relay
-   * commands (radio.send, signal.send, pin.place, announcement.send,
-   * safety.sos, reveal.send): they carry no server state to conflict
-   * on, so a retry that mints a NEW commandId re-applies them.
+   * commands (radio.send, signal.send, pin.place, announcement.send):
+   * they carry no server state to conflict on, so a retry that mints a
+   * NEW commandId re-applies them.
    * radio.send has a content-dedupe window instead (Phase 4 (r)); the
    * others are deliberately unguarded — see the note at the radio.send
    * dedupe for why.
@@ -718,7 +840,6 @@ export class RoomStore {
       paused: this.state.paused,
       pausedBy: this.state.pausedBy,
       pausedAt: this.room.pausedAt,
-      sosActive: this.state.sosActive,
     };
   }
 
@@ -726,7 +847,7 @@ export class RoomStore {
    * Per-viewer location status, teammates-only during play (P2 liveness
    * leak): an opponent's freshness must not leak to the other team. The
    * viewer always sees their own status; in the LOBBY there are no teams
-   * yet, so the whole lobby sees each other (the start gate needs it).
+   * yet, so the whole lobby sees each other.
    * Freshness needs a LIVE fix in memory, not just a durable `lastFixAt`:
    * after a hibernate/wake the fixes are gone while `lastFixAt` still
    * says "known" (P1-5) — reporting unknown until a fresh fix arrives
@@ -797,6 +918,9 @@ export class RoomStore {
       // only the viewer's teammates, never an opponent, and none at all
       // for a caught Runner.
       fixes: this.mem.latestFix,
+      // v24: the host-grace deadline, so the client can show the
+      // countdown without knowing the server constant (null = no grace).
+      hostGraceEndsAtMs: this.hostGraceEndsAtMs(),
     });
   }
 
@@ -850,6 +974,16 @@ export class RoomStore {
     this.state.room.version += 1;
   }
 
+  /** v23 Rule 1 — has the host cancelled and deleted this room? */
+  private isDeleted(): boolean {
+    return this.state.deleted === true;
+  }
+
+  /** Refusal for any op on a deleted room (v23 Rule 1). */
+  private deletedRefusal(): OpResult<never> {
+    return errResult('This room has been deleted.', 'ROOM_NOT_FOUND', 404);
+  }
+
   private roomStateEvent(reason: string, nowMs: number): OutboundEvent {
     return this.emit(
       'room.state',
@@ -862,6 +996,10 @@ export class RoomStore {
   // -- credential checks (hash comparison only; raw values never arrive) ---
 
   verifyReconnect(playerId: string, reconnectTokenHash: string | null): Player | null {
+    // v23 fix round 1 (S4): a deleted room has no seats anymore — every
+    // reconnect-token check refuses, so no reconnect-gated op (snapshot,
+    // results, pause, ticket issue, ...) can run on a deleted room.
+    if (this.isDeleted()) return null;
     if (!reconnectTokenHash) return null;
     const p = this.player(playerId);
     if (!p) return null;
@@ -869,9 +1007,19 @@ export class RoomStore {
   }
 
   verifyHost(playerId: string, hostTokenHash: string | null): Player | null {
+    // v23 Rule 1: a deleted room has no host anymore — every host-token
+    // check refuses, so no host-only op can run on a deleted room.
+    if (this.isDeleted()) return null;
     if (!hostTokenHash) return null;
     const p = this.player(playerId);
     if (!p || !p.isHost) return null;
+    // v23 fix round 1 (S1): a seat that LEFT is not the host anymore,
+    // even if its `isHost` flag and host token both survived (sole-host
+    // leave with no successor). Without this, a left host could replay
+    // the room into a lobby with 0 active players and a hostPlayerId
+    // pointing at an absent host. Rejoin-by-name restore clears
+    // `leftAt`, so a genuinely restored host still verifies.
+    if (p.leftAt !== null) return null;
     return this.state.hostTokens[playerId] === hostTokenHash ? p : null;
   }
 
@@ -932,7 +1080,6 @@ export class RoomStore {
       paused: false,
       pausedBy: null,
       pausedFrom: null,
-      sosActive: false,
       eventLog: [],
       shrinkIndexApplied: 0,
       tickets: [],
@@ -940,7 +1087,8 @@ export class RoomStore {
       idempotentReplies: [],
       pendingPings: [],
       pendingPingRecipients: {},
-      pendingShrink: null,
+      runnerQrTokens: [],
+      hostGrace: null,
     };
     const store = new RoomStore(state);
     const persist: PersistIntent[] = [
@@ -967,6 +1115,7 @@ export class RoomStore {
     nowMs: number;
   }): Promise<OpResult<{ player: PlayerView; reconnectToken: string; restored: boolean }>> {
     const nowMs = input.nowMs;
+    if (this.isDeleted()) return this.deletedRefusal();
     if (!isValidDisplayName(input.displayName)) {
       return errResult('Display name must be 1–30 characters.', 'VALIDATION_FAILED', 400);
     }
@@ -989,6 +1138,19 @@ export class RoomStore {
         Object.assign(existing, r.player);
       } else if (existing.leftAt === null) {
         existing.connectionState = 'connected';
+      }
+      // v24 — a graced host restored by name + reconnect token keeps
+      // host: cancel the grace. The host token was never deleted
+      // during the grace, so the restored host still verifies.
+      // (A host who returns AFTER a transfer is a regular player by
+      // then — the grace is already gone — so this never flips host
+      // back.)
+      if (
+        existing.isHost &&
+        existing.connectionState === 'connected' &&
+        this.state.hostGrace?.hostPlayerId === existing.playerId
+      ) {
+        this.cancelHostGrace(existing.playerId);
       }
       // An ejected seat stays ejected: ejectedAt is never cleared here.
       this.bumpVersion();
@@ -1123,6 +1285,12 @@ export class RoomStore {
       return errResult('That player is already the host.', 'CONFLICT', 409);
     }
     delete this.state.hostTokens[host.playerId];
+    // v24 fix round (Finding 5) — a manual transfer ends any running
+    // grace for the old host, like `leaveSeat` / `completeMatch` /
+    // replay already do. Inert as written: a grace only ever runs
+    // while its host is suspended, and a suspended host's client is
+    // gone — but a stale deadline must never survive a host change.
+    this.cancelHostGrace();
     host.isHost = false;
     next.isHost = true;
     this.state.room.hostPlayerId = next.playerId;
@@ -1180,13 +1348,13 @@ export class RoomStore {
         409,
       );
     }
-    // P1-7 start gate: the zone must be placed (a boundary of ≥ 3 points)
-    // and every active player must have a fix ≤ 120 s old. The error names
-    // the players without GPS in plain words. Freshness uses the live fix
-    // first, falling back to the durable `lastFixAt` (which survives a
-    // hibernate/wake while the live fix does not). Lobby clients stream
-    // fixes continuously, so a fresh fix is the normal case — a missing
-    // one means that player's GPS is off or the app is backgrounded.
+    // Zone gate (unchanged): the zone must be placed (a boundary of
+    // ≥ 3 points) before the match can start.
+    // v18: NO GPS start gate. The old P1-7 check (every active player
+    // needs a fix ≤ 120 s old) is REMOVED — the match starts even if a
+    // player's GPS has not reported yet. The backstop is the missing-fix
+    // ejection in `alarmTick` step (4a): no fix at all for 30 s during a
+    // live phase ejects that player.
     const config = this.room.config;
     if (!config.zone || config.zone.boundary.length < 3) {
       return errResult(
@@ -1195,22 +1363,14 @@ export class RoomStore {
         409,
       );
     }
-    const withoutGps = active.filter((p) => {
-      const live = this.mem.latestFix[p.playerId];
-      const liveMs = live ? nowMs - live.timestampMs : Number.POSITIVE_INFINITY;
-      const lastMs =
-        p.lastFixAt === null
-          ? Number.POSITIVE_INFINITY
-          : nowMs - Date.parse(p.lastFixAt);
-      return Math.min(liveMs, lastMs) > START_GPS_FRESHNESS_MS;
-    });
-    if (withoutGps.length > 0) {
-      return errResult(
-        `Waiting for GPS from ${withoutGps.map((p) => p.displayName).join(', ')} — their location has not been reported in the last 2 minutes.`,
-        'CONFLICT',
-        409,
-      );
-    }
+    // v18 fix round (B2): snapshot the ORIGINAL configured boundary
+    // before play can shrink it. Shrinks mutate `config.zone.boundary`
+    // in place, so without this the replayed game would start on the
+    // already-shrunk zone. Deep-copied point by point (a spread of the
+    // array alone would still share the point objects with the live
+    // boundary). Re-snapshotted on every start, so a host-edited zone
+    // in the lobby is what the next match plays on.
+    this.state.originalZoneBoundary = config.zone.boundary.map((p) => ({ ...p }));
     const draw = assignRoles(active, {
       balanceHunters: config.balanceHunters ?? true,
       randomDraw: config.randomDraw ?? true,
@@ -1375,6 +1535,10 @@ export class RoomStore {
     expiresAtMs: number;
     nowMs: number;
   }): OpResult<{ ticketId: string; expiresAtMs: number; registered: number }> {
+    // v23 fix round 1 (S4): no ticket minting on a deleted room.
+    if (this.isDeleted()) {
+      return errResult('This room has been deleted.', 'ROOM_NOT_FOUND', 404);
+    }
     const seat = this.verifyReconnect(input.playerId, input.reconnectTokenHash);
     if (!seat) {
       return errResult('Seat not found or reconnect token does not match.', 'FORBIDDEN', 403);
@@ -1432,6 +1596,11 @@ export class RoomStore {
     ticketHash: string,
     nowMs: number,
   ): OpResult<{ playerId: string; ticketId: string; expiresAtMs: number }> {
+    // v23 fix round 1 (S4): no socket upgrade on a deleted room — a
+    // ticket minted before the delete must not open a socket after it.
+    if (this.isDeleted()) {
+      return errResult('This room has been deleted.', 'ROOM_NOT_FOUND', 404);
+    }
     const rec = this.mem.tickets.find((t) => t.ticketHash === ticketHash);
     if (!rec) {
       return errResult('Ticket invalid — fetch a fresh ticket and reconnect once.', 'TICKET_INVALID', 4401);
@@ -1537,6 +1706,42 @@ export class RoomStore {
     return { events, persist };
   }
 
+  /**
+   * Eject one seat + run the win check. Shared by the tick-side
+   * ejections (missing-fix step (4a), outside-zone step (4)). Returns
+   * true when the ejection completed the match — the caller must return
+   * its tick immediately. `applyOutsideZoneEjection` is idempotent and
+   * stamps `ejectedAt` once; the seat's outside-zone countdown is
+   * dropped with it.
+   */
+  private ejectWithWinCheck(
+    p: Player,
+    nowMs: number,
+    startedAtMs: number,
+    events: OutboundEvent[],
+    persist: PersistIntent[],
+  ): boolean {
+    const ejected = applyOutsideZoneEjection(p, nowMs);
+    Object.assign(p, ejected);
+    delete this.mem.outsideZone[p.playerId];
+    this.bumpVersion();
+    events.push(this.roomStateEvent('player-ejected', nowMs));
+    persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: p });
+    const durationSeconds = Math.max(0, Math.floor((nowMs - startedAtMs) / 1000));
+    const win = maybeCompleteOnWin({
+      mode: this.room.config.mode,
+      players: this.state.players,
+      caughtRunnerIds: this.caughtRunnerIds(),
+      durationSeconds,
+      tags: confirmedTags(this.state.catches),
+    });
+    if (!win) return false;
+    const done = this.completeMatch(win, nowMs);
+    events.push(...done.events);
+    persist.push(...done.persist);
+    return true;
+  }
+
   /** Runner fetches the raw one-time catch token for their QR (HTTP route). */
   async getCatchToken(input: {
     playerId: string;
@@ -1597,7 +1802,7 @@ export class RoomStore {
     const prev = c.qrTokenHash;
     c.qrTokenHash = tokenHash;
     if (prev !== null && !held) {
-      (c as CatchEvent & { previousQrTokenHash?: string | null }).previousQrTokenHash = prev;
+      c.previousQrTokenHash = prev;
     }
     this.mem.rawCatchTokens.set(c.catchId, {
       token,
@@ -1607,6 +1812,114 @@ export class RoomStore {
       { token, catchId: c.catchId, expiresAt },
       sweep.events,
       [...sweep.persist, { kind: 'catch-update', catch: c }],
+    );
+  }
+
+  /**
+   * v18 follow-up — Runner mints a claim-less QR token (`catch.runner-token`,
+   * WS, Runner only).
+   *
+   * The Runner taps "Got Tagged" with NO claim open and shows the QR at
+   * once. The token is tied to the RUNNER (their playerId), not to a
+   * claim: 128-bit, 120 s TTL, hash-only storage, single-use, QR-only
+   * carriage — the same token rules as a claim token, with the hash
+   * domain sha256('runner:' + runnerId + ':' + raw).
+   *
+   * Rules:
+   * - ACTIVE only; the sender must be a free, present, non-suspended
+   *   Runner (an already-caught Runner, a disputed catch with the host,
+   *   or a Hunter sender all reject). A suspended/disconnected Runner
+   *   cannot mint — reconnect first.
+   * - One live token per Runner: a re-mint REPLACES the previous record
+   *   at once, so the old QR dies immediately. The server never stores
+   *   the raw value, so it cannot re-issue the same token — a re-mint is
+   *   always a fresh token with a fresh 120 s TTL. An expired token is
+   *   likewise replaced, never revived.
+   * - Minting with an open claim is CONFLICT — the Runner shows that
+   *   claim's QR instead (HTTP /catch-token, unchanged). The record is
+   *   durable (hash only): it survives DO hibernation, unlike the raw
+   *   claim tokens in memory.
+   * - The mint mutates durable state but has no Supabase row: the WS
+   *   case marks the message durable via `stateDirty` (see
+   *   `handleWsMessage`), so the DO class still `save()`s the state.
+   *   NO catch code, NO dispute button. The physical-tag gate does NOT
+   *   apply at mint time (no Hunter is involved yet) — it applies when
+   *   the scan creates the claim (`requestCatch`) and again at
+   *   `catch.confirm`.
+   */
+  async mintRunnerQrToken(input: {
+    playerId: string;
+    nowMs: number;
+  }): Promise<OpResult<{ token: string; runnerId: string; expiresAt: string }>> {
+    const nowMs = input.nowMs;
+    const me = this.player(input.playerId);
+    if (!me || me.leftAt !== null) {
+      return errResult('Seat not found in this room.', 'FORBIDDEN', 403);
+    }
+    if (me.matchRole !== 'runner') {
+      return errResult('Only a Runner can show a catch QR.', 'FORBIDDEN', 403);
+    }
+    if (this.room.phase !== 'ACTIVE') {
+      return errResult('Catches can only be made while the match is live.', 'INVALID_STATE', 409);
+    }
+    // Expire overdue claims first (same lazy sweep as catch.request):
+    // a claim that just expired must not block a fresh mint.
+    const sweep = this.expireOverdueCatches(nowMs);
+    const events: OutboundEvent[] = [...sweep.events];
+    const persist: PersistIntent[] = [...sweep.persist];
+    // A disputed catch for this Runner is with the host — it can neither
+    // be re-minted around nor re-claimed until the host resolves it.
+    if (
+      this.state.catches.some(
+        (c) => c.runnerPlayerId === me.playerId && c.state === 'disputed',
+      )
+    ) {
+      return errResult(
+        'That catch is with the host — wait for the host to resolve it.',
+        'CONFLICT',
+        409,
+        events,
+        persist,
+      );
+    }
+    if (openCatchForRunner(this.state.catches, me.playerId) !== null) {
+      return errResult(
+        'A Hunter has already claimed you — show the QR for that claim.',
+        'CONFLICT',
+        409,
+        events,
+        persist,
+      );
+    }
+    if (this.caughtRunnerIds().includes(me.playerId)) {
+      return errResult('You have already been caught.', 'CONFLICT', 409, events, persist);
+    }
+    if (!isCatchableRunner(me, this.caughtRunnerIds())) {
+      return errResult(
+        'You cannot be caught right now — reconnect first, then try again.',
+        'CONFLICT',
+        409,
+        events,
+        persist,
+      );
+    }
+    // Re-mint replaces: drop this Runner's previous record (live or
+    // expired — an expired record is dead by TTL and is never revived),
+    // then store the fresh hash-only record. The raw token goes to the
+    // Runner once, in the direct reply — it is never stored.
+    this.state.runnerQrTokens = this.state.runnerQrTokens.filter(
+      (r) => r.runnerPlayerId !== me.playerId,
+    );
+    const { token, record } = await issueRunnerQrToken(me.playerId, nowMs);
+    this.state.runnerQrTokens.push(record);
+    return okResult(
+      {
+        token,
+        runnerId: me.playerId,
+        expiresAt: new Date(record.expiresAtMs).toISOString(),
+      },
+      events,
+      persist,
     );
   }
 
@@ -1668,6 +1981,205 @@ export class RoomStore {
       persist.push(...applied.persist);
     }
     events.push(this.roomStateEvent('catch-resolved', input.nowMs));
+    return okResult({ catch: toCatchView(c) }, events, persist);
+  }
+
+  /**
+   * v18 runner Self Confirm — `catch.self-confirm` (WS, Runner only).
+   *
+   * The Runner picks the Hunter who tagged them (`hunterId`) and taps OK;
+   * the tag completes with NO confirmation needed from the Hunter. The
+   * server creates the claim if none is open for that Hunter + Runner,
+   * then confirms it in the same op — one atomic tag, no token, no QR.
+   *
+   * Rules (same as every other confirm — nothing is relaxed):
+   * - ACTIVE only; the sender must be a free, present Runner, the named
+   *   seat a Hunter still in play. An already-caught Runner, a disputed
+   *   catch (with the host), or an open claim by a DIFFERENT Hunter all
+   *   reject — the Runner must name the Hunter who actually claimed them.
+   * - PHYSICAL tag (P1-11): both phones need a recent fix within
+   *   CATCH_MAX_DISTANCE_METERS (100 m), enforced by `requestCatch` (on
+   *   claim creation) and `confirmCatch`. A self-confirm from another
+   *   city does not complete the tag.
+   * - NO catch code, NO dispute button. The 128-bit / 120 s / hash-only /
+   *   single-use / QR-only token rules are untouched — this path simply
+   *   does not use a token at all (manual Runner confirm, like the
+   *   existing `catch.confirm` manual fallback, but claim-creating).
+   * - The QR-scan way is unchanged: Hunter scans the Runner's QR, then
+   *   taps Tag via `catch.request` + `catch.confirm` with the token.
+   *
+   * A failed self-confirm rolls back a claim it just created, so no
+   * dangling pending claim is left behind. Persist: one `catch-insert`
+   * (it writes the full catch state, incl. confirmed) when the claim was
+   * created here, else `catch-update`.
+   */
+  selfConfirmCatch(input: {
+    playerId: string;
+    hunterId: string;
+    nowMs: number;
+  }): OpResult<{ catch: CatchView }> {
+    const nowMs = input.nowMs;
+    const me = this.player(input.playerId);
+    if (!me || me.leftAt !== null) {
+      return errResult('Seat not found in this room.', 'FORBIDDEN', 403);
+    }
+    if (me.matchRole !== 'runner') {
+      return errResult('Only a Runner can self-confirm a tag.', 'FORBIDDEN', 403);
+    }
+    const hunter = this.player(input.hunterId);
+    if (!hunter) {
+      return errResult('That Hunter is not in the room.', 'VALIDATION_FAILED', 400);
+    }
+    if (hunter.matchRole !== 'hunter') {
+      return errResult('That player is not a Hunter.', 'FORBIDDEN', 403);
+    }
+    if (hunter.ejectedAt !== null || hunter.leftAt !== null) {
+      return errResult('That Hunter is no longer in play.', 'CONFLICT', 409);
+    }
+    // Expire overdue claims first (same lazy sweep as catch.request).
+    const sweep = this.expireOverdueCatches(nowMs);
+    const events: OutboundEvent[] = [...sweep.events];
+    const persist: PersistIntent[] = [...sweep.persist];
+    // A disputed catch for this Runner is with the host — it can neither
+    // be self-confirmed nor re-claimed until the host resolves it.
+    if (
+      this.state.catches.some(
+        (c) => c.runnerPlayerId === me.playerId && c.state === 'disputed',
+      )
+    ) {
+      return errResult(
+        'That catch is with the host — wait for the host to resolve it.',
+        'CONFLICT',
+        409,
+        events,
+        persist,
+      );
+    }
+    const open = openCatchForRunner(this.state.catches, me.playerId);
+    if (open && open.hunterPlayerId !== hunter.playerId) {
+      return errResult(
+        'Another Hunter has already claimed this Runner.',
+        'CONFLICT',
+        409,
+        events,
+        persist,
+      );
+    }
+    let c = open;
+    let createdHere = false;
+    if (!c) {
+      const req = requestCatch({
+        catches: this.state.catches,
+        hunter,
+        runner: me,
+        caughtRunnerIds: this.caughtRunnerIds(),
+        phase: this.room.phase,
+        catchId: newId(),
+        roomId: this.room.roomId,
+        nowMs,
+        hunterFix: this.mem.latestFix[hunter.playerId] ?? null,
+        runnerFix: this.mem.latestFix[me.playerId] ?? null,
+        // P1-11: physical tag — the engine enforces proximity on these.
+        positions: {
+          hunter: this.mem.latestFix[hunter.playerId] ?? null,
+          runner: this.mem.latestFix[me.playerId] ?? null,
+        },
+        maxDistanceMeters: CATCH_MAX_DISTANCE_METERS,
+      });
+      if (!req.ok) {
+        const status = req.code === 'FORBIDDEN' ? 403 : 409;
+        return errResult(req.reason, req.code, status, events, persist);
+      }
+      c = req.value;
+      this.state.catches.push(c);
+      createdHere = true;
+    }
+    // v18 fix round (A2/F3): re-check the NAMED Hunter's liveness here,
+    // on BOTH paths, before `confirmCatch`. The create path above goes
+    // through `requestCatch`, which rejects a suspended/disconnected
+    // Hunter — but when a claim is ALREADY open this op used to skip
+    // `requestCatch` entirely and go straight to `confirmCatch`, which
+    // never checks the Hunter's state. A Hunter suspended (tab hidden /
+    // screen locked / network lost) or disconnected after claiming
+    // could then be credited with a tag the Runner confirmed alone.
+    // Same gate `requestCatch` applies: connectionState not suspended /
+    // disconnected, ejectedAt / leftAt null. The open claim is left
+    // untouched (not rolled back — it was not created here).
+    if (
+      hunter.connectionState === 'suspended' ||
+      hunter.connectionState === 'disconnected' ||
+      hunter.ejectedAt !== null ||
+      hunter.leftAt !== null
+    ) {
+      return errResult(
+        'That Hunter is suspended or no longer in play — they cannot be credited with a tag right now.',
+        'CONFLICT',
+        409,
+        events,
+        persist,
+      );
+    }
+    // Manual Runner confirm: no token is presented or needed — the
+    // Runner themself confirms the tag. The physical-tag gate below
+    // (in confirmCatch) is what stops a remote self-confirm.
+    const conf = confirmCatch({
+      catchEvent: c,
+      confirmerId: me.playerId,
+      confirmerRole: me.matchRole,
+      manualConfirm: true,
+      tokenValid: false,
+      runner: me,
+      caughtRunnerIds: this.caughtRunnerIds(),
+      phase: this.room.phase,
+      nowMs,
+      ttlSeconds: CATCH_TOKEN_TTL_SECONDS,
+      positions: {
+        hunter: this.mem.latestFix[c.hunterPlayerId] ?? null,
+        runner: this.mem.latestFix[c.runnerPlayerId] ?? null,
+      },
+      maxDistanceMeters: CATCH_MAX_DISTANCE_METERS,
+    });
+    if (!conf.ok) {
+      // Roll back a claim created by this op — a failed self-confirm
+      // must not leave a dangling pending claim behind.
+      if (createdHere) {
+        this.state.catches = this.state.catches.filter(
+          (x) => x.catchId !== (c as CatchEvent).catchId,
+        );
+      }
+      const status = conf.code === 'FORBIDDEN' ? 403 : 409;
+      return errResult(conf.reason, conf.code, status, events, persist);
+    }
+    // P1-2: validate the completion transition BEFORE mutating the
+    // catch — if confirming would complete the match from a phase that
+    // cannot complete, reject without marking it confirmed (and roll
+    // back a claim created by this op).
+    if (this.wouldCompleteOnConfirm(c, conf.value, nowMs) && !this.canCompleteMatch()) {
+      if (createdHere) {
+        this.state.catches = this.state.catches.filter((x) => x.catchId !== c.catchId);
+      }
+      return errResult(
+        'The match cannot complete from its current phase — the catch stays pending.',
+        'INVALID_STATE',
+        409,
+        events,
+        persist,
+      );
+    }
+    Object.assign(c, conf.value);
+    this.mem.rawCatchTokens.delete(c.catchId);
+    events.push(
+      this.emit('catch.confirmed', { catch: toCatchView(c) }, this.catchRecipients(c), nowMs),
+    );
+    persist.push(
+      createdHere
+        ? { kind: 'catch-insert', roomId: this.room.roomId, catch: c }
+        : { kind: 'catch-update', catch: c },
+    );
+    const applied = this.applyConfirmedTagAndWinCheck(c, nowMs);
+    events.push(...applied.events);
+    persist.push(...applied.persist);
+    events.push(this.roomStateEvent('catch-confirmed', nowMs));
     return okResult({ catch: toCatchView(c) }, events, persist);
   }
 
@@ -1747,7 +2259,6 @@ export class RoomStore {
     this.state.paused = false;
     this.state.pausedBy = null;
     this.state.pausedFrom = null;
-    void safetyStateAfterResume(this.safetyState());
     this.bumpVersion();
     const events = [
       this.emit('safety.resumed', { byPlayerId, reason: null }, this.allPlayerIds(), nowMs),
@@ -1780,11 +2291,14 @@ export class RoomStore {
     this.room.phase = transitionOrThrow(this.room.phase, 'RESOLVING');
     this.room.phase = transitionOrThrow(this.room.phase, 'COMPLETED');
     this.room.result = result;
+    // v24: the match is over — no grace survives into a terminal room.
+    this.cancelHostGrace();
     this.bumpVersion();
     // Fixes are purged at match end; raw catch tokens die with the match.
     this.mem.latestFix = {};
     this.mem.outsideZone = {};
     this.mem.rawCatchTokens.clear();
+    this.state.runnerQrTokens = [];
     this.mem.pendingPings = [];
     this.mem.pendingPingRecipients.clear();
     events.push(
@@ -1799,10 +2313,39 @@ export class RoomStore {
     return { ok: true, events, persist };
   }
 
+  /**
+   * Host cancel (v23 Rule 1, founder decision 2026-11-21) — the ONLY
+   * caller is `lifecycleOp('end')` (host-only). The store IS the
+   * deleter here: phase CANCELLED, result built, `state.deleted =
+   * true`, and exactly ONE event — a literal `'room.deleted'` with
+   * `{ result }` to every remaining seat (including suspended ones).
+   * NO `match.cancelled` from the store: the DO class, on seeing the
+   * signal, translates it into the delivered stream
+   * (`match.cancelled` synthesised FIRST, then `room.deleted`, then
+   * the `room.state` notice with reason `'room-deleted'` LAST),
+   * persists the cancel record, unregisters the invite code, closes
+   * every socket and wipes the durable state. The Supabase cancel
+   * record (`match-result` PATCH + `room-upsert`) is preserved — the
+   * class awaits it before wiping. Every later op refuses with 404
+   * ROOM_NOT_FOUND via `isDeleted()`; a second cancel refuses as
+   * deleted, not "already cancelled".
+   *
+   * The literal `'room.deleted'` string is pinned by the v23 contract
+   * (Arjun's store + DO tests, and the web client matches the raw
+   * string). It is a first-class catalogue type now (v23 fix round 1,
+   * S12: `'room.deleted'` in `WsServerPayloads` / `WS_SERVER_TYPES`,
+   * payload `{ result }` — the `MatchCancelledPayload` shape), so no
+   * cast is needed anymore.
+   *
+   * Natural completion (`completeMatch`) and the last-player-leaves
+   * path in `leaveSeat` do NOT call this and do NOT delete: a
+   * COMPLETED room still serves snapshots and replay.
+   */
   cancelMatch(
     byPlayerId: string,
     nowMs: number,
   ): OpResult<{ phase: MatchPhase; result: MatchResult }> {
+    if (this.isDeleted()) return this.deletedRefusal();
     const durationSeconds =
       this.room.startedAt === null
         ? 0
@@ -1820,10 +2363,17 @@ export class RoomStore {
       return errResult(`Cannot cancel from phase ${this.room.phase}.`, 'INVALID_STATE', 409);
     }
     this.room.result = result;
+    this.state.deleted = true;
+    // v24: the room is deleted — no grace survives it.
+    this.cancelHostGrace();
     this.bumpVersion();
     const events = [
-      this.emit('match.cancelled', { result }, this.allPlayerIds(), nowMs),
-      this.roomStateEvent('match-cancelled', nowMs),
+      this.emit(
+        'room.deleted',
+        { result },
+        this.allPlayerIds(),
+        nowMs,
+      ),
     ];
     const persist: PersistIntent[] = [
       { kind: 'match-result', room: this.room },
@@ -1831,6 +2381,122 @@ export class RoomStore {
     ];
     void byPlayerId;
     return okResult({ phase: this.room.phase, result }, events, persist);
+  }
+
+  /**
+   * v18 replay — reset a FINISHED room to LOBBY so the same room/code can
+   * play again. HOST-ONLY (host token, like start/config): a non-host
+   * gets 403, and the reset never touches the config — a non-host cannot
+   * change the config or start the game through it; starting still needs
+   * the host token via `startMatch`.
+   *
+   * Allowed only from a terminal phase (COMPLETED / CANCELLED / ABANDONED
+   * / EXPIRED) — a live or paused match cannot be replayed away (409).
+   * The phase is assigned directly, not via the state machine: terminal
+   * phases deliberately have no LOBBY edge (a replay is a reset, not a
+   * match transition), and no other caller may use this edge.
+   *
+   * Kept: room id + code, host + host tokens, roster, config (incl. the
+   * zone boundary — the next game replays on the same zone unless the
+   * host changes it in the lobby).
+   * Cleared (match state): result, startedAt/endsAt/pausedAt, pause
+   * state, shrink count, all catches, pending pings, outside-zone
+   * countdowns, raw catch tokens; every seat still in the room gets
+   * matchRole/team null, isReady false, briefing un-confirmed,
+   * suspension count 0, ejection cleared. Seats that LEFT stay left
+   * (they restore via the normal join-by-name + reconnect-token path);
+   * the game-event log is kept as the audit trail. Live GPS fixes are
+   * kept — they are current positions, not match state.
+   */
+  replayMatch(input: {
+    playerId: string;
+    hostTokenHash: string | null;
+    nowMs: number;
+  }): OpResult<{ phase: MatchPhase; roomCode: string; playerCount: number }> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    const host = this.verifyHost(input.playerId, input.hostTokenHash);
+    if (!host) {
+      return errResult('Only the host can replay the room.', 'FORBIDDEN', 403);
+    }
+    if (!isTerminalPhase(this.room.phase)) {
+      return errResult(
+        `Only a finished room can be replayed — this room is ${this.room.phase}.`,
+        'INVALID_STATE',
+        409,
+      );
+    }
+    this.room.phase = 'LOBBY';
+    this.room.result = null;
+    this.room.startedAt = null;
+    this.room.endsAt = null;
+    this.room.pausedAt = null;
+    this.state.paused = false;
+    this.state.pausedBy = null;
+    this.state.pausedFrom = null;
+    this.state.shrinkIndexApplied = 0;
+    this.state.catches = [];
+    this.state.lastPingAtMs = {};
+    this.state.runnerQrTokens = [];
+    // v24: a replayed lobby starts clean — no grace from the old match.
+    this.cancelHostGrace();
+    // v18 fix round (B2): restore the ORIGINAL configured zone boundary
+    // snapshotted at `startMatch` — shrinks mutated the live boundary
+    // in place, and resetting only the shrink counter would leave the
+    // replayed game on the ~42%-of-original zone. Deep-copied so the
+    // snapshot itself is never aliased to the live boundary. (When no
+    // match ever started the snapshot is null and the boundary is
+    // already the configured one — nothing to restore.)
+    if (this.state.originalZoneBoundary !== null && this.state.originalZoneBoundary !== undefined) {
+      this.room.config.zone.boundary = this.state.originalZoneBoundary.map((p) => ({ ...p }));
+    }
+    this.mem.outsideZone = {};
+    this.mem.rawCatchTokens.clear();
+    this.mem.pendingPings = [];
+    this.mem.pendingPingRecipients.clear();
+    // v18 fix round (F6/A10): replay must not leak cross-round state.
+    // Announcements are for the finished match ("X was tagged", "match
+    // ends in…") — a fresh lobby must not re-deliver them to a
+    // reconnecting seat. `lastDisconnectAtMs` is the same story (it
+    // drives missed-message delivery for the old match). The live fixes
+    // are from the old match too, so they go with it — a seat that
+    // never reports in the new game must read "Location never
+    // reported", not carry a stale dot. The fix/persist throttles reset
+    // with them (they are per-match hot-path state, not identity).
+    this.mem.announcements = [];
+    this.mem.lastDisconnectAtMs = {};
+    this.mem.latestFix = {};
+    this.mem.lastFixAcceptedAtMs = {};
+    this.mem.lastPlayerPersistAtMs = {};
+    const persist: PersistIntent[] = [{ kind: 'room-upsert', room: this.room }];
+    for (const p of this.state.players) {
+      if (p.leftAt !== null) continue;
+      p.matchRole = null;
+      p.team = null;
+      p.isReady = false;
+      p.briefingConfirmed = false;
+      p.suspensionCount = 0;
+      p.ejectedAt = null;
+      // v18 fix round (F6/A10): a seat suspended when the match ended
+      // must not enter the new lobby still marked suspended — it would
+      // sit "location unknown" and blocked from confirming until a
+      // resume that nothing triggers in the lobby. Back to connected,
+      // with no stale quality or fix timestamp from the old match.
+      p.connectionState = 'connected';
+      p.locationQuality = null;
+      p.lastFixAt = null;
+      persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: p });
+    }
+    this.bumpVersion();
+    const events = [this.roomStateEvent('replay-reset', input.nowMs)];
+    return okResult(
+      {
+        phase: this.room.phase,
+        roomCode: this.room.roomCode,
+        playerCount: this.activePlayers().length,
+      },
+      events,
+      persist,
+    );
   }
 
   /** REST lifecycle: start / pause / resume / end. Pause is any player; the rest host-only. */
@@ -1841,6 +2507,7 @@ export class RoomStore {
     reconnectTokenHash?: string | null;
     nowMs: number;
   }): OpResult<Record<string, unknown>> {
+    if (this.isDeleted()) return this.deletedRefusal();
     switch (input.action) {
       case 'start': {
         const r = this.startMatch({
@@ -1892,6 +2559,7 @@ export class RoomStore {
     reconnectTokenHash: string | null;
     nowMs: number;
   }): OpResult<WsSnapshotPayload> {
+    if (this.isDeleted()) return this.deletedRefusal();
     const seat = this.verifyReconnect(input.playerId, input.reconnectTokenHash);
     if (!seat) {
       return errResult('Seat not found or reconnect token does not match.', 'FORBIDDEN', 403);
@@ -1910,6 +2578,7 @@ export class RoomStore {
     result: MatchResult;
     scores: Record<string, number>;
   }> {
+    if (this.isDeleted()) return this.deletedRefusal();
     const seat = this.verifyReconnect(input.playerId, input.reconnectTokenHash);
     if (!seat) {
       return errResult('Seat not found or reconnect token does not match.', 'FORBIDDEN', 403);
@@ -1983,44 +2652,394 @@ export class RoomStore {
   ): { resumed: boolean; events: OutboundEvent[]; persist: PersistIntent[] } {
     const seat = this.player(playerId);
     if (!seat) return { resumed: false, events: [], persist: [] };
+    const events: OutboundEvent[] = [];
+    const persist: PersistIntent[] = [];
+    let resumed = false;
     const r = resumeSuspendedPlayer(seat, nowMs);
-    if (!r.resumed) return { resumed: false, events: [], persist: [] };
-    Object.assign(seat, r.player);
-    const events = [
-      this.emit('player.resumed', { playerId }, this.allPlayerIds(), nowMs),
-    ];
-    const persist: PersistIntent[] = [
-      { kind: 'player-upsert', roomId: this.room.roomId, player: seat },
-    ];
-    persist.push(
-      this.logGameEvent('PLAYER_RECONNECTED', playerId, { playerId }, nowMs),
-    );
-    return { resumed: true, events, persist };
+    if (r.resumed) {
+      Object.assign(seat, r.player);
+      resumed = true;
+      events.push(
+        this.emit('player.resumed', { playerId }, this.allPlayerIds(), nowMs),
+      );
+      persist.push(
+        { kind: 'player-upsert', roomId: this.room.roomId, player: seat },
+        this.logGameEvent('PLAYER_RECONNECTED', playerId, { playerId }, nowMs),
+      );
+    }
+    // v24 — a graced host who resumes inside the grace keeps host:
+    // cancel the grace BEFORE the re-trigger below, so it cannot
+    // transfer a host who is connected again. The host token was
+    // never deleted during the grace, so `verifyHost` still accepts
+    // the restored host. (A host who returns AFTER a transfer is a
+    // regular player by then — the grace is already gone — so this
+    // never flips host back.)
+    if (
+      seat.isHost &&
+      seat.connectionState === 'connected' &&
+      this.state.hostGrace?.hostPlayerId === playerId
+    ) {
+      this.cancelHostGrace(playerId);
+    }
+    // v23 fix round 1 (S8): a seat coming back (or re-helloing) is the
+    // trigger to re-run succession when the room is hostless — the
+    // host disconnected while every remaining seat was suspended, so
+    // the original succession found nobody. If the resuming seat IS
+    // the host it is connected again by now, so this is a no-op for it.
+    const s = this.succeedHostIfSuspended(nowMs);
+    events.push(...s.events);
+    persist.push(...s.persist);
+    return { resumed, events, persist };
   }
 
-  /** Socket close marks the seat suspended — NEVER removal. */
+  // -- v24 host reconnect grace (founder decision D1, 2026-11-21) ------
+
+  /**
+   * The running grace's deadline (epoch ms), or null when no grace is
+   * running. A grace naming a seat that is no longer the suspended
+   * host is stale — report null so the snapshot never advertises a
+   * deadline for a host who already kept / lost host another way.
+   */
+  hostGraceEndsAtMs(): number | null {
+    const g = this.state.hostGrace;
+    if (!g) return null;
+    const host = this.player(g.hostPlayerId);
+    if (!host || !host.isHost || host.connectionState !== 'suspended' || host.leftAt !== null) {
+      return null;
+    }
+    return g.endsAtMs;
+  }
+
+  /**
+   * Start the host's reconnect grace. Called ONLY from `suspendSeat`
+   * on an actually-gone reason (`'network-lost'` /
+   * `'heartbeat-timeout'`), and ONLY on the transition into
+   * actually-gone suspension — which is exactly when `suspendSeat`
+   * calls it: a fresh suspend just recorded the suspension, and an
+   * already-suspended seat (tab hidden first, socket closed after)
+   * is suspended by now. No-ops when the phase is terminal, the seat
+   * is not the host, or the seat is not suspended. A grace already
+   * running for this host is NEVER restarted or extended — timers
+   * never stack, so a second actually-gone reason while suspended
+   * keeps the deadline from the first one. Returns true when a grace
+   * actually started (the caller persists it + makes it visible).
+   *
+   * v24 follow-up — the start MUST move the snapshot key: it bumps
+   * the room version, so a snapshot re-fetched after the grace starts
+   * is never identical-skipped by the client's `(version, serverSeq)`
+   * gate. (The caller also emits a `room.state` when no other event
+   * fires, and a room-upsert persist — see `suspendSeat`.)
+   */
+  startHostGrace(hostPlayerId: string, nowMs: number): boolean {
+    if (isTerminalPhase(this.room.phase)) return false;
+    const seat = this.player(hostPlayerId);
+    if (!seat || !seat.isHost) return false;
+    if (seat.connectionState !== 'suspended') return false;
+    if (seat.leftAt !== null) return false;
+    const existing = this.state.hostGrace;
+    if (existing && existing.hostPlayerId === hostPlayerId) return false;
+    this.state.hostGrace = {
+      hostPlayerId,
+      endsAtMs: nowMs + HOST_RECONNECT_GRACE_MS,
+    };
+    this.bumpVersion();
+    return true;
+  }
+
+  /**
+   * Cancel the grace. Called when the graced host resumes
+   * (`resumeOnHello`, join-path restore), when the host leaves
+   * voluntarily (`leaveSeat` — no grace survives a leave), and when
+   * the room reaches a terminal phase. With no argument it clears
+   * whatever grace is recorded; with a host id it clears only that
+   * host's grace.
+   */
+  cancelHostGrace(hostPlayerId?: string): void {
+    const g = this.state.hostGrace;
+    if (!g) return;
+    if (hostPlayerId !== undefined && g.hostPlayerId !== hostPlayerId) return;
+    this.state.hostGrace = null;
+  }
+
+  /**
+   * v24 follow-up — notice for a grace that ended WITHOUT a transfer
+   * (expired with no successor, the graced host is no longer the
+   * suspended host, or the room went terminal). The clearing must be
+   * persisted (a room-upsert), must move the snapshot key
+   * (bumpVersion), AND must reach clients (a `room.state` broadcast,
+   * which makes them re-fetch the snapshot) — otherwise the client's
+   * grace line lingers on a deadline that no longer exists, and the
+   * alarm path (which saves only when something changed) would never
+   * persist the clearing. No-op when no grace is recorded. Callers
+   * that transfer do NOT use this: the transfer's own events /
+   * persist / version bump already carry the clearing.
+   */
+  private graceClearedNotice(
+    nowMs: number,
+  ): { events: OutboundEvent[]; persist: PersistIntent[] } {
+    if (!this.state.hostGrace) return { events: [], persist: [] };
+    this.state.hostGrace = null;
+    this.bumpVersion();
+    return {
+      events: [this.roomStateEvent('host-grace-expired', nowMs)],
+      persist: [{ kind: 'room-upsert', room: this.room }],
+    };
+  }
+
+  /**
+   * v24 — grace expiry, called from `alarmTick`. Returns the transfer
+   * (or nothing) for the caller to deliver/persist. Guards, in order:
+   * no grace → nothing; terminal phase → the grace dies with the room
+   * (no transfer); RESOLVING → the grace waits out the resolve
+   * (`completeMatch` clears it when the match completes — a transfer
+   * mid-resolve would crown a host for a finished game); deadline not
+   * yet reached → nothing; host no longer the suspended host (resumed
+   * without cancelling, left, transferred already) → the grace is
+   * cleared and nothing transfers. At expiry WITH a successor the
+   * transfer clears the grace (`transferHostToSeat`) and its own
+   * events / persist / version bump carry the clearing. At expiry
+   * with NO successor the lapsed record STANDS (F3, v24 fix round):
+   * clearing it would strand the room hostless forever, because the
+   * re-trigger (`succeedHostIfSuspended`) may only transfer on an
+   * expired grace recorded for this host — with the record gone it
+   * no-ops (F1 rule). The standing record is the marker that lets a
+   * later resume / fresh join re-trigger the transfer when a
+   * successor appears; it is cleared only by a completed transfer,
+   * a resume (`cancelHostGrace`), a leave, or a terminal phase. The
+   * snapshot keeps reporting the past deadline while the host is
+   * still the suspended host, so the client's "Waiting for the
+   * host…" line stays up in the lapsed state — acceptable, the room
+   * IS still hostless. The transfer itself calls
+   * `succeedHostAfterDisconnect` with NO batchId: a fresh id, so it
+   * can never amend an already-delivered transfer (v23 S6 lesson —
+   * expiry must never rewrite a delivered event, and a no-batchId
+   * call cannot amend anything).
+   */
+  expireHostGrace(
+    nowMs: number,
+  ): { events: OutboundEvent[]; persist: PersistIntent[] } {
+    const none = { events: [] as OutboundEvent[], persist: [] as PersistIntent[] };
+    const g = this.state.hostGrace;
+    if (!g) return none;
+    if (isTerminalPhase(this.room.phase)) {
+      // Terminal: no transfer — but the clearing itself still needs
+      // the notice (persisted + visible), not a silent drop.
+      return this.graceClearedNotice(nowMs);
+    }
+    const phase = this.room.phase;
+    if (
+      phase !== 'LOBBY' &&
+      phase !== 'READY_CHECK' &&
+      phase !== 'HEAD_START' &&
+      phase !== 'ACTIVE' &&
+      phase !== 'SAFETY_PAUSED'
+    ) {
+      return none;
+    }
+    if (nowMs < g.endsAtMs) return none;
+    const host = this.player(g.hostPlayerId);
+    if (!host || !host.isHost || host.connectionState !== 'suspended' || host.leftAt !== null) {
+      // Stale grace: the host is gone another way — clear with the
+      // notice, no transfer.
+      return this.graceClearedNotice(nowMs);
+    }
+    const s = this.succeedHostAfterDisconnect(host.playerId, nowMs);
+    if (s.transferred) {
+      // The transfer cleared the grace (`transferHostToSeat`) and its
+      // own events / persist / version bump carry the clearing.
+      return { events: s.events, persist: s.persist };
+    }
+    // F3 — expired with no successor: return NOTHING and keep the
+    // lapsed record standing (no clearing, no notice). Clearing here
+    // used to strand the room hostless forever: the re-trigger below
+    // (`succeedHostIfSuspended`) may only transfer on an expired
+    // grace recorded for this host, so a cleared record made every
+    // later resume / join a no-op. The record is the marker; the
+    // next tick / resume re-trigger transfers as soon as a successor
+    // appears, and the record is cleared then (by the transfer), by
+    // a resume, a leave, or a terminal phase.
+    return none;
+  }
+
+  /**
+   * v23 fix round 1 (S8) — hostless-room re-trigger. If the current
+   * host seat is suspended AND a grace recorded for this host has
+   * EXPIRED, run succession to the earliest-joined connected seat
+   * (the alarm's expiry step may not have run yet). A suspended host
+   * with NO grace recorded for them — 'tab-hidden' / 'screen-locked'
+   * / 'unknown' never start one — keeps host: no transfer, ever, from
+   * this path (F1, v24 fix round). If the host seat LEFT while every
+   * remaining seat was suspended, `leaveSeat` crowned nobody (S14: no
+   * suspended successor), so the room is hostless with `isHost` still
+   * on the absent host — the first seat to come back transfers host
+   * here instead. No-op when the host is connected, the room is
+   * terminal, or nobody connected remains. Called from
+   * `resumeOnHello` and from `alarmTick`, the two moments a suspended
+   * host can gain a live successor without a fresh disconnect.
+   */
+  private succeedHostIfSuspended(
+    nowMs: number,
+  ): { events: OutboundEvent[]; persist: PersistIntent[] } {
+    // F4 (v24 fix round) — RESOLVING waits out the resolve, like
+    // `expireHostGrace`: `completeMatch` transitions synchronously,
+    // so this is unreachable in practice, but the two expiry paths
+    // must agree — never crown a host for a finished game. One-line
+    // guard covering both transfer paths below.
+    if (this.room.phase === 'RESOLVING') return { events: [], persist: [] };
+    const host = this.state.players.find((p) => p.isHost);
+    if (!host) return { events: [], persist: [] };
+    if (host.connectionState === 'suspended') {
+      // v24 — while a grace is running for this host and has not
+      // expired, the host keeps host: skip the transfer. The
+      // `leftAt !== null` branch below (voluntary leave, no grace)
+      // still runs. When the grace HAS expired but the alarm's expiry
+      // step has not run yet, the transfer happens here instead.
+      const g = this.state.hostGrace;
+      if (g && g.hostPlayerId === host.playerId && nowMs < g.endsAtMs) {
+        return { events: [], persist: [] };
+      }
+      // F1 (v24 fix round) — NO grace recorded for this host means
+      // the suspension was NOT actually-gone: 'tab-hidden' /
+      // 'screen-locked' / 'unknown' never start a grace
+      // (`suspendSeat` only starts one for 'network-lost' /
+      // 'heartbeat-timeout'), and a host who merely hid a tab keeps
+      // host (v23 rule, founder D1: "host stays host until they've
+      // really left"). Only an EXPIRED grace recorded for THIS host
+      // may transfer here; without one, return no-op — otherwise
+      // the next alarm tick / resume re-trigger would transfer a
+      // tab-hidden host that `suspendSeat` correctly did not.
+      if (!g || g.hostPlayerId !== host.playerId) {
+        return { events: [], persist: [] };
+      }
+      const s = this.succeedHostAfterDisconnect(host.playerId, nowMs);
+      if (s.transferred) return { events: s.events, persist: s.persist };
+      // F3 — the grace expired but nobody could take host: return
+      // NOTHING and keep the lapsed record standing (no clearing, no
+      // notice). Clearing here used to strand the room hostless
+      // forever: with the record gone the F1 rule above makes every
+      // later tick / resume a no-op, so a seat resuming later could
+      // never take host. The standing record is the marker — the
+      // next tick / resume re-trigger transfers as soon as a
+      // successor appears.
+      return { events: [], persist: [] };
+    }
+    // The host LEFT while every remaining seat was suspended:
+    // `leaveSeat` crowns no suspended seat (S14), so the room is
+    // hostless with `isHost` still on the absent host. The first seat
+    // to come back re-triggers the transfer here, to the
+    // earliest-joined connected seat.
+    if (host.leftAt === null) return { events: [], persist: [] };
+    if (isTerminalPhase(this.room.phase)) return { events: [], persist: [] };
+    const next = this.state.players
+      .filter((p) => p.leftAt === null && p.connectionState !== 'suspended')
+      .sort((a, b) => Date.parse(a.joinedAt) - Date.parse(b.joinedAt))[0];
+    if (!next) return { events: [], persist: [] };
+    const s = this.transferHostToSeat(host, next, nowMs);
+    return { events: s.events, persist: s.persist };
+  }
+
+  /**
+   * Socket close marks the seat suspended — NEVER removal.
+   *
+   * v23 Rule 2 — host succession lives HERE, gated on the REASON
+   * (founder decision 2026-11-21; pinned by Arjun's v23 store tests):
+   *  - `'network-lost'` (socket close) and `'heartbeat-timeout'`
+   *    (alarm) are "actually gone" — a suspended HOST transfers host
+   *    to the earliest-joined remaining player, via
+   *    `succeedHostAfterDisconnect`.
+   *  - `'tab-hidden'`, `'screen-locked'` and `'unknown'` NEVER
+   *    transfer — a host switching tabs or locking the screen keeps
+   *    host. The gate is the reason, not the call site: the class's
+   *    socket-close sweep and the alarm arrive as `'network-lost'` /
+   *    `'heartbeat-timeout'` and transfer. (v23 fix round 1, S13: the
+   *    WS `player.suspended` handler no longer passes a client-supplied
+   *    `'network-lost'` / `'heartbeat-timeout'` through — those map to
+   *    `'unknown'` there, so only the server-side sweep/alarm assert
+   *    "actually gone".)
+   * A seat already suspended still succeeds when the reason is
+   * actually-gone (tab hidden first, socket closed after): the
+   * suspension itself emits nothing twice, but the succession runs.
+   *
+   * v24 (founder decision D1, 2026-11-21) — the succession above is
+   * now DEFERRED by a 30 s grace: an actually-gone host suspend
+   * starts the grace (`startHostGrace`) instead of transferring
+   * immediately. The transfer happens at expiry (`expireHostGrace`,
+   * from `alarmTick`) if the host has not returned. Everything else
+   * in this doc comment still holds, with "transfers" read as
+   * "starts the grace, then transfers at expiry".
+   *
+   * `batchId` (v23 fix round 1, S6) groups simultaneous disconnects:
+   * the class sweep and one alarm tick each pass a single id for the
+   * whole batch, so the same-batch amend in
+   * `succeedHostAfterDisconnect` only ever rewrites a transfer from
+   * THIS batch. A lone call (WS handler, resume re-trigger) passes
+   * none and gets a fresh id per call, so it can never amend another
+   * call's already-delivered transfer. (v24: `suspendSeat` no longer
+   * calls `succeedHostAfterDisconnect` at all, so the batchId is
+   * accepted but unused here — the grace expiry call passes NO
+   * batchId, which is what guarantees it can never amend a delivered
+   * transfer.)
+   */
   suspendSeat(
     playerId: string,
     reason: 'tab-hidden' | 'screen-locked' | 'network-lost' | 'heartbeat-timeout' | 'unknown',
     nowMs: number,
+    batchId?: string,
   ): { events: OutboundEvent[]; persist: PersistIntent[]; needsHostCheckin: boolean } {
     const seat = this.player(playerId);
-    if (!seat || seat.connectionState === 'suspended') {
+    if (!seat) {
       return { events: [], persist: [], needsHostCheckin: false };
     }
-    const r = recordSuspension(seat, reason);
-    Object.assign(seat, r.player);
-    this.mem.lastDisconnectAtMs[playerId] = nowMs;
-    const events = [
-      this.emit('player.suspended', { playerId, reason }, this.allPlayerIds(), nowMs),
-    ];
-    const persist: PersistIntent[] = [
-      { kind: 'player-upsert', roomId: this.room.roomId, player: seat },
-    ];
-    persist.push(
-      this.logGameEvent('PLAYER_DISCONNECTED', playerId, { playerId, reason }, nowMs),
-    );
-    return { events, persist, needsHostCheckin: r.needsHostCheckin };
+    const events: OutboundEvent[] = [];
+    const persist: PersistIntent[] = [];
+    let needsHostCheckin = false;
+    // v24 follow-up: whether the seat was ALREADY suspended before
+    // this call — when it was, this call emits no `player.suspended`,
+    // so a grace started below needs its own event to reach clients.
+    const wasSuspended = seat.connectionState === 'suspended';
+    if (seat.connectionState !== 'suspended') {
+      const r = recordSuspension(seat, reason);
+      Object.assign(seat, r.player);
+      this.mem.lastDisconnectAtMs[playerId] = nowMs;
+      events.push(
+        this.emit('player.suspended', { playerId, reason }, this.allPlayerIds(), nowMs),
+      );
+      persist.push(
+        { kind: 'player-upsert', roomId: this.room.roomId, player: seat },
+        this.logGameEvent('PLAYER_DISCONNECTED', playerId, { playerId, reason }, nowMs),
+      );
+      needsHostCheckin = r.needsHostCheckin;
+    }
+    if (reason === 'network-lost' || reason === 'heartbeat-timeout') {
+      // v24 — NO immediate succession: an actually-gone HOST starts
+      // the 30 s reconnect grace instead (`startHostGrace` — a no-op
+      // for non-host seats, and never restarts an already-running
+      // grace). The transfer happens at expiry (`expireHostGrace`,
+      // from `alarmTick`) if the host has not returned by then.
+      // `batchId` is intentionally unused here now: the expiry call
+      // passes NO batchId (fresh id), so it can never amend a
+      // delivered transfer (v23 S6 lesson).
+      void batchId;
+      if (this.startHostGrace(playerId, nowMs)) {
+        // v24 follow-up — the grace start must be persisted AND
+        // visible. The room-upsert persists it: without this, the
+        // already-suspended case returns no persist intent at all and
+        // the class would never save the grace (it would not survive
+        // a DO eviction). The version bump in `startHostGrace` moves
+        // the snapshot key, so a re-fetched snapshot is never
+        // identical-skipped. And when the seat was ALREADY suspended,
+        // this call emits nothing else — so a `room.state` is emitted
+        // here, the only trigger that makes clients re-fetch the
+        // snapshot and see the grace at all. (In the fresh case
+        // `player.suspended` already triggers the re-fetch, so no
+        // second event is needed.)
+        if (wasSuspended) {
+          events.push(this.roomStateEvent('host-grace-started', nowMs));
+        }
+        persist.push({ kind: 'room-upsert', room: this.room });
+      }
+    }
+    return { events, persist, needsHostCheckin };
   }
 
   /** Leave: marks leftAt + disconnected; host-leave auto-transfers host. */
@@ -2041,8 +3060,19 @@ export class RoomStore {
       { kind: 'player-upsert', roomId: this.room.roomId, player: seat },
     ];
     if (seat.isHost) {
+      // v24 — voluntary leave counts as really left: no grace
+      // survives a leave, even one recorded before the leave.
+      this.cancelHostGrace(seat.playerId);
       const next = this.state.players
-        .filter((p) => p.leftAt === null)
+        .filter(
+          (p) =>
+            p.leftAt === null &&
+            // v23 fix round 1 (S14): mirror
+            // `succeedHostAfterDisconnect` — a suspended seat must not
+            // be crowned. It cannot mint a host token until it
+            // reconnects, so crowning it strands the room hostless.
+            p.connectionState !== 'suspended',
+        )
         .sort((a, b) => Date.parse(a.joinedAt) - Date.parse(b.joinedAt))[0];
       if (next) {
         delete this.state.hostTokens[seat.playerId];
@@ -2058,6 +3088,12 @@ export class RoomStore {
           ),
         );
         persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: next });
+      } else {
+        // v23 fix round 1 (S1): no successor — the leaver's host token
+        // dies with the seat instead of surviving on a left host.
+        // (`verifyHost` also refuses left seats now, so the token is
+        // unusable either way; deleting it keeps the record honest.)
+        delete this.state.hostTokens[seat.playerId];
       }
     }
     this.bumpVersion();
@@ -2073,6 +3109,9 @@ export class RoomStore {
     // RESOLVING cancels. A terminal phase stops the alarm (the class
     // deletes it) and frees the invite code (class unregisters it).
     if (this.activePlayers().length === 0 && !isTerminalPhase(this.room.phase)) {
+      // v24: the room ends terminal here, so no grace survives it —
+      // a grace must never resurrect or transfer in a terminal room.
+      this.cancelHostGrace();
       const from = this.room.phase;
       const outcome = from === 'LOBBY' ? 'expire' : 'abandon';
       const moved = transitionForEvent(from, outcome);
@@ -2104,6 +3143,180 @@ export class RoomStore {
       }
     }
     return { events, persist };
+  }
+
+  /**
+   * Host succession on ACTUAL disconnect (Rule 2, founder decision
+   * 2026-11-21). v24: NO LONGER called from `suspendSeat` — a
+   * disconnect starts the 30 s grace instead, and this runs only at
+   * grace expiry (`expireHostGrace`, from `alarmTick`, NO batchId)
+   * or from the hostless re-trigger `succeedHostIfSuspended` (grace
+   * already expired — a suspended host with no grace recorded keeps
+   * host, F1). NEVER from the WS
+   * `player.suspended` handler with a tab-hidden / screen-locked
+   * reason: a host who switches tabs or locks the screen suspends
+   * but keeps host.
+   *
+   * Ordering is `leaveSeat`'s: remaining seats, sorted by `joinedAt`
+   * ascending, first wins — with one eligibility difference forced by
+   * the disconnect case. `leaveSeat` filters only on `leftAt === null`,
+   * because the leaver is the only gone seat. Here the gone seats are
+   * the suspended ones, so a suspended seat is NOT a candidate: the
+   * founder's rule is "if that player has also left, the next earliest
+   * joiner", and a disconnected player has left in exactly that sense.
+   * Without this, two simultaneous disconnects flip host BACK to the
+   * dead original host — the sweep succeeds h1→p2, then p2→h1 (h1 is
+   * still `leftAt === null`, merely suspended, and is earliest) — a
+   * double-transfer ending with a disconnected host, and a reconnected
+   * h1 resuming AS host. Skipping suspended candidates makes the
+   * double-disconnect deterministic: the earliest still-present player
+   * wins in a single transfer. A suspended seat that later reconnects
+   * is still in the room, just not host — no harm. Role / caught /
+   * ejected state are still NOT consulted: a caught/spectating
+   * CONNECTED earliest joiner still becomes host (join order only).
+   * The old host's host token is deleted, exactly as `leaveSeat` /
+   * `transferHost` do; the new host mints a fresh token via the
+   * existing `issue-host-token` op. The snapshot carries the new host
+   * at once (`room.hostPlayerId` + per-seat `isHost`), so the new
+   * host gets full host controls immediately. One-way and sticky:
+   * nothing here ever flips host back, and `resumeOnHello` never
+   * touches `isHost`, so a reconnected old host resumes as a regular
+   * player.
+   *
+   * SAME-BATCH AMEND (Arjun's v23 double-disconnect contract): two
+   * seats dropping in the same instant share one batch (the class
+   * sweep and one alarm tick each pass a single `batchId` for the
+   * whole batch — v23 fix round 1, S6: keyed by batch, NOT by
+   * `nowMs`, so two separate disconnects that happen to share a
+   * millisecond can never amend each other's transfer). The first
+   * drop transfers host to the earliest-joined remaining seat; when
+   * THAT seat drops in the same batch, the succession does NOT emit a
+   * second `host.transferred` — it AMENDS the one already emitted
+   * (its `newHostPlayerId` rewritten to the final host) and emits
+   * only a `room.state`. Exactly one transfer per simultaneous
+   * disconnect, naming the final host; a `room.state` still goes out
+   * so clients re-fetch the snapshot and see the new host at once.
+   * The amended event object is the one already returned to the
+   * caller (the class sweep delivers after the loop), so every
+   * observer sees the final target — the amend is only ever applied
+   * to an event that has not been delivered yet (the batching
+   * contract on `lastSuccession`). A later drop in a DIFFERENT batch
+   * is a separate batch and emits a fresh transfer.
+   *
+   * No-op (`transferred: false`) when the seat is not the host, is
+   * not suspended, the phase is terminal, or nobody remains.
+   */
+  succeedHostAfterDisconnect(
+    playerId: string,
+    nowMs: number,
+    batchId?: string,
+  ): { transferred: boolean; events: OutboundEvent[]; persist: PersistIntent[] } {
+    const seat = this.player(playerId);
+    const none = { transferred: false, events: [], persist: [] as PersistIntent[] };
+    if (!seat || !seat.isHost) return none;
+    if (seat.connectionState !== 'suspended') return none;
+    if (isTerminalPhase(this.room.phase)) return none;
+    const next = this.state.players
+      .filter(
+        (p) =>
+          p.leftAt === null &&
+          p.playerId !== seat.playerId &&
+          p.connectionState !== 'suspended',
+      )
+      .sort((a, b) => Date.parse(a.joinedAt) - Date.parse(b.joinedAt))[0];
+    if (!next) return none;
+    return this.transferHostToSeat(seat, next, nowMs, batchId);
+  }
+
+  /**
+   * The shared transfer core: move `isHost` + `hostPlayerId` from
+   * `prev` to `next`, delete the old host's token, persist, and emit
+   * exactly one `host.transferred` naming the final host — amending
+   * the batch's earlier transfer instead of emitting a second one
+   * when `next`'s predecessor in THIS batch was the seat that just
+   * received host (see the same-batch amend above). Used by
+   * `succeedHostAfterDisconnect` and by the hostless re-trigger
+   * `succeedHostIfSuspended` (which also covers a host that LEFT
+   * while every remaining seat was suspended — `leaveSeat` crowns no
+   * suspended seat, so the transfer waits for the first seat to come
+   * back). Callers must respect the batching contract on
+   * `lastSuccession`: the amend only rewrites an event that has not
+   * been delivered yet.
+   */
+  private transferHostToSeat(
+    prev: Player,
+    next: Player,
+    nowMs: number,
+    batchId?: string,
+  ): { transferred: boolean; events: OutboundEvent[]; persist: PersistIntent[] } {
+    // v24: any completed transfer ends the grace for the previous
+    // host — a transferred host never gets a grace back.
+    if (this.state.hostGrace?.hostPlayerId === prev.playerId) {
+      this.state.hostGrace = null;
+    }
+    delete this.state.hostTokens[prev.playerId];
+    prev.isHost = false;
+    next.isHost = true;
+    this.state.room.hostPlayerId = next.playerId;
+    this.bumpVersion();
+    const persist: PersistIntent[] = [
+      { kind: 'room-upsert', room: this.room },
+      { kind: 'player-upsert', roomId: this.room.roomId, player: prev },
+      { kind: 'player-upsert', roomId: this.room.roomId, player: next },
+    ];
+    // Same-batch amend: the seat dropping now is the seat that JUST
+    // received host via succession in this same batch — rewrite the
+    // one transfer event to name the final host, emit no second one.
+    // Keyed by `batchId` (S6): a call with no batchId, or a different
+    // batch's id, never amends — two separate disconnects sharing a
+    // millisecond emit two truthful transfers.
+    const prior = this.mem.lastSuccession;
+    if (
+      batchId !== undefined &&
+      prior !== null &&
+      prior.batchId === batchId &&
+      prior.event.payload['newHostPlayerId'] === prev.playerId
+    ) {
+      prior.event.payload['newHostPlayerId'] = next.playerId;
+      return {
+        transferred: true,
+        events: [this.roomStateEvent('host-transferred', nowMs)],
+        persist,
+      };
+    }
+    const transfer = this.emit(
+      'host.transferred',
+      { previousHostPlayerId: prev.playerId, newHostPlayerId: next.playerId },
+      this.allPlayerIds(),
+      nowMs,
+    );
+    // A lone call (no batchId) gets a fresh id, so a later call can
+    // never mistake it for its own batch.
+    this.mem.lastSuccession = { batchId: batchId ?? newId(), event: transfer };
+    return {
+      transferred: true,
+      events: [transfer, this.roomStateEvent('host-transferred', nowMs)],
+      persist,
+    };
+  }
+
+  /**
+   * Deletion notice (Rule 1) — the LAST event of the delivered
+   * deletion stream, minted by the DO class (not by `cancelMatch`):
+   * a `room.state` broadcast with reason `'room-deleted'`. The full
+   * stream the class delivers is `match.cancelled` (with the result,
+   * synthesised by the class) → `room.deleted` (the literal signal
+   * from `cancelMatch`, re-emitted here) → this notice. The notice is
+   * NOT a new WS event type: the free-form `reason` string on the
+   * existing `room.state` event carries the signal (no
+   * packages/shared change). The notice tells every connected client
+   * the room is gone: on it (or on `room.deleted`, or on a snapshot
+   * 404, or on the socket closing) the client goes home with the one
+   * plain message and never offers replay — snapshot / results /
+   * replay all answer 404 from here on.
+   */
+  roomDeletedNotice(nowMs: number): OutboundEvent {
+    return this.roomStateEvent('room-deleted', nowMs);
   }
 
   // -- pending pings ----------------------------------------------------------
@@ -2143,7 +3356,10 @@ export class RoomStore {
    * SAFETY_PAUSED. Called every 1 s while live, every 30 s in the lobby,
    * never once terminal.
    */
-  alarmTick(nowMs: number): { events: OutboundEvent[]; persist: PersistIntent[] } {
+  alarmTick(
+    nowMs: number,
+    opts: { firstTickAfterWake?: boolean } = {},
+  ): { events: OutboundEvent[]; persist: PersistIntent[] } {
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
     const phase = this.room.phase;
@@ -2210,7 +3426,25 @@ export class RoomStore {
       phase === 'ABANDONED' ||
       phase === 'EXPIRED'
     ) {
+      // v24 follow-up: a grace that somehow survived to a terminal
+      // tick must still be cleared visibly + persistently (the
+      // notice), not silently — the alarm saves only when something
+      // changed, and clients must see the grace line go away.
+      const cleared = this.graceClearedNotice(nowMs);
+      events.push(...cleared.events);
+      persist.push(...cleared.persist);
       return { events, persist };
+    }
+    // v23 fix round 1 (S8): hostless-room re-trigger on the tick — a
+    // host that disconnected while every remaining seat was suspended
+    // gains a successor as soon as any seat is connected again (a
+    // seat that resumed without a hello, a fresh joiner in the lobby,
+    // ...). Cheap no-op while the host is connected; the transfer
+    // itself runs at most once (after it, the host is connected).
+    {
+      const s = this.succeedHostIfSuspended(nowMs);
+      events.push(...s.events);
+      persist.push(...s.persist);
     }
     // Idle-lobby expiry: a LOBBY older than 24 h transitions to EXPIRED
     // via transitionForEvent (the class unregisters the invite code and
@@ -2222,12 +3456,31 @@ export class RoomStore {
         const moved = transitionForEvent(phase, 'expire');
         if (moved.ok) {
           this.room.phase = moved.phase;
+          // v24: the lobby expired terminal — no grace survives it.
+          this.cancelHostGrace();
           this.bumpVersion();
           events.push(this.roomStateEvent('lobby-expired', nowMs));
           persist.push({ kind: 'room-upsert', room: this.room });
         }
         return { events, persist };
       }
+    }
+    // v24 — host reconnect grace expiry. Runs in LOBBY, READY_CHECK
+    // and live phases (HEAD_START / ACTIVE / SAFETY_PAUSED); the step
+    // itself guards the phase and the deadline. Placed BEFORE the
+    // `startedAt === null` return so the lobby (startedAt null) is
+    // covered, and AFTER the lobby-expiry block so a 24 h-expired
+    // lobby expires instead of transferring first. In the lobby and
+    // ready-check the tick is 30 s, so a tick-only check could land
+    // up to ~60 s after disconnect — the class arms a one-shot alarm
+    // at the grace deadline (see `armAlarm` in room-do-class.ts), so
+    // the tick that expires the grace fires at ~30 s. Live phases
+    // tick every 1 s, so tick expiry alone lands within a second
+    // there.
+    {
+      const g = this.expireHostGrace(nowMs);
+      events.push(...g.events);
+      persist.push(...g.persist);
     }
     if (this.room.startedAt === null) return { events, persist };
 
@@ -2268,6 +3521,72 @@ export class RoomStore {
       return { events, persist };
     }
 
+    // (4a) Missing-fix ejection (v18 — the replacement for the removed
+    // GPS start gate). A player whose location has not been reported AT
+    // ALL for 30 s during ACTIVE is EJECTED. "Reported" is the server
+    // receipt time (`lastFixAt`, set on every accepted fix — including
+    // a poor fix up to ±1000 m, which proves liveness even though its
+    // position is never used for gameplay) — NOT the fix's device
+    // timestamp, which can be skewed up to 5 min and would let a fast
+    // device clock delay its own ejection. The baseline is the moment
+    // ACTIVE began (`activeAtMs`), so a player who never reported at
+    // all is ejected 30 s into ACTIVE, not the instant the head start
+    // ends. INVARIANT: in production a live fix never exists without a
+    // fresh `lastFixAt` — `location.update` is the only writer of
+    // `mem.latestFix` and it always stamps `lastFixAt` in the same
+    // call — so reading the receipt time cannot miss a real report.
+    // (Test harnesses that write `mem.latestFix` directly MUST stamp
+    // `lastFixAt` too, or the tick will — correctly, by this rule —
+    // eject the seat for silence.)
+    // This runs BEFORE the outside-zone accrual: the old code FROZE the
+    // countdown on a missing/stale fix, so a player who went outside and
+    // then stopped sending fixes could never be ejected. That freeze is
+    // now gone for a COMPLETELY missing fix.
+    // EXACT RULE — missing vs poor:
+    // - NO fix for ≥ 30 s (lastFixAt older than 30 s / never, measured
+    //   from max(last fix, ACTIVE start)) → EJECTED here. No zone is
+    //   needed: a player with no GPS cannot be placed inside or outside
+    //   anything. Runs in ACTIVE ONLY — never during HEAD_START (a
+    //   player with a cold GPS lock, or indoors at start, gets the head
+    //   start to acquire GPS; a safety pause freezes the clock, so a
+    //   paused match never ejects for silence). JUDGMENT CALL (A4):
+    //   the founder's rule as written ejects any seat silent for 30 s
+    //   from match start — this is the softer version, flag it for the
+    //   founder to override if he wants the strict one.
+    // - A fix IS present (lastFixAt fresh, ≤ 30 s old) but POOR accuracy
+    //   → NO ejection here; the outside-zone countdown freezes as before
+    //   (step (4) + location.update). Poor GPS is warned, never treated
+    //   as absent.
+    // - SUSPENDED seats are EXEMPT here (A3/F4): a seat suspended for
+    //   tab-hidden / screen-locked / network-lost is already visible as
+    //   "location unknown" and blocked from confirming, and ejection is
+    //   terminal — suspending for 30 s must not end a player's game
+    //   while the 60 s disconnect grace is still running. JUDGMENT
+    //   CALL: the founder's rule as written ejects any seat silent for
+    //   30 s — this is the safer default, flag it for override.
+    // - FIRST TICK AFTER WAKE: `firstTickAfterWake` skips this step
+    //   once (A3/F4). After a DO eviction the durable `lastFixAt` can
+    //   be > 30 s old for a whole live roster; without the skip the
+    //   first tick would mass-eject players whose phones are alive and
+    //   about to report. They are ejected on the next tick if they
+    //   really stay silent.
+    if (this.room.phase === 'ACTIVE' && !opts.firstTickAfterWake) {
+      const activeAtMs = startedAtMs + this.room.config.headStartSeconds * 1000;
+      for (const p of this.state.players) {
+        if (p.ejectedAt !== null || p.leftAt !== null) continue;
+        if (p.connectionState === 'suspended') continue;
+        const lastSeenMs = Math.max(
+          p.lastFixAt === null ? Number.NEGATIVE_INFINITY : Date.parse(p.lastFixAt),
+          activeAtMs,
+        );
+        if (nowMs - lastSeenMs >= LOCATION_FRESHNESS_SECONDS * 1000) {
+          if (this.ejectWithWinCheck(p, nowMs, startedAtMs, events, persist)) {
+            return { events, persist };
+          }
+        }
+      }
+    }
+
     // (4) Outside-zone ejection (tick-side accrual for players already outside).
     if (this.room.config.playZoneEnabled !== false && this.room.config.zone.boundary.length >= 3) {
       for (const p of this.state.players) {
@@ -2277,7 +3596,11 @@ export class RoomStore {
         // Freeze ejection when the player's fix is stale (P2): no fresh
         // evidence, no ejection — mirroring the location.update freeze
         // for poor accuracy. A stale fix means we cannot prove the
-        // player is still outside the zone.
+        // player is still outside the zone. NOTE (v18): this freeze now
+        // only covers a fix that is present-but-stale (e.g. a device
+        // clock so skewed the fix looks old while lastFixAt is fresh) —
+        // a COMPLETELY missing fix (no fix for ≥ 30 s) was already
+        // ejected by step (4a) above and never reaches this freeze.
         const fix = this.mem.latestFix[p.playerId];
         if (!fix || nowMs - fix.timestampMs > LOCATION_FRESHNESS_SECONDS * 1000) {
           continue;
@@ -2312,75 +3635,24 @@ export class RoomStore {
     }
 
     // (5) Zone shrink — ACTIVE ONLY (P2): shrinks never fire during
-    // HEAD_START. The next zone is previewed PREVIEW_LEAD_SECONDS (30 s)
-    // ahead (P1-18) via `previewShrinkBoundary` and STORED, so the
-    // previewed boundary is the one applied when the shrink fires —
-    // never a second, different draw.
+    // HEAD_START. v18: NO preview — the founder removed `zone.preview`
+    // entirely, so nothing is drawn or broadcast ahead of a shrink. The
+    // boundary is drawn fresh at fire time via
+    // `randomOffsetShrinkBoundary` (random offset, never concentric);
+    // timing (interval), the 75% factor and the final 42% are unchanged.
     if (
       this.room.phase === 'ACTIVE' &&
       this.room.config.zoneShrinkEnabled &&
       this.room.config.zone.boundary.length >= 3
     ) {
       const intervalSeconds = this.room.config.zoneShrinkIntervalSeconds;
-      const nextIndex = this.state.shrinkIndexApplied;
-      const nextFireInSeconds = (nextIndex + 1) * intervalSeconds;
-      if (nextFireInSeconds < this.room.config.durationSeconds) {
-        const firesAtMs = startedAtMs + nextFireInSeconds * 1000;
-        if (firesAtMs > nowMs && firesAtMs - nowMs <= PREVIEW_LEAD_SECONDS * 1000) {
-          const pending = this.state.pendingShrink;
-          if (!pending || pending.shrinkIndex !== nextIndex) {
-            const drawn = previewShrinkBoundary(this.room.config.zone.boundary);
-            this.state.pendingShrink = {
-              boundary: drawn.boundary,
-              firesAtMs,
-              shrinkIndex: nextIndex,
-            };
-            this.bumpVersion();
-            events.push(
-              this.emit(
-                // 'zone.preview' is defined by the engine/shared contract
-                // (Meera); the cast goes away once it lands in
-                // WsServerPayloads.
-                'zone.preview' as WsServerMessageType,
-                { boundary: drawn.boundary, firesAtMs, shrinkIndex: nextIndex },
-                this.allPlayerIds(),
-                nowMs,
-              ),
-            );
-            persist.push({ kind: 'room-upsert', room: this.room });
-          } else if (pending.firesAtMs !== firesAtMs) {
-            // The pause shifted the deadlines: refresh the stored fire
-            // time and re-broadcast so the countdown stays honest.
-            pending.firesAtMs = firesAtMs;
-            this.bumpVersion();
-            events.push(
-              this.emit(
-                'zone.preview' as WsServerMessageType,
-                { boundary: pending.boundary, firesAtMs, shrinkIndex: nextIndex },
-                this.allPlayerIds(),
-                nowMs,
-              ),
-            );
-            persist.push({ kind: 'room-upsert', room: this.room });
-          }
-        }
-      }
       const target = shrinkIndexAt(
         elapsedSeconds,
         intervalSeconds,
         true,
       );
       while (this.state.shrinkIndexApplied < target) {
-        const idx = this.state.shrinkIndexApplied;
-        const pending = this.state.pendingShrink;
-        // Use the previewed boundary for this shrink when one was stored;
-        // otherwise draw fresh (e.g. the shrink fired without a preview
-        // because the DO woke after its fire time).
-        const boundary =
-          pending && pending.shrinkIndex === idx
-            ? pending.boundary
-            : randomOffsetShrinkBoundary(this.room.config.zone.boundary).boundary;
-        if (pending && pending.shrinkIndex === idx) this.state.pendingShrink = null;
+        const boundary = randomOffsetShrinkBoundary(this.room.config.zone.boundary).boundary;
         this.room.config.zone.boundary = boundary;
         this.state.shrinkIndexApplied += 1;
         this.bumpVersion();
@@ -2591,9 +3863,7 @@ export class RoomStore {
    * read-only traffic (heartbeat, GPS fix, snapshot, voice signal) returns
    * `durable: false`, so a tap never queues behind a full state rewrite.
    * Game mutations (ready, catch, config, pause, start, leave, join)
-   * always return `durable: true` — via a non-empty `persist`, or via
-   * `durableChanged` for the rare mutation with no Supabase intent
-   * (reveal.send's `lastFixAt`).
+   * always return `durable: true`, via a non-empty `persist`.
    */
   async handleWsMessage(
     session: WsSessionRef,
@@ -2609,12 +3879,29 @@ export class RoomStore {
     const me = this.player(playerId);
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
+    // v23 fix round 1 (S4): no WS traffic on a deleted room. Every op
+    // below is served from the store, so one guard here covers
+    // snapshot.request, radio.send, signal.send, pin.place,
+    // location.update, ready.set and the rest at once. The socket is
+    // closed — a deleted room has nothing left to say.
+    if (this.isDeleted()) {
+      return {
+        events: [
+          this.errorEvent(playerId, 'ROOM_NOT_FOUND', 'This room has been deleted.', false, undefined, nowMs),
+        ],
+        persist,
+        durable: false,
+        close: { code: 4403, reason: 'Room deleted.' },
+      };
+    }
+    // v18 follow-up: the runner-token mint mutates durable DO state
+    // (the hash-only record) but emits no Supabase persist intent, so
+    // `persist.length > 0` alone would report it non-durable and the DO
+    // class would skip `save()`. A case that changes durable state
+    // without a Supabase row sets this instead.
+    let stateDirty = false;
     const type = envelope.type;
     const payload = (envelope.payload ?? {}) as Record<string, unknown>;
-    // Set by cases that mutate durable state without emitting a persist
-    // intent (reveal.send's lastFixAt). Anything with a persist intent is
-    // durable by construction.
-    let durableChanged = false;
 
     // P1-9: cache the ACTUAL reply — broadcast events included, not an
     // empty list. A genuine same-commandId replay gets the original
@@ -2832,8 +4119,7 @@ export class RoomStore {
         // while fixes aged in between. Advance serverSeq (in-memory
         // only — this case still returns durable:false unless a persist
         // is due, so no save is written per fix; the bump persists with
-        // the next durable save). reveal.send needs no bump here: it
-        // always emits, which advances the sequence itself.
+        // the next durable save).
         this.nextSeq();
         me.lastFixAt = new Date(nowMs).toISOString();
         const quality: LocationQuality = check.quality ?? classifyAccuracy(goodFix.accuracyMeters);
@@ -2848,6 +4134,20 @@ export class RoomStore {
           events.push(this.emit('player.resumed', { playerId }, this.allPlayerIds(), nowMs));
         } else {
           me.connectionState = 'connected';
+        }
+        // v24 fix round (F4) — a suspended seat that resumes on a fix
+        // cancels its grace, mirroring `resumeOnHello` and the
+        // join-path restore. Defence-in-depth only: in production
+        // hello must be the first message, so a fix from a suspended
+        // seat is currently unreachable — but a resumed host must
+        // never leave a stale grace behind to transfer it away later.
+        if (
+          resumed &&
+          me.isHost &&
+          me.connectionState === 'connected' &&
+          this.state.hostGrace?.hostPlayerId === playerId
+        ) {
+          this.cancelHostGrace(playerId);
         }
         const connectionChanged = resumed || prevConnection !== me.connectionState;
         // Outside-zone countdown (live phases, play zone on, boundary set,
@@ -2919,48 +4219,111 @@ export class RoomStore {
         }
         break;
       }
-      case 'reveal.send': {
-        const fix = payload['fix'] as LocationFix | undefined;
-        const check = validateFix(fix, this.mem.latestFix[playerId] ?? null, nowMs);
-        if (!fix) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Reveal needs a fresh fix.', false, undefined, nowMs));
+      // v18: `reveal.send` REMOVED — the founder removed hold-to-reveal
+      // entirely. There is no case for it: a stray `reveal.send` from an
+      // old client falls through to the default case ("Unknown message
+      // type"). The shared `reveal` event type is kept for the web
+      // builder's parallel removal of the play-page button.
+      case 'catch.runner-token': {
+        // v18 follow-up — claim-less runner QR token: the Runner mints
+        // their own QR with no claim open and shows it the moment they
+        // tap "Got Tagged". Empty payload; the raw token comes back in
+        // the direct `catch.runner-token` reply, once, to the Runner
+        // only. See `mintRunnerQrToken` for the rules (Runner-only,
+        // ACTIVE-only, one live token per Runner, re-mint replaces).
+        const r = await this.mintRunnerQrToken({ playerId, nowMs });
+        if (!r.ok) {
+          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs));
+          if (r.events) events.push(...r.events);
+          if (r.persist) persist.push(...r.persist);
           break;
         }
-        if (!check.ok) {
-          // Same code mapping as location.update: malformed is
-          // VALIDATION_FAILED, only too-old is STALE_LOCATION.
-          events.push(this.errorEvent(playerId, check.code ?? 'VALIDATION_FAILED', check.errors.join(' ') || 'Reveal needs a fresh fix.', false, undefined, nowMs));
-          break;
-        }
-        // Reveals are a manual ping (a 150 m circle around the sender's
-        // exact fix, shown to the whole room) — ACTIVE only, never during
-        // HEAD_START, or a Runner could hand the Hunters their position
-        // before the hunt starts (and vice versa).
-        if (this.room.phase !== 'ACTIVE') {
-          events.push(this.errorEvent(playerId, 'INVALID_STATE', 'Reveals start once the head start ends.', false, undefined, nowMs));
-          break;
-        }
-        this.mem.latestFix[playerId] = fix;
-        me.lastFixAt = new Date(nowMs).toISOString();
-        // No Supabase intent here (as before), but the lastFixAt change
-        // IS durable state — flag it so the caller saves.
-        durableChanged = true;
-        const centre: GeoPoint = { lat: fix.lat, lng: fix.lng };
-        const reveal: RevealArea = {
-          revealId: newId(),
-          roomId: this.room.roomId,
-          byPlayerId: playerId,
-          centre,
-          radiusMeters: 150,
-          sentAt: new Date(nowMs).toISOString(),
-        };
-        events.push(this.emit('reveal', { reveal }, this.allPlayerIds(), nowMs));
+        stateDirty = true;
+        events.push(...r.events);
+        persist.push(...r.persist);
+        events.push(
+          direct('catch.runner-token', {
+            token: r.value.token,
+            runnerId: r.value.runnerId,
+            expiresAt: r.value.expiresAt,
+          }),
+        );
         break;
       }
       case 'catch.request': {
-        const runnerId = payload['runnerId'];
-        if (typeof runnerId !== 'string') {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.request needs runnerId.', false, undefined, nowMs));
+        // v18 follow-up — scan path: `qrToken` carries the raw token the
+        // Hunter decoded from the Runner's QR, with NO runnerId needed.
+        // A claim-less runner token resolves the Runner from the hash
+        // and creates the claim for them; a claim token (the QR of an
+        // already-open claim) resolves the same way. When both `qrToken`
+        // and `runnerId` are given they must agree. A failed request
+        // (too far apart, Runner not catchable, another Hunter's claim)
+        // does NOT consume the token — the Hunter can re-scan / retry
+        // with the same QR until its 120 s TTL runs out.
+        const qrToken = payload['qrToken'];
+        const runnerIdRaw = payload['runnerId'];
+        let runnerId = typeof runnerIdRaw === 'string' ? runnerIdRaw : undefined;
+        let scanned: { record: RunnerQrToken; raw: string } | null = null;
+        if (typeof qrToken === 'string') {
+          if (!isValidCatchToken(qrToken)) {
+            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', "That QR didn't scan as a catch token — try again.", false, undefined, nowMs));
+            break;
+          }
+          const resolved = await resolveRunnerQrToken(this.state.runnerQrTokens, qrToken, nowMs);
+          if (resolved.status === 'unknown') {
+            // v18 fix round (A1): the token matched NO claim-less runner
+            // record — but it may be a CLAIM QR. After a name-claim the
+            // Runner displays the claim's QR (HTTP /catch-token), and
+            // that token lives only in the claim's hash, not in any
+            // runner record. Try the open claims' hashes before giving
+            // up: a match resolves the Runner from the claim (no runner
+            // record is consumed or bound — `scanned` stays null, the
+            // claim keeps its own token). The hash domains are NOT
+            // merged — this is an explicit second lookup, and a runner
+            // token still never verifies as a claim token on its own.
+            // A match on an EXPIRED claim does not resolve (the sweep
+            // below expires it and the scan opens a fresh claim).
+            const claim = await resolveOpenClaimQrToken(this.state.catches, qrToken, nowMs);
+            if (claim !== null) {
+              if (runnerId !== undefined && runnerId !== claim.runnerPlayerId) {
+                events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That QR is for a different Runner.', false, undefined, nowMs));
+                break;
+              }
+              runnerId = claim.runnerPlayerId;
+            } else {
+              // v18 fix round (A8): an unknown token may be a genuine QR
+              // that ROTATED under the Hunter's camera (a re-mint
+              // replaces the record, so the old QR dies instantly) —
+              // say so, instead of the bare "didn't match". The
+              // distinct CATCH_EXPIRED code below is kept for tokens
+              // that are genuinely expired.
+              events.push(this.errorEvent(playerId, 'FORBIDDEN', "That QR didn't match — it may have expired or been refreshed. Ask the Runner to show a fresh QR.", false, undefined, nowMs));
+              break;
+            }
+          }
+          if (resolved.status === 'expired') {
+            events.push(this.errorEvent(playerId, 'CATCH_EXPIRED', 'That QR expired — ask the Runner to show a fresh QR.', false, undefined, nowMs));
+            break;
+          }
+          if (resolved.status === 'used') {
+            events.push(this.errorEvent(playerId, 'FORBIDDEN', 'That QR was already used — ask the Runner to show a fresh QR.', false, undefined, nowMs));
+            break;
+          }
+          // 'valid' only — 'unknown' was handled above (claim lookup
+          // sets runnerId and skips this block; no match breaks out),
+          // so `resolved.record` is non-null here.
+          if (resolved.status === 'valid') {
+            const record = resolved.record as RunnerQrToken;
+            if (runnerId !== undefined && runnerId !== record.runnerPlayerId) {
+              events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That QR is for a different Runner.', false, undefined, nowMs));
+              break;
+            }
+            runnerId = record.runnerPlayerId;
+            scanned = { record, raw: qrToken };
+          }
+        }
+        if (runnerId === undefined) {
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.request needs runnerId or a scanned qrToken.', false, undefined, nowMs));
           break;
         }
         const runner = this.player(runnerId);
@@ -2974,6 +4337,16 @@ export class RoomStore {
         const open = openCatchForRunner(this.state.catches, runnerId);
         if (open && open.hunterPlayerId === playerId) {
           // Same-Hunter re-request returns the open claim (idempotent).
+          // With a scanned runner token, BIND it to the claim as its
+          // previous hash: the claim keeps its own token (the Runner's
+          // displayed claim QR stays valid) and the scanned QR confirms
+          // too — `catch.confirm` accepts the current hash or the
+          // previous hash. The runner token is consumed either way.
+          if (scanned !== null) {
+            open.previousQrTokenHash = await catchTokenHash(open.catchId, scanned.raw);
+            scanned.record.used = true;
+            persist.push({ kind: 'catch-update', catch: open });
+          }
           events.push(direct('catch.requested', { catch: toCatchView(open) }));
           break;
         }
@@ -3002,12 +4375,28 @@ export class RoomStore {
           break;
         }
         const claim = req.value;
-        const { token, tokenHash } = await issueCatchToken(claim.catchId);
-        claim.qrTokenHash = tokenHash;
-        this.mem.rawCatchTokens.set(claim.catchId, {
-          token,
-          expiresAtMs: Date.parse(claim.requestedAt) + CATCH_TOKEN_TTL_SECONDS * 1000,
-        });
+        if (scanned !== null) {
+          // Transfer the scanned token into the claim: the claim's token
+          // hash is the catchId-scoped hash of the SAME raw value, so
+          // the Hunter's later `catch.confirm` with the scanned token
+          // verifies unchanged. The Runner keeps showing the same QR —
+          // the raw is also held in memory, so a re-fetch returns it,
+          // exactly like the name-claim path. The runner token is
+          // consumed: it can never create a second claim.
+          claim.qrTokenHash = await catchTokenHash(claim.catchId, scanned.raw);
+          scanned.record.used = true;
+          this.mem.rawCatchTokens.set(claim.catchId, {
+            token: scanned.raw,
+            expiresAtMs: Date.parse(claim.requestedAt) + CATCH_TOKEN_TTL_SECONDS * 1000,
+          });
+        } else {
+          const { token, tokenHash } = await issueCatchToken(claim.catchId);
+          claim.qrTokenHash = tokenHash;
+          this.mem.rawCatchTokens.set(claim.catchId, {
+            token,
+            expiresAtMs: Date.parse(claim.requestedAt) + CATCH_TOKEN_TTL_SECONDS * 1000,
+          });
+        }
         this.state.catches.push(claim);
         events.push(this.emit('catch.requested', { catch: toCatchView(claim) }, this.catchRecipients(claim), nowMs));
         persist.push({ kind: 'catch-insert', roomId: this.room.roomId, catch: claim });
@@ -3036,8 +4425,7 @@ export class RoomStore {
         // hash (P1-5: a QR displayed before a hibernate-driven re-mint
         // stays valid until it expires or is confirmed). A rotated token
         // (P2 re-fetch) has no preserved hash, so its old QR is dead.
-        const previousHash =
-          (c as CatchEvent & { previousQrTokenHash?: string | null }).previousQrTokenHash ?? null;
+        const previousHash = c.previousQrTokenHash ?? null;
         const tokenValid =
           manualConfirm && isRunnerConfirmer
             ? true
@@ -3093,6 +4481,27 @@ export class RoomStore {
         events.push(...applied.events);
         persist.push(...applied.persist);
         events.push(this.roomStateEvent('catch-confirmed', nowMs));
+        break;
+      }
+      case 'catch.self-confirm': {
+        // v18 Self Confirm: the Runner names the Hunter who tagged them
+        // and taps OK — the tag completes with NO confirmation needed
+        // from the Hunter. See `selfConfirmCatch` for the rules (claim
+        // created if none open, physical-tag gate, no token, no code).
+        const hunterId = payload['hunterId'];
+        if (typeof hunterId !== 'string') {
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.self-confirm needs hunterId.', false, undefined, nowMs));
+          break;
+        }
+        const r = this.selfConfirmCatch({ playerId, hunterId, nowMs });
+        if (!r.ok) {
+          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs));
+          if (r.events) events.push(...r.events);
+          if (r.persist) persist.push(...r.persist);
+          break;
+        }
+        events.push(...r.events);
+        persist.push(...r.persist);
         break;
       }
       case 'catch.dispute': {
@@ -3153,33 +4562,10 @@ export class RoomStore {
         persist.push(...r.persist);
         break;
       }
-      case 'safety.sos': {
-        const reason = typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null;
-        if (reason !== null && reason.length > REASON_MAX_CHARS) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `SOS reason must be at most ${REASON_MAX_CHARS} characters.`, false, undefined, nowMs));
-          break;
-        }
-        const next = raiseSos(this.safetyState());
-        this.state.sosActive = next.sosActive;
-        events.push(
-          this.emit(
-            'sos.raised',
-            { byPlayerId: playerId },
-            // Dedupe: when the host raises SOS the host is both the
-            // recipient and the raiser — one copy, not two.
-            [...new Set([this.room.hostPlayerId, playerId])],
-            nowMs,
-          ),
-        );
-        persist.push({
-          kind: 'safety-event',
-          roomId: this.room.roomId,
-          playerId,
-          type: 'sos',
-          reason,
-        });
-        break;
-      }
+      // v18: `safety.sos` REMOVED — the founder removed SOS entirely
+      // (server + shared). There is no case for it: a stray `safety.sos`
+      // from an old client falls through to the default case ("Unknown
+      // message type"). The safety PAUSE / resume above STAYS.
       case 'leave': {
         const reason = typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null;
         if (reason !== null && reason.length > REASON_MAX_CHARS) {
@@ -3196,14 +4582,19 @@ export class RoomStore {
         return { events, persist, durable: persist.length > 0, close: { code: 1000, reason: 'Left the room.' } };
       }
       case 'player.suspended': {
+        // v23 fix round 1 (S13): a client may only report the reasons
+        // it can honestly know — tab-hidden / screen-locked / unknown.
+        // `'network-lost'` and `'heartbeat-timeout'` are "actually
+        // gone" and trigger host succession, so a client-supplied one
+        // would let a host abdicate (or force a transfer) without a
+        // host token. They map to `'unknown'` here: the seat is still
+        // marked suspended, just without succession. Only the
+        // server-side sweep (socket close) and alarm assert those
+        // reasons, via `suspendSeat` directly.
         const reason = payload['reason'];
         const valid =
-          reason === 'tab-hidden' ||
-          reason === 'screen-locked' ||
-          reason === 'network-lost' ||
-          reason === 'heartbeat-timeout' ||
-          reason === 'unknown'
-            ? (reason as 'tab-hidden' | 'screen-locked' | 'network-lost' | 'heartbeat-timeout' | 'unknown')
+          reason === 'tab-hidden' || reason === 'screen-locked' || reason === 'unknown'
+            ? (reason as 'tab-hidden' | 'screen-locked' | 'unknown')
             : 'unknown';
         const r = this.suspendSeat(playerId, valid, nowMs);
         events.push(...r.events);
@@ -3246,17 +4637,15 @@ export class RoomStore {
         // (empty) cached reply — which is honest here, not a false
         // success: nothing was sent, so there is nothing to replay.
         // Why radio only: the other relay commands are deliberately
-        // unguarded. safety.sos must NEVER be dropped — a second SOS
-        // is a second distress call, and raiseSos is already
-        // state-idempotent (sosActive stays true); only its audit row
-        // would double-log, which is intended. pin.place / reveal.send
-        // are deliberate re-assertions (a re-placed pin or a fresh
-        // reveal is a new marker / a new position broadcast, each with
-        // a fresh id). signal.send is a transient toast with no server
-        // state — a duplicate only re-flashes it, and suppressing a
-        // quick signal the sender deliberately re-tapped would hide a
-        // live "I need help" repeat. Radio is the one where a duplicate
-        // is both likely (chat send double-tap) and pure noise.
+        // unguarded. pin.place is a deliberate re-assertion (a re-placed
+        // pin is a new marker with a fresh id). signal.send is a
+        // transient toast with no server state — a duplicate only
+        // re-flashes it, and suppressing a quick signal the sender
+        // deliberately re-tapped would hide a live "I need help" repeat.
+        // (v18: safety.sos and reveal.send no longer exist — the founder
+        // removed SOS and hold-to-reveal entirely.) Radio is the one
+        // where a duplicate is both likely (chat send double-tap) and
+        // pure noise.
         const radioKey = `${playerId}:${kind}:${text}`;
         const lastRadioAtMs = this.mem.recentRadio.get(radioKey) ?? 0;
         for (const [k, atMs] of this.mem.recentRadio) {
@@ -3438,11 +4827,12 @@ export class RoomStore {
     }
 
     rememberReply(events);
-    // Durable iff a persist intent was produced or a case flagged a
-    // durable change with no intent (reveal.send). Everything else —
-    // heartbeat ack, snapshot, GPS fix, radio/signal/voice/pin relay —
-    // is transient: the caller skips putSession + save + re-arm for it.
-    return { events, persist, durable: persist.length > 0 || durableChanged };
+    // Durable iff a persist intent was produced OR durable DO state
+    // changed with no Supabase row (`stateDirty` — the runner-token
+    // mint). Everything else — heartbeat ack, snapshot, GPS fix,
+    // radio/signal/voice/pin relay — is transient: the caller skips
+    // putSession + save + re-arm for it.
+    return { events, persist, durable: persist.length > 0 || stateDirty };
   }
 }
 

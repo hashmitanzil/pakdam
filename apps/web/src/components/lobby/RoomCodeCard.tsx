@@ -9,6 +9,8 @@
  * the same code (`/join/<CODE>`).
  */
 import { memo, useEffect, useState } from 'react';
+import QRCode from 'qrcode';
+import { Sheet } from '@/components/ui/Sheet';
 
 export interface RoomCodeCardProps {
   code: string;
@@ -56,9 +58,43 @@ export const RoomCodeCard = memo(function RoomCodeCard({
   const [copied, setCopied] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
   const [inviteLink, setInviteLink] = useState('');
+  const [showQr, setShowQr] = useState(false);
+  const [inviteQrDataUrl, setInviteQrDataUrl] = useState<string | null>(null);
+  const [inviteQrGenerating, setInviteQrGenerating] = useState(false);
   useEffect(() => {
     setInviteLink(`${window.location.origin}/join/${code}`);
   }, [code]);
+
+  // Invite QR — encodes the FULL live invite link (never the bare
+  // code), regenerated whenever the link changes (e.g. a code change).
+  // Separate from CatchQR: that path encodes raw catch tokens only.
+  useEffect(() => {
+    if (!showQr || !inviteLink) {
+      setInviteQrDataUrl(null);
+      setInviteQrGenerating(false);
+      return;
+    }
+    // F10: clear the stale QR as soon as the link changes — a fast
+    // scan in the gap must not join with the old code. The sheet shows
+    // "Generating QR…" until the new code resolves.
+    setInviteQrDataUrl(null);
+    setInviteQrGenerating(true);
+    let cancelled = false;
+    QRCode.toDataURL(inviteLink, { width: 220, margin: 1 })
+      .then((url) => {
+        if (cancelled) return;
+        setInviteQrDataUrl(url);
+        setInviteQrGenerating(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setInviteQrDataUrl(null);
+        setInviteQrGenerating(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showQr, inviteLink]);
 
   useEffect(() => {
     if (!copied) return;
@@ -126,6 +162,13 @@ export const RoomCodeCard = memo(function RoomCodeCard({
         >
           Settings
         </button>
+        <button
+          type="button"
+          onClick={() => setShowQr(true)}
+          className="text-[15px] font-semibold text-[#EF4444]"
+        >
+          Show QR
+        </button>
         {isHost ? (
           <button
             type="button"
@@ -154,6 +197,31 @@ export const RoomCodeCard = memo(function RoomCodeCard({
           {inviteLink}
         </button>
       ) : null}
+      <Sheet open={showQr} onClose={() => setShowQr(false)} title="Join with QR">
+        <div className="flex flex-col items-center gap-3 p-2 text-center">
+          {inviteQrDataUrl ? (
+            // Plain <img> on purpose: the QR is a generated data URL,
+            // which next/image does not optimise (same as CatchQR).
+            <img
+              src={inviteQrDataUrl}
+              alt={`QR code to join with code ${code}`}
+              width={220}
+              height={220}
+              className="rounded-xl bg-white p-2"
+            />
+          ) : inviteQrGenerating ? (
+            <p className="text-[14px] text-[#A1A1AA]">Generating QR…</p>
+          ) : (
+            <p className="text-[14px] text-[#A1A1AA]">
+              QR unavailable — share the code instead.
+            </p>
+          )}
+          <p className="text-[18px] font-bold text-white pakdam-numeric">{code}</p>
+          <p className="text-[13px] text-[#A1A1AA]">
+            Scan to join — no account needed.
+          </p>
+        </div>
+      </Sheet>
     </section>
   );
 });

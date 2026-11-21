@@ -32,33 +32,44 @@ test.describe('brutal phone end-to-end (demo)', () => {
     const runnerName = names[runnerIdx]!;
 
     // Play HUD on the phone: status strip + per-role catch button.
-    // (The runner's button is "Got Tagged" — there is no "SHOW MY QR"
-    // button on the play screen; the QR itself is shown on /catch.)
+    // (The Hunter's button is "Tag a runner" — v18 renamed it from
+    // "CATCH BY QR". The runner's button is "Got Tagged" — there is no
+    // "SHOW MY QR" button on the play screen; the QR itself is shown
+    // automatically on /catch.)
     await expect(hunterPage.getByText('Time left')).toBeVisible();
-    await expect(hunterPage.getByRole('button', { name: 'CATCH BY QR' })).toBeVisible();
+    await expect(hunterPage.getByRole('button', { name: 'Tag a runner', exact: true })).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Got Tagged' })).toBeVisible();
 
-    // Catch via the working path: /catch (no query) → pick a name → claim.
-    // Claiming opens the QR scanner first (claim → scan); Cancel it to
-    // reach the claim-open card, where the runner confirms on their phone.
-    await hunterPage.goto(`/room/${roomId}/catch`);
-    await expect(hunterPage.getByText('Who did you tag?')).toBeVisible();
+    // Catch, Way 1 (v18): the hunter taps "Tag a runner" on the play HUD
+    // — camera on top, column below. Headless has no camera, so the tag
+    // goes through the manual fallback: pick the runner's name, then the
+    // runner confirms on their own phone (Self Confirm) — a Hunter Tag
+    // with no scan cannot confirm (Runner confirmation is always
+    // required, BEHAVIOUR.md).
+    await hunterPage.getByRole('button', { name: 'Tag a runner', exact: true }).click();
+    await expect(hunterPage.getByText("Point at the runner's QR")).toBeVisible();
+    await hunterPage.getByRole('button', { name: "Runner can't show a QR?" }).click();
     await hunterPage.getByRole('button', { name: runnerName }).click();
-    await hunterPage
-      .getByRole('button', { name: `I TAGGED ${runnerName.toUpperCase()}` })
-      .click();
-    await expect(hunterPage.getByText(`${runnerName} · Tag them?`)).toBeVisible();
-    await hunterPage.getByRole('button', { name: 'Cancel' }).click();
+    const taggedBtn = hunterPage.getByRole('button', {
+      name: `I TAGGED ${runnerName.toUpperCase()}`,
+    });
+    if ((await taggedBtn.count()) > 0) await taggedBtn.click();
+    // The picked Runner lands in the column with a Tag button that stays
+    // disabled until their QR is scanned — the fallback has no scan, so
+    // the Runner confirms on their phone instead.
     await expect(hunterPage.getByText(`Claim open — ${runnerName}`)).toBeVisible();
-
-    // Runner confirms on their phone.
+    const tagBtn = hunterPage.getByRole('button', { name: 'Scan their QR first' });
+    await expect(tagBtn).toBeDisabled();
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await expect(runnerPage.getByText(`You were tagged by ${hunterName}?`)).toBeVisible();
-    await runnerPage.getByRole('button', { name: 'Self confirm' }).click();
+    await runnerPage.getByRole('button', { name: 'Self Confirm', exact: true }).click();
+    await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
+    await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
+    await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
+
     // Classic: the tagged Runner is out — after-tagged screen.
+    await runnerPage.goto(`/room/${roomId}/catch`);
     await expect(runnerPage.getByText('You were tagged')).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
-    await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
 
     // Back to the map, end the match, results, fresh game.
     await hunterPage.getByRole('button', { name: 'Back to the map' }).click();

@@ -17,11 +17,11 @@ these modules for behaviour.
   - `close(reason?)` — best-effort `leave`, then close 1000; never auto-reconnects.
   - `sendCommand(type, payload, commandId?)` — one command; `false` when disconnected (discarded, never queued). Retries reuse the same `commandId`.
   - `requestSnapshot()` / `resync()` — `snapshot.request` / `resync.request`.
-  - `sendLocationUpdate(fix)` / `sendReveal(fix)` — `location.update` / `reveal.send`.
+  - `sendLocationUpdate(fix)` — `location.update`.
   - `setReady(isReady)` — "I'm ready": sends `ready.set` AND `briefing.confirm` together when turning ready on.
-  - `sendRadio(text, kind?)` / `sendSignal(code)` / `sendVoiceSignal(toPlayerId, kind, sdp?, candidate?)` / `sendPin(point, label)` / `sendAnnouncement(text)` / `sendCheckIn(text?)` — radio, quick signal, voice signalling, pin, announcement ("I'm safe" travels as an announcement).
+  - `sendRadio(text, kind?)` / `sendSignal(code)` / `sendVoiceSignal(toPlayerId, kind, sdp?, candidate?)` / `sendPin(point, label)` / `sendAnnouncement(text)` — radio, quick signal, voice signalling, pin, announcement.
   - `requestCatch(runnerId)` / `sendCatchConfirm(catchId, qrToken, manualConfirm?)` / `sendCatchDispute(catchId, reason)` — catch claim / confirm (QR token, or manual confirm with no token) / dispute.
-  - `safetyPause(reason?)` / `safetyResume()` / `safetySos(reason?)` — safety pause / resume / SOS.
+  - `safetyPause(reason?)` / `safetyResume()` — safety pause / resume. (SOS is removed, founder decision v18: no `safetySos`, no check-in.)
   - `leave(reason?)` / `reportSuspended(reason)` — best-effort leave / `player.suspended` notice.
   - `connectionState` / `lastAppliedServerSeq` — getters.
   - Close codes follow the CONTRACT (`WS_CLOSE_CODE_ACTION`): 4400 → fresh ticket, reconnect once, AND surface the failure; 4401 → fresh ticket, reconnect once, a second 4401 → closed; 1000/4403/4409 never auto-reconnect; 1001/1006/1011/4413 back off (1 s base, doubling, 30 s ceiling, jitter ×0.5–1.0, max 5 attempts, then `reconnect-failed` with detail `reconnect failed — Retry`).
@@ -55,7 +55,7 @@ these modules for behaviour.
 
 ## `demo-store.ts` — local demo mode, no server (PROTOCOL-MAP §9)
 
-Rooms persist to localStorage `pakdam.demo.rooms.v1` WITHOUT coordinates; fixes, raw catch tokens, verified scans and idempotency keys are in-memory only. Demo parity with the DO: pings auto-fire on schedule; shrink uses the random-offset draw, never concentric; demo SOS notifies nobody (`SOS_DEMO_COPY`).
+Rooms persist to localStorage `pakdam.demo.rooms.v1` WITHOUT coordinates; fixes, raw catch tokens, verified scans and idempotency keys are in-memory only. Demo parity with the DO: pings auto-fire on schedule; shrink uses the random-offset draw, never concentric.
 
 - `createRoom(displayName, config?)` / `joinRoom(roomId, displayName)` — create / join (rejoin by display name restores the seat; an ejected seat stays ejected).
 - `getRoom(roomId)` / `getRoomByCode(code)` / `listRooms()` — reads; `getRoom`/`getRoomByCode` tick the room first (`listRooms` does NOT tick).
@@ -77,8 +77,7 @@ Rooms persist to localStorage `pakdam.demo.rooms.v1` WITHOUT coordinates; fixes,
 - `recordZoneExit(demo, playerId, nowMs?)` — logs the crossing (starts the 30 s countdown); caller guards to once per crossing.
 - `leaveRoom(demo, playerId)` — host-leave transfers host to the earliest-joined remaining player.
 - `ejectPlayer(demo, playerId)` — ACTIVE/HEAD_START only; completes as Hunters win when no Runner is left free.
-- `safetyPauseDemo(demo, playerId)` / `safetyResumeDemo(demo)` / `sosDemo(demo, playerId)` — demo safety; SOS notifies nobody (see `SOS_DEMO_COPY`).
-- `hostCheckin(demo, playerId, text)` — demo event-log check-in.
+- `safetyPauseDemo(demo, playerId)` / `safetyResumeDemo(demo)` — demo safety pause / resume. (SOS is removed, founder decision v18.)
 - `fireDemoPing(demo, runnerPlayerId, nowMs?)` — one demo ping (coarse 150 m area; the UI labels it simulated).
 - `randomOffsetShrinkBoundary(boundary)` / `circlePolygon(centre, radiusMeters, points?)` — shrink draw / circle approximation.
 - `pollDemoRoom(roomId)` / `watchDemoPhase(roomId, onLeaveLobby, intervalMs?)` — F2: poll every 1 s; `watchDemoPhase` calls `onLeaveLobby` ONCE when the phase leaves LOBBY (guest auto-navigates to /play).

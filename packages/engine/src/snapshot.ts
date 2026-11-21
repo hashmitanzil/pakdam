@@ -164,6 +164,11 @@ export function buildSnapshot(input: {
   missedAnnouncements: WsSnapshotPayload['missedAnnouncements'];
   /** Latest live fix per player (server-held, memory only). */
   fixes: Readonly<Record<string, LocationFix | null>>;
+  /**
+   * v24 — host reconnect grace deadline (epoch ms), or null when no
+   * grace is running. Passed straight through to the payload.
+   */
+  hostGraceEndsAtMs: number | null;
 }): WsSnapshotPayload {
   const teammates = teammateViewFor(
     input.viewerPlayerId,
@@ -192,5 +197,8 @@ export function buildSnapshot(input: {
     teammateFixes: teammates.teammateFixes,
     safetyState: input.safetyState,
     missedAnnouncements: input.missedAnnouncements,
+    // v24: null when no grace is running (older callers that omit
+    // the field read as null, not undefined).
+    hostGraceEndsAtMs: input.hostGraceEndsAtMs ?? null,
   };
 }

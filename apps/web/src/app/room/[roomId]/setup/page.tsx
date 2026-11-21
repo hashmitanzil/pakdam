@@ -21,7 +21,8 @@ import type { PlayerView, Room, RoomConfig } from '@pakdam/shared';
 import { METERS_PER_DEG_LAT, metersPerDegreeLng } from '@pakdam/shared';
 import { PakdamSocket } from '../../../../lib/websocket';
 import type { WsSnapshotPayload } from '../../../../lib/websocket';
-import { liveErrorMessage } from '../../../../lib/live-client';
+import { liveErrorMessage, LiveHttpError } from '../../../../lib/live-client';
+import { goHomeAfterRoomDeleted } from '../../../../lib/room-deleted';
 import {
   fetchLiveRoomState,
   snapshotToLiveRoomState,
@@ -140,6 +141,18 @@ export default function SetupPage() {
     router.push(`/room/${roomId}`);
   }, [roomId, router]);
 
+  // Room deleted (founder decision, 2026-11-21): the host cancelled and
+  // the room is gone — home with the one plain message, once. Setup is
+  // host-only, so this fires on a reload/reopen after the room was
+  // deleted, or on the `room.deleted` event / a socket close that
+  // probes 404.
+  const deletedRef = useRef(false);
+  const goHomeDeleted = useCallback(() => {
+    if (deletedRef.current) return;
+    deletedRef.current = true;
+    goHomeAfterRoomDeleted(router, roomId);
+  }, [roomId, router]);
+
   const isLive = session?.mode === 'live';
   const me = lobby?.players.find((p) => p.playerId === session?.playerId);
   const isHost = me?.isHost ?? session?.isHost ?? false;
@@ -230,6 +243,13 @@ export default function SetupPage() {
         })
         .catch((err: unknown) => {
           if (cancelled) return;
+          // 404 = the room is gone (host cancelled, server deleted it):
+          // a reload/reopen after deletion lands home with the one plain
+          // message, not on a stale setup screen or an error screen.
+          if (err instanceof LiveHttpError && err.status === 404) {
+            goHomeDeleted();
+            return;
+          }
           setLoadError(err instanceof Error ? err.message : 'Game not found or ended.');
         });
       const socket = new PakdamSocket({
@@ -254,7 +274,31 @@ export default function SetupPage() {
             setLobby({ room: state.room, players: state.players });
           }
         },
-        onStateChange: () => {},
+        onServerMessage: (envelope) => {
+          // `room.deleted` — the host cancelled and the server deleted
+          // the room. Not in the frozen @pakdam/shared catalogue, so it
+          // is matched on the raw string (see useRoomState for the same
+          // handling on the play / catch / results pages).
+          if ((envelope.type as string) === 'room.deleted') {
+            goHomeDeleted();
+          }
+        },
+        onStateChange: (state) => {
+          // A server-side close (or an exhausted reconnect) can mean the
+          // room was deleted out from under this client — the socket dies
+          // with the room, and no `room.deleted` event may arrive first.
+          // Probe the state fetch on every close: 404 = deleted (home
+          // with the one plain message); anything else keeps the old
+          // behaviour.
+          if ((state === 'closed' || state === 'reconnect-failed') && !cancelled) {
+            void fetchLiveRoomState(roomId, found.playerId, found.reconnectToken ?? '')
+              .then(() => undefined)
+              .catch((err: unknown) => {
+                if (cancelled) return;
+                if (err instanceof LiveHttpError && err.status === 404) goHomeDeleted();
+              });
+          }
+        },
         onError: (error) => showNotice(error.message),
       });
       socketRef.current = socket;
@@ -272,10 +316,22 @@ export default function SetupPage() {
     if (demo) {
       lastDemoKeyRef.current = demoRoomChangeKey(demo);
       setLobby({ room: demo.room, players: demo.players });
-    } else setLoadError('Game not found or ended.');
+    } else {
+      // A session for this room means the room existed when this seat
+      // was created — a missing room after a reload/reopen is a
+      // deletion (host cancel), so home with the one plain message,
+      // not an error screen.
+      goHomeDeleted();
+    }
     const timer = setInterval(() => {
       const current = pollDemoRoom(roomId);
-      if (!current) return;
+      if (!current) {
+        // A setup that was alive and is now gone was deleted (the host
+        // cancelled in another tab) — home with the one plain message.
+        // A setup never seen alive keeps the first-paint error above.
+        if (lobbyRef.current) goHomeDeleted();
+        return;
+      }
       if (current.room.phase !== 'LOBBY') {
         goPlay();
         return;

@@ -209,3 +209,26 @@ test('applyOutsideZoneEjection: stamps once, never overwrites, never mutates the
   assert.notEqual(stamped, player);
   assert.equal(applyOutsideZoneEjection(stamped, 1_700_000_000_001), stamped);
 });
+
+test('outside-zone countdown: a poor fix NEVER clears it — not even from inside (B1)', () => {
+  // 20 s already accrued outside; a poor fix whose centre lands inside
+  // must freeze the countdown, not wipe the accrued time: a ±1000 m
+  // fix cannot prove the player is actually back inside.
+  const state = { outsideSinceMs: null, outsideAccumMs: 20_000 };
+  const frozen = updateOutsideZone(state, {
+    inside: true,
+    poorAccuracy: true,
+    nowMs: 30_000,
+  });
+  assert.equal(frozen.shouldEject, false);
+  assert.equal(frozen.remainingSeconds, 10);
+  assert.deepEqual(frozen.state, { outsideSinceMs: null, outsideAccumMs: 20_000 });
+  // A trustworthy inside fix still clears it.
+  const cleared = updateOutsideZone(frozen.state, {
+    inside: true,
+    poorAccuracy: false,
+    nowMs: 31_000,
+  });
+  assert.deepEqual(cleared.state, { outsideSinceMs: null, outsideAccumMs: 0 });
+  assert.equal(cleared.remainingSeconds, 30);
+});
