@@ -74,17 +74,51 @@ export type MapState = 'loading' | 'ready' | 'no-key' | 'unavailable' | 'error';
  *  - the hyphen form `api-key=<value>`;
  *  - the JSON-colon form `"api_key":"<value>"` (a serialised error
  *    object), matched by KEY_JSON_RE below.
+ *
+ * v27 fix round (Zara Advisory 1–2 — same defence in depth):
+ *  - an encoded underscore in the name, `api%5Fkey%3D<value>`
+ *    (and the encoded equals on a bare `key%3D<value>`);
+ *  - the colon-space form `api_key: <value>` / `key: <value>`,
+ *    quoted or unquoted (an error message naming the key, not a
+ *    query string), matched by KEY_COLON_RE below;
+ *  - a bare key value with no parameter name at all — a long
+ *    standalone token (≥ 32 chars, letters + digits), matched by
+ *    BARE_KEY_RE below. The length + mixed-content bar keeps
+ *    ordinary diagnostic words out: a 32-char token that is all
+ *    letters or all digits is left alone.
  */
 const KEY_PARAM_RE =
-  /(api[-_]?key(?:%253D|%3D|=)|(?:^|[?&"'\s])key=)[^&\s"']*/gi;
+  /(api(?:[-_]|%5F)?key(?:%253D|%3D|=)|(?:^|[?&"'\s])key(?:%3D|=))[^&\s"']*/gi;
 
 /** `"api_key":"<value>"` / `"api-key":"<value>"` / `"key":"<value>"` — a JSON-colon key value. */
 const KEY_JSON_RE = /("(?:api[-_]?key|key)"\s*:\s*")[^"]*/gi;
 
+/**
+ * `api_key: <value>` / `api-key: <value>` / `key: <value>` — the
+ * colon-space form, value quoted or unquoted. The `[^\w]` prefix
+ * guard keeps words that merely contain "key" (turkey:, monkey:)
+ * untouched, like KEY_PARAM_RE's prefix guard.
+ */
+const KEY_COLON_RE = /((?:^|[^\w])(?:api[-_]?key|key)\s*:\s*)"?[^,\s"'}\]]+"?/gi;
+
+/**
+ * A bare key value with no parameter name: a standalone token of
+ * ≥ 32 `[A-Za-z0-9_-]` chars, delimited by whitespace or a URL
+ * delimiter on both sides (so a token embedded in a longer word is
+ * never half-redacted). The replace callback redacts only when the
+ * token carries both a letter and a digit — a long run of digits
+ * (a count, a timestamp) or of letters (a word) is not a key.
+ */
+const BARE_KEY_RE = /(^|[\s/?&=])([A-Za-z0-9_-]{32,})(?=$|[\s/?&=.,;"'}])/g;
+
 function redactKeyValues(text: string): string {
   return text
     .replace(KEY_JSON_RE, '$1…')
-    .replace(KEY_PARAM_RE, (_match, key: string) => `${key}…`);
+    .replace(KEY_PARAM_RE, (_match, key: string) => `${key}…`)
+    .replace(KEY_COLON_RE, '$1…')
+    .replace(BARE_KEY_RE, (match, prefix: string, token: string) =>
+      /[A-Za-z]/.test(token) && /\d/.test(token) ? `${prefix}…` : match,
+    );
 }
 
 /**
@@ -222,8 +256,34 @@ export interface OtherResourceProblem {
  * not read "Map ready" either. Zero height still outranks zero width
  * (D9: a 0-height area paints nothing at all, so it outranks the
  * camera, which outranks the tiles).
+ *
+ * v27 FIX (Meera — the play map was STILL blank after v26, founder
+ * 2026-11-21 ~23:33 IST, pill "Map area has no height — try Retry",
+ * and Retry changed nothing): the pill now NAMES which element has
+ * no height — `heightDiagnosis` ('container-zero-height' vs
+ * 'canvas-zero-height', and the width pair) — because v25/v26
+ * collapsed both into one flag and one text, so the next field report
+ * could never pin the element. The root cause (see PlayMap.tsx) was
+ * the CONTAINER: unlayered
+ * `.maplibregl-map{position:relative}` beats Tailwind's layered
+ * `.absolute`, so the `absolute inset-0` container collapsed to
+ * 526.4×0 and its `overflow:hidden` clipped the canvas to nothing.
+ * When `heightDiagnosis` is null the legacy boolean behaviour
+ * applies (the generic "Map area has no height/width" texts) — the
+ * component always passes its live diagnosis, so the generic texts
+ * only survive for older callers. A defect diagnosis on a ready map
+ * is the WHOLE pill (D9: it outranks fit failures and tile errors);
+ * 'ok' / 'hidden-by-design' fall through to the normal ready text.
+ *
+ * v27 FIX ROUND (Zara Advisory 1–2): this is the UNREDACTED
+ * implementation (`pillTextForStateRaw`) — the exported
+ * `pillTextForState` below re-sanitises the composed string, so any
+ * future unsanitised producer (a new fit reason, tile detail, or
+ * resource detail) leaks nothing to screen. The re-sanitisation
+ * runs on the composed pill, not per value, so a new interpolated
+ * value is covered without touching this function.
  */
-export function pillTextForState(
+function pillTextForStateRaw(
   mapState: MapState,
   mapDetail: string | null,
   slowLoad: boolean,
@@ -236,7 +296,20 @@ export function pillTextForState(
   fitReason: string | null = null,
   fitPending = false,
   zeroWidth = false,
+  heightDiagnosis: MapAreaHeightDiagnosis | null = null,
 ): string {
+  if (mapState === 'ready' && heightDiagnosis === 'container-zero-height') {
+    return 'Map container has no height — try Retry';
+  }
+  if (mapState === 'ready' && heightDiagnosis === 'canvas-zero-height') {
+    return 'Map canvas has no height — try Retry';
+  }
+  if (mapState === 'ready' && heightDiagnosis === 'container-zero-size') {
+    return 'Map container has no width — try Retry';
+  }
+  if (mapState === 'ready' && heightDiagnosis === 'canvas-zero-size') {
+    return 'Map canvas has no width — try Retry';
+  }
   if (mapState === 'ready' && zeroHeight) {
     return 'Map area has no height — try Retry';
   }
@@ -270,6 +343,50 @@ export function pillTextForState(
     }${elapsedS !== null ? ` · ${elapsedS}s` : ''}`;
   }
   return `Map ${mapState} — ${mapDetail ?? 'failed'}`;
+}
+
+/**
+ * The one-line diagnostic pill text for a map state — the exact text
+ * PlayMap renders. Every current producer sanitises at source, but
+ * the pill is the last boundary before the screen: the composed
+ * string is re-sanitised here (`redactKeyValues`), so a future
+ * unsanitised `fitReason` / `tileDetail` / `otherResource.detail` /
+ * `mapDetail` can never leak a key. Legitimate pill text is
+ * untouched — the sanitiser only fires on key-like patterns (see
+ * the tests: exact legitimate texts pass through byte-identical).
+ */
+export function pillTextForState(
+  mapState: MapState,
+  mapDetail: string | null,
+  slowLoad: boolean,
+  elapsedS: number | null,
+  tileErrorCount = 0,
+  tileDetail: string | null = null,
+  fitFailed = false,
+  zeroHeight = false,
+  otherResource: OtherResourceProblem | null = null,
+  fitReason: string | null = null,
+  fitPending = false,
+  zeroWidth = false,
+  heightDiagnosis: MapAreaHeightDiagnosis | null = null,
+): string {
+  return redactKeyValues(
+    pillTextForStateRaw(
+      mapState,
+      mapDetail,
+      slowLoad,
+      elapsedS,
+      tileErrorCount,
+      tileDetail,
+      fitFailed,
+      zeroHeight,
+      otherResource,
+      fitReason,
+      fitPending,
+      zeroWidth,
+      heightDiagnosis,
+    ),
+  );
 }
 
 export type MapErrorClassification =
@@ -1106,6 +1223,61 @@ export function diagnoseMapAreaHeight(
   return 'ok';
 }
 
+/**
+ * Whether a map may be BUILT for this area diagnosis, or must DEFER
+ * (v27 — the single build gate, used by the creation effect for the
+ * initial mount, every Retry, and the post-await re-check).
+ *
+ * 'build' when the container HAS size: 'ok', and a canvas defect
+ * ('canvas-zero-height' / 'canvas-zero-size' — a canvas defect is
+ * repaired by recreating into the sized container). 'defer' when it
+ * does not: 'hidden-by-design' (Radio / More tab) and the container
+ * defects ('container-zero-height' / 'container-zero-size') — never
+ * build into a flat area: a rebuild there just re-adds
+ * `maplibregl-map` and reproduces the 526×0 collapse.
+ */
+export function mapBuildDecision(diagnosis: MapAreaHeightDiagnosis): 'build' | 'defer' {
+  switch (diagnosis) {
+    case 'ok':
+    case 'canvas-zero-height':
+    case 'canvas-zero-size':
+      return 'build';
+    case 'hidden-by-design':
+    case 'container-zero-height':
+    case 'container-zero-size':
+      return 'defer';
+  }
+}
+
+/**
+ * Whether the canvas rect matches the container rect (v27 — the
+ * post-resize verification). Per-dimension |diff| <= tolerancePx.
+ * The 1 px default is load-bearing: canvas style px are integers
+ * (clientWidth) while a getBoundingClientRect container width can be
+ * fractional (526 vs 526.4) on a healthy map.
+ */
+export function canvasMatchesContainer(
+  canvasRect: AreaRect,
+  containerRect: AreaRect,
+  tolerancePx = 1,
+): boolean {
+  return (
+    Math.abs(canvasRect.width - containerRect.width) <= tolerancePx &&
+    Math.abs(canvasRect.height - containerRect.height) <= tolerancePx
+  );
+}
+
+/**
+ * The repair ladder for a canvas that does not match its container
+ * (v27 — defensive: the real canvas was never 0, the container was;
+ * this is for a genuinely stuck canvas). 0 re-resizes tried →
+ * 're-resize' (one more resize may repair it); >= 1 → 'recreate'
+ * (a resize already failed to repair it).
+ */
+export function canvasRepairStep(resizesTried: number): 're-resize' | 'recreate' {
+  return resizesTried === 0 ? 're-resize' : 'recreate';
+}
+
 // ---------------------------------------------------------------------------
 // View bounds (Diya 4 — A1ii): is the zone still in view after a resize?
 // ---------------------------------------------------------------------------
@@ -1198,6 +1370,11 @@ export function isMaterialSizeChange(prev: AreaRect, next: AreaRect): boolean {
 /** Cooldown after a Retry tap, during which both Retry buttons stay disabled. */
 export const RETRY_COOLDOWN_MS = 2000;
 
+/** True while the RETRY_COOLDOWN_MS window after a Retry tap is still running. */
+export function retryCooldownActive(nowMs: number, lastRetryAtMs: number | null): boolean {
+  return lastRetryAtMs !== null && nowMs - lastRetryAtMs < RETRY_COOLDOWN_MS;
+}
+
 /**
  * Whether the Retry buttons must be disabled. Disabled while a load is
  * in flight (Zara 4: spamming Retry during a load keeps aborting map
@@ -1206,13 +1383,25 @@ export const RETRY_COOLDOWN_MS = 2000;
  * Ola key, so sustained hammering can 429 the map for everyone on
  * that key). The component re-derives this on every render (the 1 s
  * clock tick re-renders), so the cooldown lifts without a timer.
+ *
+ * v27 fix round (Diya AT RISK 2 — the deferred exception): while the
+ * build is DEFERRED (`isDeferred`, set by the component when the
+ * build gate defers) the map is NOT loading — nothing is in flight
+ * to abort — so the loading block must not apply. A deferred build
+ * whose only exit is the ResizeObserver leaves the user with no
+ * manual recovery when the container stays flat for a non-
+ * `display:none` reason; Retry while deferred re-runs the gate
+ * (retryNonce → creation effect). The cooldown still applies while
+ * deferred: a deferred tap still stamps `lastRetryAtMs`, so a
+ * hammering user waits 2 s between gate re-runs.
  */
 export function retryDisabled(
   mapState: MapState,
   nowMs: number,
   lastRetryAtMs: number | null,
+  isDeferred = false,
 ): boolean {
+  if (isDeferred) return retryCooldownActive(nowMs, lastRetryAtMs);
   if (mapState === 'loading') return true;
-  if (lastRetryAtMs === null) return false;
-  return nowMs - lastRetryAtMs < RETRY_COOLDOWN_MS;
+  return retryCooldownActive(nowMs, lastRetryAtMs);
 }

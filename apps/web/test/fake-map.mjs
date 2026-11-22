@@ -45,7 +45,49 @@
  * first-fit-throws reproduction). Zoom is derived from the fitted span
  * so a correct 500 m fit lands at a street-level zoom, not the default.
  *
- * Two documented deviations from real MapLibre (Diya F9):
+ * v27 CANVAS MODEL (Arjun — grounded in installed maplibre-gl 5.24.1,
+ * `node_modules/maplibre-gl/dist/maplibre-gl-dev.js`):
+ *  - `resize()` (:71682) has NO early return on matching sizes: it
+ *    always runs `_resizeInternal` (:71712) → `_resizeCanvas` +
+ *    `painter.resize` + `_resizeTransform`. The fake records and
+ *    counts every `resize()` call and always re-applies the canvas
+ *    size — it never had an early return, and the v27 tests pin that.
+ *  - `_containerDimensions()` (:73658) falls back to 400×300 when
+ *    `clientWidth`/`clientHeight` are 0 (`clientWidth || 400`,
+ *    `clientHeight || 300`, each dimension independently). The fake
+ *    models this in `containerDimensions()`; the canvas style size is
+ *    set from it at construction (like `_setupCanvas` :73727-73729)
+ *    and on every `resize()` (like `_resizeInternal` :71713-71715).
+ *  - `_resizeCanvas()` (:73737) sets EXPLICIT canvas style width/
+ *    height px (`canvas.style.width = `${width}px``). The fake's
+ *    `canvasWidth`/`canvasHeight` are that style size — what
+ *    `getBoundingClientRect()` reports for the canvas when rendered.
+ *    Assigning `containerWidth`/`containerHeight` alone does NOT
+ *    resize the canvas (that models a DOM layout change); only
+ *    `resize()` (or construction) re-reads the container.
+ *  - CORRECTION to the v27 working hypothesis ("a map created at 0
+ *    size keeps a 0-height canvas unless resize repairs it"): the
+ *    real build does NOT do that. A map built in a 0-size container
+ *    gets a 400×300 canvas (the fallback), clipped invisible by the
+ *    0 container — and `resize()` at a 0-size container sets the
+ *    canvas to 400×300 too, never to 0. A `getBoundingClientRect`
+ *    canvas height of 0 is therefore only readable when the canvas
+ *    is under a `display:none` ancestor (then outer/container/canvas
+ *    ALL read 0 — the 'hidden-by-design' case), never from
+ *    construction/resize alone. On a VISIBLE tab with a collapsed
+ *    container, container-zero and canvas-zero do NOT "read the
+ *    same": the container reads 526.4×0 and the canvas reads 400×300.
+ *    The diagnosis order (container before canvas) is what separates
+ *    them — and the repair for a 0 container is to WAIT for size
+ *    (defer), not to resize harder. For the founder's exact rect
+ *    (container 526 wide × 0 tall) the canvas is 526×300 — width
+ *    real, height the 300 fallback — confirmed by Diya in the live
+ *    build, so the pill's container-vs-canvas distinction is a real
+ *    one on a visible tab. `setCanvasSize` / `freezeCanvas`
+ *    are test-only fault injection for the stuck-canvas repair
+ *    ladder (see below), not real MapLibre behaviour.
+ *
+ * Documented deviations from real MapLibre:
  *  - STRICTER on `setData` after `remove()`: real MapLibre's `setData`
  *    itself never throws synchronously — the throw comes from
  *    `getSource` on a removed map. The fake throws from `setData` too,
@@ -67,12 +109,32 @@
  *    `Map.resize` → `_resizeInternal` → `_resizeTransform` →
  *    `transform.resize`, all synchronous, unthrottled — stays
  *    React-only and is verified by code reading, not by this fake.)
+ *  - The canvas model is the STYLE size only: the fake does not model
+ *    `display:none` clipping, so a canvas under a hidden wrapper
+ *    still reports its style size here (400×300 at a 0 container).
+ *    Tests that need a 0 canvas rect pass explicit rects to
+ *    `diagnoseMapAreaHeight` (or use `setCanvasSize` fault
+ *    injection). `setCanvasSize` / `freezeCanvas` are test-only fault
+ *    injection (v27): the real `_resizeCanvas` never writes a 0
+ *    style size, so a canvas that "never gains size" is a defect
+ *    the fake must be told to model, not something it models by
+ *    default.
  */
 
 export class FakeMapLibreMap {
   constructor(options = {}) {
     this.containerWidth = options.containerWidth ?? 660;
     this.containerHeight = options.containerHeight ?? 525;
+    // The canvas style size (what getBoundingClientRect reports when
+    // rendered) — set from _containerDimensions() at construction,
+    // exactly like real MapLibre's _setupCanvas → _resizeCanvas
+    // (maplibre-gl-dev.js :73727-73729). A 0-size container yields the
+    // 400×300 fallback, NOT a 0 canvas (v27 grounding — see header).
+    const [canvasWidth, canvasHeight] = this.containerDimensions();
+    this.canvasWidth = canvasWidth;
+    this.canvasHeight = canvasHeight;
+    /** Test-only fault injection (v27): when true, resize() never updates the canvas. */
+    this.canvasFrozen = false;
     this.centre = [...(options.centre ?? [85.33, 23.36])]; // [lng, lat] — Ranchi default
     this.zoom = options.zoom ?? 14;
     this.bearing = 0;
@@ -113,6 +175,59 @@ export class FakeMapLibreMap {
       // handler must catch this (Diya F6); the fake proves it does.
       throw new Error('FakeMap resize: map is removed (destroyed painter)');
     }
+    // Real resize() (:71682) has NO early return on matching sizes:
+    // it always runs _resizeInternal → _resizeCanvas from the CURRENT
+    // container dimensions (with the 400×300 fallback). Assigning
+    // containerWidth/containerHeight alone does NOT resize the canvas
+    // — only resize() (or construction) does. A frozen canvas (test
+    // fault injection) never updates.
+    if (!this.canvasFrozen) {
+      const [width, height] = this.containerDimensions();
+      this.canvasWidth = width;
+      this.canvasHeight = height;
+    }
+  }
+
+  /**
+   * The container dimensions MapLibre reads — `clientWidth ||
+   * 400`, `clientHeight || 300` (installed maplibre-gl 5.24.1,
+   * `_containerDimensions`, maplibre-gl-dev.js :73658). Each
+   * dimension falls back independently.
+   */
+  containerDimensions() {
+    return [this.containerWidth || 400, this.containerHeight || 300];
+  }
+
+  /** The canvas style size in px — what getBoundingClientRect reports when rendered. */
+  canvasRect() {
+    return { width: this.canvasWidth, height: this.canvasHeight };
+  }
+
+  /** The container rect, as the pill measures it. */
+  containerRect() {
+    return { width: this.containerWidth, height: this.containerHeight };
+  }
+
+  /**
+   * Test-only fault injection (v27): set the canvas style size
+   * directly — models the founder's symptom (a real-size container
+   * with a 0-height canvas) so the post-resize repair ladder can be
+   * tested. NOT a real MapLibre behaviour: the real _resizeCanvas
+   * never writes 0 (see header).
+   */
+  setCanvasSize(width, height) {
+    this.canvasWidth = width;
+    this.canvasHeight = height;
+  }
+
+  /**
+   * Test-only fault injection (v27): freeze the canvas so resize()
+   * never updates it — models a canvas that never gains size. The
+   * resize() call itself still records and counts (it ran; it just
+   * did not repair the canvas).
+   */
+  freezeCanvas() {
+    this.canvasFrozen = true;
   }
 
   triggerRepaint() {

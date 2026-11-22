@@ -46,7 +46,11 @@ const {
   isMaterialSizeChange,
   mapAreaHasHeight,
   diagnoseMapAreaHeight,
+  mapBuildDecision,
+  canvasMatchesContainer,
+  canvasRepairStep,
   retryDisabled,
+  retryCooldownActive,
   RETRY_COOLDOWN_MS,
 } = await import('../src/components/hud/play-map-logic.ts');
 const { circlePolygon } = await import('@pakdam/engine');
@@ -840,11 +844,21 @@ test('v26: diagnoseMapAreaHeight tells hidden-by-design apart from a real 0-heig
     'ok',
     'no canvas yet (pre-load) is not a height failure',
   );
-  // And the 0-height pill text is unchanged for both container and
-  // canvas cases, with Retry offered by the component.
+  // v27: with NO diagnosis passed (13th arg null — the legacy
+  // default), the generic text still applies; the element-specific
+  // texts need the diagnosis (see the v27 section at the end of this
+  // file, and play-map-v27.test.mjs Section B).
   assert.equal(
     pillTextForState('ready', 'ready', false, null, 0, null, false, true),
     'Map area has no height — try Retry',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true, null, null, false, false, 'container-zero-height'),
+    'Map container has no height — try Retry',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true, null, null, false, false, 'canvas-zero-height'),
+    'Map canvas has no height — try Retry',
   );
 });
 
@@ -1177,7 +1191,7 @@ test('v26 FIX ROUND (A4 — Diya 6): diagnoseMapAreaHeight checks width too — 
   assert.equal(
     pillTextForState('ready', 'ready', false, null, 0, null, false, true, null, null, false, true),
     'Map area has no height — try Retry',
-    'both dimensions zero on a visible tab reads as the height defect',
+    'both dimensions zero on a visible tab reads as the height defect (legacy generic text with no diagnosis passed)',
   );
   assert.equal(
     pillTextForState('ready', 'ready', false, null, 0, null, false, true),
@@ -1232,3 +1246,308 @@ test('v26 FIX ROUND (Arjun 5): the combined pill is separator-unambiguous — th
 // in the fit effect's dependency array and NOWHERE in the zone
 // effect's. The founder's live check (a shrink landing while a fit
 // retry is pending) is the verdict for the animation itself.
+
+// ---------------------------------------------------------------------------
+// v27 FIX (Meera — the play map was STILL blank after v26, founder
+// 2026-11-21 ~23:33 IST, pill "Map area has no height — try Retry",
+// Retry changed nothing).
+//
+// ROOT CAUSE (proven from the built CSS, not assumed): the element
+// with no height was the CONTAINER. `new Map` adds MapLibre's
+// `.maplibregl-map` class to the container div; that rule is UNLAYERED
+// (maplibre-gl.css carries no `@layer`) while Tailwind v4 puts
+// `.absolute` in `@layer utilities` — and unlayered author CSS beats
+// ANY layered rule, so `.maplibregl-map{position:relative}` overrode
+// the container's Tailwind `absolute`. A `relative` div gets NO size
+// from `inset-0`, and its only children (canvas container + control
+// container) are absolutely positioned, out of flow — so the container
+// collapsed to exactly 526.4×0 (the founder's measurement) while the
+// outer stayed 420. The container also inherits
+// `.maplibregl-map{overflow:hidden}`, so the 526×300 canvas MapLibre
+// sized from the 0-height container (400×300 fallback) was clipped to
+// zero — completely blank. Every rebuild re-adds the class, so Retry
+// could never change the outcome. The setup map paints because its
+// container is a block div with an explicit inline `style={{height}}`.
+// The fix (PlayMap.tsx, React-only — stated, not papered over): the
+// container now ALSO carries `h-full w-full`, so its size no longer
+// depends on `position:absolute` at all.
+//
+// What Node CAN test here (this section): the pill names WHICH
+// element has no height, and a zero-height area still outranks every
+// other ready-state failure for BOTH kinds.
+//
+// What Node CANNOT test here (React/DOM-only, stated):
+//  - the container actually measuring 526×420 once `h-full w-full`
+//    is present (the class string in PlayMap.tsx — verified by
+//    reading the JSX, and by the production build regenerating the
+//    `.h-full` / `.w-full` rules, which are already in the bundle);
+//  - the canvas verify (resize + repaint + one bounded rebuild) and
+//    the visibilitychange / window-resize re-measure (the callbacks
+//    in PlayMap.tsx — verified by reading them, not by a test);
+//  - the Retry re-measure before rebuilding: v27 fix round (Diya
+//    Advisory 3) REMOVED the dead `checkMapAreaHeight()` call from
+//    `retryMap` — it wiped everything it set, and the real
+//    re-measure is the creation effect's build gate, which re-runs
+//    on the retryNonce bump (verified by reading).
+// ---------------------------------------------------------------------------
+
+test('v27: the 0-height pill names the element — container vs canvas — and still outranks everything else', () => {
+  // The founder's exact pill, with the element named: the v25/v26
+  // text ("Map area has no height") could never pin it. The 13th
+  // argument is the live diagnosis (play-map-v27.test.mjs Section B
+  // pins the same contract exhaustively).
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true, null, null, false, false, 'container-zero-height'),
+    'Map container has no height — try Retry',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true, null, null, false, false, 'canvas-zero-height'),
+    'Map canvas has no height — try Retry',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, false, true, 'container-zero-size'),
+    'Map container has no width — try Retry',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, false, true, 'canvas-zero-size'),
+    'Map canvas has no width — try Retry',
+  );
+  // Zero height still outranks a fit failure AND tile errors, for
+  // both elements (D9 — a 0-height area paints nothing at all).
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 2, 'HTTP 401', true, true, null, 'camera could not fit the zone', false, false, 'container-zero-height'),
+    'Map container has no height — try Retry',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 2, 'HTTP 401', true, true, null, 'camera could not fit the zone', false, false, 'canvas-zero-height'),
+    'Map canvas has no height — try Retry',
+  );
+  // No diagnosis (null) keeps the legacy generic texts.
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true, null, null, false, false, null),
+    'Map area has no height — try Retry',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, false, true, null),
+    'Map area has no width — try Retry',
+  );
+});
+
+test('v27: mapBuildDecision — build into a sized container, defer into a flat one', () => {
+  assert.equal(mapBuildDecision('ok'), 'build');
+  assert.equal(mapBuildDecision('canvas-zero-height'), 'build');
+  assert.equal(mapBuildDecision('canvas-zero-size'), 'build');
+  assert.equal(mapBuildDecision('hidden-by-design'), 'defer');
+  assert.equal(mapBuildDecision('container-zero-height'), 'defer');
+  assert.equal(mapBuildDecision('container-zero-size'), 'defer');
+});
+
+test('v27: canvasMatchesContainer — 1 px tolerance absorbs a fractional container rect; canvasRepairStep — one re-resize, then recreate', () => {
+  assert.equal(
+    canvasMatchesContainer({ width: 526, height: 420 }, { width: 526.4, height: 420 }),
+    true,
+  );
+  assert.equal(
+    canvasMatchesContainer({ width: 526, height: 420 }, { width: 526.4, height: 420 }, 0),
+    false,
+  );
+  assert.equal(
+    canvasMatchesContainer({ width: 400, height: 300 }, { width: 526.4, height: 420 }),
+    false,
+  );
+  assert.equal(canvasRepairStep(0), 're-resize');
+  assert.equal(canvasRepairStep(1), 'recreate');
+  assert.equal(canvasRepairStep(2), 'recreate');
+});
+
+// ---------------------------------------------------------------------------
+// v27 FIX ROUND (Meera — Diya AT RISK 1+2, Zara Advisory 1–4, Diya
+// Advisory 3): the review round after v27.
+//  F1: apps/web/test/*.test.mjs now runs in `pnpm --filter
+//      pakdam-web test`, wired into the root `test` script before
+//      test:e2e (package.json — verified by running it, not by a
+//      test in this file).
+//  F2: a deferred build is no longer a dead end — Retry stays
+//      enabled while deferred (cooldown only) and re-runs the gate.
+//  F3: the pill re-sanitises at its boundary, and the sanitiser
+//      covers the encoded-underscore, colon-space and bare-key forms.
+//  F4: retryMap guards on the same predicate as the button.
+//  F5: retryMap's dead re-measure call is removed (see the v27
+//      "verified by reading" note above — updated, not deleted).
+// What Node CANNOT test here (React/DOM-only, stated): the
+// `isDeferred` state flips at the two defer sites in PlayMap.tsx
+// and clears in startCreation, and the retryNonce bump re-running
+// the creation effect's gate — the predicate tests below pin the
+// exact values those sites read and write, and the wiring is
+// verified by reading PlayMap.tsx (retryMap / retryIsDisabled /
+// the creation effect), not by a test.
+// ---------------------------------------------------------------------------
+
+test('v27 FIX ROUND (F2 — Diya AT RISK 2): Retry is ENABLED while the build is deferred, and the cooldown still applies', () => {
+  // (a) Retry enabled while deferred: mapState stays 'loading' while
+  // the gate defers, but the loading block must not apply — the map
+  // is not loading, nothing is in flight to abort.
+  assert.equal(retryDisabled('loading', 10_000, null, true), false, 'deferred, never tapped: enabled');
+  // (b) A deferred Retry tap re-runs the gate: the tap passes the
+  // guard (this predicate — see the F4 test), so retryMap bumps
+  // retryNonce and the creation effect re-runs the gate
+  // (PlayMap.tsx retryMap → retryNonce → creation effect). The
+  // gate, not the button, decides build vs defer on the live
+  // diagnosis — the button's job is only to let the tap through.
+  assert.equal(retryDisabled('loading', 10_000, null, true), false, 'deferred tap passes the guard → gate re-runs');
+  // (c) Cooldown still enforced after a deferred Retry tap: a tap
+  // stamps lastRetryAtMs, so the next tap inside 2 s is blocked
+  // even while deferred — the escape is manual, not a hammer.
+  assert.equal(retryDisabled('loading', 10_000, 9_500, true), true, 'deferred, tapped 500 ms ago: still cooling down');
+  assert.equal(
+    retryDisabled('loading', 10_000, 10_000 - RETRY_COOLDOWN_MS, true),
+    false,
+    'deferred, cooldown spent: enabled again',
+  );
+  // (d) Normal loading still disables Retry — the exception is the
+  // deferred flag, not loading as such.
+  assert.equal(retryDisabled('loading', 10_000, null, false), true, 'loading, not deferred: disabled');
+  assert.equal(retryDisabled('loading', 10_000, null), true, 'default isDeferred=false: loading still disables');
+  assert.equal(retryDisabled('loading', 10_000, 9_000, false), true);
+  // Non-loading states are unchanged by the flag (the cooldown is
+  // the only block there, deferred or not).
+  assert.equal(retryDisabled('ready', 10_000, null, true), false);
+  assert.equal(retryDisabled('ready', 10_000, 9_500, true), true);
+  assert.equal(retryDisabled('error', 10_000, 10_000 - RETRY_COOLDOWN_MS - 1, true), false);
+});
+
+test('v27 FIX ROUND (F2): retryCooldownActive — the 2 s window, boundary-exact', () => {
+  assert.equal(retryCooldownActive(10_000, null), false, 'never tapped: no cooldown');
+  assert.equal(retryCooldownActive(10_000, 9_500), true, 'tapped 500 ms ago: cooling down');
+  assert.equal(
+    retryCooldownActive(10_000, 10_000 - RETRY_COOLDOWN_MS),
+    false,
+    'exactly RETRY_COOLDOWN_MS ago: window spent',
+  );
+  assert.equal(retryCooldownActive(10_000, 10_000 - RETRY_COOLDOWN_MS - 1), false);
+});
+
+test('v27 FIX ROUND (F4 — Zara Advisory 3): retryMap\'s internal guard — loading (non-deferred) is a no-op, deferred proceeds', () => {
+  // The guard in PlayMap.tsx retryMap is `if (retryDisabled(mapState,
+  // Date.now(), lastRetryAtMs, isDeferred)) return;` — the SAME
+  // predicate the button reads (retryIsDisabled), so guard and
+  // button can never disagree. Node cannot mount the component, so
+  // this pins the predicate the guard reads, with the exact argument
+  // shape the guard passes (mapState first, isDeferred last).
+  assert.equal(
+    retryDisabled('loading', 10_000, null, false),
+    true,
+    'loading, non-deferred: guard blocks — retryMap is a no-op, the in-flight creation is not aborted',
+  );
+  assert.equal(
+    retryDisabled('loading', 10_000, null, true),
+    false,
+    'loading, deferred: guard lets the tap through — the deferred escape is not blocked by its own guard',
+  );
+  assert.equal(
+    retryDisabled('loading', 10_000, 9_500, true),
+    true,
+    'deferred but cooling down: guard blocks — the cooldown is enforced by the guard too',
+  );
+  assert.equal(retryDisabled('error', 10_000, null, false), false, 'error: guard lets the tap through');
+  assert.equal(retryDisabled('ready', 10_000, null, false), false, 'ready: guard lets the tap through');
+});
+
+test('v27 FIX ROUND (F3 — Zara Advisory 1–2): the sanitisers redact the encoded-underscore, colon-space and bare-key forms', () => {
+  const bareKey = 'aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY3z'; // 36 chars, letters + digits
+  const cases = [
+    // Encoded underscore in the name: api%5Fkey%3D<value> (and %5f lowercase, plain =).
+    'GET https://api.olamaps.io/tiles?api%5Fkey%3Dabc123secret failed',
+    'GET https://api.olamaps.io/tiles?api%5fkey=abc123secret failed',
+    // Colon-space form, unquoted and quoted, api_key / api-key / bare key.
+    'Invalid api_key: abc123secret — check the key',
+    'Invalid api-key: abc123secret',
+    'key: abc123secret is not valid',
+    'api_key: "abc123secret"',
+    // Bare key value with no parameter name at all.
+    `tile request failed for ${bareKey}`,
+  ];
+  for (const message of cases) {
+    const detail = mapErrorDetail({ error: { status: 401, message } });
+    assert.doesNotMatch(detail, /abc123secret/, message);
+    assert.doesNotMatch(detail, new RegExp(bareKey), message);
+    assert.match(detail, /…/, message);
+  }
+  // The same shapes through unknownErrorDetail (the createOlaMap
+  // rejection path).
+  for (const message of cases) {
+    assert.doesNotMatch(unknownErrorDetail(new Error(message)), /abc123secret/, message);
+    assert.doesNotMatch(unknownErrorDetail(new Error(message)), new RegExp(bareKey), message);
+  }
+  // Words that merely contain "key" are NOT redacted — the prefix
+  // guards on the param and colon forms (turkey=, donkey=, monkey:).
+  const innocent = mapErrorDetail({ error: { message: 'turkey=leg day failed' } });
+  assert.match(innocent, /turkey=leg/);
+  const monkey = pillTextForState('loading', 'monkey: business as usual', false, null);
+  assert.equal(monkey, 'Map loading — monkey: business as usual');
+  // A long token that is NOT key-like is left alone: all letters
+  // (a word) or all digits (a count) with no parameter name.
+  const allLetters = pillTextForState('ready', 'ready', false, null, 1, 'a'.repeat(36));
+  assert.match(allLetters, /a{36}/, '36 letters, no digit: not a bare key');
+  const allDigits = pillTextForState('ready', 'ready', false, null, 1, '1'.repeat(36));
+  assert.match(allDigits, /1{36}/, '36 digits, no letter: not a bare key');
+});
+
+test('v27 FIX ROUND (F3 — Zara Advisory 1–2): an unsanitised detail passed to pillTextForState comes out redacted — the pill is the last boundary', () => {
+  // Every current producer sanitises at source; these go in RAW, as
+  // a future unsanitised producer would, and the pill must redact.
+  const tilePill = pillTextForState(
+    'ready', 'ready', false, null, 1,
+    'GET https://api.olamaps.io/tiles?api%5Fkey%3Dabc123secret failed',
+  );
+  assert.doesNotMatch(tilePill, /abc123secret/);
+  assert.match(tilePill, /api%5Fkey%3D…/);
+  const fitPill = pillTextForState(
+    'ready', 'ready', false, null, 0, null, true, false, null, 'api_key: abc123secret',
+  );
+  assert.doesNotMatch(fitPill, /abc123secret/);
+  assert.match(fitPill, /camera fit failed: api_key: …/);
+  const resourcePill = pillTextForState(
+    'ready', 'ready', false, null, 0, null, false, false,
+    { label: 'sprite', detail: 'api_key=abc123secret' },
+  );
+  assert.doesNotMatch(resourcePill, /abc123secret/);
+  assert.match(resourcePill, /Map sprite failing — api_key=…/);
+  const loadingPill = pillTextForState('loading', 'style failed api_key=abc123secret', false, null);
+  assert.doesNotMatch(loadingPill, /abc123secret/);
+  assert.match(loadingPill, /api_key=…/);
+  const barePill = pillTextForState(
+    'ready', 'ready', false, null, 1,
+    'tile failed for aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY3z',
+  );
+  assert.doesNotMatch(barePill, /aB3dE5fG7hJ9kL2mN4pQ6rS8tU0vW1xY3z/);
+});
+
+test('v27 FIX ROUND (F3): the pill-boundary re-sanitisation does NOT mangle legitimate pill text', () => {
+  // Exact legitimate texts, byte-identical through pillTextForState.
+  assert.equal(pillTextForState('ready', 'ready', false, null), 'Map ready');
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, true, false, null, 'camera could not fit the zone'),
+    'Zone not in view — camera fit failed: camera could not fit the zone',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 2, 'HTTP 401 — Unauthorized'),
+    'Map tiles failing — 2 tile errors — HTTP 401 — Unauthorized',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, true),
+    'Camera moving to the zone…',
+  );
+  assert.equal(
+    pillTextForState('loading', 'creating map… (attempt 1)', false, 5),
+    'Map loading — creating map… (attempt 1) · 5s',
+  );
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, true, null, null, false, false, 'container-zero-height'),
+    'Map container has no height — try Retry',
+  );
+  assert.equal(
+    pillTextForState('error', 'HTTP 401 — tile failed', false, null),
+    'Map error — HTTP 401 — tile failed',
+  );
+});

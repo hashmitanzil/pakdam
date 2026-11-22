@@ -73,6 +73,49 @@
  * outranks every other failure in the pill (D9), and rapid Map↔Radio
  * toggling can mint fit attempts (D10b — cheap local math, no loop).
  *
+ * v27 (Meera — the map was STILL blank after v26, founder
+ * 2026-11-21 ~23:33 IST, pill "Map area has no height — try Retry",
+ * Retry changed nothing): ROOT CAUSE, proven from the built CSS,
+ * was the CONTAINER, not the canvas and not a stale flag. `new Map`
+ * adds MapLibre's `.maplibregl-map` class to the container div, and
+ * that rule is UNLAYERED (maplibre-gl.css has no `@layer`) while
+ * Tailwind v4 puts `.absolute` in `@layer utilities` — unlayered
+ * author CSS beats ANY layered rule, so
+ * `.maplibregl-map{position:relative}` overrode the container's
+ * Tailwind `absolute`. A `relative` div gets NO size from `inset-0`
+ * (insets only offset it), and its only children (the canvas
+ * container + control container) are absolutely positioned, out of
+ * flow — so the container collapsed to exactly 526.4×0, the founder's
+ * measurement, while the outer stayed 420. The container ALSO
+ * inherits `.maplibregl-map{overflow:hidden}`, so the 526×300 canvas
+ * MapLibre sized from the 0-height container (400×300 fallback) was
+ * clipped to zero — completely blank, not a strip. Every rebuild
+ * re-adds the class, so Retry could never change the outcome; no
+ * resize, tab return, or fit retry could either — the height was 0
+ * by cascade, not by timing. The setup map paints because its
+ * container is a block div with an explicit inline `style={{height}}`
+ * (PlayAreaMap.tsx), so the same override is harmless there. FIX:
+ * the container now ALSO carries `h-full w-full`, so its size no
+ * longer depends on `position:absolute` at all — `relative` or
+ * `absolute`, it is 526×420. The pill now names WHICH element has no
+ * height or width (container vs canvas — the live diagnosis is kept
+ * in `areaDiagnosis` and passed to the pill). Builds go through ONE
+ * gate, `mapBuildDecision`: build into a sized container, defer
+ * while hidden or while the CONTAINER has no size — on mount, on
+ * Retry, and re-checked AFTER the createOlaMap awaits (a tab switch
+ * mid-creation defers construction instead of building into a flat
+ * container). While the gate defers, Retry stays ENABLED (2 s
+ * cooldown only) so the user can re-run the gate by hand — the
+ * loading block in `retryDisabled` does not apply while deferred
+ * (`isDeferred`), and `retryMap` itself guards on the same
+ * predicate, so button and guard can never disagree. After every load / resize / tab return the canvas is
+ * VERIFIED against its container (`canvasMatchesContainer`, 1 px
+ * tolerance) and a mismatch runs the repair ladder
+ * (`canvasRepairStep`): one re-resize first, then ONE bounded
+ * rebuild per manual Retry instead of reporting the same failure
+ * forever. The diagnosis is re-checked on visibilitychange and
+ * window resize too, so it always reflects a live measurement.
+ *
  * No map-style switcher, no layers button: single dark style only.
  * When the Ola key is missing, or `maplibre-gl` is not installed yet, the
  * map is not constructed at all and a one-line banner says so — never a
@@ -101,6 +144,8 @@ import {
   EMPTY_TILE_LEDGER,
   TILE_ERROR_QUIET_DECAY_MS,
   boundaryChangedMaterially,
+  canvasMatchesContainer,
+  canvasRepairStep,
   classifyMapError,
   collection,
   createFitRetryBudget,
@@ -111,6 +156,7 @@ import {
   fitOutcomeAction,
   handleMapTabReturn,
   isMaterialSizeChange,
+  mapBuildDecision,
   pillTextForState,
   polygonFeature,
   recordTileError,
@@ -126,15 +172,20 @@ import {
   unknownErrorDetail,
   zoneBboxInView,
   type FitRetryBudget,
+  type MapAreaHeightDiagnosis,
   type MapState,
   type OtherResourceProblem,
   type TileErrorLedger,
 } from '@/components/hud/play-map-logic';
 
-/** The mapDetail text recorded when the map area has no height (Diya F3). */
-const ZERO_HEIGHT_DETAIL = 'map area has no height (0 px tall) — try Retry';
-/** The mapDetail text recorded when the map area has no width (v26 fix round, Diya 6). */
-const ZERO_WIDTH_DETAIL = 'map area has no width (0 px wide) — try Retry';
+/** The mapDetail text recorded when the map CONTAINER has no height (v27 — the pill names the element now). */
+const ZERO_HEIGHT_CONTAINER_DETAIL = 'map container has no height (0 px tall) — try Retry';
+/** The mapDetail text recorded when the map CANVAS has no height (v27). */
+const ZERO_HEIGHT_CANVAS_DETAIL = 'map canvas has no height (0 px tall) — try Retry';
+/** The mapDetail text recorded when the map CONTAINER has no width (v27). */
+const ZERO_WIDTH_CONTAINER_DETAIL = 'map container has no width (0 px wide) — try Retry';
+/** The mapDetail text recorded when the map CANVAS has no width (v27). */
+const ZERO_WIDTH_CANVAS_DETAIL = 'map canvas has no width (0 px wide) — try Retry';
 
 /** True when the map container has a real (non-zero) size. */
 function containerHasSize(container: HTMLElement): boolean {
@@ -217,9 +268,16 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // same commit — reading fittedRef during render would leave the
   // pill one render stale.
   const [fitLanded, setFitLanded] = useState(false);
-  // The map area has no height (Diya F3): the founder measured a
-  // 526.4×0 rect while the pill said "Map ready".
-  const [zeroHeight, setZeroHeight] = useState(false);
+  // The LIVE diagnosis of the map area (v27 — Diya F3's boolean
+  // collapsed container-zero and canvas-zero into one flag and one
+  // pill text, so no field report could ever pin the element): the
+  // full `diagnoseMapAreaHeight` value — 'ok', 'hidden-by-design',
+  // 'container-zero-height' | 'canvas-zero-height' |
+  // 'container-zero-size' | 'canvas-zero-size' — or null before the
+  // first measurement. The pill takes it as its 13th argument and
+  // names the element exactly; zeroHeight / zeroWidth below are
+  // derived from it for the Retry-button condition.
+  const [areaDiagnosis, setAreaDiagnosis] = useState<MapAreaHeightDiagnosis | null>(null);
   // The map area has no width (v26 fix round, Diya 6): a 0×420
   // container on the visible tab paints nothing and must not read
   // "Map ready" either. Height still outranks width in the pill.
@@ -227,6 +285,16 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // Last Retry tap (ms epoch) — both Retry buttons stay disabled while
   // loading and for RETRY_COOLDOWN_MS after a tap (Zara 4).
   const [lastRetryAtMs, setLastRetryAtMs] = useState<number | null>(null);
+  // v27 fix round (Diya AT RISK 2): true while map creation is
+  // DEFERRED by the build gate — the container has no size and the
+  // only exit is waitObserver. While deferred, mapState stays
+  // 'loading', which would keep Retry disabled forever (retryDisabled
+  // blocks while loading), so the button's disabled state takes the
+  // deferred exception: Retry stays enabled (cooldown only) and a
+  // tap re-runs the gate via retryNonce → the creation effect. Set
+  // at both defer sites (the initial gate and the post-await
+  // re-check); cleared when a build starts (startCreation).
+  const [isDeferred, setIsDeferred] = useState(false);
   // Bumped by the fit-retry timer — re-runs the zone effect so a failed
   // first fit retries without waiting for a tab switch (Diya F1).
   const [fitRetryNonce, setFitRetryNonce] = useState(0);
@@ -296,43 +364,137 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // 'ready'. v26 fix round (Diya 10 — D10): the defect branch writes
   // the detail ONLY when the style has loaded (`loadedRef`) — a
   // 0-height container coinciding with a load failure (e.g. 401) used
-  // to clobber the real failure detail with ZERO_HEIGHT_DETAIL. The
-  // zeroHeight / zeroWidth FLAGS are still set in any state (the pill
-  // only reads them when 'ready'), so the defect itself is never lost.
-  const checkMapAreaHeight = useCallback(() => {
+  // to clobber the real failure detail with a zero-height detail. The
+  // diagnosis / zeroWidth flags are still set in any state (the pill
+  // only reads them when 'ready'), so the defect itself is never
+  // lost. v27: the live diagnosis is KEPT in `areaDiagnosis` (not a
+  // boolean) — the pill takes it as its 13th argument and names the
+  // element, and the detail written is the diagnosis's own text.
+  // Measure the container AND canvas rects (Diya F3) and return the
+  // live diagnosis, or null when the refs are not mounted yet. The
+  // build gate (creation effect) and the pill both read through this
+  // one measurement, so they can never disagree about the area.
+  const measureAreaDiagnosis = useCallback((): MapAreaHeightDiagnosis | null => {
     const outer = outerRef.current;
     const container = containerRef.current;
-    if (!outer || !container) return;
+    if (!outer || !container) return null;
     const outerRect = outer.getBoundingClientRect();
     const containerRect = container.getBoundingClientRect();
     const canvas = container.querySelector('canvas');
     const canvasRect = canvas ? canvas.getBoundingClientRect() : null;
-    const diagnosis = diagnoseMapAreaHeight(
+    return diagnoseMapAreaHeight(
       { width: outerRect.width, height: outerRect.height },
       { width: containerRect.width, height: containerRect.height },
       canvasRect ? { width: canvasRect.width, height: canvasRect.height } : null,
     );
+  }, []);
+
+  const checkMapAreaHeight = useCallback(() => {
+    const diagnosis = measureAreaDiagnosis();
+    if (diagnosis === null) return;
     if (diagnosis === 'hidden-by-design') return; // Radio / More tab — not a defect
+    setAreaDiagnosis(diagnosis);
     if (diagnosis === 'ok') {
-      setZeroHeight(false);
       setZeroWidth(false);
       if (loadedRef.current) {
         setMapDetail((prev) =>
-          prev === ZERO_HEIGHT_DETAIL || prev === ZERO_WIDTH_DETAIL ? 'ready' : prev,
+          prev === ZERO_HEIGHT_CONTAINER_DETAIL ||
+          prev === ZERO_HEIGHT_CANVAS_DETAIL ||
+          prev === ZERO_WIDTH_CONTAINER_DETAIL ||
+          prev === ZERO_WIDTH_CANVAS_DETAIL
+            ? 'ready'
+            : prev,
         );
       }
-    } else if (diagnosis === 'container-zero-size' || diagnosis === 'canvas-zero-size') {
+    } else if (diagnosis === 'container-zero-size') {
       // v26 fix round (Diya 6): height > 0 but width == 0 on the
       // visible tab — a real defect, reported distinctly from height.
-      setZeroHeight(false);
       setZeroWidth(true);
-      if (loadedRef.current) setMapDetail(ZERO_WIDTH_DETAIL);
-    } else {
-      setZeroHeight(true);
+      if (loadedRef.current) setMapDetail(ZERO_WIDTH_CONTAINER_DETAIL);
+    } else if (diagnosis === 'canvas-zero-size') {
+      setZeroWidth(true);
+      if (loadedRef.current) setMapDetail(ZERO_WIDTH_CANVAS_DETAIL);
+    } else if (diagnosis === 'canvas-zero-height') {
+      // v27: the container has height but the canvas inside it does
+      // not — a distinct defect with its own pill text, so the next
+      // field report pins the element exactly.
       setZeroWidth(false);
-      if (loadedRef.current) setMapDetail(ZERO_HEIGHT_DETAIL);
+      if (loadedRef.current) setMapDetail(ZERO_HEIGHT_CANVAS_DETAIL);
+    } else {
+      setZeroWidth(false);
+      if (loadedRef.current) setMapDetail(ZERO_HEIGHT_CONTAINER_DETAIL);
     }
-  }, []);
+  }, [measureAreaDiagnosis]);
+
+  // One automatic canvas rebuild per MANUAL Retry (v27): spent by
+  // the load-handler verify below, re-armed only by retryMap. Never
+  // reset in startCreation — that runs on the auto-rebuild too, and
+  // re-arming there would loop rebuilds forever on a persistently
+  // 0-height canvas.
+  const autoCanvasRecreateRef = useRef(false);
+  // Re-resizes tried on the CURRENT map instance (v27 repair ladder):
+  // reset in startCreation and retryMap, so a fresh map gets its own
+  // one re-resize before the ladder says 'recreate'.
+  const canvasResizesTriedRef = useRef(0);
+
+  // VERIFY the canvas actually matches its container after a load /
+  // resize / tab return (v27): the pill must never report the same
+  // failure forever while a repair was never attempted. The check is
+  // `canvasMatchesContainer` (1 px tolerance — canvas style px are
+  // integers, a container rect can be fractional). A mismatch runs
+  // the repair ladder (`canvasRepairStep`): one re-resize first
+  // (resize + repaint, then re-verify once); a canvas still
+  // mismatched after that earns ONE bounded rebuild, and only from
+  // the load handler — the one place a rebuild has a fresh map to
+  // land in. A container with NO size is NOT repaired here — that is
+  // the creation effect's defer decision (`mapBuildDecision`), and
+  // re-resizing into it would just re-apply the 400×300 fallback.
+  const verifyCanvasPainted = useCallback(
+    (allowRecreate: boolean) => {
+      const container = containerRef.current;
+      const map = mapRef.current;
+      if (!container || !map) return;
+      const containerRect = container.getBoundingClientRect();
+      if (containerRect.width <= 0 || containerRect.height <= 0) return;
+      const canvas = container.querySelector('canvas');
+      const canvasRect = canvas ? canvas.getBoundingClientRect() : null;
+      if (canvasRect === null) return;
+      if (
+        canvasMatchesContainer(
+          { width: canvasRect.width, height: canvasRect.height },
+          { width: containerRect.width, height: containerRect.height },
+        )
+      )
+        return;
+      if (canvasRepairStep(canvasResizesTriedRef.current) === 're-resize') {
+        canvasResizesTriedRef.current += 1;
+        try {
+          map.resize();
+        } catch {
+          // Dead map: the re-measure below still runs.
+        }
+        try {
+          map.triggerRepaint();
+        } catch {
+          // Dead map: the re-measure below still runs.
+        }
+        checkMapAreaHeight();
+        // Re-verify once: if the re-resize repaired it this returns
+        // at the match check; if not, the ladder's next step is
+        // 'recreate' (bounded by allowRecreate + the auto budget).
+        verifyCanvasPainted(allowRecreate);
+      } else if (allowRecreate && !autoCanvasRecreateRef.current) {
+        autoCanvasRecreateRef.current = true;
+        setMapReady(false);
+        setMapState('loading');
+        setMapDetail('canvas still does not match its container — rebuilding once…');
+        setAreaDiagnosis(null);
+        setZeroWidth(false);
+        setRetryNonce((n) => n + 1);
+      }
+    },
+    [checkMapAreaHeight],
+  );
 
   // Tile-error decay (Diya F4): a transient blip must not permanently
   // brand a healthy map. 30 s after the last recorded post-load error
@@ -376,13 +538,21 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     const startCreation = () => {
       loadedRef.current = false;
       fittedRef.current = false;
+      // A build is starting, so the gate is no longer deferred (F2:
+      // a deferred Retry tap that reaches here clears the flag; a
+      // tap that defers again sets it at the defer site instead).
+      setIsDeferred(false);
       // A fresh attempt starts with a clean diagnostic slate.
       setTileLedger(EMPTY_TILE_LEDGER);
       setOtherResource(null);
       setFitReason(null);
       setFitLanded(false);
-      setZeroHeight(false);
+      setAreaDiagnosis(null);
       setZeroWidth(false);
+      // v27: a fresh map gets its own one re-resize on the canvas
+      // repair ladder (canvasResizesTriedRef — NOT the one auto
+      // rebuild, which stays spent until a manual Retry).
+      canvasResizesTriedRef.current = 0;
       // v26 fix round (Diya 2 — B2): a manual Retry starts with a
       // FRESH fit-retry budget. The budget used to reset only on a
       // new-boundary identity and on a landed fit, so after 3 throws
@@ -422,6 +592,37 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           setMapError('Map needs an Ola key — the game still works without it.');
           setMapDetail('NEXT_PUBLIC_OLA_MAPS_API_KEY is empty in this build');
           setMapState('no-key');
+          return;
+        }
+        // v27 (b): RE-CHECK size AFTER the awaits — the player may
+        // have switched tab DURING the style fetch / chunk import, so
+        // the container this map was just constructed in may be
+        // 0-size now. Never wire up a map built into a flat area:
+        // discard it and defer until the container gains size (the
+        // same waitObserver the initial gate uses below). The
+        // decision is `mapBuildDecision`, the single build gate for
+        // mount, Retry, and this post-await re-check.
+        const postAwaitDiagnosis = measureAreaDiagnosis();
+        if (
+          postAwaitDiagnosis !== null &&
+          mapBuildDecision(postAwaitDiagnosis) === 'defer'
+        ) {
+          map.remove();
+          // The 12 s slow-load watchdog belongs to the discarded
+          // attempt — clear it, or it would fire mid-wait and brand
+          // the deferred build "still trying" for no reason.
+          clearTimeout(loadTimer);
+          setMapDetail('waiting for the map area to become visible…');
+          setIsDeferred(true);
+          waitObserver = new ResizeObserver(() => {
+            const c = containerRef.current;
+            if (c && containerHasSize(c)) {
+              waitObserver?.disconnect();
+              waitObserver = null;
+              if (!cancelled) startCreation();
+            }
+          });
+          waitObserver.observe(container);
           return;
         }
         mapRef.current = map;
@@ -479,6 +680,10 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           // Diya F3: a resize that lands on a 0-height canvas must
           // surface in the pill, not hide behind "Map ready".
           checkMapAreaHeight();
+          // v27: verify the canvas actually has height after the
+          // resize — a still-0 canvas is resized + repainted here
+          // (no auto-rebuild from the observer: it fires often).
+          verifyCanvasPainted(false);
           prevHasSizeRef.current = hasSize;
         });
         observer.observe(container);
@@ -497,6 +702,11 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           // Diya F3: measure the area at ready — a 0-height container
           // or canvas surfaces in the pill instead of "Map ready".
           checkMapAreaHeight();
+          // v27: verify the canvas actually has height on the fresh
+          // map — a still-0 canvas is resized + repainted, and once
+          // per manual Retry the map is rebuilt once instead of the
+          // pill reporting the same failure forever.
+          verifyCanvasPainted(true);
         });
         map.on('error', (event: unknown) => {
           if (cancelled) return;
@@ -557,15 +767,25 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         setMapState('unavailable');
       });
     };
-    // Zero-size rule: never create the map in a 0-size container —
-    // `new Map` there (and the `fitBounds` below) leaves a 'ready'
-    // map painting nothing. If the container is hidden right now
-    // (player on Radio / More while the map was still loading), wait
-    // for it to gain size and create then.
-    if (containerHasSize(container)) {
+    // Zero-size rule (v18) + v27 build gate: never create the map in
+    // a 0-size container — `new Map` there (and the `fitBounds`
+    // below) leaves a 'ready' map painting nothing. The decision is
+    // `mapBuildDecision` on the LIVE diagnosis (not a bare size
+    // check): 'defer' while hidden or while the CONTAINER has no
+    // size, 'build' when the container has size — including a
+    // canvas-only defect, which a rebuild into the sized container
+    // repairs. This is the single gate for mount AND Retry (a Retry
+    // bump re-runs this effect): a Retry into a still-flat container
+    // defers instead of rebuilding into the same flat area. If the
+    // container is hidden right now (player on Radio / More while
+    // the map was still loading), wait for it to gain size and
+    // create then.
+    const gateDiagnosis = measureAreaDiagnosis();
+    if (gateDiagnosis !== null && mapBuildDecision(gateDiagnosis) === 'build') {
       startCreation();
     } else {
       setMapDetail('waiting for the map area to become visible…');
+      setIsDeferred(true);
       waitObserver = new ResizeObserver(() => {
         const c = containerRef.current;
         if (c && containerHasSize(c)) {
@@ -585,9 +805,10 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       mapRef.current?.remove();
       mapRef.current = null;
     };
-    // Re-created only when the user taps Retry (checkMapAreaHeight is a
-    // stable callback — listed only to satisfy exhaustive-deps).
-  }, [retryNonce, checkMapAreaHeight]);
+    // Re-created only when the user taps Retry (checkMapAreaHeight,
+    // verifyCanvasPainted and measureAreaDiagnosis are stable
+    // callbacks — listed only to satisfy exhaustive-deps).
+  }, [retryNonce, checkMapAreaHeight, verifyCanvasPainted, measureAreaDiagnosis]);
 
   // The role-reveal overlay covers the map at game start, and the Map
   // tab hides the map entirely. Dismissing the overlay / returning to
@@ -661,13 +882,49 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         // Diya F3: re-measure the area on return — a 0-height canvas
         // after a tab switch surfaces in the pill.
         checkMapAreaHeight();
+        // v27: verify the canvas actually has height after the
+        // return resize (resize + repaint only, no auto-rebuild).
+        verifyCanvasPainted(false);
       });
     });
     return () => {
       cancelAnimationFrame(raf1);
       cancelAnimationFrame(raf2);
     };
-  }, [resizeNonce, mapReady, zoneBoundary, checkMapAreaHeight]);
+  }, [resizeNonce, mapReady, zoneBoundary, checkMapAreaHeight, verifyCanvasPainted]);
+
+  // v27: the flag must reflect a LIVE measurement — re-measure on the
+  // paths that can change the area without a ResizeObserver
+  // notification or a tab return: coming back to the browser tab
+  // (visibilitychange — the browser may have throttled or discarded
+  // the WebGL context while hidden) and viewport changes (resize).
+  // Resize-then-measure, at a real size only; the canvas verify runs
+  // without an auto-rebuild here.
+  useEffect(() => {
+    if (!mapReady) return;
+    const remeasure = () => {
+      const map = mapRef.current;
+      const container = containerRef.current;
+      if (map && container && containerHasSize(container)) {
+        try {
+          map.resize();
+        } catch {
+          // Dead map: the re-measure below still runs.
+        }
+      }
+      checkMapAreaHeight();
+      verifyCanvasPainted(false);
+    };
+    const onVisibility = () => {
+      if (!document.hidden) remeasure();
+    };
+    window.addEventListener('resize', remeasure);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('resize', remeasure);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [mapReady, checkMapAreaHeight, verifyCanvasPainted]);
 
   // Ping circles (64-pt geodesic) are built once per ping set, not once
   // per clock tick — the old single overlay effect rebuilt every circle
@@ -1320,6 +1577,25 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
 
   /** Tear the map down and build it again (error overlay / slow-load retry). */
   const retryMap = useCallback(() => {
+    // v27 fix round (Zara Advisory 3): the guard lives HERE, not only
+    // on the buttons' `disabled` attribute — the guard and the button
+    // agree on one predicate (`retryDisabled`, with the deferred
+    // exception from F2: while deferred the tap goes through, subject
+    // to the cooldown, because it is the only manual escape from a
+    // flat container). A programmatic / keyboard / double-tap call
+    // while a load is in flight is a no-op instead of aborting the
+    // creation that is already running.
+    if (retryDisabled(mapState, Date.now(), lastRetryAtMs, isDeferred)) return;
+    // v27 fix round (Diya Advisory 3): NO re-measure first — the old
+    // `checkMapAreaHeight()` call here was dead code: the lines below
+    // immediately wiped everything it set (`setAreaDiagnosis(null)`,
+    // `setZeroWidth(false)`, `setMapDetail('retrying…')`). The real
+    // re-measure is the creation effect's build gate, which re-runs
+    // on the retryNonce bump below and measures the LIVE diagnosis
+    // before deciding build vs defer — so a Retry can never again
+    // rebuild into the same flat area blind. A manual Retry also
+    // re-arms the one auto canvas rebuild.
+    autoCanvasRecreateRef.current = false;
     setMapError(null);
     setMapDetail('retrying…');
     setSlowLoad(false);
@@ -1331,8 +1607,12 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     setOtherResource(null);
     setFitReason(null);
     setFitLanded(false);
-    setZeroHeight(false);
+    setAreaDiagnosis(null);
     setZeroWidth(false);
+    // v27: a manual Retry re-arms the canvas repair ladder's one
+    // re-resize too (canvasResizesTriedRef), as well as the one auto
+    // rebuild (autoCanvasRecreateRef, reset above).
+    canvasResizesTriedRef.current = 0;
     // v26 fix round (Diya 2 — B2): a manual Retry starts with a FRESH
     // fit-retry budget (startCreation resets it again as well — both
     // places, so a Retry can never inherit a spent budget from the
@@ -1343,7 +1623,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     refitAtSizeRef.current = null;
     setLastRetryAtMs(Date.now());
     setRetryNonce((n) => n + 1);
-  }, []);
+  }, [mapState, lastRetryAtMs, isDeferred]);
 
   // No early returns: the map container below stays mounted in EVERY
   // state (no-key / unavailable / error included). The v13 error path
@@ -1360,9 +1640,14 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // v26: `fitFailed` is derived from the fit's OWN reason (null = no
   // real failure), and a fit that has not landed yet is PENDING, not
   // failed — the pill says so honestly instead of "fit failed — ready".
+  // v27: zeroHeight / zeroWidth are derived from the LIVE diagnosis
+  // (`areaDiagnosis`), which is also the pill's 13th argument — so
+  // the pill names the element exactly (container vs canvas).
   const fitFailed = fitReason !== null;
   const fitPending =
     mapState === 'ready' && !fitFailed && !fitLanded && zoneBoundary.length >= 3;
+  const zeroHeight =
+    areaDiagnosis === 'container-zero-height' || areaDiagnosis === 'canvas-zero-height';
   const elapsedS =
     nowMs !== undefined && attemptStartedAtRef.current > 0
       ? Math.max(0, Math.floor((nowMs - attemptStartedAtRef.current) / 1000))
@@ -1380,19 +1665,36 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     fitReason,
     fitPending,
     zeroWidth,
+    areaDiagnosis,
   );
   // Zara 4: both Retry buttons stay disabled while a load is in flight
   // and for 2 s after a tap — spamming Retry aborts creation and can
-  // 429 the shared Ola key for everyone.
+  // 429 the shared Ola key for everyone. v27 fix round (Diya AT RISK
+  // 2): while the build is DEFERRED the loading block does NOT apply
+  // — the map is not loading, nothing is in flight to abort, and
+  // Retry is the only manual escape from a flat container. The
+  // cooldown still applies while deferred.
   const retryIsDisabled = retryDisabled(
     mapState,
     nowMs ?? Date.now(),
     lastRetryAtMs,
+    isDeferred,
   );
 
   return (
     <div ref={outerRef} className="relative h-full min-h-[320px] w-full overflow-hidden rounded-2xl border border-[#26262B] bg-[#141416]">
-      <div ref={containerRef} className="absolute inset-0" aria-label="Play map" />
+      {/* v27 ROOT CAUSE FIX: this container MUST have height even
+          though `new Map` adds MapLibre's unlayered
+          `.maplibregl-map{position:relative}` to it, which beats
+          Tailwind's layered `.absolute` (unlayered author CSS beats
+          ANY layered rule) — the old `absolute inset-0` alone
+          collapsed to 526.4×0, and the container's inherited
+          `overflow:hidden` then clipped the canvas to nothing. So the
+          size does NOT depend on `position:absolute` any more:
+          `h-full w-full` sizes it as a block too (100% of the 420 px
+          outer, whichever position wins). The setup map never had
+          this bug — its container carries an explicit inline height. */}
+      <div ref={containerRef} className="absolute inset-0 h-full w-full" aria-label="Play map" />
       <div className="absolute right-3 top-3 z-10 flex flex-col gap-2">
         <button
           type="button"
