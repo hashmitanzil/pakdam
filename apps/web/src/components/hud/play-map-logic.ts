@@ -309,6 +309,21 @@ export const RECENTRE_ZONE_FALLBACK_NOTE =
   'Centred on the zone — no GPS fix yet.';
 
 /**
+ * v30 follow-up (Diya review, item C): the zone/default fallback
+ * must be LOUD, not a footnote. These are the visible-pill copies
+ * PlayMap shows (top of the map, amber, role=status) when ◎ centred
+ * on the zone or the Ranchi default because there was no fix — the
+ * map moving silently used to make a dead watcher look like a
+ * working button. The fallback behaviour itself is unchanged
+ * (falling back to zone centre with no fix is correct); only the
+ * surfacing changes. The old `RECENTRE_*_NOTE` constants stay
+ * exported — v28 tests pin their values — but PlayMap no longer
+ * renders them as the fallback's only trace.
+ */
+export const RECENTRE_NO_FIX_ZONE_PILL = 'No GPS fix — showing zone centre';
+export const RECENTRE_NO_FIX_DEFAULT_PILL = 'No GPS fix — showing Ranchi';
+
+/**
  * v28 (Diya F2): the ◎ note when there is neither a fix nor a USABLE
  * zone to centre on. v28 fix round (Diya A6): the old copy said "no
  * zone yet", which is wrong when a zone EXISTS but is degenerate /
@@ -1600,15 +1615,31 @@ export function retryCooldownActive(nowMs: number, lastRetryAtMs: number | null)
  * (retryNonce → creation effect). The cooldown still applies while
  * deferred: a deferred tap still stamps `lastRetryAtMs`, so a
  * hammering user waits 2 s between gate re-runs.
+ *
+ * v30 (Meera — founder's live v29 phone: play map "not ready" with
+ * no way forward): the loading block has the same no-recovery hole
+ * once the 12 s slow-load watchdog has fired (`slowLoad`). A style
+ * load stalled on flaky mobile data — `createOlaMap`'s own 8 s
+ * style-prefetch / 30 s chunk timeouts only bound the pre-fetch; the
+ * fallback style-URL load inside `new Map` has no timeout, so the
+ * map can sit in 'loading' indefinitely with Retry disabled and the
+ * only escape is reopening the PWA. Once `slowLoad` is true the load
+ * has already had 12 s, so Retry is allowed (cooldown only): a tap
+ * aborts the stalled attempt and rebuilds from the live container,
+ * exactly like the deferred escape. Before the watchdog fires the
+ * loading block still applies — a fresh load must not be aborted.
  */
 export function retryDisabled(
   mapState: MapState,
   nowMs: number,
   lastRetryAtMs: number | null,
   isDeferred = false,
+  slowLoad = false,
 ): boolean {
   if (isDeferred) return retryCooldownActive(nowMs, lastRetryAtMs);
-  if (mapState === 'loading') return true;
+  if (mapState === 'loading') {
+    return slowLoad ? retryCooldownActive(nowMs, lastRetryAtMs) : true;
+  }
   return retryCooldownActive(nowMs, lastRetryAtMs);
 }
 
@@ -1747,6 +1778,14 @@ export function meDotMarkerStyle(stale: boolean): Record<string, string> {
   return {
     width: `${ME_DOT_MARKER_SIZE_PX}px`,
     height: `${ME_DOT_MARKER_SIZE_PX}px`,
+    // v30: roundness must not depend on Tailwind preflight or on
+    // MapLibre's marker CSS — `boxSizing: border-box` keeps the 2 px
+    // border INSIDE the 18 px box under any box-sizing, so the box
+    // stays square and `border-radius: 999px` stays a circle whatever
+    // stylesheet wins. The style itself was already square in v29
+    // (this was NOT the pill's cause — see the trail note below).
+    boxSizing: 'border-box',
+    display: 'block',
     borderRadius: '999px',
     background: '#EF4444',
     border: '2px solid #fff',
@@ -1756,34 +1795,89 @@ export function meDotMarkerStyle(stale: boolean): Record<string, string> {
 }
 
 /**
- * Dot trails — spacing and size (v29 fix round M8).
+ * Dot trails — spacing and size (v29 fix round M8, CORRECTED v30).
  *
- * THE PILL, FOUND IN CODE: the v28 me-dot is a MapLibre `circle`
- * layer and the v29 dot is a DOM marker — both round by construction
- * — yet the founder's phone showed the GPS point as a pill. The
- * stretched-canvas hypothesis for that has no supporting evidence
- * (the only observed canvas/container disagreement, the v27 526×0
- * collapse, renders nothing, not a pill), and the accuracy ring is a
- * true geodesic circle and the status pill is HUD text, not a map
- * point — neither can elongate the dot. The trails CAN, and the
- * mechanism is provable from this file alone: every new fix appends
- * a fading circle, and while moving slowly the points land a few
- * metres apart — closer together than their own diameter at play
- * zoom — so the overlapping circles merge into one elongated
- * capsule trailing the dot, i.e. the dot reads as a pill. The fix
- * is spacing, not shape: a new trail point is appended only after
- * ~11 m of movement (`TRAIL_MIN_MOVE_DEG`, 0.0001 deg ≈ 11.1 m),
- * so consecutive points stay discrete dots with a clear gap at any
- * play zoom, and the points are smaller (`TRAIL_DOT_RADIUS_PX`).
- * Standing still still refreshes the same spot (points stack
- * exactly — no elongation). The DOM marker stays: it is correct and
- * robust, and it keeps the dot round whatever the canvas does. The
- * pill's cause remains unproven on a real phone — the founder's
- * phone is the verdict — but the trail merge is the only
- * code-provable elongation mechanism, and it is fixed here.
+ * THE PILL, FOUND IN CODE (v30 — the v29 fix did NOT hold): the v29
+ * spacing gate was `if (movedDeg < TRAIL_MIN_MOVE_DEG &&
+ * now - last.atMs < 3000) return;` in PlayMap.tsx — a skip that fires
+ * only when the last point is BOTH close AND < 3 s old. But `now` is
+ * the 5 s-quantised map clock (`mapNowMs`, play/page.tsx) and the
+ * trail effect re-runs at most every 5 s (clock tick, or a
+ * display-throttled fix ≥ 5 m / ≥ 5 s), so at append time
+ * `now - last.atMs` is essentially always ≥ 3000 ms and the `&&`
+ * never skips: a point was appended on EVERY tick regardless of
+ * distance moved. Walking 1–2 m/s appends a point every ~5–10 m;
+ * each point is 3 px radius (6 px diameter) in the same red as the
+ * 18 px me-dot, and at play zoom (a fitted zone is ~0.4–1.2 m/px)
+ * points 5–10 m apart sit ~4–25 px apart centre-to-centre and merge
+ * into one continuous capsule trailing the dot — the dot reads as a
+ * pill. Standing still appended a fresh point at the IDENTICAL
+ * coords every 5 s tick too (different opacity, same spot), which
+ * proves the gate never held even though it cannot elongate.
+ * The v29 threshold value (~11 m) was fine; the gate's TIME BYPASS
+ * was the defect, so the fix is the gate itself, not the number:
+ * `appendTrailPoint` below appends ONLY on ≥ ~11 m of movement
+ * (distance-only, no time leg), and a sub-threshold fix REFRESHES
+ * the last point's timestamp in place — a stationary player keeps a
+ * fresh dot without stacking a new point. PlayMap.tsx calls it; the
+ * inline append logic is gone, so the gate cannot drift from its
+ * test again.
+ * Residual (zoom-blindness, no code change): spacing is in metres,
+ * not screen px — in a very large zone (radius ≳ 500 m, ~4 m/px)
+ * 11 m-spaced 6 px dots still touch. If the founder still sees a
+ * pill in a big zone, the next step is px-based spacing from
+ * `map.getZoom()`, not another metre threshold.
  */
 export const TRAIL_MIN_MOVE_DEG = 0.0001;
 export const TRAIL_DOT_RADIUS_PX = 3;
+/** A trail point lives 10 s (same fade window as before). */
+export const TRAIL_MAX_AGE_MS = 10_000;
+/** Cap per player, as before (PlayMap sliced to the last 200). */
+export const TRAIL_MAX_POINTS = 200;
+
+export interface TrailPoint {
+  lng: number;
+  lat: number;
+  atMs: number;
+}
+
+/**
+ * Append one fix to a player's trail, or refresh the last point.
+ * Pure (unit-tested in v30-gps-dot.test.mjs) — the ONLY place trail
+ * points are appended, so the spacing gate is tested, not commented.
+ *  - empty / fully-pruned list → the fix becomes the first point;
+ *  - moved ≥ TRAIL_MIN_MOVE_DEG (~11 m) since the last point → append;
+ *  - moved less → NO new point: the last point's `atMs` is refreshed
+ *    in place, so a stationary player keeps one fresh dot instead of
+ *    a stack of same-spot points with different opacities.
+ * Points older than TRAIL_MAX_AGE_MS are pruned first (a key that
+ * stopped receiving fixes never ships stale points), and the list is
+ * capped at TRAIL_MAX_POINTS. Returns a new list; the input is not
+ * mutated.
+ */
+export function appendTrailPoint(
+  list: TrailPoint[],
+  fix: LocationFix,
+  nowMs: number,
+): TrailPoint[] {
+  const atMs = fix.timestampMs ?? nowMs;
+  const cutoff = nowMs - TRAIL_MAX_AGE_MS;
+  const pruned = list.filter((p) => p.atMs >= cutoff);
+  const last = pruned[pruned.length - 1];
+  if (!last) {
+    return [{ lng: fix.lng, lat: fix.lat, atMs }].slice(-TRAIL_MAX_POINTS);
+  }
+  const movedDeg = Math.hypot(fix.lng - last.lng, fix.lat - last.lat);
+  if (movedDeg < TRAIL_MIN_MOVE_DEG) {
+    // No new point — but the single point moves to the latest fix
+    // (same spot within ~11 m, refreshed timestamp): keeping the OLD
+    // coordinates would let the point lag up to 11 m behind a slow
+    // walker, and the accumulated lag would eventually cross the
+    // gate and append — the v29 failure in miniature.
+    return [...pruned.slice(0, -1), { lng: fix.lng, lat: fix.lat, atMs }];
+  }
+  return [...pruned, { lng: fix.lng, lat: fix.lat, atMs }].slice(-TRAIL_MAX_POINTS);
+}
 
 /**
  * The 'pakdam-me' dot features (v28, Diya F5/F6) — REMOVED (v29 fix
@@ -1860,6 +1954,67 @@ export const GPS_NO_FIX_NOTICE =
 /** The no-fix notice, or null when there is a fix or GPS may still arrive. */
 export function gpsNoFixNotice(noFix: boolean, elapsedMs: number): string | null {
   return noFix && elapsedMs >= GPS_NO_FIX_WAIT_MS ? GPS_NO_FIX_NOTICE : null;
+}
+
+/**
+ * v30 follow-up (Diya review, item A — BROKEN in v30): the no-fix
+ * notice driven off the WATCH clock, not the watchable clock. The
+ * play page passed `nowMs - watchStartedAtMsRef.current`, with
+ * `watchStartedAtMsRef` stuck at null when the watcher never started
+ * (play page mounted hidden — `shouldWatchLocation` refuses while
+ * `document.hidden` — so `startWatch` returns before stamping it):
+ * elapsed was then forced to 0 and the notice NEVER fired — no fix,
+ * no dot, no notice, exactly the founder's live-v29 report.
+ *
+ * This variant takes both clocks: when the watch DID start, the
+ * elapsed time runs from the watch start (unchanged behaviour); when
+ * it NEVER started, the elapsed time runs from the moment the match
+ * entered a watchable phase (HEAD_START / ACTIVE / SAFETY_PAUSED —
+ * `watchableSinceMs`, null while in LOBBY / terminal / before start,
+ * so no false notice fires there) and the copy NAMES the state
+ * instead of pretending GPS is merely slow.
+ */
+export const GPS_WATCH_NEVER_STARTED_NOTICE =
+  'GPS watcher never started — tab was hidden / page loaded in background. Waiting for GPS — no fix yet. Your dot appears once your phone reports a location.';
+
+export function gpsNoFixNoticeForWatch(
+  noFix: boolean,
+  nowMs: number,
+  watchStartedAtMs: number | null,
+  watchableSinceMs: number | null,
+): string | null {
+  if (!noFix) return null;
+  if (watchStartedAtMs !== null) {
+    return gpsNoFixNotice(true, nowMs - watchStartedAtMs);
+  }
+  if (watchableSinceMs === null) return null;
+  return nowMs - watchableSinceMs >= GPS_NO_FIX_WAIT_MS
+    ? GPS_WATCH_NEVER_STARTED_NOTICE
+    : null;
+}
+
+/**
+ * v30 (Meera — founder's live v29 phone: no dot, apparently no GPS
+ * notice either): the STALE-fix silence. `gpsNoFixNotice` only fires
+ * while `myFix === null` — once ANY fix has arrived, the page goes
+ * quiet forever even if GPS then dies: `fixNotice` is null (the last
+ * fix was good), `gpsNoFixNotice` returns null (a fix exists), and
+ * the dot just fades (opacity 0.35 via `isFixStale`) with no words.
+ * A fix older than STALE_FIX_MS (60 s) is stale, not live — name it.
+ * Returns null for a fresh fix or no fix at all (the no-fix notice
+ * owns that case). The play page renders this between `fixNotice`
+ * and `gpsNoFixNotice`: an explicit error notice always wins, then
+ * stale, then no-fix.
+ */
+export function gpsStaleFixNotice(
+  myFix: LocationFix | null,
+  nowMs: number,
+): string | null {
+  if (myFix === null) return null;
+  const ageMs = nowMs - myFix.timestampMs;
+  if (ageMs <= STALE_FIX_MS) return null;
+  const ageSeconds = Math.floor(ageMs / 1000);
+  return `Your location is stale — last fix ${ageSeconds}s ago. Your dot returns when GPS reports again.`;
 }
 
 /**

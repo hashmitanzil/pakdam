@@ -5650,6 +5650,28 @@ export class RoomStore {
           events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice peer is not in the room.', false, undefined, nowMs));
           break;
         }
+        // F2 (v30 AppSec): an ejected seat keeps no live team voice.
+        // Reject before the team check so an ejected seat's signals
+        // are never forwarded and its peers never answer.
+        if (me.ejectedAt !== null) {
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs));
+          break;
+        }
+        // F2 (v30 AppSec, target half): the sender block above cannot
+        // fire for an in-flight handshake — the ejected seat offered
+        // to a teammate BEFORE ejection, so after ejection it sends
+        // nothing and only the teammate's `answer` (or further ICE)
+        // arrives. Without a target check that handshake completes
+        // against a stale/tampered client that never runs `disable()`.
+        // Block delivery TO an ejected seat: the error goes to the
+        // sending teammate, the ejected target receives nothing.
+        // This does not tear down pre-existing peer connections —
+        // only the client `disable()` does that — which is why both
+        // halves remain necessary.
+        if (target.ejectedAt !== null) {
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs));
+          break;
+        }
         // Team-only: the DO rejects cross-team signals (lobby = whole lobby).
         if (
           this.room.phase !== 'LOBBY' &&

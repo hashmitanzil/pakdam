@@ -17,6 +17,19 @@
  * The mic track is DISABLED except while the button is held. Mute silences
  * both directions (mic off + remote playback muted).
  *
+ * Playback (v30 — this was the silent-radio defect): `getRemoteStream()`
+ * used to have ZERO callers, so a teammate's voice arrived over WebRTC
+ * and was never played. `VoiceRadio` now owns one hidden `<audio>`
+ * element per connected teammate: on `ontrack` the remote stream is
+ * attached as `srcObject` and `play()` is called. The elements live in
+ * this class (not in React) so voice keeps playing when the radio tab is
+ * hidden — the floating PTT on the map tab must be heard too. Browsers
+ * block `play()` without a user gesture, so a rejected `play()` sets
+ * `playbackBlocked` (surfaced by RadioStrip as a "Tap to enable sound"
+ * button) instead of failing silent; the PTT press itself is a gesture,
+ * so `startTalking()` also retries playback. Team-only: elements are
+ * created only for peer ids in the teammate list.
+ *
  * Mesh + exactly-one-offerer: every voice-enabled teammate connects to
  * every other voice-enabled teammate. When A enables voice it sends `join`
  * to each teammate; a teammate already voice-enabled replies with an
@@ -62,6 +75,8 @@ export interface VoiceRadioOptions {
   onStatusChange?: (status: VoiceRadioStatus, detail?: string) => void;
   onPttChange?: (state: PttState) => void;
   onTalkingChange?: (talking: boolean) => void;
+  /** Fired when `play()` is blocked by the browser (true) or unblocked (false). */
+  onPlaybackBlockedChange?: (blocked: boolean) => void;
 }
 
 export class VoiceRadio {
@@ -80,6 +95,12 @@ export class VoiceRadio {
   private burstTimer: ReturnType<typeof setTimeout> | null = null;
   private burstStartedAtMs = 0;
   private handledSignals = new Set<string>();
+  /** One hidden `<audio>` element per connected teammate (v30 playback). */
+  private audioElements = new Map<string, HTMLAudioElement>();
+  /** True when the browser rejected `play()` — needs a user gesture. */
+  private playbackBlocked = false;
+  /** RadioStrip subscribes here (the play page cannot pass a callback — it owns no such prop). */
+  private playbackBlockedListener: ((blocked: boolean) => void) | null = null;
   private teammates: string[];
   private readonly options: VoiceRadioOptions;
 
@@ -115,6 +136,59 @@ export class VoiceRadio {
 
   get failedPeers(): string[] {
     return [...this.failedPeerIds];
+  }
+
+  /** True when the browser blocked remote playback — needs a user tap. */
+  get isPlaybackBlocked(): boolean {
+    return this.playbackBlocked;
+  }
+
+  /** Teammate ids with a live hidden `<audio>` element attached. */
+  get playbackPeerIds(): string[] {
+    return [...this.audioElements.keys()];
+  }
+
+  /**
+   * Subscribe to playback-blocked changes (RadioStrip uses this — the
+   * play page constructs VoiceRadio without an `onPlaybackBlockedChange`
+   * prop, so the strip subscribes directly). The listener is called
+   * immediately with the current state, so a newly shown strip never
+   * misses a blocked state that arrived while it was hidden.
+   */
+  setPlaybackBlockedListener(listener: ((blocked: boolean) => void) | null): void {
+    this.playbackBlockedListener = listener;
+    if (listener) listener(this.playbackBlocked);
+  }
+
+  /**
+   * Retry `play()` on every attached element — call from a user gesture
+   * (the PTT press, or RadioStrip's "Tap to enable sound" button).
+   * Returns false while the browser still refuses playback.
+   */
+  async unlockPlayback(): Promise<boolean> {
+    const attempts: Promise<void>[] = [];
+    for (const el of this.audioElements.values()) {
+      let result: unknown;
+      try {
+        result = el.play();
+      } catch {
+        // play() threw synchronously — no gesture has happened yet.
+        this.setPlaybackBlocked(true);
+        return false;
+      }
+      const asPromise = toPromise(result);
+      if (asPromise) attempts.push(asPromise);
+    }
+    if (attempts.length === 0) {
+      // No elements, or play() returned nothing to await: nothing is
+      // blocked — a later track arrival attempts play() again.
+      this.setPlaybackBlocked(false);
+      return true;
+    }
+    const settled = await Promise.allSettled(attempts);
+    const blocked = settled.some((r) => r.status === 'rejected');
+    this.setPlaybackBlocked(blocked);
+    return !blocked;
   }
 
   /** `Connected: N of M teammates.` */
@@ -165,6 +239,11 @@ export class VoiceRadio {
       }
     }
     this.peers.clear();
+    // v30: stop every hidden <audio> element (pause, clear srcObject,
+    // remove from the DOM) so no teammate keeps playing after disable.
+    for (const peerId of [...this.audioElements.keys()]) {
+      this.detachPlayback(peerId);
+    }
     this.remoteStreams.clear();
     this.connectedPeerIds.clear();
     this.failedPeerIds.clear();
@@ -184,6 +263,10 @@ export class VoiceRadio {
 
   /** Hold to talk: enables the mic track for at most one 10 s burst. */
   startTalking(): boolean {
+    // The press is a user gesture — retry any playback the browser
+    // blocked earlier, even if this press itself cannot talk (muted /
+    // not ready): the listener still needs to hear teammates.
+    void this.unlockPlayback();
     if (this.status !== 'ready' || this.muted || !this.micTrack) return false;
     this.micTrack.enabled = true;
     this.burstStartedAtMs = Date.now();
@@ -221,6 +304,11 @@ export class VoiceRadio {
     if (this.micTrack) this.micTrack.enabled = !muted && this.ptt === 'talking';
     for (const stream of this.remoteStreams.values()) {
       for (const track of stream.getAudioTracks()) track.enabled = !muted;
+    }
+    // v30: mute the hidden <audio> elements too — the element's own
+    // muted flag is what actually silences playback.
+    for (const el of this.audioElements.values()) {
+      el.muted = muted;
     }
   }
 
@@ -285,9 +373,70 @@ export class VoiceRadio {
     }
   }
 
-  /** The remote audio stream for a teammate (attach to an <audio> element). */
+  /** The remote audio stream for a teammate (v30: attached internally to a hidden `<audio>` element; kept for tests / debugging). */
   getRemoteStream(peerId: string): MediaStream | undefined {
     return this.remoteStreams.get(peerId);
+  }
+
+  /**
+   * Attach a teammate's remote stream to their hidden `<audio>` element
+   * (one element per teammate; a second track for the same peer reuses
+   * the element) and start playback. Team-only: peers only exist for
+   * ids that passed the teammate check in `handleSignal`, and this
+   * re-checks the roster so a stale peer can never become audible.
+   */
+  private attachPlayback(peerId: string, stream: MediaStream): void {
+    if (!this.teammates.includes(peerId)) return;
+    let el: HTMLAudioElement | null | undefined = this.audioElements.get(peerId);
+    if (!el) {
+      el = createHiddenAudioElement();
+      // No DOM / Audio constructor in this environment (SSR, or node
+      // tests without a stub): the stream is still stored, so
+      // getRemoteStream() stays available for inspection.
+      if (!el) return;
+      this.audioElements.set(peerId, el);
+    }
+    el.srcObject = stream;
+    el.muted = this.muted;
+    this.attemptPlay(el);
+  }
+
+  /** One `play()` attempt: a rejection means the browser wants a gesture — flag it, never fail silent. */
+  private attemptPlay(el: HTMLAudioElement): void {
+    let result: unknown;
+    try {
+      result = el.play();
+    } catch {
+      this.setPlaybackBlocked(true);
+      return;
+    }
+    toPromise(result)?.catch(() => this.setPlaybackBlocked(true));
+  }
+
+  /** Stop a teammate's hidden element: pause, clear the stream, remove it from the DOM. */
+  private detachPlayback(peerId: string): void {
+    const el = this.audioElements.get(peerId);
+    if (!el) return;
+    this.audioElements.delete(peerId);
+    try {
+      el.pause();
+    } catch {
+      // Already paused.
+    }
+    el.srcObject = null;
+    try {
+      el.remove();
+    } catch {
+      // Never attached to the DOM.
+    }
+    if (this.audioElements.size === 0) this.setPlaybackBlocked(false);
+  }
+
+  private setPlaybackBlocked(blocked: boolean): void {
+    if (this.playbackBlocked === blocked) return;
+    this.playbackBlocked = blocked;
+    this.options.onPlaybackBlockedChange?.(blocked);
+    this.playbackBlockedListener?.(blocked);
   }
 
   private async createOffer(peerId: string): Promise<void> {
@@ -343,11 +492,20 @@ export class VoiceRadio {
       }
     };
     pc.ontrack = (event) => {
-      const stream = event.streams[0];
-      if (stream) {
-        this.remoteStreams.set(peerId, stream);
-        for (const track of stream.getAudioTracks()) track.enabled = !this.muted;
-      }
+      // Some browsers fire ontrack with a track but no streams array —
+      // wrap the track so the voice is never lost for that reason.
+      const stream =
+        event.streams?.[0] ??
+        (typeof MediaStream !== 'undefined' && event.track
+          ? new MediaStream([event.track])
+          : undefined);
+      if (!stream) return;
+      this.remoteStreams.set(peerId, stream);
+      for (const track of stream.getAudioTracks()) track.enabled = !this.muted;
+      // v30: this was the silent-radio defect — the stream used to sit
+      // in the map with no caller. Attach it to a hidden <audio>
+      // element and play it now.
+      this.attachPlayback(peerId, stream);
     };
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'connected') {
@@ -379,6 +537,10 @@ export class VoiceRadio {
     }
     this.remoteStreams.delete(peerId);
     this.connectedPeerIds.delete(peerId);
+    // v30: the teammate left / the peer closed — stop their audio
+    // element too, or the last thing they said would keep a stale
+    // element (and a stale stream) around.
+    this.detachPlayback(peerId);
   }
 
   private markFailed(peerId: string): void {
@@ -398,4 +560,42 @@ export class VoiceRadio {
     this.options.onPttChange?.(state);
     if (state === 'talking') this.options.onTalkingChange?.(true);
   }
+}
+
+/**
+ * One hidden `<audio>` element: created in the DOM (so it is inspectable
+ * and really plays) and hidden from sight and screen readers. Falls back
+ * to a detached `new Audio()` when there is no document body (SSR), and
+ * to null when there is no DOM at all.
+ */
+function createHiddenAudioElement(): HTMLAudioElement | null {
+  try {
+    if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+      const el = document.createElement('audio');
+      el.style.display = 'none';
+      el.setAttribute('aria-hidden', 'true');
+      // playsInline keeps iOS Safari from taking over playback.
+      el.setAttribute('playsinline', '');
+      if (document.body && typeof document.body.appendChild === 'function') {
+        document.body.appendChild(el);
+      }
+      return el;
+    }
+    if (typeof Audio !== 'undefined') {
+      const el = new Audio();
+      el.style.display = 'none';
+      return el;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+/** `play()` returns a promise in browsers, undefined in some stubs — normalise. */
+function toPromise(value: unknown): Promise<void> | null {
+  if (value && typeof (value as { then?: unknown }).then === 'function') {
+    return value as Promise<void>;
+  }
+  return null;
 }

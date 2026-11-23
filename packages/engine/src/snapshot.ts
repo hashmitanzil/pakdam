@@ -203,23 +203,56 @@ export function buildSnapshot(input: {
   );
   // v29 (R1) — durable watermark for the client snapshot key
   // `version:serverSeq:maxLastFixAtMs:epochMs`: the newest `lastFixAt`
-  // across the roster (null when nobody has reported). `lastFixAt` is
+  // (null when nobody in scope has reported). `lastFixAt` is
   // durable and persisted ≤ 30 s, so after a DO eviction the restored
   // watermark is ≤ the cached one and the key differs. The epoch
   // (memory only, stamped on load) covers the case the watermark
   // cannot: durable seq + watermark unchanged across a wake while
   // memory-only `teammateFixes` / `locationStatus` are gone.
+  // F1 (v30 AppSec): the watermark is per-viewer — the viewer plus
+  // their SAME-TEAM players only, never an opponent. A roster-wide
+  // max degenerates in a 2-player game to the opponent's freshest
+  // fix timestamp whenever it exceeds the viewer's own — the same
+  // signal class F1 was filed over (the per-player redaction below
+  // already strips opponents' `lastFixAt`, so the top-level
+  // aggregate must not re-introduce it). A viewer with no team
+  // (null) scopes to themselves alone. This costs the R5
+  // `snapshot.unchanged` key nothing: every accepted fix — opponent
+  // or not — advances `serverSeq` (`location.update` calls
+  // `nextSeq()`), so an opponent fix still moves the key and the
+  // client never answers `unchanged` over a stale snapshot.
+  const viewerTeam =
+    input.players.find((p) => p.playerId === input.viewerPlayerId)?.team ?? null;
   let maxLastFixAtMs: number | null = null;
   for (const p of input.players) {
+    if (p.playerId !== input.viewerPlayerId && (viewerTeam === null || p.team !== viewerTeam)) continue;
     if (p.lastFixAt === null) continue;
     const ms = Date.parse(p.lastFixAt);
     if (!Number.isNaN(ms) && (maxLastFixAtMs === null || ms > maxLastFixAtMs)) {
       maxLastFixAtMs = ms;
     }
   }
+  // F1 (v30 AppSec): outside the lobby, a non-viewer's `lastFixAt` /
+  // `locationQuality` are a GPS-liveness signal the visibility model
+  // ("opponents ping-only") denies — the DO's own `player.visibility`
+  // event and `locationStatusFor` already restrict liveness to
+  // teammates. In the LOBBY the whole lobby is one scope and the
+  // roster legitimately shows per-player freshness, so the fields
+  // ship raw there. `connectionState` is NOT redacted: the host-grace
+  // banner needs the host's suspended state. The viewer's own fields
+  // are intact in every phase (the client guards nulls everywhere
+  // these are read: snapshot-key fallback, play page, Roster).
+  const playersView =
+    input.room.phase === 'LOBBY'
+      ? playersViewFor(input.viewerPlayerId, input.players, input.seatPresence)
+      : playersViewFor(input.viewerPlayerId, input.players, input.seatPresence).map((p) =>
+          p.playerId === input.viewerPlayerId
+            ? p
+            : { ...p, lastFixAt: null, locationQuality: null },
+        );
   return {
     room: input.room,
-    players: playersViewFor(input.viewerPlayerId, input.players, input.seatPresence),
+    players: playersView,
     phase: input.room.phase,
     version: input.room.version,
     serverSeq: input.serverSeq,

@@ -72,6 +72,16 @@ export interface DemoRoom {
   outsideAccumMs: Record<string, number>;
   /** Phase paused from (safety pause resumes here, never hard-coded ACTIVE). */
   pausedFrom: MatchPhase | null;
+  /**
+   * v30 follow-up (Diya review, item D): who paused the match (demo).
+   * `safetyPauseDemo` used to take `_playerId` (explicitly unused) and
+   * `demoSafety` hardcoded `pausedBy: null`, so the sheet could never
+   * render "Match paused by <name> — clock frozen." The live path is
+   * untouched — the server snapshot already carries `pausedBy`; this
+   * is the demo mirror of it. Cleared on resume (setPhase) and replay.
+   * Old rooms stored before this field existed read as null.
+   */
+  pausedByPlayerId: string | null;
   // NOTE (founder decision, v18): SOS is removed — no sosActive /
   // sosByPlayerId on the demo room, no sosDemo(), no SOS_DEMO_COPY.
   // The safety PAUSE stays.
@@ -258,6 +268,7 @@ export function createRoom(
     outsideSinceMs: {},
     outsideAccumMs: {},
     pausedFrom: null,
+    pausedByPlayerId: null,
     announcements: [],
     originalZoneBoundary: null,
     appliedShrinks: 0,
@@ -517,6 +528,9 @@ export function setPhase(demo: DemoRoom, phase: MatchPhase): void {
       ).toISOString();
     }
     demo.room.pausedAt = null;
+    // v30 follow-up (item D): the pauser is forgotten on resume —
+    // a resumed match has nobody "pausing" it any more.
+    demo.pausedByPlayerId = null;
   }
   demo.room.phase = phase;
   demo.room.version += 1;
@@ -1236,6 +1250,8 @@ export function replayDemoRoom(demo: DemoRoom, actorPlayerId: string): DemoRoom 
   demo.room.endsAt = null;
   demo.room.pausedAt = null;
   demo.pausedFrom = null;
+  // v30 follow-up (item D): a replayed room has no pauser on record.
+  demo.pausedByPlayerId = null;
   // v24 (D1): a replayed room has no grace running — every kept seat
   // rejoins connected below.
   demo.hostGraceEndsAtMs = null;
@@ -1652,8 +1668,12 @@ export function ejectPlayer(demo: DemoRoom, playerId: string): void {
 }
 
 /** Safety pause (any player). NOTE (founder decision, v18): SOS is removed — there is no sosDemo() and no "Tell everyone / I'm safe" broadcast; the safety PAUSE stays. */
-export function safetyPauseDemo(demo: DemoRoom, _playerId: string): void {
+export function safetyPauseDemo(demo: DemoRoom, playerId: string): void {
   if (demo.room.phase !== 'HEAD_START' && demo.room.phase !== 'ACTIVE') return;
+  // v30 follow-up (item D): record WHO paused, before setPhase saves
+  // the room — demoSafety reads this, so the sheet renders
+  // "Match paused by <name> — clock frozen." (live path untouched).
+  demo.pausedByPlayerId = playerId;
   setPhase(demo, 'SAFETY_PAUSED');
 }
 
@@ -1723,6 +1743,10 @@ export function demoRoomChangeKey(demo: DemoRoom | null): string {
     room.config.selectedHunterIds.join(','),
     room.config.hunterCount,
     demo.pausedFrom ?? '',
+    // v30 follow-up (item D): the pauser — without it, a poll that
+    // only records who paused would be skipped as identical and the
+    // sheet would keep rendering "Match paused — clock frozen."
+    demo.pausedByPlayerId ?? '',
     demo.appliedShrinks,
     JSON.stringify(demo.lastPingAtMs),
     players,

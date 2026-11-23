@@ -2,13 +2,20 @@
  * Foreground GPS — PROTOCOL-MAP §4.10 (R11).
  *
  * Foreground-only `watchPosition` (enableHighAccuracy, maximumAge 0,
- * timeout 15 s). Transient errors are swallowed; only permission-denied
- * (and position-unavailable, v28) is terminal. Live send rule (B1,
- * v18 — liveness decoupled from usability): a fix is SENT whenever it
- * is within the server validity bound (±1000 m), so a poor-but-present
- * GPS still stamps `lastFixAt`; only fixes accurate to ±50 m are
- * USABLE for gameplay, and that gate lives server-side. Poor accuracy
- * is warned, never treated as cheating.
+ * timeout 15 s). Permission-denied (and position-unavailable, v28)
+ * is terminal/visible; a timeout (v30) is surfaced too — the watch
+ * stays alive, but a GPS chip that has searched 15 s with nothing
+ * must not be silent. Live send rule (B1, v18 — liveness decoupled
+ * from usability): a fix is SENT whenever it is within the server
+ * validity bound (±1000 m), so a poor-but-present GPS still stamps
+ * `lastFixAt`; only fixes accurate to ±50 m are USABLE for gameplay,
+ * and that gate lives server-side. Poor accuracy is warned, never
+ * treated as cheating. (Note the split: `isFixSendable` in
+ * @pakdam/shared is the ±50 m USABILITY / quality bar — the lobby
+ * uses it as its fix-quality bar — while the play page sends up to
+ * ±1000 m via MAX_FIX_ACCURACY_METERS. The two are different gates
+ * on purpose; do not "fix" one to match the other without a founder
+ * call — see the v30 report.)
  *
  * v28 (Diya F13): the header used to claim "Location stops when the
  * tab hides" — `watchLocation` itself never implemented any such
@@ -85,17 +92,20 @@ export interface WatchHandle {
 
 /**
  * Foreground-only watch. Calls `onFix` for every fresh fix that passes
- * validation (deduped by timestamp); `onError` for terminal errors —
- * permission-denied (the watch is dead: the OS will not call back
- * again until permission is re-granted and the watch is recreated)
- * and position-unavailable (v28, Diya F16: GPS off / unavailable is
- * a VISIBLE state for the player, not silence — the old code
- * swallowed it and the dot froze with no explanation). Timeouts stay
- * swallowed (transient: the play page's 15 s no-fix notice covers a
- * fix that simply never arrives). The caller decides whether to send
- * the fix (only ≤ ±1000 m fixes are ever sent — see `isFixSendable`).
- * The caller ALSO owns pausing: this helper never pauses on hide
- * itself (v28, Diya F13) — the play page stops/starts the watch.
+ * validation (deduped by timestamp); `onError` for permission-denied
+ * (the watch is dead: the OS will not call back again until permission
+ * is re-granted and the watch is recreated), position-unavailable
+ * (v28, Diya F16: GPS off / unavailable is a VISIBLE state for the
+ * player, not silence — the old code swallowed it and the dot froze
+ * with no explanation), and timeout (v30: a 15 s search with no fix
+ * is VISIBLE too — the watch stays alive and keeps trying, so a
+ * timeout is a notice, never a suspension or a dot clear; the caller
+ * decides that). The caller decides whether to send the fix (only
+ * ≤ ±1000 m fixes are ever sent — see the play page's
+ * MAX_FIX_ACCURACY_METERS check, NOT `isFixSendable`, which is the
+ * ±50 m usability bar). The caller ALSO owns pausing: this helper
+ * never pauses on hide itself (v28, Diya F13) — the play page
+ * stops/starts the watch.
  */
 export function watchLocation(
   onFix: (fix: LocationFix) => void,
@@ -112,19 +122,31 @@ export function watchLocation(
   const watchId = navigator.geolocation.watchPosition(
     (position) => {
       const fix = toFix(position);
+      // Dedupe by timestamp — but ONLY for accepted fixes (v30): the
+      // old code stamped `lastTimestampMs` BEFORE `validateFix`, so a
+      // REJECTED fix (> ±1000 m, stale, skewed) poisoned the dedupe
+      // and a valid fix arriving in the same millisecond was dropped
+      // with it. A rejected fix must not eat a later valid one.
       if (fix.timestampMs === lastTimestampMs) return; // exact duplicate
-      lastTimestampMs = fix.timestampMs;
       const result = validateFix(fix);
       if (!result.ok) return; // bad shape / skew / stale — rejected, never sent
+      lastTimestampMs = fix.timestampMs;
       onFix(fix);
     },
     (error) => {
       const mapped = toError(error);
       // Permission-denied is terminal (the watch is dead); so is a
       // reported position-unavailable (GPS off / no signal — the
-      // player must see it, not silence). Timeouts are transient and
-      // stay swallowed.
-      if (mapped.kind === 'permission-denied' || mapped.kind === 'position-unavailable') {
+      // player must see it, not silence). A timeout is surfaced too
+      // (v30): the watch stays alive, but 15 s of searching with no
+      // fix is a visible state, not silence — the old code swallowed
+      // it, so a phone whose GPS chip never acquires (indoors, cold
+      // start) showed nothing at all from the error path.
+      if (
+        mapped.kind === 'permission-denied' ||
+        mapped.kind === 'position-unavailable' ||
+        mapped.kind === 'timeout'
+      ) {
         onError?.(mapped);
       }
     },

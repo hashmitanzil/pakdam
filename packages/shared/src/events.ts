@@ -212,7 +212,7 @@ export interface SnapshotRequestPayload {
 export interface SnapshotKey {
   version: number;
   serverSeq: number;
-  /** Newest `lastFixAt` across the roster, epoch ms, or null. */
+  /** Newest `lastFixAt` over the viewer + same-team players only (v30 AppSec F1), epoch ms, or null. */
   maxLastFixAtMs: number | null;
   /** The DO instance's memory epoch (changes on every wake). */
   epochMs: number;

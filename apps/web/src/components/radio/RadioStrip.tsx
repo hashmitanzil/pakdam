@@ -11,7 +11,7 @@
  */
 'use client';
 
-import { memo, useState } from 'react';
+import { memo, useEffect, useState } from 'react';
 import type { RadioMessage, Team, VoiceRadioStatus } from '@pakdam/shared';
 import { QUICK_SIGNALS, RADIO_MAX_CHARS } from '@pakdam/shared';
 import type { PttState, VoiceRadio } from '@/lib/voice-radio';
@@ -66,6 +66,21 @@ export const RadioStrip = memo(function RadioStrip({
   // B18: "Enabling…" while getUserMedia resolves — the tap used to
   // sit dead until the mic permission prompt answered.
   const [enablingVoice, setEnablingVoice] = useState(false);
+  // v30: the browser can connect voice yet refuse playback until the
+  // user taps — the radio must say so instead of staying silent.
+  // VoiceRadio owns the <audio> elements (so voice plays even when
+  // this tab is hidden); the strip only subscribes to the blocked
+  // state. The play page constructs VoiceRadio without a callback
+  // prop, so subscription happens here, directly on the radio.
+  const [playbackBlocked, setPlaybackBlocked] = useState(false);
+  useEffect(() => {
+    if (!voiceRadio) {
+      setPlaybackBlocked(false);
+      return;
+    }
+    voiceRadio.setPlaybackBlockedListener(setPlaybackBlocked);
+    return () => voiceRadio.setPlaybackBlockedListener(null);
+  }, [voiceRadio]);
   const quick = team === 'hunters' ? QUICK_SIGNALS.hunters : QUICK_SIGNALS.runners;
 
   const sendDraft = () => {
@@ -124,6 +139,22 @@ export const RadioStrip = memo(function RadioStrip({
           {voiceSummary || (voiceStatus === 'talking' ? 'Talking…' : 'Voice ready.')}
         </p>
       )}
+
+      {/* v30: voice connected but the browser blocked playback — a tap
+          is the gesture that unblocks it. Never fail silent. */}
+      {voiceRadio !== null &&
+      playbackBlocked &&
+      (voiceStatus === 'ready' || voiceStatus === 'talking') ? (
+        <button
+          type="button"
+          onClick={() => {
+            void voiceRadio.unlockPlayback();
+          }}
+          className="self-start rounded-full border border-[#EF4444] bg-[#EF4444]/10 px-3 py-1 text-[13px] font-semibold text-[#EF4444]"
+        >
+          Tap to enable sound — voice is connected but your browser blocked playback
+        </button>
+      ) : null}
 
       {/* Messages — system lines centred, own messages red right, others grey left. */}
       <div className="flex min-h-[120px] flex-1 flex-col gap-2 overflow-y-auto rounded-2xl border border-[#26262B] bg-[#141416] p-3">

@@ -212,7 +212,9 @@ function toCatchView(
 function demoSafety(demo: DemoRoom): SafetyState {
   return {
     paused: demo.room.phase === 'SAFETY_PAUSED',
-    pausedBy: null,
+    // v30 follow-up (item D): the demo pauser, recorded by
+    // safetyPauseDemo — the live snapshot already carries pausedBy.
+    pausedBy: demo.pausedByPlayerId ?? null,
     pausedAt: demo.room.pausedAt,
     // v18: no `sosActive` — SOS was removed entirely.
   };

@@ -644,7 +644,14 @@ test('M8: trail points stay discrete (spacing > diameter) and meDotFeatures is g
   assert.equal(TRAIL_MIN_MOVE_DEG, 0.0001, 'a new trail point needs ~11 m of movement');
   assert.equal(TRAIL_DOT_RADIUS_PX, 3, 'trail dots are 3 px');
   const mapSrc = readSrc('src/components/hud/PlayMap.tsx');
-  assert.ok(mapSrc.includes('TRAIL_MIN_MOVE_DEG'), 'the trail must use the spacing constant');
+  // v30: the gate lives in the pure `appendTrailPoint`
+  // (play-map-logic.ts) — the v29 inline gate in PlayMap had a
+  // `< 3 s` time bypass the 5 s clock defeated, so a point was
+  // appended on every tick while moving slowly (the pill). PlayMap
+  // must call the helper and carry no inline gate of its own.
+  assert.ok(mapSrc.includes('appendTrailPoint('), 'the trail must append through the pure helper');
+  assert.ok(!mapSrc.includes('TRAIL_MIN_MOVE_DEG'), 'no inline spacing gate may remain in PlayMap');
+  assert.ok(!mapSrc.includes('now - last.atMs < 3000'), 'the v29 time bypass must be gone');
   assert.ok(mapSrc.includes('TRAIL_DOT_RADIUS_PX'), 'the trail must use the radius constant');
   assert.ok(!mapSrc.includes('0.00005'), 'the old 5.5 m merge spacing must be gone');
   const logic = readSrc('src/components/hud/play-map-logic.ts');

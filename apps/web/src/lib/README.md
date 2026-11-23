@@ -100,9 +100,9 @@ Rooms persist to localStorage `pakdam.demo.rooms.v1` WITHOUT coordinates; fixes,
 
 ## `geolocation.ts` — foreground GPS (PROTOCOL-MAP §4.10)
 
-- `watchLocation(onFix, onError?)` — foreground-only `watchPosition` (high accuracy, maximumAge 0, timeout 15 s); dedupes by timestamp; only permission-denied is terminal (transient errors swallowed). Returns a `{ stop() }` handle, or null when unsupported.
+- `watchLocation(onFix, onError?)` — foreground-only `watchPosition` (high accuracy, maximumAge 0, timeout 15 s); dedupes by timestamp; permission-denied, position-unavailable and timeout (v30) are surfaced to `onError` (a timeout is a notice only — the watch stays alive); returns a `{ stop() }` handle, or null when unsupported.
 - `getCurrentFix()` — one-shot fix, staged chain (12 s high-accuracy watch → 10 s high-accuracy one-shot → 15 s low-accuracy one-shot → 8 s cached one-shot), 45 s global deadline; best fix within ±50 m or a plain-words timeout.
-- `isFixSendableToServer(fix)` / `canZoneAutoCentreOn(fix)` — the ±50 m rule (only fixes ≤ ±50 m are ever sent; a zone is never auto-centred on a worse fix).
+- `isFixSendableToServer(fix)` / `canZoneAutoCentreOn(fix)` — the ±50 m USABILITY / quality bar (a zone is never auto-centred on a worse fix; the lobby uses it as its fix-quality bar). This is NOT the play-page send gate: the play page sends liveness fixes up to ±1000 m (`MAX_FIX_ACCURACY_METERS`), so a poor-but-present GPS still stamps `lastFixAt` — the two gates differ on purpose, do not merge them without a founder call.
 - `locationFreshnessLabel(lastFixAtMs, nowMs?)` — `Location never reported` / `Location unknown` / `Last fix 0:20 ago` (from `@pakdam/shared`).
 
 ## `session-credentials.ts` — seat credentials (PROTOCOL-MAP §10)

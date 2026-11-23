@@ -141,9 +141,10 @@ import {
 // used to live inline in this file — same behaviour, one home.
 import {
   EMPTY_TILE_LEDGER,
-  RECENTRE_DEFAULT_NOTE,
-  RECENTRE_ZONE_FALLBACK_NOTE,
+  RECENTRE_NO_FIX_DEFAULT_PILL,
+  RECENTRE_NO_FIX_ZONE_PILL,
   TILE_ERROR_QUIET_DECAY_MS,
+  appendTrailPoint,
   boundaryChangedMaterially,
   canvasMatchesContainer,
   canvasRepairStep,
@@ -178,7 +179,6 @@ import {
   tileLedgerStale,
   tryFitZone,
   TRAIL_DOT_RADIUS_PX,
-  TRAIL_MIN_MOVE_DEG,
   unknownErrorDetail,
   zoneBboxInView,
   type FitRetryBudget,
@@ -284,9 +284,18 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // until the next tap, Retry, or fresh map.
   const [recentreFailedAtMs, setRecentreFailedAtMs] = useState<number | null>(null);
   // v28 (Diya F2): the ◎ fallback note — shown under the buttons when
-  // the tap centred on the zone (no fix) or on a stale fix. Plain
-  // words, cleared by the next tap or by a fresh fix arriving.
+  // the tap centred on a stale fix. Plain words, cleared by the next
+  // tap or by a fresh fix arriving.
+  // v30 follow-up (Diya review, item C): the NO-FIX fallback is NOT
+  // a note any more — a footnote under the buttons (max-w 88 px) let
+  // the map move silently, so a dead watcher looked like a working
+  // button. It is a LOUD pill instead (`recentreFallback`, rendered
+  // top-left, amber, role=status): "No GPS fix — showing zone centre"
+  // / "No GPS fix — showing Ranchi". The fallback behaviour itself is
+  // unchanged (zone centre with no fix is correct); only the surfacing
+  // changed. A stale fix still uses the small note below.
   const [recentreNote, setRecentreNote] = useState<string | null>(null);
+  const [recentreFallback, setRecentreFallback] = useState<'zone' | 'default' | null>(null);
   // The first zone fit never landed (Diya F1/F2): the pill must not
   // claim "Map ready" while the camera never reached the zone.
   // v26: this is the reason of the last REAL failed fit attempt (a
@@ -612,6 +621,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       // is a new chance to re-centre, not a stale failure.
       setRecentreFailed(false);
       setRecentreNote(null);
+      setRecentreFallback(null);
       setAreaDiagnosis(null);
       setZeroWidth(false);
       // v27: a fresh map gets its own one re-resize on the canvas
@@ -1384,29 +1394,31 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // The v28 dot was a MapLibre `circle` layer — a screen-space
   // circle, round by construction — and no non-square box or wrong
   // border-radius exists anywhere in that path, yet the founder's
-  // phone showed the GPS point as a pill. The stretched-canvas
-  // hypothesis for that has no supporting evidence (the only
-  // observed canvas/container disagreement, the v27 526×0 collapse,
-  // renders nothing, not a pill). The fix-round re-examination (M8)
-  // found the actual code-provable mechanism in the DOT TRAILS below:
-  // overlapping fading trail points merge into an elongated capsule
-  // while moving slowly, so the dot read as a pill — the trail
-  // spacing is fixed there (~11 m between points, 3 px dots). The
-  // DOM marker stays as well: an 18×18 px square with a 50% radius
+  // phone showed the GPS point as a pill. The v29 fix-round
+  // re-examination (M8) blamed overlapping fading trail points, and
+  // the v29 spacing threshold (~11 m) was right — but v30 proved the
+  // GATE never held (see `appendTrailPoint`, play-map-logic.ts): the
+  // inline append skipped only when the last point was BOTH close
+  // AND < 3 s old, and the 5 s-quantised map clock meant the age leg
+  // was almost always ≥ 3 s, so a point was appended on every tick
+  // regardless of distance. The trail gate is now the pure
+  // distance-only `appendTrailPoint` below; the DOM marker stays as
+  // well: an 18×18 px square with a 50% radius
   // (`meDotMarkerStyle`, play-map-logic.ts — the same proven pattern
-  // as the setup map's orange dot), so it is round whatever the
-  // canvas does. The ring is the fix's real accuracy circle, so a
-  // rough fix shows wide and a precise fix tight; the ±50 m gate is
-  // a gameplay-usability gate, never a display gate, so ANY validated
-  // fix (up to ±1000 m) draws. A stale fix (> 60 s, STALE_FIX_MS)
-  // draws faded instead of masquerading as live. Deps include nowMs
-  // so the stale fade advances on the 5 s clock even while standing
-  // still. The marker is created once per map (the maplibre chunk is
-  // already loaded by createOlaMap, so the import resolves from
-  // cache) and removed with the map; the test fake implements
-  // MapLibreMapLike but is not a real Map (no getContainer), so no
-  // marker is created under it — the style is covered by
-  // `meDotMarkerStyle` unit tests.
+  // as the setup map's orange dot, now with an explicit
+  // `boxSizing: border-box` so the border cannot inflate the box),
+  // so it is round whatever the canvas does. The ring is the fix's
+  // real accuracy circle, so a rough fix shows wide and a precise
+  // fix tight; the ±50 m gate is a gameplay-usability gate, never a
+  // display gate, so ANY validated fix (up to ±1000 m) draws. A stale
+  // fix (> 60 s, STALE_FIX_MS) draws faded instead of masquerading
+  // as live. Deps include nowMs so the stale fade advances on the 5 s clock
+  // even while standing still. The marker is created once
+  // per map (the maplibre chunk is already loaded by createOlaMap,
+  // so the import resolves from cache) and removed with the map; the
+  // test fake implements MapLibreMapLike but is not a real Map (no
+  // getContainer), so no marker is created under it — the style is
+  // covered by `meDotMarkerStyle` unit tests.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
@@ -1511,12 +1523,16 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // 5 s-quantised clock (mapNowMs, passed in as nowMs) so the fade
   // advances in 5 s steps even while standing still.
   // Own + teammates only — the caller never passes an opponent's fix.
-  // v29 fix round (M8): points append only after ~11 m of movement
-  // (`TRAIL_MIN_MOVE_DEG`) and are 3 px (`TRAIL_DOT_RADIUS_PX`) —
-  // the old 5.5 m / 4 px spacing let overlapping fading points merge
-  // into an elongated capsule while moving slowly, i.e. the GPS dot
-  // read as a pill (see the constants' comment in play-map-logic.ts).
-  // A stationary player still leaves a fresh dot at the same spot.
+  // v30 (Meera — the v29 pill fix did NOT hold): the old inline
+  // append skipped only when the last point was BOTH < ~11 m away
+  // AND < 3 s old, and the 5 s clock meant the age leg was almost
+  // always ≥ 3 s, so a point was appended on every tick while moving
+  // slowly and the overlapping 3 px dots merged into a capsule
+  // trailing the me-dot — the pill. Appends now go through the pure
+  // `appendTrailPoint` (play-map-logic.ts): distance-only ≥ ~11 m,
+  // sub-threshold fixes refresh the last point in place instead of
+  // stacking a new one. A stationary player still keeps a fresh dot
+  // at the same spot (one point, refreshed timestamp — no stack).
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
@@ -1533,22 +1549,13 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     }
     const append = (key: string, fix: LocationFix | null) => {
       if (!fix) return;
-      const list = trailPointsRef.current.get(key) ?? [];
-      const atMs = fix.timestampMs ?? now;
-      const last = list[list.length - 1];
-      if (last) {
-        // Don't stack a duplicate point for standing still — unless
-        // 3 s passed, so a stationary player still leaves a fresh dot.
-        // `TRAIL_MIN_MOVE_DEG` (≈ 11 m) is the pill fix (M8): points
-        // closer than their own diameter merge into a capsule while
-        // moving slowly, so slow movement appends only every ~11 m.
-        const movedDeg = Math.hypot(fix.lng - last.lng, fix.lat - last.lat);
-        if (movedDeg < TRAIL_MIN_MOVE_DEG && now - last.atMs < 3000) return;
-      }
-      list.push({ lng: fix.lng, lat: fix.lat, atMs });
+      // v30: the spacing gate lives in `appendTrailPoint`
+      // (play-map-logic.ts) — distance-only, tested. The old inline
+      // gate had a `< 3 s` time bypass that the 5 s clock defeated,
+      // so slow movement appended a point every tick (the pill).
       trailPointsRef.current.set(
         key,
-        list.filter((p) => p.atMs >= cutoff).slice(-200),
+        appendTrailPoint(trailPointsRef.current.get(key) ?? [], fix, now),
       );
     };
     append('me', myFix);
@@ -1629,9 +1636,11 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // A throw is caught here and recorded as the allow-listed
   // `RECENTRE_FAILED_COPY` in the pill — never raw error text, never
   // a "resource failure" (Zara A1, Diya F3). The player is TOLD when
-  // the tap fell back: zone centroid (no fix) or a stale fix get a
-  // plain note under the buttons (Diya F2) instead of silently
-  // centring somewhere the player did not ask for.
+  // the tap fell back: zone centroid / Ranchi default (no fix) get the
+  // LOUD amber pill (v30 follow-up, item C — the old footnote under
+  // the buttons let a dead watcher look like a working tap), and a
+  // stale fix gets a plain note under the buttons (Diya F2) — never
+  // silently centring somewhere the player did not ask for.
   const centreOn = useCallback(
     (bearing?: number) => {
       const map = mapRef.current;
@@ -1652,12 +1661,14 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         setRecentreFailed(true);
         setRecentreFailedAtMs(Date.now());
         setRecentreNote(null);
+        setRecentreFallback(null);
         return;
       }
       setRecentreFailed(false);
       setRecentreFailedAtMs(null);
       if (source === 'fix' && myFix !== null) {
         const now = nowMs ?? Date.now();
+        setRecentreFallback(null);
         if (isFixStale(myFix, now)) {
           const ageS = Math.max(0, Math.floor((now - myFix.timestampMs) / 1000));
           setRecentreNote(recentreStaleNote(ageS));
@@ -1665,9 +1676,12 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           setRecentreNote(null);
         }
       } else if (source === 'zone') {
-        setRecentreNote(RECENTRE_ZONE_FALLBACK_NOTE);
+        // v30 follow-up (item C): loud pill, not the footnote.
+        setRecentreNote(null);
+        setRecentreFallback('zone');
       } else {
-        setRecentreNote(RECENTRE_DEFAULT_NOTE);
+        setRecentreNote(null);
+        setRecentreFallback('default');
       }
     },
     [myFix, zoneBoundary, mapReady, nowMs],
@@ -1675,9 +1689,12 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
 
   // A fresh fix makes a fallback/stale ◎ note obsolete — clear it so
   // the note never outlives the GPS state it described (Diya F2).
+  // v30 follow-up (item C): the loud fallback pill clears too — a
+  // fresh fix means GPS is back, so "No GPS fix" must not linger.
   useEffect(() => {
     if (myFix !== null && !isFixStale(myFix, nowMs ?? Date.now())) {
       setRecentreNote(null);
+      setRecentreFallback(null);
     }
   }, [myFix, nowMs]);
 
@@ -1823,7 +1840,11 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     // flat container). A programmatic / keyboard / double-tap call
     // while a load is in flight is a no-op instead of aborting the
     // creation that is already running.
-    if (retryDisabled(mapState, Date.now(), lastRetryAtMs, isDeferred)) return;
+    // v30: a slow load (12 s watchdog fired) may be retried too — the
+    // loading block lifts then (see `retryDisabled`); a stalled style
+    // load otherwise leaves the user with no recovery but reopening
+    // the PWA.
+    if (retryDisabled(mapState, Date.now(), lastRetryAtMs, isDeferred, slowLoad)) return;
     // v27 fix round (Diya Advisory 3): NO re-measure first — the old
     // `checkMapAreaHeight()` call here was dead code: the lines below
     // immediately wiped everything it set (`setAreaDiagnosis(null)`,
@@ -1848,6 +1869,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     // v28: the ◎ failure state clears on Retry too.
     setRecentreFailed(false);
     setRecentreNote(null);
+    setRecentreFallback(null);
     setAreaDiagnosis(null);
     setZeroWidth(false);
     // v27: a manual Retry re-arms the canvas repair ladder's one
@@ -1864,7 +1886,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     refitAtSizeRef.current = null;
     setLastRetryAtMs(Date.now());
     setRetryNonce((n) => n + 1);
-  }, [mapState, lastRetryAtMs, isDeferred]);
+  }, [mapState, lastRetryAtMs, isDeferred, slowLoad]);
 
   // No early returns: the map container below stays mounted in EVERY
   // state (no-key / unavailable / error included). The v13 error path
@@ -1919,12 +1941,15 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // 2): while the build is DEFERRED the loading block does NOT apply
   // — the map is not loading, nothing is in flight to abort, and
   // Retry is the only manual escape from a flat container. The
-  // cooldown still applies while deferred.
+  // cooldown still applies while deferred. v30: a SLOW load (12 s
+  // watchdog fired) lifts the loading block the same way — a stalled
+  // style load is otherwise unrecoverable without reopening the PWA.
   const retryIsDisabled = retryDisabled(
     mapState,
     nowMs ?? Date.now(),
     lastRetryAtMs,
     isDeferred,
+    slowLoad,
   );
 
   return (
@@ -1941,6 +1966,20 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           outer, whichever position wins). The setup map never had
           this bug — its container carries an explicit inline height. */}
       <div ref={containerRef} className="absolute inset-0 h-full w-full" aria-label="Play map" />
+      {/* v30 follow-up (Diya review, item C): the no-fix re-centre
+          fallback is a LOUD pill, top-left, amber, role=status — not
+          the old 88 px footnote under the buttons. The map moving to
+          the zone centre must never read as a working ◎ tap on a dead
+          watcher. Cleared by a fresh fix, a fix-centred tap, Retry,
+          or a failed tap (see centreOn / the effects above). */}
+      {recentreFallback ? (
+        <p
+          role="status"
+          className="absolute left-3 top-3 z-10 max-w-[calc(100%-6.5rem)] rounded-full border border-[#F59E0B] bg-[#141416] px-3 py-1.5 text-[13px] font-bold text-[#FBBF24]"
+        >
+          {recentreFallback === 'zone' ? RECENTRE_NO_FIX_ZONE_PILL : RECENTRE_NO_FIX_DEFAULT_PILL}
+        </p>
+      ) : null}
       <div className="absolute right-3 top-3 z-10 flex flex-col gap-2">
         <button
           type="button"

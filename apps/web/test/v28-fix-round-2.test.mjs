@@ -236,15 +236,18 @@ test('R3: a manual retry is allowed to start a watch mid-game (visible tab, live
   assert.equal(shouldWatchLocation('SAFETY_PAUSED', false), true);
 });
 
-test('R3 (wiring pin): the play page offers "Try again" only for a GPS denial, and the tap re-runs the watcher effect', () => {
+test('R3 (wiring pin, v30): the play page offers "Try again" for a GPS denial AND for the other visible GPS errors, and the tap re-runs the watcher effect', () => {
   const src = readFileSync(
     new URL('../src/app/room/[roomId]/play/page.tsx', import.meta.url),
     'utf8',
   );
-  // The button renders only when the watch is dead on denial…
+  // v30: the button renders for a denial OR a retryable visible GPS
+  // error (position-unavailable / timeout / unsupported) — the old
+  // pin asserted denial-only, which left those states with no
+  // recovery tap at all. Denial is still included.
   assert.ok(
-    src.includes('{gpsDenied ? ('),
-    'the retry button must render only in the gps-denied state',
+    src.includes('{gpsDenied || gpsRetryable ? ('),
+    'the retry button must render for denial and for retryable GPS errors',
   );
   assert.ok(
     src.includes('Try again'),

@@ -55,7 +55,7 @@ import { Button } from '@/components/ui/Button';
 import { formatSuspendedLabel, formatOutsideCountdown } from '@/components/match/freshness';
 import { formatDurationShort, ageLabelFromTimestamp, haversineMeters } from '@/lib/utils';
 import { watchLocation, shouldSendFix, type GeolocationError, type LastSentFix, type WatchHandle } from '@/lib/geolocation';
-import { effectiveNowMs, GPS_DENIED_NOTICE, gpsNoFixNotice, shouldEjectForMissingFix, shouldWatchLocation } from '@/components/hud/play-map-logic';
+import { effectiveNowMs, GPS_DENIED_NOTICE, gpsNoFixNoticeForWatch, gpsStaleFixNotice, shouldEjectForMissingFix, shouldWatchLocation } from '@/components/hud/play-map-logic';
 import { requestWakeLock } from '@/lib/wake-lock';
 import { clearSession } from '@/lib/session-credentials';
 import { clearRejoinToken } from '@/lib/rejoin-token';
@@ -182,6 +182,16 @@ export default function PlayPage({
   // watcher effect on an explicit tap, so it can never spam a
   // permission prompt.
   const [gpsDenied, setGpsDenied] = useState(false);
+  // v30 (Meera): true while a VISIBLE, non-denied GPS error is on
+  // record — position-unavailable, timeout, or unsupported — so the
+  // "Try again" retry below shows for those too, not only for a
+  // denial. A fresh fix clears it (location works again). Like the
+  // denial retry it only re-runs the watcher effect on an explicit
+  // tap (bumping `gpsRetryNonce`, whose cleanup stops the old watch
+  // first), so it can never spam a permission prompt — and for a
+  // timeout / unavailable watch, which is still alive, the tap is a
+  // fresh watch attempt against a possibly wedged OS watch.
+  const [gpsRetryable, setGpsRetryable] = useState(false);
   // Bumped by the "Try again" tap — re-runs the watcher effect, whose
   // cleanup stops the dead watch first (a denied watch's handle is
   // still held, and `startWatch` refuses to start while one is held).
@@ -269,6 +279,16 @@ export default function PlayPage({
   // demo (4a) 30 s clock, so a hidden tab is never ejected on return.
   const watchHandleRef = useRef<WatchHandle | null>(null);
   const watchStartedAtMsRef = useRef<number | null>(null);
+  // v30 follow-up (Diya review, item A): when the match entered a
+  // phase in which the watcher SHOULD be running (HEAD_START / ACTIVE
+  // / SAFETY_PAUSED) — the no-fix notice's clock when the watcher
+  // never started at all. `watchStartedAtMsRef` stays null then (the
+  // watcher refuses while the tab is hidden), so the old
+  // `nowMs - watchStartedAtMsRef` elapsed was forced to 0 and the
+  // notice never fired. This ref is the wall-clock baseline instead:
+  // set on entry to a watchable phase, cleared on leaving one, so a
+  // LOBBY page (or a pre-start page) never fires a false notice.
+  const watchableSinceRef = useRef<number | null>(null);
   const hiddenSinceRef = useRef<number | null>(null);
   const hiddenGapTotalMsRef = useRef(0);
   // B20: when the current outside-zone spell started (ms epoch) — the
@@ -411,6 +431,41 @@ export default function PlayPage({
     if (ejectedAt) clearRejoinToken(roomId);
   }, [ejectedAt, roomId]);
 
+  // v30 (Zara F2 — BROKEN in v29): an ejected seat kept live team
+  // voice for the rest of the match. The ejected banner keeps the
+  // player on the play page with RadioStrip mounted, and nothing
+  // tore the radio down. Disable it here, next to the rejoin-token
+  // effect: `disable()` closes the peer connections, and nulling the
+  // ref + state means the RadioStrip/PTTButton get `null` and the
+  // creation effect's `voiceRadioRef.current` guard will not re-create
+  // it (its deps `[mode, socket, myPlayerId]` do not re-run on
+  // `ejectedAt`). The server half (DO rejecting `voice.signal` from
+  // ejected seats) is separate — this is the client half only.
+  // Deliberately NOT applied to a caught Runner turned spectator:
+  // whether a spectator keeps voice is a founder call, not this fix.
+  useEffect(() => {
+    if (ejectedAt && voiceRadioRef.current) {
+      voiceRadioRef.current.disable();
+      voiceRadioRef.current = null;
+      setVoiceRadio(null);
+    }
+  }, [ejectedAt]);
+
+  // v30 follow-up (Diya review, item A): track when the match
+  // entered a watchable phase, so the no-fix notice has a wall-clock
+  // baseline even when the watcher never started (mounted hidden).
+  // Cleared whenever the phase leaves the watchable set — a LOBBY or
+  // terminal page must never fire the notice.
+  useEffect(() => {
+    if (phase === 'HEAD_START' || phase === 'ACTIVE' || phase === 'SAFETY_PAUSED') {
+      if (watchableSinceRef.current === null) {
+        watchableSinceRef.current = Date.now();
+      }
+    } else {
+      watchableSinceRef.current = null;
+    }
+  }, [phase]);
+
   // Location watch — foreground only. B1 (v18 fix round): liveness is
   // decoupled from usability — a fix is SENT whenever it is within the
   // server validity bound (±1000 m, MAX_FIX_ACCURACY_METERS), so a
@@ -454,6 +509,7 @@ export default function PlayPage({
       // (and its retry) however the watch came back: visibility
       // return, phase change, or the manual "Try again" tap.
       setGpsDenied(false);
+      setGpsRetryable(false);
       // Display throttle: the dot only needs to move when the fix
       // actually moved (≥ 5 m) or 5 s passed — before this, EVERY raw
       // GPS fix re-rendered the whole page and rebuilt the map
@@ -531,10 +587,35 @@ export default function PlayPage({
       } else if (err.kind === 'position-unavailable') {
         // GPS unavailable (not denied): visible, but the watch is
         // still alive — a fix may still arrive. No suspend, no dot
-        // clear; the stale-dot fade covers a frozen dot.
+        // clear; the stale-dot fade covers a frozen dot. v30: the
+        // notice is retryable — a fresh watch attempt can revive a
+        // wedged OS watch.
         setFixNotice(
           'GPS is unavailable right now — your dot will return when it does.',
         );
+        setGpsRetryable(true);
+      } else if (err.kind === 'timeout') {
+        // v30: a timeout used to be swallowed in `watchLocation`, so
+        // a phone whose GPS chip searched 15 s with no fix (indoors,
+        // cold start) showed nothing at all from the error path. The
+        // watch stays alive and keeps trying — visible notice only:
+        // no suspend, no dot clear. Play-appropriate copy (the
+        // shared `err.message` says "tap the map to place the zone",
+        // which is lobby copy — there is no zone placement on the
+        // play screen).
+        setFixNotice(
+          'GPS is taking a while — your dot appears when your phone reports a location.',
+        );
+        setGpsRetryable(true);
+      } else if (err.kind === 'unsupported') {
+        // v30: the page used to drop this kind entirely — no notice,
+        // no retry, only the 15 s no-fix notice as a backstop. Name
+        // it at once; the watch was never created, so a retry is a
+        // fresh (cheap, prompt-free) attempt.
+        setFixNotice(
+          'This device has no GPS — you can still play, but your dot will not show.',
+        );
+        setGpsRetryable(true);
       }
     };
     const startWatch = () => {
@@ -1267,13 +1348,20 @@ export default function PlayPage({
   }, [handleEndRound]);
   const handleResumeSharing = useCallback(() => {
     if (mode !== 'demo') return;
+    // v30 follow-up (Diya review, item B): a gps-denied seat's watch
+    // is DEAD, so no fix will arrive — resuming would set `connected`
+    // + `lastFixAt = now` and the (4a) check would eject the seat 30 s
+    // later, defeating the v28 F16 suspend-instead-of-eject design.
+    // The button is hidden while gpsDenied (below); this guard is the
+    // defence in depth if it is ever reached another way.
+    if (gpsDenied) return;
     const current = getRoom(roomId);
     if (!current) return;
     resumePlayer(current, myPlayerId);
     const fix = myFixRef.current;
     if (fix) recordPlayerFix(current, myPlayerId, fix);
     refreshDemo();
-  }, [mode, roomId, myPlayerId, refreshDemo]);
+  }, [mode, roomId, myPlayerId, refreshDemo, gpsDenied]);
   // Stable tab / navigation callbacks — inline arrows here re-rendered
   // the memoized tab bar and buttons on every clock tick.
   const handleTabChange = useCallback((next: BottomTabId) => setTab(next), []);
@@ -1328,13 +1416,21 @@ export default function PlayPage({
   // behaviour when GPS never delivers — after 15 s with no fix at all,
   // show the plain waiting notice. An explicit `fixNotice` (denied /
   // rough / unavailable) always wins over the derived waiting notice.
+  // v30: a STALE fix is its own notice in between — once any fix has
+  // arrived, the no-fix notice never fires again, so a dot that froze
+  // minutes ago used to sit there with no words at all.
   const shownFixNotice =
     fixNotice ??
-    gpsNoFixNotice(
+    gpsStaleFixNotice(myFix, nowMs) ??
+    // v30 follow-up (Diya review, item A): the no-fix clock runs off
+    // the watchable-phase baseline when the watcher never started —
+    // the old `watchStartedAtMsRef`-only elapsed was stuck at 0 in
+    // exactly that case, so the notice never fired.
+    gpsNoFixNoticeForWatch(
       myFix === null,
-      watchStartedAtMsRef.current === null
-        ? 0
-        : nowMs - watchStartedAtMsRef.current,
+      nowMs,
+      watchStartedAtMsRef.current,
+      watchableSinceRef.current,
     );
 
   return (
@@ -1394,7 +1490,16 @@ export default function PlayPage({
               ? 'The server marks you connected again when a fresh fix arrives.'
               : 'Your location is unknown until a fresh fix arrives.'}
           </p>
-          {mode === 'demo' ? (
+          {/* v30 follow-up (Diya review, item B): "Resume sharing" is
+              hidden while GPS is denied — the seat's watch is dead, so
+              resuming would start a 30 s fuse to ejection instead of
+              the v28 F16 suspension. The page-local `gpsDenied` flag
+              is the gate (the suspension reason is not stored on the
+              player). The "Try again" GPS retry next to the fix notice
+              is the way back; a fresh fix clears `gpsDenied` and the
+              button returns. Live mode has no Resume button (banner
+              only, server resumes on a fresh fix). */}
+          {mode === 'demo' && !gpsDenied ? (
             <button
               type="button"
               onClick={handleResumeSharing}
@@ -1427,8 +1532,12 @@ export default function PlayPage({
               cleared and the seat suspended even with permission back
               on. One tap = one fresh watch attempt (the effect's
               cleanup stops the dead watch first); a tap while still
-              denied just errors again, it never spams a prompt. */}
-          {gpsDenied ? (
+              denied just errors again, it never spams a prompt.
+              v30: the same tap is offered for the other visible GPS
+              errors (unavailable / timeout / unsupported) — those
+              watches are alive or never existed, so a tap is a fresh
+              attempt, never a prompt. */}
+          {gpsDenied || gpsRetryable ? (
             <button
               type="button"
               onClick={() => setGpsRetryNonce((n) => n + 1)}

@@ -141,14 +141,14 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
           <>
             <p className="text-[15px] font-bold text-white">The map failed to load.</p>
             <p className="text-[14px] text-[#A1A1AA]">
-              The game itself is still running — your position, pings and radio are unaffected.
+              The game is still running — only the map crashed.
             </p>
             <button
               type="button"
               onClick={this.handleRetry}
               className="mt-1 rounded-full bg-white px-4 py-2 text-[14px] font-bold text-black"
             >
-              Retry map
+              Retry
             </button>
           </>
         ) : this.props.kind === 'radio' ? (

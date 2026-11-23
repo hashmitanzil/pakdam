@@ -565,8 +565,10 @@ export interface WsSnapshotPayload {
   /**
    * v29 (R1) — durable watermark for the client snapshot key
    * `version:serverSeq:maxLastFixAtMs:epochMs`: the newest `lastFixAt`
-   * across the roster, as epoch ms, or null when nobody has reported
-   * a fix. `lastFixAt` is durable and persisted ≤ 30 s (player-upsert
+   * over the viewer + their same-team players only (v30 AppSec F1 —
+   * never an opponent's fix), as epoch ms, or null when nobody in
+   * scope has reported a fix. `lastFixAt` is durable and persisted
+   * ≤ 30 s (player-upsert
    * throttle), so after a DO eviction the restored watermark is ≤ the
    * cached one and the key differs — the client re-fetches instead of
    * trusting a collided `serverSeq`. Optional: snapshots built by
