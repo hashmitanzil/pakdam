@@ -23,6 +23,8 @@ import { Button } from '../components/ui/Button';
 import { PakdamWordmark } from '../components/PakdamWordmark';
 import { WelcomeScreen } from '../components/WelcomeScreen';
 import { ROOM_DELETED_MESSAGE, takeRoomDeletedNotice } from '../lib/room-deleted';
+import { listRejoinTokens, type RejoinEntry } from '../lib/rejoin-token';
+import { storeLiveSeat } from '../lib/session-credentials';
 
 export default function HomePage() {
   const router = useRouter();
@@ -38,6 +40,30 @@ export default function HomePage() {
   useEffect(() => {
     if (takeRoomDeletedNotice()) setRoomDeletedNotice(true);
   }, []);
+  // v29 (A): "Rejoin your game" — seats whose reconnect token
+  // survived the app being killed (localStorage, per room). A tap
+  // restores the seat into sessionStorage and navigates to the room,
+  // so the existing resume path runs (role/score intact). Entries are
+  // cleared on leave / eject / match-end / room deletion; a room that
+  // ended while the app was killed leaves a stale entry, and the tap
+  // then lands on the lobby's deleted-room path (home, one plain
+  // message) instead of the game.
+  const [rejoinEntries, setRejoinEntries] = useState<RejoinEntry[]>([]);
+  useEffect(() => {
+    setRejoinEntries(listRejoinTokens());
+  }, []);
+  const handleRejoin = (entry: RejoinEntry): void => {
+    storeLiveSeat({
+      mode: 'live',
+      roomId: entry.roomId,
+      playerId: entry.playerId,
+      displayName: entry.displayName,
+      reconnectToken: entry.reconnectToken,
+      isHost: entry.isHost,
+      roomCode: entry.roomCode,
+    });
+    router.push(`/room/${entry.roomId}`);
+  };
 
   // bfcache: a back/forward-cache restore preserves React state
   // (welcomeDone=true) without a remount, so a browser-back return
@@ -176,6 +202,40 @@ export default function HomePage() {
           </span>
         </Button>
       </div>
+
+      {/* v29 (A): "Rejoin your game" — a game you left mid-match (or
+          the app was killed) is one tap away, with your role and
+          score intact. Only live rooms with a stored reconnect token
+          are listed; the entry dies when the game ends or you leave. */}
+      {rejoinEntries.length > 0 ? (
+        <div className="pakdam-anim-rise mt-3" style={{ animationDelay: '0.38s' }}>
+          <p className="mb-2 text-[13px] font-semibold uppercase tracking-wide text-[#A1A1AA]">
+            Rejoin your game
+          </p>
+          <div className="flex flex-col gap-2">
+            {rejoinEntries.map((entry) => (
+              <button
+                key={entry.roomId}
+                type="button"
+                onClick={() => handleRejoin(entry)}
+                className="flex w-full items-center justify-between rounded-[14px] border border-[#EF4444]/50 bg-[#141416] px-4 py-3 text-left"
+              >
+                <span>
+                  <span className="block text-[15px] font-bold text-white">
+                    {entry.displayName} · {entry.roomCode}
+                  </span>
+                  <span className="mt-0.5 block text-[13px] text-[#A1A1AA]">
+                    Tap to rejoin with your role and score
+                  </span>
+                </span>
+                <span aria-hidden className="text-[20px] text-[#EF4444]">
+                  →
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       {/* Short info: what Pakdam is and how one game works. Three small
           cards, one line each — enough to understand the game at a

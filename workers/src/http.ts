@@ -99,11 +99,19 @@ export function json(data: unknown, status: number = 200): Response {
   });
 }
 
-export function err(message: string, status: number, issues?: string[]): Response {
-  return json(
-    issues ? { error: message, issues } : { error: message },
-    status,
-  );
+/**
+ * v29 (Gap 4) — the HTTP error envelope now carries an optional `code`
+ * alongside `error`: `{ error, code }`. Additive — existing clients
+ * read `error` only and ignore the extra field. `doError` passes the
+ * DO's code through instead of dropping it, so a client can branch on
+ * RATE_LIMITED / FORBIDDEN / ROOM_NOT_FOUND without parsing text.
+ * No new codes are introduced by this change.
+ */
+export function err(message: string, status: number, issues?: string[], code?: string): Response {
+  const body: Record<string, unknown> =
+    issues ? { error: message, issues } : { error: message };
+  if (code) body['code'] = code;
+  return json(body, status);
 }
 
 export async function parseBody(req: Request): Promise<{ ok: true; body: Record<string, unknown> } | { ok: false; response: Response }> {
@@ -189,6 +197,23 @@ async function callDo(
   return data;
 }
 
+/**
+ * v29 (Gap 4) — read the `Idempotency-Key` request header for POST
+ * routes and forward it into the DO op payload. A key is an
+ * opaque client-minted token (max 64 chars, non-empty); an absent or
+ * over-long header means "no key" — the op executes normally with no
+ * caching (never an error). Keys are minted once per user action by
+ * the client; the server mints nothing (no Date.now() in key
+ * generation — a fresh key per retry would defeat dedupe).
+ */
+export function idempotencyKeyFromRequest(req: Request): string | null {
+  const raw = req.headers.get('Idempotency-Key');
+  if (raw === null) return null;
+  const key = raw.trim();
+  if (key.length === 0 || key.length > 64) return null;
+  return key;
+}
+
 async function callRegistry(
   env: Env,
   op: string,
@@ -223,7 +248,9 @@ function doError(r: DoResponse): Response {
             : r.code === 'VALIDATION_FAILED'
               ? 400
               : 400;
-  const res = err(r.error ?? 'Room operation failed.', status);
+  // v29 (Gap 4) — pass the DO code through into the envelope
+  // instead of dropping it (additive; existing clients read `error`).
+  const res = err(r.error ?? 'Room operation failed.', status, undefined, r.code);
   if (r.code === 'RATE_LIMITED' && typeof r['retryAfterSeconds'] === 'number') {
     const headers = new Headers(res.headers);
     headers.set('Retry-After', String(r['retryAfterSeconds']));
@@ -348,6 +375,9 @@ export async function handleJoin(
     displayName: displayName.trim(),
     roomCode,
     reconnectTokenHash: rawReconnect ? await hashReconnectToken(rawReconnect) : null,
+    // v29 (Gap 4) — HTTP idempotency: a retried join with the same key
+    // returns the cached reply, including the ORIGINAL reconnectToken.
+    idempotencyKey: idempotencyKeyFromRequest(req),
   });
   if (!joined.ok) return doError(joined);
   // A restore returns an EMPTY reconnect token — the client must never
@@ -406,6 +436,8 @@ export async function handleJoinByCode(
     displayName: displayName.trim(),
     roomCode: roomCode.trim().toUpperCase(),
     reconnectTokenHash: rawReconnect ? await hashReconnectToken(rawReconnect) : null,
+    // v29 (Gap 4) — same as handleJoin.
+    idempotencyKey: idempotencyKeyFromRequest(req),
   });
   if (!joined.ok) return doError(joined);
   const joinedPlayer = joined['player'];
@@ -545,6 +577,8 @@ export async function handleReplay(
   const replayed = await callDo(ctx.env, roomId, 'replay', {
     playerId,
     hostTokenHash,
+    // v29 (Gap 4) — HTTP idempotency (phase 2: start/replay).
+    idempotencyKey: idempotencyKeyFromRequest(req),
   });
   if (!replayed.ok) return doError(replayed);
   return json({ ok: true, ...stripDoEnvelope(replayed) });
@@ -570,6 +604,8 @@ export async function handleStart(
   const started = await callDo(ctx.env, roomId, 'start', {
     playerId,
     hostTokenHash,
+    // v29 (Gap 4) — HTTP idempotency (phase 2: start/replay).
+    idempotencyKey: idempotencyKeyFromRequest(req),
   });
   if (!started.ok) return doError(started);
   return json({ ok: true, ...stripDoEnvelope(started) });

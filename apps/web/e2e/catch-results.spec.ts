@@ -46,7 +46,7 @@ test.describe('catch → results (demo)', () => {
    */
   async function catchRunner(hunterPage: Page, runnerPage: Page, roomId: string, runnerName: string, hunterName: string) {
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await runnerPage.getByRole('button', { name: 'Self Confirm', exact: true }).click();
+    await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
     // Classic: the tagged Runner is out — after-tagged screen.
@@ -108,7 +108,7 @@ test.describe('catch → results (demo)', () => {
     const tagBtn = hunterPage.getByRole('button', { name: 'Scan their QR first' });
     await expect(tagBtn).toBeDisabled();
     await runnerPages[1]!.goto(`/room/${roomId}/catch`);
-    await runnerPages[1]!.getByRole('button', { name: 'Self Confirm', exact: true }).click();
+    await runnerPages[1]!.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPages[1]!.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPages[1]!.getByRole('button', { name: 'OK', exact: true }).click();
     // Catching the last free runner completes the match at once, so the
@@ -229,6 +229,10 @@ test.describe('catch → results (demo)', () => {
     // The mode card does nothing until the on-site box is ticked.
     await hostPage.getByRole('checkbox', { name: /I'm at the play location/ }).click();
     await hostPage.getByRole('button', { name: /Classic/ }).click();
+    // The mode card lands on /setup ('Create lobby' heading) — the room
+    // code exists only on the lobby, after CREATE LOBBY.
+    await expect(hostPage.getByRole('heading', { name: 'Create lobby' })).toBeVisible();
+    await hostPage.getByRole('button', { name: 'CREATE LOBBY', exact: true }).click();
     await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
     const newCode = (await hostPage.locator('section[aria-label="Game code"] .pakdam-code').innerText()).trim();
     expect(newCode).not.toBe(oldCode);

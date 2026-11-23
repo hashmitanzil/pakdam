@@ -22,7 +22,6 @@
 import { use, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
-  LOCATION_FRESHNESS_SECONDS,
   MAX_FIX_ACCURACY_METERS,
   OUTSIDE_ZONE_RETURN_SECONDS,
   ZONE_AUTO_CENTRE_MAX_ACCURACY_M,
@@ -43,20 +42,24 @@ import { useRoomState } from '@/components/match/useRoomState';
 import { StatusStrip } from '@/components/hud/StatusStrip';
 import { PlayerDots, type PlayerDot } from '@/components/hud/PlayerDots';
 import { PlayMap } from '@/components/hud/PlayMap';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { ErrorBoundaryThrowTest } from '@/components/ErrorBoundaryThrowTest';
 import { effectiveHunterCount } from '@/components/host-setup/draft';
 import { endLiveMatch } from '@/lib/live-client';
 import { RadioStrip } from '@/components/radio/RadioStrip';
 import { PTTButton } from '@/components/radio/PTTButton';
-import { SafetyControls } from '@/components/match/SafetyControls';
 import { BottomTabs, type BottomTabId } from '@/components/ui/BottomTabs';
 import { Sheet } from '@/components/ui/Sheet';
-import { Toggle } from '@/components/ui/Toggle';
+import { MoreSheet } from '@/components/hud/MoreSheet';
 import { Button } from '@/components/ui/Button';
 import { formatSuspendedLabel, formatOutsideCountdown } from '@/components/match/freshness';
 import { formatDurationShort, ageLabelFromTimestamp, haversineMeters } from '@/lib/utils';
-import { watchLocation } from '@/lib/geolocation';
+import { watchLocation, shouldSendFix, type GeolocationError, type LastSentFix, type WatchHandle } from '@/lib/geolocation';
+import { effectiveNowMs, GPS_DENIED_NOTICE, gpsNoFixNotice, shouldEjectForMissingFix, shouldWatchLocation } from '@/components/hud/play-map-logic';
 import { requestWakeLock } from '@/lib/wake-lock';
 import { clearSession } from '@/lib/session-credentials';
+import { clearRejoinToken } from '@/lib/rejoin-token';
+import { formatReconnectCountdown, readPlayerPresence, readReconnectEndsAtMs } from '@/lib/presence';
 import { goHomeAfterRoomDeleted } from '@/lib/room-deleted';
 import {
   deleteDemoRoom,
@@ -64,6 +67,7 @@ import {
   getRoom,
   leaveRoom,
   recordPlayerFix,
+  recordPlayerSuspension,
   resumePlayer,
   safetyPauseDemo,
   safetyResumeDemo,
@@ -112,10 +116,15 @@ export default function PlayPage({
   searchParams,
 }: {
   params: Promise<{ roomId: string }>;
-  searchParams: Promise<{ spectate?: string }>;
+  searchParams: Promise<{ spectate?: string; errorBoundaryTest?: string }>;
 }) {
   const { roomId } = use(params);
-  const spectateParam = use(searchParams)?.spectate === '1';
+  const query = use(searchParams);
+  const spectateParam = query?.spectate === '1';
+  // TEST-ONLY (`e2e/error-boundary.spec.ts`): renders the throwing test
+  // component inside the map boundary so the fallback + bug report can
+  // be asserted. Never set in normal use.
+  const errorBoundaryTestMap = query?.errorBoundaryTest === 'map';
   const router = useRouter();
 
   const voiceRadioRef = useRef<VoiceRadio | null>(null);
@@ -123,6 +132,10 @@ export default function PlayPage({
     onVoiceSignal: (signal: VoiceSignal) => {
       void voiceRadioRef.current?.handleSignal(signal);
     },
+    // v29 (R3, fix round M4): teammate dots go live by `teammate.fix`
+    // broadcast (see useRoomState — the meter math is documented
+    // there). No periodic re-fetch: the play page passes no dot
+    // option any more.
   });
   const {
     session,
@@ -162,6 +175,17 @@ export default function PlayPage({
   const mapNowMs = useMemo(() => Math.floor(nowMs / 5000) * 5000, [nowMs]);
   const [myFix, setMyFix] = useState<LocationFix | null>(null);
   const [fixNotice, setFixNotice] = useState<string | null>(null);
+  // v28 fix round (Diya R3): true while the GPS watch is dead on a
+  // permission denial — the "Try again" retry below shows only then.
+  // A fresh fix clears it (location works again); a fresh denial
+  // re-sets it. The retry NEVER fires on its own: it only re-runs the
+  // watcher effect on an explicit tap, so it can never spam a
+  // permission prompt.
+  const [gpsDenied, setGpsDenied] = useState(false);
+  // Bumped by the "Try again" tap — re-runs the watcher effect, whose
+  // cleanup stops the dead watch first (a denied watch's handle is
+  // still held, and `startWatch` refuses to start while one is held).
+  const [gpsRetryNonce, setGpsRetryNonce] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [reveal, setReveal] = useState<'hunter' | 'runner' | null>(null);
   // Bumped when the role-reveal overlay dismisses — PlayMap resizes
@@ -230,6 +254,23 @@ export default function PlayPage({
   const myFixRef = useRef<LocationFix | null>(null);
   // Last fix actually shown on screen — the display throttle below.
   const lastShownFixRef = useRef<{ fix: LocationFix; atMs: number } | null>(null);
+  // v29 (R7): the GPS send gate — the last fix actually SENT (not the
+  // last fix seen). The gate lives in `shouldSendFix` (geolocation.ts):
+  // ≤ 1 fix / 5 s OR ≥ 10 m movement, whichever first.
+  const lastSentFixRef = useRef<LastSentFix | null>(null);
+  // v29 (H2): the demo (4a) baseline is the moment ACTIVE began (the
+  // server ejects 30 s into ACTIVE, never during HEAD_START) — a
+  // head-start GPS cold start must never eject on ACTIVE entry.
+  const activeSinceRef = useRef<number | null>(null);
+  // v28 (Diya F13/F14): the GPS watcher's lifecycle. The watch handle
+  // (stopped on terminal phase / hide, restarted on visible), when the
+  // current watch started (the 15 s no-fix notice), and how long the
+  // tab has spent hidden in total — hidden time is excluded from the
+  // demo (4a) 30 s clock, so a hidden tab is never ejected on return.
+  const watchHandleRef = useRef<WatchHandle | null>(null);
+  const watchStartedAtMsRef = useRef<number | null>(null);
+  const hiddenSinceRef = useRef<number | null>(null);
+  const hiddenGapTotalMsRef = useRef(0);
   // B20: when the current outside-zone spell started (ms epoch) — the
   // countdown is computed from the wall clock, never accumulated.
   const outsideSinceRef = useRef<number | null>(null);
@@ -338,6 +379,8 @@ export default function PlayPage({
   // never flashes the results screen on the way home.
   useEffect(() => {
     if (!roomDeleted) return;
+    // v29 (A): the room is gone — the rejoin token dies with it.
+    clearRejoinToken(roomId);
     goHomeAfterRoomDeleted(router, roomId);
   }, [roomDeleted, roomId, router]);
 
@@ -348,11 +391,25 @@ export default function PlayPage({
   useEffect(() => {
     if (roomDeleted || !room) return;
     if (TERMINAL.includes(room.phase)) {
+      // v29 (A): the match ended — the rejoin token dies with the game.
+      clearRejoinToken(roomId);
+      // v28 (Diya F13): no heartbeats to a dead room — the socket
+      // closes on the redirect's unmount, but a terminal room is
+      // never heartbeated even if the redirect stalls.
+      socketRef.current?.pauseHeartbeat();
       router.replace(`/room/${roomId}/results`);
     } else if (room.phase === 'LOBBY') {
       router.replace(`/room/${roomId}`);
     }
   }, [room, roomDeleted, roomId, router]);
+
+  // v29 (A): an ejected seat's rejoin token dies with the seat — an
+  // ejected player must not be offered "Rejoin your game" for a room
+  // they were removed from.
+  const ejectedAt = myPlayer?.ejectedAt ?? null;
+  useEffect(() => {
+    if (ejectedAt) clearRejoinToken(roomId);
+  }, [ejectedAt, roomId]);
 
   // Location watch — foreground only. B1 (v18 fix round): liveness is
   // decoupled from usability — a fix is SENT whenever it is within the
@@ -364,52 +421,160 @@ export default function PlayPage({
   // IS sent (to stay connected) but is too rough for the game to use.
   // The outside-zone freeze below reads `myFixRef` (every fix,
   // sendable or not) and is untouched by this change.
+  //
+  // v28 (Diya F13/F14/F16): the watcher runs ONLY while the match is
+  // running AND the tab is visible (`shouldWatchLocation`) — it stops
+  // on terminal phase (the effect re-runs on `phase`, so the cleanup
+  // stops the old watch) and pauses while `document.hidden`, resuming
+  // on visible. That is the second half of the DO-cap fix: a phone
+  // left on the play screen after the game ends, or with the tab
+  // hidden, sends nothing. The seat is NOT lost by pausing: live,
+  // the socket already reports `player.suspended` ('tab-hidden') on
+  // hide and the DO exempts suspended seats from the ACTIVE-only (4a)
+  // missing-fix ejection, and the first fix on return resumes the
+  // seat; demo, the (4a) check below excludes hidden time. GPS
+  // denial (the watch is dead) suspends the seat instead of letting
+  // the 30 s ejection take it — and clears the dot, so a frozen dot
+  // never masquerades as live.
   useEffect(() => {
     if (!myPlayerId) return;
-    const handle = watchLocation(
-      (fix) => {
-        myFixRef.current = fix;
-        // Display throttle: the dot only needs to move when the fix
-        // actually moved (≥ 5 m) or 5 s passed — before this, EVERY raw
-        // GPS fix re-rendered the whole page and rebuilt the map
-        // overlays, up to ~1×/s even standing still. Sending to the
-        // server still happens per fix below; only the display waits.
-        const lastShown = lastShownFixRef.current;
-        const movedM = lastShown ? haversineMeters(lastShown.fix, fix) : Infinity;
-        if (movedM >= 5 || !lastShown || fix.timestampMs - lastShown.atMs >= 5000) {
-          lastShownFixRef.current = { fix, atMs: fix.timestampMs };
-          setMyFix(fix);
-        }
-        if (fix.accuracyMeters <= MAX_FIX_ACCURACY_METERS) {
+    let stopped = false;
+    // v28 fix round (Diya R2): seed the hidden-since stamp at mount
+    // when the tab is ALREADY hidden — a play page opened in a
+    // background tab never sees a visibilitychange hide event, so
+    // without this the (4a) clock would count the whole hidden span
+    // and the first tick after return would eject. The guard keeps
+    // an earlier hide's stamp (an effect re-run must not restart it).
+    if (document.hidden && hiddenSinceRef.current === null) {
+      hiddenSinceRef.current = Date.now();
+    }
+    const onFix = (fix: LocationFix) => {
+      myFixRef.current = fix;
+      // A fix means location works again — clear the denied state
+      // (and its retry) however the watch came back: visibility
+      // return, phase change, or the manual "Try again" tap.
+      setGpsDenied(false);
+      // Display throttle: the dot only needs to move when the fix
+      // actually moved (≥ 5 m) or 5 s passed — before this, EVERY raw
+      // GPS fix re-rendered the whole page and rebuilt the map
+      // overlays, up to ~1×/s even standing still. Sending to the
+      // server still happens per fix below; only the display waits.
+      const lastShown = lastShownFixRef.current;
+      const movedM = lastShown ? haversineMeters(lastShown.fix, fix) : Infinity;
+      if (movedM >= 5 || !lastShown || fix.timestampMs - lastShown.atMs >= 5000) {
+        lastShownFixRef.current = { fix, atMs: fix.timestampMs };
+        setMyFix(fix);
+      }
+      if (fix.accuracyMeters <= MAX_FIX_ACCURACY_METERS) {
+        // v29 (R7): the send gate — at most 1 fix / 5 s OR on ≥ 10 m
+        // movement, whichever first (`shouldSendFix`, geolocation.ts).
+        // The display above already updated: a gated fix is still
+        // SHOWN, just not sent. The movement leg is load-bearing
+        // (anti-cheat burst evidence); the 5 s leg keeps `lastFixAt`
+        // fresh for a stationary player so the no-fix ejection never
+        // fires for standing still. The server 1 s throttle is
+        // untouched.
+        if (shouldSendFix(fix, lastSentFixRef.current, fix.timestampMs)) {
+          lastSentFixRef.current = { fix, sentAtMs: fix.timestampMs };
           if (mode === 'live') {
             socketRef.current?.sendLocationUpdate(fix);
           } else {
             const current = getRoom(roomId);
             if (current) recordPlayerFix(current, myPlayerId, fix);
           }
-          if (fix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
-            setFixNotice(
-              'GPS is rough here — your location was sent to stay connected, but it is too rough for the game to use.',
-            );
-          } else {
-            setFixNotice(null);
-          }
+        }
+        if (fix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
+          setFixNotice(
+            'GPS is rough here — your location was sent to stay connected, but it is too rough for the game to use.',
+          );
         } else {
-          // Unreachable in practice — `validateFix` already rejects
-          // fixes worse than ±1000 m before they reach this callback —
-          // kept as defence in depth.
-          setFixNotice('GPS is too rough here — your fix was not sent.');
+          setFixNotice(null);
         }
-      },
-      (err) => {
-        if (err.kind === 'permission-denied') {
-          setFixNotice('Location is off — allow it in your browser settings.');
+      } else {
+        // Unreachable in practice — `validateFix` already rejects
+        // fixes worse than ±1000 m before they reach this callback —
+        // kept as defence in depth.
+        setFixNotice('GPS is too rough here — your fix was not sent.');
+      }
+    };
+    const onError = (err: GeolocationError) => {
+      if (err.kind === 'permission-denied') {
+        // v28 (Diya F16): the watch is DEAD — the OS will not call
+        // back again until permission is re-granted and the watch is
+        // recreated. Clear the dot (a frozen dot is a lie), show the
+        // GPS-off state, and SUSPEND the seat instead of letting the
+        // 30 s no-fix ejection take it: live, `reportSuspended('unknown')`
+        // (never transfers host, never starts a grace); demo,
+        // `recordPlayerSuspension`. The first fix after the player
+        // re-enables location resumes the seat.
+        // v28 fix round (Diya R3): the watch is recreated ONLY by
+        // (a) the visibility return below (`onVisibility` →
+        // `startWatch`), (b) a phase change re-running this effect,
+        // or (c) the player's explicit "Try again" tap on the GPS
+        // notice (`gpsRetryNonce` — re-runs this effect; its cleanup
+        // stops the dead watch first). Re-enabling location in
+        // browser settings WITHOUT leaving the tab fires none of
+        // (a)/(b) — no visibilitychange, no phase change — so
+        // without (c) the watch would stay dead forever. The old
+        // comment claimed the visibility resume recreates it; that
+        // is true only when the tab actually hides and returns.
+        setMyFix(null);
+        myFixRef.current = null;
+        setGpsDenied(true);
+        setFixNotice(GPS_DENIED_NOTICE);
+        if (mode === 'live') {
+          socketRef.current?.reportSuspended('unknown');
+        } else {
+          const current = getRoom(roomId);
+          if (current) recordPlayerSuspension(current, myPlayerId, 'gps-denied');
         }
-      },
-    );
-    return () => handle?.stop();
-    // The watcher is created once per seat/mode.
-  }, [roomId, myPlayerId, mode]);
+      } else if (err.kind === 'position-unavailable') {
+        // GPS unavailable (not denied): visible, but the watch is
+        // still alive — a fix may still arrive. No suspend, no dot
+        // clear; the stale-dot fade covers a frozen dot.
+        setFixNotice(
+          'GPS is unavailable right now — your dot will return when it does.',
+        );
+      }
+    };
+    const startWatch = () => {
+      if (stopped || watchHandleRef.current !== null) return;
+      if (!shouldWatchLocation(phase, document.hidden)) return;
+      watchStartedAtMsRef.current = Date.now();
+      watchHandleRef.current = watchLocation(onFix, onError);
+    };
+    const stopWatch = () => {
+      watchHandleRef.current?.stop();
+      watchHandleRef.current = null;
+    };
+    const onVisibility = () => {
+      if (document.hidden) {
+        // Record when the tab hid — the hidden span is excluded
+        // from the demo (4a) 30 s clock (see the outside-zone
+        // effect below), so a hidden tab is never ejected on return.
+        hiddenSinceRef.current = Date.now();
+        stopWatch();
+      } else {
+        if (hiddenSinceRef.current !== null) {
+          hiddenGapTotalMsRef.current += Date.now() - hiddenSinceRef.current;
+          hiddenSinceRef.current = null;
+        }
+        startWatch();
+      }
+    };
+    startWatch();
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      stopped = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      stopWatch();
+    };
+    // The watcher is created once per seat/mode/phase. `gpsRetryNonce`
+    // re-runs it on an explicit "Try again" tap after a GPS denial
+    // (Diya R3): the cleanup above stops the dead watch first, so the
+    // fresh run creates a new one — `startWatch` alone would refuse
+    // while the dead handle is still held.
+  }, [roomId, myPlayerId, mode, phase, gpsRetryNonce]);
 
   // Outside-zone countdown (display; demo enforces at 0, live is server-enforced).
   // B20: computed from the wall clock (Date.now() - outsideSinceMs),
@@ -418,6 +583,14 @@ export default function PlayPage({
   // tick even when the displayed second had not changed.
   useEffect(() => {
     const now = Date.now();
+    // v29 (H2): track the moment ACTIVE began — the demo (4a) baseline
+    // (server: 30 s into ACTIVE, never HEAD_START). Cleared whenever the
+    // phase leaves ACTIVE, so a later re-entry starts a fresh clock.
+    if (phase === 'ACTIVE') {
+      if (activeSinceRef.current === null) activeSinceRef.current = now;
+    } else {
+      activeSinceRef.current = null;
+    }
     // Elapsed wall-clock since the last tick — the poor-GPS freeze
     // below slides the spell start by exactly this, so a throttled or
     // backgrounded tick freezes the full time that passed, not 1 s.
@@ -439,35 +612,54 @@ export default function PlayPage({
     }
     // (4a) Missing-fix ejection — demo only (live is server-enforced by
     // the alarm tick). v18: no fix at all for ≥ 30 s ejects, the same
-    // 30 s as out-of-zone. Baseline is max(last fix, match start), so a
-    // player who never reported is ejected 30 s after the match starts,
-    // not instantly. "Last fix" is ANY fix this tab has seen — including
-    // a poor one the watcher never sent (myFixRef updates on every fix
-    // callback, sendable or not) plus the store's lastFixAt — so a
-    // poor-but-present fix NEVER ejects here; it only freezes the
-    // countdown below. This runs BEFORE the stale-fix freeze: the old
-    // code froze on a missing fix forever and never ejected. A safety
-    // pause never ejects — this effect already returns early unless the
-    // phase is HEAD_START or ACTIVE.
-    if (mode === 'demo') {
-      const startedAtMs = room?.startedAt ? Date.parse(room.startedAt) : null;
-      if (startedAtMs !== null && !missingFixEjectedRef.current) {
-        const lastFixMs = myPlayer?.lastFixAt ? Date.parse(myPlayer.lastFixAt) : null;
-        const lastSeenMs = Math.max(
-          myFixRef.current?.timestampMs ?? Number.NEGATIVE_INFINITY,
-          lastFixMs ?? Number.NEGATIVE_INFINITY,
-          startedAtMs,
-        );
-        if (now - lastSeenMs >= LOCATION_FRESHNESS_SECONDS * 1000) {
-          missingFixEjectedRef.current = true;
-          const current = getRoom(roomId);
-          if (current) {
-            ejectPlayer(current, myPlayerId);
-            refreshDemo();
-          }
-          setNotice('You were ejected — no location for 30 s.');
-          return;
+    // 30 s as out-of-zone. ACTIVE ONLY — never during HEAD_START (the
+    // server rule, room-do.ts: a player with a cold GPS lock, or
+    // indoors at start, gets the head start to acquire GPS; the demo
+    // used to eject 30 s into HEAD_START — fixed in v29). Baseline is
+    // max(last fix, ACTIVE start), so a player who never reported is
+    // ejected 30 s into ACTIVE, not instantly. "Last fix" is ANY fix
+    // this tab has seen — including a poor one the watcher never sent
+    // (myFixRef updates on every fix callback, sendable or not) plus
+    // the store's lastFixAt — so a poor-but-present fix NEVER ejects
+    // here; it only freezes the countdown below. This runs BEFORE the
+    // stale-fix freeze: the old code froze on a missing fix forever
+    // and never ejected. A safety pause never ejects — this effect
+    // already returns early unless the phase is HEAD_START or ACTIVE.
+    if (mode === 'demo' && phase === 'ACTIVE') {
+      const activeAtMs = activeSinceRef.current;
+      // v28 (Diya F14): hidden time does not count toward the 30 s
+      // no-fix ejection — the clock runs on `effectiveNow`, the
+      // wall clock minus all hidden time since mount (see
+      // `effectiveNowMs`, play-map-logic.ts). The old code
+      // ran on wall-clock `now`, so the 1 s clock firing on return
+      // with `now` jumped ejected on the first tick after a > 30 s
+      // hide. A suspended seat (hidden tab, or GPS denied — F16)
+      // never ejects either: the seat is held, not lost.
+      const lastFixMs = myPlayer?.lastFixAt ? Date.parse(myPlayer.lastFixAt) : null;
+      const lastSeenMs = Math.max(
+        myFixRef.current?.timestampMs ?? Number.NEGATIVE_INFINITY,
+        lastFixMs ?? Number.NEGATIVE_INFINITY,
+      );
+      const effectiveNow = effectiveNowMs(now, hiddenGapTotalMsRef.current);
+      if (
+        shouldEjectForMissingFix({
+          mode,
+          phase,
+          activeAtMs,
+          lastSeenMs,
+          effectiveNowMs: effectiveNow,
+          connectionState: myPlayer?.connectionState ?? 'connected',
+          alreadyEjected: missingFixEjectedRef.current,
+        })
+      ) {
+        missingFixEjectedRef.current = true;
+        const current = getRoom(roomId);
+        if (current) {
+          ejectPlayer(current, myPlayerId);
+          refreshDemo();
         }
+        setNotice('You were ejected — no location for 30 s.');
+        return;
       }
     }
     const fix = myFixRef.current;
@@ -485,7 +677,16 @@ export default function PlayPage({
     // stream stopped (tunnel, permission revoked, backgrounded
     // watcher) and the countdown must freeze on minutes-old data,
     // never keep decrementing — in demo it used to eject at 0.
-    if (now - fix.timestampMs > 10_000) return;
+    // v28 (Diya F14): slide the spell start by the elapsed time,
+    // like the poor-GPS freeze below — otherwise the hidden/stale
+    // span counts against the countdown and the first fresh outside
+    // fix after a return ejects at once.
+    if (now - fix.timestampMs > 10_000) {
+      if (outsideSinceRef.current !== null) {
+        outsideSinceRef.current += elapsedMs;
+      }
+      return;
+    }
     // (l-i) The spell starts on the FIRST outside tick, BEFORE the
     // poor-GPS branch: if the first outside fix is the poor one, the
     // old code returned before ever setting outsideSinceRef, so the
@@ -890,14 +1091,26 @@ export default function PlayPage({
           const p = playerById.get(teammateId);
           if (!p || p.leftAt !== null) continue;
           const lastFixMs = p.lastFixAt ? new Date(p.lastFixAt).getTime() : null;
+          // v29 (A): an away teammate (no live socket) shows the 30 s
+          // return countdown — "Away · back in 0:23 or out". The seat
+          // is never removed from the dots; ejection is the server's
+          // job and the dot disappears with the seat.
+          const awayEndsAtMs = readReconnectEndsAtMs(p);
+          const awayLabel =
+            readPlayerPresence(p) === 'away'
+              ? awayEndsAtMs !== null
+                ? `Away · back in ${formatReconnectCountdown(awayEndsAtMs, mapNowMs)} or out`
+                : 'Away'
+              : null;
           out.push({
             playerId: p.playerId,
             displayName: p.displayName,
             tone: 'teammate',
             label:
-              lastFixMs === null
+              awayLabel ??
+              (lastFixMs === null
                 ? 'Location never reported'
-                : ageLabelFromTimestamp(lastFixMs, mapNowMs),
+                : ageLabelFromTimestamp(lastFixMs, mapNowMs)),
             suspended: p.connectionState === 'suspended',
           });
         }
@@ -1022,6 +1235,8 @@ export default function PlayPage({
       if (current) leaveRoom(current, myPlayerId);
     }
     clearSession(roomId);
+    // v29 (A): leaving clears the rejoin token — the seat is gone.
+    clearRejoinToken(roomId);
     router.push('/');
   }, [leaveArmed, mode, roomId, myPlayerId, leave, router]);
   const handleEndRound = useCallback(() => {
@@ -1109,6 +1324,19 @@ export default function PlayPage({
     );
   }
 
+  // v28 (Diya F16): a missing dot with no explanation is the current
+  // behaviour when GPS never delivers — after 15 s with no fix at all,
+  // show the plain waiting notice. An explicit `fixNotice` (denied /
+  // rough / unavailable) always wins over the derived waiting notice.
+  const shownFixNotice =
+    fixNotice ??
+    gpsNoFixNotice(
+      myFix === null,
+      watchStartedAtMsRef.current === null
+        ? 0
+        : nowMs - watchStartedAtMsRef.current,
+    );
+
   return (
     <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pb-24 pt-3">
       <StatusStrip
@@ -1138,6 +1366,20 @@ export default function PlayPage({
           <p className="text-[14px] font-semibold text-white">You&apos;re out — spectating the match.</p>
           <p className="mt-1 text-[13px] text-[#A1A1AA]">
             You can watch the map, but you can&apos;t tag or be tagged.
+          </p>
+        </div>
+      ) : null}
+
+      {/* v29 (A): an ejected player gets a plain-words message, not a
+          silent disappearance — the game goes on without them. */}
+      {ejectedAt ? (
+        <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3" role="status">
+          <p className="text-[14px] font-semibold text-white">
+            You were removed from the game.
+          </p>
+          <p className="mt-1 text-[13px] text-[#A1A1AA]">
+            You were away too long or your location stopped updating. The game goes on without
+            you — you can watch the results when the round ends, or join a new game.
           </p>
         </div>
       ) : null}
@@ -1175,10 +1417,27 @@ export default function PlayPage({
         </div>
       ) : null}
 
-      {fixNotice ? (
-        <p className="rounded-2xl border border-[#26262B] bg-[#141416] p-3 text-[13px] text-[#A1A1AA]">
-          {fixNotice}
-        </p>
+      {shownFixNotice ? (
+        <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3">
+          <p className="text-[13px] text-[#A1A1AA]">{shownFixNotice}</p>
+          {/* v28 fix round (Diya R3): the GPS watch is dead on denial
+              and only an explicit tap recreates it — re-enabling
+              location in browser settings fires no visibilitychange
+              and no phase change, so without this the dot would stay
+              cleared and the seat suspended even with permission back
+              on. One tap = one fresh watch attempt (the effect's
+              cleanup stops the dead watch first); a tap while still
+              denied just errors again, it never spams a prompt. */}
+          {gpsDenied ? (
+            <button
+              type="button"
+              onClick={() => setGpsRetryNonce((n) => n + 1)}
+              className="mt-2 text-[15px] font-semibold text-[#EF4444]"
+            >
+              Try again
+            </button>
+          ) : null}
+        </div>
       ) : null}
       {notice ? (
         <p className="rounded-2xl border border-[#26262B] bg-[#141416] p-3 text-[13px] text-[#A1A1AA]">
@@ -1211,17 +1470,23 @@ export default function PlayPage({
           (style fetch + ~1 MB chunk + tiles + fitBounds from scratch).
           A resize fires when the tab comes back (see the tab effect). */}
       <div className={`relative h-[420px] shrink-0 ${tab === 'map' ? '' : 'hidden'}`}>
-        <PlayMap
-          zoneBoundary={zoneBoundary}
-          pings={visiblePings}
-          noGoAreas={noGoAreas}
-          myFix={myFix}
-          // Teammates' live positions (green dots). A spectator sees no
-          // live dots, so nothing is passed while spectating.
-          teammateFixes={isSpectator ? EMPTY_FIXES : stableTeammateFixes}
-          nowMs={mapNowMs}
-          resizeNonce={mapResizeNonce}
-        />
+        {/* v29 (B): the map is inside an error boundary — a map crash
+            shows a plain-words fallback with Retry, and the game
+            (radio, status, buttons) keeps running outside it. */}
+        <ErrorBoundary kind="map" roomId={roomId} playerId={myPlayerId}>
+          <PlayMap
+            zoneBoundary={zoneBoundary}
+            pings={visiblePings}
+            noGoAreas={noGoAreas}
+            myFix={myFix}
+            // Teammates' live positions (green dots). A spectator sees no
+            // live dots, so nothing is passed while spectating.
+            teammateFixes={isSpectator ? EMPTY_FIXES : stableTeammateFixes}
+            nowMs={mapNowMs}
+            resizeNonce={mapResizeNonce}
+          />
+          {errorBoundaryTestMap ? <ErrorBoundaryThrowTest /> : null}
+        </ErrorBoundary>
         <PlayerDots dots={dots} />
         <div className="absolute bottom-3 right-3 z-10 flex flex-col items-center gap-3">
           <PTTButton
@@ -1236,23 +1501,28 @@ export default function PlayPage({
       {/* B10: the radio tab stays mounted too — switching tabs used to
           unmount RadioStrip and drop the in-progress draft. */}
       <div className={`min-h-[420px] flex-1 ${tab === 'radio' ? '' : 'hidden'}`}>
-        <RadioStrip
-          team={myTeam}
-          channelLine={channelLine}
-          messages={radioMessages}
-          notices={radioNotices}
-          myPlayerId={myPlayerId}
-          canSend={canSendRadio}
-          voiceRadio={mode === 'live' ? voiceRadio : null}
-          voiceStatus={voiceStatus}
-          voiceDetail={voiceDetail}
-          voiceSummary={voiceRadio?.connectionSummary ?? ''}
-          pttState={pttState}
-          muted={muted}
-          onToggleMute={handleToggleMute}
-          onEnableVoice={handleEnableVoice}
-          onSendRadio={handleSendRadio}
-        />
+        {/* v29 (B): the radio strip is inside its own boundary — a
+            radio crash shows "Radio is unavailable right now." and the
+            map, status strip and dots keep running outside it. */}
+        <ErrorBoundary kind="radio" roomId={roomId} playerId={myPlayerId}>
+          <RadioStrip
+            team={myTeam}
+            channelLine={channelLine}
+            messages={radioMessages}
+            notices={radioNotices}
+            myPlayerId={myPlayerId}
+            canSend={canSendRadio}
+            voiceRadio={mode === 'live' ? voiceRadio : null}
+            voiceStatus={voiceStatus}
+            voiceDetail={voiceDetail}
+            voiceSummary={voiceRadio?.connectionSummary ?? ''}
+            pttState={pttState}
+            muted={muted}
+            onToggleMute={handleToggleMute}
+            onEnableVoice={handleEnableVoice}
+            onSendRadio={handleSendRadio}
+          />
+        </ErrorBoundary>
       </div>
 
       {tab === 'map' && isHunter && !isSpectator ? (
@@ -1284,109 +1554,32 @@ export default function PlayPage({
       />
 
       <Sheet open={tab === 'more'} onClose={closeMoreSheet} title="More">
-        <div className="flex flex-col gap-4">
-          {/* Host only: end the round early (POST …/lifecycle, host-only).
-              Host cancel deletes the room (founder decision, 2026-11-21),
-              so every player goes home with the one plain message —
-              never to results. A match that ends on its own (time up /
-              all caught) still goes to results via the terminal effect. */}
-          {isHost && (displayPhase === 'HEAD_START' || displayPhase === 'ACTIVE' || displayPhase === 'SAFETY_PAUSED') ? (
-            <button
-              type="button"
-              onClick={handleEndRoundFromSheet}
-              className="self-start text-[15px] font-semibold text-[#EF4444]"
-            >
-              End the round
-            </button>
-          ) : null}
-          {/* Players — the complete roster still in the room, each with
-              an Alive / Tagged status. Tagged names its tagger, from the
-              same confirmed-catch data as the results page. */}
-          <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
-            <p className="text-[15px] font-bold text-white">
-              Players · {playerStatuses.length}
-            </p>
-            <ul className="mt-3 flex flex-col gap-3">
-              {playerStatuses.map(({ player, taggerName }) => (
-                <li
-                  key={player.playerId}
-                  className="flex items-start justify-between gap-3"
-                >
-                  <span className="min-w-0 truncate text-[15px] font-semibold text-white">
-                    {player.displayName}
-                    {player.playerId === myPlayerId ? ' (you)' : ''}
-                  </span>
-                  {taggerName ? (
-                    <span className="flex shrink-0 flex-col items-end gap-1">
-                      <span className="rounded-full bg-[#EF4444] px-2 py-0.5 text-[12px] font-bold text-white">
-                        Tagged
-                      </span>
-                      <span className="text-[12px] text-[#A1A1AA]">
-                        Tagged by {taggerName}
-                      </span>
-                    </span>
-                  ) : (
-                    <span className="shrink-0 rounded-full bg-[#22C55E] px-2 py-0.5 text-[12px] font-bold text-black">
-                      Alive
-                    </span>
-                  )}
-                </li>
-              ))}
-            </ul>
-          </div>
-          {/* Sound & vibration — haptics + cue tones. Separate state
-              from the voice-radio mute: this mutes only cue sounds. */}
-          <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
-            <p className="text-[15px] font-bold text-white">Sound &amp; vibration</p>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <div>
-                <p className="text-[15px] font-semibold text-white">
-                  Vibration (Android only)
-                </p>
-                <p className="text-[13px] text-[#A1A1AA]">
-                  Buzz on pings, zone warnings and tags. Silent on devices
-                  without vibration support.
-                </p>
-              </div>
-              <Toggle
-                checked={cueSettings.hapticsEnabled}
-                onChange={(checked) => setCueSetting({ hapticsEnabled: checked })}
-                label="Vibration (Android only)"
-              />
-            </div>
-            <div className="mt-3 flex items-center justify-between gap-3">
-              <div>
-                <p className="text-[15px] font-semibold text-white">Cue sounds</p>
-                <p className="text-[13px] text-[#A1A1AA]">
-                  Short tones for pings, zone warnings and tags. Off by
-                  default. This does not mute voice radio.
-                </p>
-              </div>
-              <Toggle
-                checked={cueSettings.soundsEnabled}
-                onChange={(checked) => setCueSetting({ soundsEnabled: checked })}
-                label="Cue sounds"
-              />
-            </div>
-          </div>
-          <SafetyControls
-            phase={displayPhase}
-            paused={effectivePaused}
+        {/* v29 (R20): the sheet content is a memoised component rendered
+            only while the tab is open — the play page no longer
+            evaluates this whole subtree on every render. */}
+        {tab === 'more' ? (
+          <MoreSheet
+            isHost={isHost}
+            displayPhase={displayPhase}
+            playerStatuses={playerStatuses}
+            myPlayerId={myPlayerId}
+            cueSettings={cueSettings}
+            setCueSetting={setCueSetting}
+            effectivePaused={effectivePaused}
             pausedByName={pausedByName}
             pausedFrom={demo?.pausedFrom ?? null}
-            canPause={displayPhase === 'HEAD_START' || displayPhase === 'ACTIVE' || displayPhase === 'SAFETY_PAUSED'}
-            isHost={isHost}
+            canPause={
+              displayPhase === 'HEAD_START' ||
+              displayPhase === 'ACTIVE' ||
+              displayPhase === 'SAFETY_PAUSED'
+            }
             onPause={handlePause}
             onResume={handleResume}
+            onEndRound={handleEndRoundFromSheet}
+            onLeave={handleLeave}
+            leaveArmed={leaveArmed}
           />
-          <button
-            type="button"
-            onClick={handleLeave}
-            className="self-start text-[15px] font-semibold text-[#EF4444]"
-          >
-            {leaveArmed ? 'Tap again to leave' : 'Leave game'}
-          </button>
-        </div>
+        ) : null}
       </Sheet>
 
       {/* Role reveal — once at start, full-screen flash (SCRAM-SPEC §8a):

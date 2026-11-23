@@ -11,6 +11,7 @@ import { test, expect } from '@playwright/test';
 import {
   LIVE,
   createHostSetupRoom,
+  setStepper,
   startDemoMatch,
 } from './helpers';
 
@@ -33,7 +34,10 @@ test.describe('zone accuracy (demo)', () => {
     const hostPage = await context.newPage();
     await createHostSetupRoom(hostPage);
     const decrease = hostPage.getByRole('button', { name: 'Decrease Zone size' });
-    for (let i = 0; i < 8; i++) await decrease.click(); // 500 → 100 m
+    // The step grid is 100 m at 500 m then 50 m below — 500→100 takes
+    // SEVEN clicks, so a fixed 8-click loop hits the disabled Decrease
+    // button and hangs to the test timeout. Drive to min instead.
+    await setStepper(hostPage, 'Zone size', 0);
     await expect(
       hostPage.getByRole('group', { name: 'Zone size' }).getByText('100 m'),
     ).toBeVisible();

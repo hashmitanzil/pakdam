@@ -52,16 +52,119 @@ async function postgrest(
   }
 }
 
+/** Coordinate keys — stripped at ANY depth from log/event payloads.
+ * One list, shared by `redactPayload`, `stripCoordinatesDeep` and
+ * `RoomStore.logGameEvent`: a nested `fix` / `centre` / `coordinates`
+ * / `position` / `lngLat` object must never reach a log through a
+ * nested payload. v29 fix round (F9) extends the list with `center`,
+ * `coordinates`, `position`, `lngLat` (in addition to
+ * lat/lng/latitude/longitude/fix/centre). All current payloads are
+ * scalar by construction — this is hardening, not a live leak. */
+export const COORDINATE_KEYS: readonly string[] = [
+  'lat',
+  'lng',
+  'latitude',
+  'longitude',
+  'fix',
+  'centre',
+  'center',
+  'coordinates',
+  'position',
+  'lngLat',
+];
+
 /** Strip any coordinate keys from a payload (room_events trigger backstop).
- * Same key list as RoomStore.logGameEvent — a nested `fix` / `centre`
- * object must never reach the log through this backstop either. */
+ * Deep: nested objects and arrays are stripped too — see
+ * `stripCoordinatesDeep`. Same key list as RoomStore.logGameEvent. */
 export function redactPayload(payload: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [k, v] of Object.entries(payload)) {
-    if (['lat', 'lng', 'latitude', 'longitude', 'fix', 'centre'].includes(k)) continue;
-    out[k] = v;
+  return stripCoordinatesDeep(payload) as Record<string, unknown>;
+}
+
+/**
+ * v29 (Gap 5) — one structured-log entry, buffered in DO memory (cap
+ * 100) and flushed as a `log-batch` intent. `metadata` is audit data
+ * only: codes, counts, durations — NEVER coordinates, NEVER a fix.
+ * `persistLogBatch` strips coordinate keys as a backstop, so a
+ * caller mistake cannot smuggle a position into the `logs` table.
+ */
+export interface LogEntry {
+  level: 'debug' | 'info' | 'warn' | 'error';
+  message: string;
+  roomId?: string;
+  playerId?: string;
+  operation?: string;
+  durationMs?: number;
+  metadata?: Record<string, unknown>;
+}
+
+/** Deep-strip coordinate keys from a value (objects AND arrays). */
+export function stripCoordinatesDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stripCoordinatesDeep);
+  if (value !== null && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (COORDINATE_KEYS.includes(k)) continue;
+      out[k] = stripCoordinatesDeep(v);
+    }
+    return out;
   }
-  return out;
+  return value;
+}
+
+/**
+ * v29 (Gap 5) — write a batch of structured-log rows (plain PostgREST
+ * POST to `logs`). Boolean return, never throws: a failed insert never
+ * fails a game request. One row per entry; `metadata` is deep-stripped
+ * of coordinate keys first, so a log row can never carry a fix.
+ * Migration 0008 creates the table (written, NOT applied — the
+ * founder applies it); before it lands, PostgREST 404s and this
+ * returns false, silently — logging is best-effort, like everything
+ * else in this file.
+ */
+export async function persistLogBatch(
+  env: SupabaseEnv,
+  entries: readonly LogEntry[],
+): Promise<boolean> {
+  if (entries.length === 0) return true;
+  const rows = entries.map((e) => ({
+    level: e.level,
+    message: e.message,
+    room_id: e.roomId ?? null,
+    player_id: e.playerId ?? null,
+    operation: e.operation ?? null,
+    duration_ms: e.durationMs ?? null,
+    metadata: stripCoordinatesDeep(e.metadata ?? {}),
+  }));
+  return postgrest(env, 'logs', 'POST', rows, 'return=minimal');
+}
+
+/**
+ * v29 (Gap 5) — 7-day log retention: delete `logs` rows older than 7
+ * days. Called from the Worker `scheduled` handler (see index.ts).
+ * pg_cron (nightly `DELETE FROM logs WHERE created_at < now() -
+ * interval '7 days'`) is the alternative the founder can switch to —
+ * pg_cron availability cannot be checked from this VM, so the Worker
+ * handler is the implementation, not the fallback. Boolean return,
+ * never throws.
+ */
+export async function deleteOldLogs(env: SupabaseEnv): Promise<boolean> {
+  if (!isSupabaseConfigured(env)) return false;
+  try {
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    const res = await fetch(
+      `${env.SUPABASE_URL as string}/rest/v1/logs?created_at=lt.${encodeURIComponent(cutoff)}`,
+      {
+        method: 'DELETE',
+        headers: {
+          apikey: env.SUPABASE_SERVICE_ROLE_KEY as string,
+          Authorization: `Bearer ${env.SUPABASE_SERVICE_ROLE_KEY as string}`,
+        },
+      },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
 }
 
 function roomRow(room: Room): Record<string, unknown> {
@@ -257,6 +360,24 @@ export async function upsertTelemetryDaily(
 // Supabase; a Supabase read path would go stale on every DO-only update.
 // ---------------------------------------------------------------------------
 
+/**
+ * v29 (R12) — per-game rows-written budget: ~2,500 rows for a
+ * 30-player 30-min game. The budget is a guardrail, not a quota:
+ * intents are the audit trail — a game that needs more rows writes
+ * more rows. Honest composition (v29 fix round, F8): the MEASURED
+ * slice is 1,800 rows (30 players × ~1 player-upsert/30 s × 30 min);
+ * the honest total is ≈ 2,200 — slice 1,800 + pings ~240 + catches
+ * ~100–150 + start/match ~35 + log-batches — against the 2,500
+ * assert budget. "~2,500" is the assert budget, NOT the measurement:
+ * the start batch is NOT counted in the measured slice (if it were,
+ * the extrapolated slice would be 2,760 and the test would fail).
+ * Note the 30 s player-upsert throttle is memory-only and resets on
+ * wake — after an eviction every seat's next fix re-upserts at once,
+ * so a wake costs up to one extra upsert per seat.
+ * The number to watch is the per-game total in tests
+ * (`v29-rows-written.test.mjs`): if it grows past ~3,000, the
+ * player-upsert throttle or the log buffer is the first suspect.
+ */
 export type PersistIntent =
   | { kind: 'room-upsert'; room: Room }
   | { kind: 'player-upsert'; roomId: string; player: Player }
@@ -264,7 +385,8 @@ export type PersistIntent =
   | { kind: 'catch-insert'; roomId: string; catch: CatchEvent }
   | { kind: 'catch-update'; catch: CatchEvent }
   | { kind: 'safety-event'; roomId: string; playerId: string; type: string; reason: string | null }
-  | { kind: 'match-result'; room: Room };
+  | { kind: 'match-result'; room: Room }
+  | { kind: 'log-batch'; entries: LogEntry[] };
 
 export async function executePersistIntent(
   env: SupabaseEnv,
@@ -285,6 +407,8 @@ export async function executePersistIntent(
       return persistSafetyEvent(env, intent.roomId, intent.playerId, intent.type, intent.reason);
     case 'match-result':
       return persistMatchResult(env, intent.room);
+    case 'log-batch':
+      return persistLogBatch(env, intent.entries);
     default:
       return false;
   }

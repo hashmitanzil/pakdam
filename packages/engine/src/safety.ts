@@ -98,8 +98,28 @@ export type ResumeResult =
       /** Deadlines shifted forward by the pause duration. */
       startedAt: string | null;
       endsAt: string | null;
+      /**
+       * v29 fix round (F4) — the 30 s return windows, shifted forward
+       * by the same pause duration. Present only when the caller
+       * passed `disconnectDeadlineMs`: a deadline that passes during
+       * a pause must not eject on the first ACTIVE tick after resume
+       * — the player had zero chance to return while paused.
+       */
+      disconnectDeadlineMs?: Record<string, number>;
     }
   | { ok: false; reason: string; code: 'INVALID_STATE' };
+
+/** Shift every 30 s return deadline forward by `pauseDurationMs`. */
+export function shiftDisconnectDeadlines(
+  deadlines: Readonly<Record<string, number>>,
+  pauseDurationMs: number,
+): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const [playerId, endsAtMs] of Object.entries(deadlines)) {
+    out[playerId] = endsAtMs + pauseDurationMs;
+  }
+  return out;
+}
 
 /**
  * Shift an ISO deadline forward by `pauseDurationMs`. Null deadlines stay
@@ -116,7 +136,10 @@ export function shiftDeadlineForward(
 /**
  * Resume from a safety pause. Returns to the phase paused from and shifts
  * `startedAt`/`endsAt` forward by the pause, so a paused room cannot reach
- * its deadlines. Nothing completes while safety-paused.
+ * its deadlines. Nothing completes while safety-paused. When the caller
+ * passes `disconnectDeadlineMs`, the 30 s return windows shift forward
+ * by the same pause duration (F4): a deadline set before the pause is
+ * extended by exactly the paused duration.
  */
 export function resumeMatch(input: {
   phase: MatchPhase;
@@ -125,6 +148,7 @@ export function resumeMatch(input: {
   startedAt: string | null;
   endsAt: string | null;
   nowMs: number;
+  disconnectDeadlineMs?: Readonly<Record<string, number>>;
 }): ResumeResult {
   if (input.phase !== 'SAFETY_PAUSED') {
     return {
@@ -147,6 +171,9 @@ export function resumeMatch(input: {
     phase: input.pausedFrom,
     startedAt: shiftDeadlineForward(input.startedAt, pauseDurationMs),
     endsAt: shiftDeadlineForward(input.endsAt, pauseDurationMs),
+    ...(input.disconnectDeadlineMs !== undefined
+      ? { disconnectDeadlineMs: shiftDisconnectDeadlines(input.disconnectDeadlineMs, pauseDurationMs) }
+      : {}),
   };
 }
 

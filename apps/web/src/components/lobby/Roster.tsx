@@ -15,6 +15,7 @@ import type { PlayerView } from '@pakdam/shared';
 import { Pill } from '../ui/Pill';
 import { initialsForName } from '../../lib/utils';
 import { locationFreshnessLabel } from '../../lib/geolocation';
+import { formatReconnectCountdown, readPlayerPresence, readReconnectEndsAtMs } from '../../lib/presence';
 import { submitReport } from '../../lib/live-client';
 import { isLiveTransportEnabled } from '../../lib/websocket';
 
@@ -29,6 +30,12 @@ export interface RosterProps {
   hunterCount: number;
   onToggleHunter?: (playerId: string) => void;
   onRemove?: (playerId: string) => void;
+  /**
+   * v29 (A): the lobby clock for the 30 s return countdowns on away
+   * seats. The lobby passes a 1 s tick; without it the countdown
+   * renders once from `Date.now()` and never advances.
+   */
+  nowMs?: number;
 }
 
 function freshnessLabel(player: PlayerView): string {
@@ -47,6 +54,7 @@ export const Roster = memo(function Roster({
   hunterCount,
   onToggleHunter,
   onRemove,
+  nowMs,
 }: RosterProps) {
   const [menuFor, setMenuFor] = useState<string | null>(null);
   const [actionNote, setActionNote] = useState<string | null>(null);
@@ -84,6 +92,11 @@ export const Roster = memo(function Roster({
         const isPlayerHost = player.playerId === hostPlayerId;
         const suspended = player.connectionState === 'suspended';
         const ejected = player.ejectedAt !== null;
+        // v29 (A): an away seat (no live socket) and its 30 s return
+        // window, from the snapshot (tolerant reads — an older server
+        // reads as present / null, never a client-computed deadline).
+        const away = readPlayerPresence(player) === 'away';
+        const awayEndsAtMs = away ? readReconnectEndsAtMs(player) : null;
         const selected = selectedHunterIds.includes(player.playerId);
         const pickable = pickingHunters && isHost && !ejected;
         return (
@@ -122,6 +135,17 @@ export const Roster = memo(function Roster({
               {suspended ? (
                 <span className="block text-[13px] text-[#A1A1AA]">
                   ✕ Suspended · {freshnessLabel(player)}
+                </span>
+              ) : away ? (
+                // v29 (A): an away seat is NEVER removed from the
+                // roster — it shows "Away" with the 30 s return
+                // countdown when a window is running ("Away · back in
+                // 0:23 or out"). Ejection is the server's job; the row
+                // turns "Ejected" when it lands.
+                <span className="block text-[13px] text-[#F59E0B]">
+                  {awayEndsAtMs !== null
+                    ? `Away · back in ${formatReconnectCountdown(awayEndsAtMs, nowMs ?? Date.now())} or out`
+                    : 'Away'}
                 </span>
               ) : ejected ? (
                 <span className="block text-[13px] text-[#A1A1AA]">Ejected</span>

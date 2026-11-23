@@ -16,6 +16,12 @@
 import { useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import jsQR from 'jsqr';
+import {
+  QR_SCAN_ESCALATE_AFTER_MS,
+  qrScanDimensions,
+  qrScanIsDecodeFrame,
+  qrScanShouldStop,
+} from '@/lib/qr-scan';
 
 export interface CatchQRProps {
   /** 'show' renders the Runner's QR; 'scan' opens the Hunter's camera scanner. */
@@ -44,19 +50,26 @@ export function CatchQR({
   const [cameraError, setCameraError] = useState<string | null>(null);
   // (m) The scanner used to run silently forever at ≤640 px, every 3rd
   // frame — a QR held far, small or blurry never decoded and nothing
-  // said so. After ~5 s without a decode it escalates to full
-  // resolution, every frame, and says so.
+  // said so. After ~5 s without a decode it escalates (v29 R4: capped
+  // at 1280 px, every 3rd frame kept) and says so; after ~18 s without
+  // a decode the loop stops with a retry state instead of decoding
+  // forever.
   const [notDetecting, setNotDetecting] = useState(false);
+  // v29 (R4): the loop stopped after ~18 s without a decode — the
+  // camera preview stays live, and "Scan again" restarts it.
+  const [scanStopped, setScanStopped] = useState(false);
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
-  // The decode loop NEVER exits on the first decode (P1-28): a wrong scan
-  // must let the Hunter re-scan in place, not force Cancel → "Scan their
-  // QR" again. The loop keeps running until a valid scan or Cancel; the
-  // same QR value is ignored for 3 s so one frame is not reported twice,
-  // and "Scan again" clears the lock immediately.
+  // v29 (R4) — REPLACES the old P1-28 "loop never exits" rule: the
+  // loop STOPS on a reported scan (the page holds the token until
+  // the Hunter taps Tag) and after ~18 s without a decode. A wrong
+  // scan is re-scanned via "Scan again", which restarts the loop
+  // (scanNonce is an effect dep) — not by leaving the loop running.
+  // The same QR value is ignored for 3 s so one frame is not
+  // reported twice, and "Scan again" clears the lock immediately.
   const lastScannedRef = useRef<{ value: string; atMs: number } | null>(null);
-  const [, setScanNonce] = useState(0);
+  const [scanNonce, setScanNonce] = useState(0);
   const onScanRef = useRef(onScan);
   onScanRef.current = onScan;
   const onScanErrorRef = useRef(onScanError);
@@ -91,6 +104,10 @@ export function CatchQR({
   // the cost. (m) After ~5 s without a decode, the loop escalates to
   // full resolution every frame until a read succeeds — a far, small
   // or blurry QR gets a real second chance instead of failing silently.
+  // v29 (R4): the escalation is CAPPED — 1280 px wide, every 3rd
+  // frame kept (never every frame) — and the loop STOPS after ~18 s
+  // without a decode, or after a successful scan. "Scan again"
+  // restarts it (scanNonce is an effect dep).
   useEffect(() => {
     if (mode !== 'scan') return;
     let raf = 0;
@@ -101,6 +118,7 @@ export function CatchQR({
     let hintShown = false;
     lastScannedRef.current = null;
     setNotDetecting(false);
+    setScanStopped(false);
 
     const decodeLoop = () => {
       if (stopped) return;
@@ -109,17 +127,19 @@ export function CatchQR({
       const canvas = canvasRef.current;
       if (video && video.readyState === video.HAVE_ENOUGH_DATA) {
         if (startedAtMs === 0) startedAtMs = Date.now();
-        // Escalated once no decode has landed in ~5 s: full resolution,
-        // every frame, until a read succeeds.
-        const escalated = !decoded && Date.now() - startedAtMs > 5_000;
+        // Escalated once no decode has landed in ~5 s: 1280 px cap,
+        // every 3rd frame — never full resolution, never every frame.
+        const escalated = !decoded && Date.now() - startedAtMs > QR_SCAN_ESCALATE_AFTER_MS;
         if (escalated && !hintShown) {
           hintShown = true;
           setNotDetecting(true);
         }
-        if ((escalated || frame % 3 === 0) && canvas) {
-          const scale = escalated ? 1 : Math.min(1, 640 / video.videoWidth);
-          const width = Math.max(1, Math.round(video.videoWidth * scale));
-          const height = Math.max(1, Math.round(video.videoHeight * scale));
+        if (qrScanIsDecodeFrame(frame) && canvas) {
+          const { width, height } = qrScanDimensions(
+            video.videoWidth,
+            video.videoHeight,
+            escalated,
+          );
           canvas.width = width;
           canvas.height = height;
           const ctx = canvas.getContext('2d');
@@ -128,18 +148,31 @@ export function CatchQR({
             const imageData = ctx.getImageData(0, 0, width, height);
             const result = jsQR(imageData.data, width, height);
             if (result?.data) {
-              decoded = true;
               const value = result.data.trim();
               const last = lastScannedRef.current;
               // Same QR within 3 s = the same frame re-read: ignore it.
               // A different QR, or the same one after a wrong scan cooled
-              // off, is reported — the loop keeps running either way.
+              // off, is reported — and the loop STOPS on a reported
+              // scan (v29 R4): the page holds the token until the
+              // Hunter taps Tag. A wrong scan is re-scanned via
+              // "Scan again", which restarts the loop.
               if (!last || last.value !== value || Date.now() - last.atMs > 3000) {
                 lastScannedRef.current = { value, atMs: Date.now() };
                 onScanRef.current(value);
+                decoded = true;
+                return;
               }
             }
           }
+        }
+        // v29 (R4): ~18 s without a decode ends the loop — a QR that
+        // has not decoded in 18 s will not decode on frame 1000
+        // either, and decoding is the most expensive work on this
+        // screen. The camera preview stays live; "Scan again"
+        // restarts the loop.
+        if (qrScanShouldStop(Date.now() - startedAtMs, decoded)) {
+          setScanStopped(true);
+          return;
         }
       }
       raf = window.requestAnimationFrame(decodeLoop);
@@ -171,7 +204,7 @@ export function CatchQR({
       streamRef.current?.getTracks().forEach((t) => t.stop());
       streamRef.current = null;
     };
-  }, [mode]);
+  }, [mode, scanNonce]);
 
   if (mode === 'show') {
     if (!token || !qrDataUrl) {
@@ -211,17 +244,22 @@ export function CatchQR({
         />
       </div>
       <p className="text-center text-[14px] text-[#A1A1AA]">Point at the runner&apos;s QR</p>
-      {notDetecting ? (
+      {notDetecting && !scanStopped ? (
         <p className="text-center text-[14px] text-[#F59E0B]">
           Not detecting a QR — move closer, hold steady, and make sure the whole QR is inside the frame.
+        </p>
+      ) : null}
+      {scanStopped ? (
+        <p className="text-center text-[14px] text-[#F59E0B]">
+          Couldn&apos;t read the QR — move closer, hold steady, then tap Scan again to try once more.
         </p>
       ) : null}
       {cameraError ? (
         <p className="text-center text-[14px] text-[#EF4444]">{cameraError}</p>
       ) : null}
-      {/* After a wrong scan ("That QR didn't match") the camera keeps
-          running — tap Scan again to re-read at once instead of
-          cancelling out and reopening the scanner. */}
+      {/* After a wrong scan ("That QR didn't match") or a stopped loop,
+          tap Scan again to re-read at once instead of cancelling out
+          and reopening the scanner. */}
       <button
         type="button"
         onClick={() => {

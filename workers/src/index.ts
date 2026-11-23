@@ -39,6 +39,7 @@ import {
   isUuid,
   type HttpContext,
 } from './http.js';
+import { deleteOldLogs } from './supabase.js';
 import { flushTelemetry } from './telemetry.js';
 
 export { CodeRegistryDO, RoomDO } from './room-do-class.js';
@@ -85,7 +86,10 @@ function corsHeaders(req: Request, env: Env): Record<string, string> {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    // v29 (Gap 4) — `Idempotency-Key` is a custom request header, so
+    // the browser preflight must allow it or join/start/replay retries
+    // can never carry a key.
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization, Idempotency-Key',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
@@ -292,6 +296,25 @@ const ROUTES: Route[] = [
 // ---------------------------------------------------------------------------
 
 export default {
+  /**
+   * v29 (Gap 5) — 7-day log retention, Worker scheduled handler.
+   * Runs on the cron trigger (wrangler.toml `[triggers] crons =
+   * ["0 3 * * *"]` — 03:00 UTC daily, configured in this repo, not
+   * added at deploy time). Deletes `logs` rows older than 7 days.
+   * Best-effort: failures are logged to the Worker console only,
+   * never retried here (the next day's run picks them up). pg_cron
+   * (nightly `DELETE FROM logs WHERE created_at < now() - interval
+   * '7 days'`) is the alternative the founder can switch to — pg_cron
+   * availability cannot be checked from this VM, so the Worker
+   * handler is the implementation, not the fallback.
+   */
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
+    ctx.waitUntil(
+      deleteOldLogs(env).then((ok) => {
+        if (!ok) console.error('Scheduled log retention failed.');
+      }),
+    );
+  },
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const cors = corsHeaders(req, env);
     const url = new URL(req.url);

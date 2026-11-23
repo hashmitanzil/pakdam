@@ -158,7 +158,7 @@ test.describe('catch flow (demo)', () => {
    */
   async function selfConfirmAsRunner(runnerPage: Page, roomId: string, hunterName: string) {
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await runnerPage.getByRole('button', { name: 'Self Confirm', exact: true }).click();
+    await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await expect(runnerPage.getByRole('button', { name: hunterName, exact: true })).toBeVisible();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
@@ -214,7 +214,7 @@ test.describe('catch flow (demo)', () => {
     await expect(runnerPage.locator(`img[alt="QR code for ${runnerName}"]`)).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'SHOW MY QR' })).toBeHidden();
     // Self Confirm sits below the QR on the same screen.
-    await expect(runnerPage.getByRole('button', { name: 'Self Confirm', exact: true })).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Self confirm', exact: true })).toBeVisible();
   });
 
   test('Way 2: Self Confirm → Hunter list → OK completes the tag with no hunter action', async ({
@@ -224,7 +224,7 @@ test.describe('catch flow (demo)', () => {
       await setupCatch(context);
     // The Hunter does nothing at all — the Runner drives the whole tag.
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await runnerPage.getByRole('button', { name: 'Self Confirm', exact: true }).click();
+    await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     // The list holds the Hunters in this game only — not the other Runner.
     await expect(runnerPage.getByRole('button', { name: hunterName, exact: true })).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: otherRunnerName, exact: true })).toBeHidden();
@@ -262,7 +262,7 @@ test.describe('catch flow (demo)', () => {
     const { hostPage, runnerPage, roomId } = await setupCatch(context);
     await runnerPage.goto(`/room/${roomId}/catch`);
     await expect(runnerPage.getByRole('button', { name: 'NO — DISPUTE' })).toBeHidden();
-    await expect(runnerPage.getByRole('button', { name: 'Self Confirm', exact: true })).toBeVisible();
+    await expect(runnerPage.getByRole('button', { name: 'Self confirm', exact: true })).toBeVisible();
     await hostPage.goto(`/room/${roomId}/catch`);
     await expect(hostPage.getByText('Disputes')).toBeHidden();
   });
@@ -296,9 +296,9 @@ test.describe('catch flow (demo)', () => {
       timeout: 10000,
     });
     await expect(runnerPage.getByText("You're suspended — reconnect to confirm.")).toBeHidden();
-    await expect(runnerPage.getByRole('button', { name: 'Self Confirm', exact: true })).toBeEnabled();
+    await expect(runnerPage.getByRole('button', { name: 'Self confirm', exact: true })).toBeEnabled();
     // Way 2: pick the Hunter, OK — the tag completes.
-    await runnerPage.getByRole('button', { name: 'Self Confirm', exact: true }).click();
+    await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
     // Classic: the tagged Runner is out — after-tagged screen, not the

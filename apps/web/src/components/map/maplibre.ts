@@ -213,6 +213,8 @@ export interface MapLibreMapLike {
   /** Force a repaint — used after a hidden-then-shown resize so a 'ready' map actually paints (v18). */
   triggerRepaint(): void;
   remove(): void;
+  /** The map's WebGL canvas — v29 (E): the context-loss listeners attach here. */
+  getCanvas(): HTMLCanvasElement;
   on(event: string, handler: (...args: unknown[]) => void): void;
   off(event: string, handler: (...args: unknown[]) => void): void;
   getCenter(): { lng: number; lat: number };
@@ -287,6 +289,21 @@ export interface CreateOlaMapOptions {
  * container resizes or is hidden-then-shown, or the canvas stays blank
  * though tiles loaded.
  *
+ * DOUBLE-TAP ZOOM (v28, Diya F4 — do NOT build a custom handler):
+ * double-tap zoom is a LIBRARY DEFAULT in the installed maplibre-gl
+ * 5.24.1 — `TapZoomHandler` (dist :66581: single-finger double-tap
+ * zooms in +1, two-finger single tap zooms out −1, both around the
+ * tap point), registered and enabled when `interactive &&
+ * doubleClickZoom` (dist :68474-68479), with defaults
+ * `interactive: true, doubleClickZoom: true, touchZoomRotate: true`
+ * (dist :71233, :71256-71257). This function passes NEITHER option,
+ * so the defaults apply and the built-in is ON. A custom handler
+ * would double-zoom every double-tap. The founder's "no double-tap
+ * zoom" report predates the v27 height fix — with a 526×0 container
+ * there was no tap target and no tiles to zoom into. If the built-in
+ * is ever proven not to fire on a healthy map, build a replacement
+ * ONLY with the built-in disabled first.
+ *
  * BOUNDED (root cause, after v13): neither await inside may hang
  * forever. The style pre-fetch is capped at 8 s (falls back to the
  * style URL on timeout) and the lazy `maplibre-gl` import — a ~1 MB
@@ -349,6 +366,17 @@ export async function createOlaMap(
 let mapAssetsPrefetched = false;
 export function prefetchMapAssets(): void {
   if (mapAssetsPrefetched || typeof window === 'undefined' || !isOlaConfigured()) return;
+  // v29 (R11): never prefetch on a data-saver connection or a 2G
+  // link — a ~1 MB chunk + style fetch is the wrong spend when the
+  // player asked the browser to save data. The map path fetches on
+  // demand instead, so nothing breaks; the first paint is just slower.
+  const connection = (
+    window.navigator as unknown as {
+      connection?: { saveData?: boolean; effectiveType?: string };
+    }
+  ).connection;
+  if (connection?.saveData === true) return;
+  if (connection?.effectiveType === 'slow-2g' || connection?.effectiveType === '2g') return;
   mapAssetsPrefetched = true;
   const run = (): void => {
     void import('maplibre-gl').catch(() => undefined);

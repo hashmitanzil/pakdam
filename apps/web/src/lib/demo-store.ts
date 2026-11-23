@@ -42,6 +42,7 @@ import {
   type Player,
   type Room,
   type RoomConfig,
+  type SuspensionReason,
 } from '@pakdam/shared';
 import {
   checkCatchProximity,
@@ -1359,6 +1360,28 @@ export function listCatchPickerNames(
 const HOST_GRACE_MS = 30_000;
 
 /**
+ * v28 fix round — which suspension reasons start the host grace.
+ * Mirrors live (`workers/src/room-do.ts` `suspendSeat`): a grace
+ * starts ONLY for an actually-gone host, i.e. `'network-lost'` /
+ * `'heartbeat-timeout'` — and only the server-side socket-close and
+ * heartbeat sweeps ever assert those (`room-do-class.ts`); the
+ * `player.suspended` handler allow-lists client-supplied reasons to
+ * `'tab-hidden'` / `'screen-locked'` / `'unknown'` and maps anything
+ * else to `'unknown'`, so a client can never start a grace. Live
+ * maps gps-denied to `reportSuspended('unknown')`
+ * (`play/page.tsx:447-452`: "never transfers host, never starts a
+ * grace"), so `'gps-denied'`, `'unknown'` and `'screen-locked'`
+ * suspend the seat WITHOUT a grace or a succession clock.
+ *
+ * `'tab-hidden'` is the ONE demo-only exception: the demo has no
+ * socket, so no server-side sweep can ever detect an actually-gone
+ * host — tab-hidden IS the demo's disconnect signal (a demo host who
+ * backgrounds/closes the tab would otherwise keep host
+ * indefinitely). Any reason outside this set fails closed: no grace.
+ */
+const GRACE_START_REASONS = new Set(['tab-hidden', 'network-lost', 'heartbeat-timeout']);
+
+/**
  * One wake-up timer per room, in this tab only. The demo alarm
  * (tickDemoRoom, on every read) is the real expiry mechanism — pages
  * poll every 1 s — but a room nobody is polling would never tick, so
@@ -1481,10 +1504,30 @@ function maybeTransferHostlessRoom(demo: DemoRoom): boolean {
   return true;
 }
 
+/**
+ * Reasons the demo can suspend a seat (v28 fix round, Zara V3 — the
+ * parameter used to be an untyped `string`, interpolated verbatim
+ * into a player-visible announcement below, so a typo'd reason would
+ * have reached the screen). It is the live `SuspensionReason` union
+ * (shared/types.ts — 'tab-hidden' | 'screen-locked' |
+ * 'network-lost' | 'heartbeat-timeout' | 'unknown') PLUS the demo's
+ * own reason: the demo has no socket, so a GPS denial is detected
+ * client-side and reported as `'gps-denied'` (play/page.tsx), a
+ * reason live never passes (live maps it to `reportSuspended(
+ * 'unknown')`). 'network-lost' / 'heartbeat-timeout' are in the
+ * union for parity but the demo never passes them — only the
+ * server-side sweep asserts those, via `suspendSeat` directly.
+ * The grace gate below (`GRACE_START_REASONS`) still typechecks:
+ * it is a `Set<string>`, and every member of this union that can
+ * start a grace ('tab-hidden') is in it, while 'gps-denied' /
+ * 'unknown' / 'screen-locked' suspend WITHOUT a grace, like live.
+ */
+export type DemoSuspensionReason = SuspensionReason | 'gps-denied';
+
 export function recordPlayerSuspension(
   demo: DemoRoom,
   playerId: string,
-  reason: string,
+  reason: DemoSuspensionReason,
 ): void {
   const player = demo.players.find((p) => p.playerId === playerId);
   if (!player) return;
@@ -1502,17 +1545,20 @@ export function recordPlayerSuspension(
   // expires (expireHostGrace, run by the demo alarm on every read plus
   // the wake-up timer below), to the earliest-joined remaining
   // CONNECTED seat (by joinedAt; role/caught not consulted) — the same
-  // eligibility as the v23 succession. The demo does NOT gate on the
-  // reason the way live does (live transfers only on 'network-lost' /
-  // 'heartbeat-timeout' and keeps host on 'tab-hidden'): the demo has
-  // no socket, so tab-hidden IS its disconnect signal — a demo host
-  // who backgrounds/closes the tab would otherwise keep host
-  // indefinitely. No grace in a terminal phase (live agrees), and no
-  // transfer when no connected seat remains at expiry — the suspended
-  // host keeps the crown until one exists to take it, and the first
-  // seat to join or resume afterwards takes it via
-  // maybeTransferHostlessRoom (v24 fix round, F5).
-  if (player.isHost && !TERMINAL_PHASES.includes(demo.room.phase)) {
+  // eligibility as the v23 succession. v28 fix round: the grace starts
+  // ONLY for a GRACE_START_REASONS reason (see the set above) — a
+  // 'gps-denied' / 'unknown' / 'screen-locked' suspension suspends
+  // the seat WITHOUT a grace, exactly like live. No grace in a
+  // terminal phase (live agrees), and no transfer when no connected
+  // seat remains at expiry — the suspended host keeps the crown until
+  // one exists to take it, and the first seat to join or resume
+  // afterwards takes it via maybeTransferHostlessRoom (v24 fix round,
+  // F5).
+  if (
+    player.isHost &&
+    !TERMINAL_PHASES.includes(demo.room.phase) &&
+    GRACE_START_REASONS.has(reason)
+  ) {
     demo.hostGraceEndsAtMs = Date.now() + HOST_GRACE_MS;
     scheduleHostGraceTimer(demo.room.roomId);
   }

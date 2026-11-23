@@ -343,6 +343,49 @@ export function validateRoomConfig(config: unknown): string[] {
   if (c.hostOnSiteConfirmed !== true) {
     issues.push('hostOnSiteConfirmed is required — the host confirms they are on site');
   }
+  // Gap 1 — GPS anti-cheat overrides are optional; when present every
+  // field is bounded (action enum, threshold integer 1–10). Absent =
+  // GPS_ANTI_CHEAT_DEFAULTS (warn-only). No host UI in v1.
+  if (c.gpsAntiCheat !== undefined && c.gpsAntiCheat !== null) {
+    const g = c.gpsAntiCheat;
+    if (typeof g !== 'object') {
+      issues.push('gpsAntiCheat must be an object');
+    } else {
+      if (g.enabled !== undefined && typeof g.enabled !== 'boolean') {
+        issues.push('gpsAntiCheat.enabled must be a boolean');
+      }
+      if (g.warnOnly !== undefined && typeof g.warnOnly !== 'boolean') {
+        issues.push('gpsAntiCheat.warnOnly must be a boolean');
+      }
+      if (g.action !== undefined && g.action !== 'warn' && g.action !== 'eject') {
+        issues.push("gpsAntiCheat.action must be 'warn' or 'eject'");
+      }
+      const positive = (
+        value: unknown,
+        name: string,
+        min: number,
+        max: number,
+        integer: boolean,
+      ): void => {
+        if (value === undefined) return;
+        if (
+          typeof value !== 'number' ||
+          !Number.isFinite(value) ||
+          value < min ||
+          value > max ||
+          (integer && !Number.isInteger(value))
+        ) {
+          issues.push(`gpsAntiCheat.${name} must be ${integer ? 'an integer ' : ''}between ${min} and ${max}`);
+        }
+      };
+      positive(g.maxSpeedMs, 'maxSpeedMs', 1, 500, false);
+      positive(g.burstMaxMs, 'burstMaxMs', 1, 500, false);
+      positive(g.burstWindowMs, 'burstWindowMs', 100, 60000, true);
+      positive(g.teleportMaxGapM, 'teleportMaxGapM', 10, 100000, false);
+      positive(g.teleportMaxGapMs, 'teleportMaxGapMs', 1000, 600000, true);
+      positive(g.violationThreshold, 'violationThreshold', 1, 10, true);
+    }
+  }
   return issues;
 }
 

@@ -34,6 +34,12 @@ class_name = "CodeRegistryDO"
 tag = "v1"
 new_sqlite_classes = ["RoomDO", "CodeRegistryDO"]
 
+# v29 (Gap 5, fix round F10) — 7-day log retention: the `scheduled`
+# handler in src/index.ts fires on this cron (03:00 UTC daily).
+# Without a [triggers] section the handler never fires at all.
+[triggers]
+crons = ["0 3 * * *"]
+
 [vars]
 SUPABASE_URL = "https://gcgakeslhfmilicokdtp.supabase.co"
 # ALLOWED_ORIGINS is optional (comma-separated). When unset, the Worker

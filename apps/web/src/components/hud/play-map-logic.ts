@@ -53,9 +53,13 @@
  * stripping; the only runtime import is `circlePolygon` from
  * @pakdam/engine (already a PlayMap dependency).
  */
-import { circlePolygon } from '@pakdam/engine';
-import type { GeoPoint, GeoPolygon } from '@pakdam/shared';
-import type { MapLibreMapLike } from '../map/maplibre';
+import { circlePolygon, polygonCentroid } from '@pakdam/engine';
+import { LOCATION_FRESHNESS_SECONDS, STALE_FIX_MS } from '@pakdam/shared';
+import type { GeoPoint, GeoPolygon, LocationFix } from '@pakdam/shared';
+import {
+  OLA_MAP_INITIAL_CENTRE,
+  type MapLibreMapLike,
+} from '../map/maplibre';
 
 export type MapState = 'loading' | 'ready' | 'no-key' | 'unavailable' | 'error';
 
@@ -225,6 +229,15 @@ export interface OtherResourceProblem {
   /** Plain-words label: 'sprite', 'glyph', or 'resource'. */
   label: string;
   detail: string | null;
+  /**
+   * ms epoch the problem was recorded (v28, Diya F3 — the decay clock
+   * for a LONE non-tile problem: the old decay only cleared
+   * `otherResource` when the TILE ledger was stale, and
+   * `tileLedgerStale` requires `count > 0`, so a lone TypeError with
+   * zero tile errors stuck forever. The component stamps this and
+   * clears via `otherResourceStale` on its own 30 s quiet clock).
+   */
+  atMs?: number;
 }
 
 /**
@@ -283,6 +296,35 @@ export interface OtherResourceProblem {
  * runs on the composed pill, not per value, so a new interpolated
  * value is covered without touching this function.
  */
+/**
+ * v28 (Zara A1): the ONLY copy a failed ◎ tap may ever show. It is
+ * ALLOW-LISTED — no raw `err.message`, no stack, no coordinates.
+ * A tap-handler failure is not a tile/sprite/glyph resource failure,
+ * so it never goes through `otherResource` / `mapErrorDetail` either.
+ */
+export const RECENTRE_FAILED_COPY = 'Re-centre failed — try again';
+
+/** v28 (Diya F2): the ◎ note when there is no fix to centre on. */
+export const RECENTRE_ZONE_FALLBACK_NOTE =
+  'Centred on the zone — no GPS fix yet.';
+
+/**
+ * v28 (Diya F2): the ◎ note when there is neither a fix nor a USABLE
+ * zone to centre on. v28 fix round (Diya A6): the old copy said "no
+ * zone yet", which is wrong when a zone EXISTS but is degenerate /
+ * malformed (a < 3-point boundary, a non-finite vertex, a NaN
+ * centroid) — `resolveRecentreCentre` falls back to the Ranchi
+ * default for that boundary too. "No usable zone" covers both: no
+ * boundary at all, or a boundary that could not be centred on.
+ */
+export const RECENTRE_DEFAULT_NOTE =
+  'Centred on Ranchi — no GPS fix and no usable zone.';
+
+/** v28 (Diya F2/F6): the ◎ note when the fix it centred on is stale. */
+export function recentreStaleNote(ageSeconds: number): string {
+  return `Centred on your last fix from ${ageSeconds}s ago — GPS is stale.`;
+}
+
 function pillTextForStateRaw(
   mapState: MapState,
   mapDetail: string | null,
@@ -297,7 +339,21 @@ function pillTextForStateRaw(
   fitPending = false,
   zeroWidth = false,
   heightDiagnosis: MapAreaHeightDiagnosis | null = null,
+  // v28 (Zara A1 + Diya F3): a failed ◎ tap is its OWN honest pill
+  // part — a tap-handler failure is not a tile/sprite/glyph resource
+  // failure, and it must never be labelled as one. The copy is
+  // ALLOW-LISTED (`RECENTRE_FAILED_COPY`): no raw `err.message`, no
+  // stack, no coordinates ever reach the pill from this path.
+  recentreFailed = false,
+  // v29 (E): a lost WebGL context outranks every other ready-state
+  // part — the canvas is frozen (or blank) on its last frame, so
+  // "Map ready" would be a lie. The pill names the loss and offers
+  // Retry (the map remounts on Retry).
+  contextLost = false,
 ): string {
+  if (mapState === 'ready' && contextLost) {
+    return 'Map graphics lost — try Retry';
+  }
   if (mapState === 'ready' && heightDiagnosis === 'container-zero-height') {
     return 'Map container has no height — try Retry';
   }
@@ -330,6 +386,9 @@ function pillTextForStateRaw(
     }
     if (otherResource) {
       parts.push(`Map ${otherResource.label} failing — ${otherResource.detail ?? 'resource failed'}`);
+    }
+    if (recentreFailed) {
+      parts.push(RECENTRE_FAILED_COPY);
     }
     if (fitPending) {
       parts.push('Camera moving to the zone…');
@@ -369,6 +428,8 @@ export function pillTextForState(
   fitPending = false,
   zeroWidth = false,
   heightDiagnosis: MapAreaHeightDiagnosis | null = null,
+  recentreFailed = false,
+  contextLost = false,
 ): string {
   return redactKeyValues(
     pillTextForStateRaw(
@@ -385,6 +446,8 @@ export function pillTextForState(
       fitPending,
       zeroWidth,
       heightDiagnosis,
+      recentreFailed,
+      contextLost,
     ),
   );
 }
@@ -399,7 +462,16 @@ export type MapErrorClassification =
   // `resource` — only a real tile failure is a "tile error". Sprites,
   // glyphs and anything else are labelled honestly by the component
   // and never counted in the tile-error count.
-  | { kind: 'post-load-tile-error'; detail: string | null; resource: PostLoadResource };
+  | { kind: 'post-load-tile-error'; detail: string | null; resource: PostLoadResource }
+  // v28 (Diya F3): a post-load error that is NOT a resource failure
+  // at all — no tile, no sprite/glyph signal, no HTTP status, no
+  // resource word in the message (e.g. a JS TypeError from camera /
+  // render work, "Cannot read properties of null (reading '0')").
+  // The old code filed every post-load error as a tile/resource
+  // error, so a camera/JS failure was branded "Map resource
+  // failing". This kind is NOT recorded in the tile ledger or
+  // `otherResource`: the map is still up and the pill stays honest.
+  | { kind: 'post-load-non-resource'; detail: string | null };
 
 /**
  * Which post-load resource failed, from the event shape — grounded in
@@ -443,6 +515,62 @@ export function resourceLabel(resource: PostLoadResource): string {
 }
 
 /**
+ * True when a post-load MapLibre `error` event is actually a RESOURCE
+ * failure (v28, Diya F3 — the positive-signal test). Grounded in the
+ * installed maplibre-gl 5.24.1 build (`ErrorEvent` = `{ error }` plus
+ * whatever `data` the firer passed, spread onto the event):
+ *  - tile loads fire `ErrorEvent(err, { tile })` — a `tile` property
+ *    is the positive tile signal (TileManager._loadTile :51123);
+ *  - sprite / glyph loads fire a bare `ErrorEvent(err)` — identified
+ *    only by the message;
+ *  - a fetch failure is an `AJAXError`, which carries an HTTP `status`
+ *    AND the request `url` (`AJAXError: <statusText> (<status>):
+ *    <url>`) — either is a positive fetch signal;
+ *  - style / source / layer failures name the resource in the
+ *    message ("Source layer … does not exist", "Failed to load …").
+ * MapLibre errors carry NO `code` (verified against the installed
+ * 5.24.1 build: `AJAXError` has only `status` / `statusText` / `url` /
+ * `body`), so there is no error-code allow-list to prefer — the
+ * positive signals above ARE the allow-list.
+ * v28 fix round (Zara V4): the message fallback is NARROW on purpose.
+ * The old regex matched bare `load` / `style` / `fetch`, so any
+ * future JS error whose message contained "load" ("Failed to load
+ * user settings") was misfiled as a resource failure. Now a message
+ * matches only on a genuine resource word (sprite / glyph / tile /
+ * source / layer / network / an HTTP status), or on a load FAILURE
+ * naming a resource ("Failed to load style", "style failed to
+ * load") — a bare "load"/"fetch"/"style" with no resource in the
+ * sentence does not match. A bare JS TypeError ("Cannot read
+ * properties of null (reading '0')") matches NONE of these — it is
+ * camera/render work failing, not a resource, and must never be
+ * labelled one.
+ */
+export function isMapResourceError(event: unknown): boolean {
+  const ev = (event ?? {}) as {
+    tile?: unknown;
+    error?: { message?: unknown; status?: unknown; url?: unknown };
+  };
+  if (ev.tile !== undefined && ev.tile !== null) return true;
+  if (ev.error?.status !== undefined && ev.error?.status !== null) return true;
+  // An AJAXError always carries the request URL — a url on the error
+  // is a fetch that was actually attempted (see the doc above).
+  if (typeof ev.error?.url === 'string' && ev.error.url.length > 0) return true;
+  const message = String(ev.error?.message ?? '');
+  // Plurals included (`glyphs`, `tiles`): MapLibre's own messages
+  // use them ("Failed to load glyphs: range 0-255"). `tilejson` is
+  // a resource in its own right (a style/source TileJSON load).
+  if (/\b(sprites?|glyphs?|tiles?|tilejson|source|layer)\b/i.test(message)) return true;
+  if (/\bnetwork\b|HTTP\s*\d/i.test(message)) return true;
+  // A load failure naming a resource ("Failed to load style",
+  // "style failed to load") — but NOT a bare "Failed to load …"
+  // with no resource in the sentence ("Failed to load user
+  // settings" is an app/JS error, not a map resource).
+  return /\b(style|sprites?|glyphs?|tiles?|tilejson|source|layer)\b[^.]{0,32}\b(failed|failure|error)\b|\b(failed|failure|error)\b[^.]{0,32}\b(style|sprites?|glyphs?|tiles?|tilejson|source|layer)\b/i.test(
+    message,
+  );
+}
+
+/**
  * Decide what a MapLibre `error` event means, given whether the style
  * has loaded yet.
  *
@@ -450,6 +578,14 @@ export function resourceLabel(resource: PostLoadResource): string {
  * 'post-load-tile-error' — PlayMap records it (count + detail) and the
  * pill names the tile failure with a Retry, instead of swallowing the
  * error while the map sits blank behind a "Map ready" pill.
+ *
+ * v28 (Diya F3): a post-load error that is NOT a resource failure
+ * (see `isMapResourceError`) is 'post-load-non-resource' — the
+ * component records nothing for it. The old code filed it as a
+ * tile/resource error, which is how the founder's ◎ tap read
+ * "Map resource failing — Cannot read properties of null
+ * (reading '0')" for what was camera/JS work failing, not a
+ * resource.
  */
 export function classifyMapError(
   loaded: boolean,
@@ -457,6 +593,9 @@ export function classifyMapError(
 ): MapErrorClassification {
   const detail = mapErrorDetail(event);
   if (loaded) {
+    if (!isMapResourceError(event)) {
+      return { kind: 'post-load-non-resource', detail };
+    }
     return {
       kind: 'post-load-tile-error',
       detail,
@@ -527,6 +666,43 @@ export function tileLedgerStale(ledger: TileErrorLedger, nowMs: number): boolean
     ledger.lastErrorAtMs !== null &&
     nowMs - ledger.lastErrorAtMs >= TILE_ERROR_QUIET_DECAY_MS
   );
+}
+
+/**
+ * True when a lone non-tile problem (`otherResource`, stamped with
+ * `atMs` when recorded) is at least the quiet period old — time to
+ * clear it on its OWN clock (v28, Diya F3). The old decay only
+ * cleared `otherResource` when `tileLedgerStale(...)` was true, and
+ * that requires `ledger.count > 0` — so a lone TypeError with zero
+ * tile errors never cleared and the pill branded a healthy map
+ * "Map resource failing" forever. An unstamped problem (no `atMs`,
+ * e.g. built by an older caller) is treated as stale: nothing may
+ * stick forever for want of a timestamp.
+ */
+export function otherResourceStale(
+  atMs: number | null | undefined,
+  nowMs: number,
+): boolean {
+  if (atMs === null || atMs === undefined) return true;
+  return nowMs - atMs >= TILE_ERROR_QUIET_DECAY_MS;
+}
+
+/**
+ * True when a failed ◎ tap (`recentreFailed`, stamped with `atMs`
+ * when recorded) is at least the quiet period old — time to clear it
+ * on its OWN clock (v28 fix round, Zara V1). The pill used to keep
+ * showing "Re-centre failed — try again" indefinitely until the next
+ * tap, Retry, or fresh map: the decay effect only cleared the tile
+ * ledger and `otherResource`. Same window as `otherResourceStale`
+ * (30 s quiet, `TILE_ERROR_QUIET_DECAY_MS`); an unstamped failure is
+ * treated as stale, like an unstamped `otherResource` — nothing may
+ * stick forever for want of a timestamp.
+ */
+export function recentreFailedStale(
+  atMs: number | null | undefined,
+  nowMs: number,
+): boolean {
+  return otherResourceStale(atMs, nowMs);
 }
 
 /** A `{ current: boolean }` flag — a React `useRef(false)` satisfies this. */
@@ -951,17 +1127,42 @@ export function ensureMapLayer(
  * the page down. (Diya F8: the six synchronous overlay writes in
  * PlayMap route through here; the zone effect's interpolate branch
  * routes its ensure calls through ensureMapSource/ensureMapLayer.)
+ *
+ * v29 (R17): the `setData` is SKIPPED when the serialised payload is
+ * unchanged — the overlay effects re-run on the 5 s clock, and an
+ * identical write still costs a GL buffer upload + re-render. A
+ * freshly created source ALWAYS writes: a rebuilt map starts empty
+ * even when the payload matches the old map's last write, so the
+ * skip only applies when the source already existed. The ping ripple
+ * loop writes the same source directly (see `rippleFrame`) and
+ * invalidates this cache on every write, so a finished ripple can
+ * never be left on screen by a skipped static write.
  */
+const lastSourcePayloadJson = new Map<string, string>();
+
+export function invalidateSourcePayloadCache(id: string): void {
+  lastSourcePayloadJson.delete(id);
+}
+
 export function syncSource(
   map: MapLibreMapLike,
   id: string,
   layers: Record<string, unknown>[],
   data: Record<string, unknown>,
 ): boolean {
+  let existed = false;
+  try {
+    existed = !!map.getSource(id);
+  } catch {
+    existed = false;
+  }
   if (!ensureMapSource(map, id)) return false;
   for (const layer of layers) {
     if (!ensureMapLayer(map, layer)) return false;
   }
+  const json = JSON.stringify(data);
+  if (existed && lastSourcePayloadJson.get(id) === json) return true;
+  lastSourcePayloadJson.set(id, json);
   return safeSetSourceData(map, id, data);
 }
 
@@ -1137,6 +1338,11 @@ export function rippleFrame(
     'pakdam-pings',
     collection([...staticFeatures, ...ripples]),
   );
+  // v29 (R17): the ripple writes this source directly, bypassing
+  // `syncSource`'s payload cache — invalidate it, so the next static
+  // sync writes (and clears the finished ripple) instead of skipping
+  // on a stale cache hit.
+  invalidateSourcePayloadCache('pakdam-pings');
   return { done: allDone || !wrote };
 }
 
@@ -1405,3 +1611,276 @@ export function retryDisabled(
   if (mapState === 'loading') return true;
   return retryCooldownActive(nowMs, lastRetryAtMs);
 }
+
+// ---------------------------------------------------------------------------
+// v28 — ◎ re-centre, GPS-dot staleness + accuracy, client fix-stop.
+// ---------------------------------------------------------------------------
+
+/**
+ * v28 (Diya F1/F2): the ◎ centre, resolved with a finite check at
+ * every step. The pre-v28 `centreOn` passed an UNVALIDATED centre
+ * straight to `map.easeTo`:
+ *  - `polygonCentroid` (engine/zone.ts:97) sums raw vertex values and
+ *    divides by length — one non-finite vertex (a malformed snapshot
+ *    vertex) poisons the sum to NaN, and MapLibre's `LngLat`
+ *    constructor throws on NaN (`Invalid LngLat object: (NaN, NaN)`,
+ *    installed maplibre-gl 5.24.1) — synchronously out of the onClick,
+ *    so the pill could never name it and the tap died silently;
+ *  - `centreOn` also passed `bearing: undefined` as a PRESENT key —
+ *    `easeTo` reads `'bearing' in options` and runs
+ *    `_normalizeBearing(undefined)` → `wrap(undefined, -180, 180)`
+ *    → NaN (maplibre-gl-dev.js `wrap$1` :9075, verified by
+ *    arithmetic), so EVERY ◎ tap eased the camera toward a NaN
+ *    bearing and poisoned the transform. `resetNorth` (bearing 0)
+ *    never had this defect.
+ * This resolver NEVER returns a non-finite centre: fix → zone
+ * centroid → Ranchi default. The caller omits `bearing` entirely
+ * when it has none (never passes an explicit `undefined` key) and
+ * wraps `easeTo` in try/catch with the allow-listed copy.
+ */
+export type RecentCentreSource = 'fix' | 'zone' | 'default';
+
+/** True when the point is a usable map centre (finite, in range). */
+export function isFiniteLngLat(
+  p: { lng: number; lat: number } | null | undefined,
+): p is { lng: number; lat: number } {
+  return (
+    p !== null &&
+    p !== undefined &&
+    Number.isFinite(p.lng) &&
+    Number.isFinite(p.lat) &&
+    p.lng >= -180 &&
+    p.lng <= 180 &&
+    p.lat >= -90 &&
+    p.lat <= 90
+  );
+}
+
+export function resolveRecentreCentre(
+  myFix: LocationFix | null,
+  zoneBoundary: GeoPolygon | null | undefined,
+): { centre: { lng: number; lat: number }; source: RecentCentreSource } {
+  if (isFiniteLngLat(myFix)) {
+    return { centre: { lng: myFix.lng, lat: myFix.lat }, source: 'fix' };
+  }
+  const boundary = zoneBoundary ?? [];
+  if (boundary.length >= 3 && boundary.every(isFiniteLngLat)) {
+    const centroid = polygonCentroid(boundary);
+    if (isFiniteLngLat(centroid)) {
+      return { centre: { lng: centroid.lng, lat: centroid.lat }, source: 'zone' };
+    }
+  }
+  return {
+    centre: { lng: OLA_MAP_INITIAL_CENTRE[0], lat: OLA_MAP_INITIAL_CENTRE[1] },
+    source: 'default',
+  };
+}
+
+/**
+ * v28 (Diya F2/F6): a fix is stale when it is older than
+ * `STALE_FIX_MS` (60 s, calibration.ts:280). The dot and ◎ used to
+ * treat a minutes-old fix as live — GPS dying mid-game left the dot
+ * sitting at the last position indefinitely, indistinguishable from
+ * live. Callers flag it (faded dot, ◎ note) instead of trusting it.
+ */
+export function isFixStale(fix: LocationFix | null, nowMs: number): boolean {
+  if (fix === null) return false;
+  return nowMs - fix.timestampMs > STALE_FIX_MS;
+}
+
+/**
+ * v29 (H2) — the demo (4a) missing-fix ejection decision, pure and
+ * unit-tested. The server rule (room-do.ts): a player silent for 30 s
+ * is ejected 30 s into ACTIVE, NEVER during HEAD_START — a cold GPS
+ * lock gets the head start to acquire GPS. The demo mirror used to
+ * eject 30 s after MATCH start (HEAD_START included); this is the
+ * corrected rule, with the baseline the moment ACTIVE began.
+ *
+ * - `activeAtMs`: epoch ms when ACTIVE began (null when not ACTIVE).
+ * - `lastSeenMs`: the freshest fix this tab has seen OR the store's
+ *   `lastFixAt` (either may be -Infinity when nothing was ever seen).
+ *   A poor-but-present fix counts — it proves liveness, even though
+ *   its position is never used for gameplay.
+ * - `effectiveNowMs`: wall clock minus hidden time (hidden time is
+ *   frozen browser time, not time without GPS).
+ * - Suspended seats never eject; live mode never ejects here (the
+ *   server enforces it); an already-ejected seat stays ejected once.
+ */
+export interface MissingFixEjectionInput {
+  mode: 'live' | 'demo';
+  phase: string;
+  activeAtMs: number | null;
+  lastSeenMs: number;
+  effectiveNowMs: number;
+  connectionState: string;
+  alreadyEjected: boolean;
+}
+
+export function shouldEjectForMissingFix(input: MissingFixEjectionInput): boolean {
+  if (input.mode !== 'demo') return false;
+  if (input.phase !== 'ACTIVE') return false;
+  if (input.activeAtMs === null) return false;
+  if (input.alreadyEjected) return false;
+  if (input.connectionState === 'suspended') return false;
+  const baselineMs = Math.max(input.lastSeenMs, input.activeAtMs);
+  return input.effectiveNowMs - baselineMs >= LOCATION_FRESHNESS_SECONDS * 1000;
+}
+
+/**
+ * v29 (D) — the own-position dot as a DOM marker style, square by
+ * construction. The v28 dot is a MapLibre `circle` layer (screen-space
+ * circle, round by construction) with a geodesic accuracy ring — no
+ * non-square box and no wrong border-radius exists in that path — yet
+ * the founder's phone showed the GPS point as a pill. The one
+ * mechanism that can elongate a WebGL layer dot is a stretched canvas
+ * (the v27 526×0 collapse proved the canvas/container can disagree
+ * about size), and a canvas stretch would stretch the dot with it. A
+ * DOM marker is positioned by the map but its box is plain CSS: an
+ * 18×18 px square with 50% radius, so it is round whatever the canvas
+ * does — the same proven pattern as the setup map's orange dot
+ * (PlayAreaMap.tsx). The accuracy ring stays a MapLibre fill layer
+ * (geodesic circle, untouched). Stale fixes draw faded.
+ */
+export const ME_DOT_MARKER_SIZE_PX = 18;
+
+export function meDotMarkerStyle(stale: boolean): Record<string, string> {
+  return {
+    width: `${ME_DOT_MARKER_SIZE_PX}px`,
+    height: `${ME_DOT_MARKER_SIZE_PX}px`,
+    borderRadius: '999px',
+    background: '#EF4444',
+    border: '2px solid #fff',
+    boxShadow: '0 0 0 5px rgba(239, 68, 68, 0.25)',
+    opacity: stale ? '0.35' : '1',
+  };
+}
+
+/**
+ * Dot trails — spacing and size (v29 fix round M8).
+ *
+ * THE PILL, FOUND IN CODE: the v28 me-dot is a MapLibre `circle`
+ * layer and the v29 dot is a DOM marker — both round by construction
+ * — yet the founder's phone showed the GPS point as a pill. The
+ * stretched-canvas hypothesis for that has no supporting evidence
+ * (the only observed canvas/container disagreement, the v27 526×0
+ * collapse, renders nothing, not a pill), and the accuracy ring is a
+ * true geodesic circle and the status pill is HUD text, not a map
+ * point — neither can elongate the dot. The trails CAN, and the
+ * mechanism is provable from this file alone: every new fix appends
+ * a fading circle, and while moving slowly the points land a few
+ * metres apart — closer together than their own diameter at play
+ * zoom — so the overlapping circles merge into one elongated
+ * capsule trailing the dot, i.e. the dot reads as a pill. The fix
+ * is spacing, not shape: a new trail point is appended only after
+ * ~11 m of movement (`TRAIL_MIN_MOVE_DEG`, 0.0001 deg ≈ 11.1 m),
+ * so consecutive points stay discrete dots with a clear gap at any
+ * play zoom, and the points are smaller (`TRAIL_DOT_RADIUS_PX`).
+ * Standing still still refreshes the same spot (points stack
+ * exactly — no elongation). The DOM marker stays: it is correct and
+ * robust, and it keeps the dot round whatever the canvas does. The
+ * pill's cause remains unproven on a real phone — the founder's
+ * phone is the verdict — but the trail merge is the only
+ * code-provable elongation mechanism, and it is fixed here.
+ */
+export const TRAIL_MIN_MOVE_DEG = 0.0001;
+export const TRAIL_DOT_RADIUS_PX = 3;
+
+/**
+ * The 'pakdam-me' dot features (v28, Diya F5/F6) — REMOVED (v29 fix
+ * round M8): the me dot is a DOM marker now (`meDotMarkerStyle`,
+ * PlayMap.tsx), and this helper had no caller left in src — only
+ * tests called it. Dead code that builds a circle layer for a dot
+ * that no longer exists is a trap for the next reader (it was already
+ * misread once as the pill's source). The display rules it carried
+ * live on in the marker path: ANY validated fix draws (no ±50 m gate
+ * on display), a non-finite fix hides the marker, a stale fix draws
+ * faded (`meDotMarkerStyle`). `meAccuracyFeatures` below stays — the
+ * accuracy ring still syncs through it.
+ */
+
+/**
+ * The 'pakdam-me-accuracy' ring (v28, Diya F5): the dot used to
+ * render a 900 m-accuracy fix as the identical 8 px circle as a 5 m
+ * fix — a rough fix drawn as a precise point. The ring is the fix's
+ * real accuracy circle (`circlePolygon`, 64 points), so a rough fix
+ * shows as a wide honest circle around the dot and a precise fix as
+ * a tight one. Empty when there is no (finite) fix or no positive
+ * accuracy — the ring never invents precision.
+ */
+export function meAccuracyFeatures(
+  myFix: LocationFix | null,
+): Record<string, unknown>[] {
+  if (!isFiniteLngLat(myFix)) return [];
+  const radius =
+    Number.isFinite(myFix.accuracyMeters) && myFix.accuracyMeters > 0
+      ? myFix.accuracyMeters
+      : 0;
+  if (radius <= 0) return [];
+  return [
+    polygonFeature(
+      circlePolygon({ lng: myFix.lng, lat: myFix.lat }, radius, 64),
+      {},
+    ),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// v28 — client fix-stop (DO cap).
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether the play-page GPS watcher may run (v28, Diya F13): only
+ * while a match is actually running AND the tab is visible. The old
+ * watcher ran while the page was open in EVERY phase — `mode ===
+ * 'live'` is the room mode, not the match phase — so a phone left on
+ * the play screen after the game ended kept sending ~1 fix/s all
+ * night (~86,400 DO requests/day), and the geolocation.ts header
+ * claimed "Location stops when the tab hides" while `watchLocation`
+ * implemented no such pause. Terminal phases (COMPLETED / CANCELLED /
+ * ABANDONED / EXPIRED), RESOLVING, and LOBBY never watch; a hidden
+ * tab never watches, in any phase. The seat is NOT lost by pausing:
+ * live, the socket already reports `player.suspended` ('tab-hidden')
+ * on hide and the DO exempts suspended seats from the ACTIVE-only
+ * (4a) missing-fix ejection, and the first fix on return resumes the
+ * seat (`location.update` resumes a suspended seat, room-do.ts);
+ * demo, the page's (4a) check excludes hidden time (see play page).
+ */
+export function shouldWatchLocation(phase: string, hidden: boolean): boolean {
+  if (hidden) return false;
+  return phase === 'HEAD_START' || phase === 'ACTIVE' || phase === 'SAFETY_PAUSED';
+}
+
+/** How long with no fix at all before the player gets a plain GPS state (v28, Diya F16). */
+export const GPS_NO_FIX_WAIT_MS = 15_000;
+
+/** The plain-words no-fix notice — a missing dot with no explanation is the current behaviour. */
+export const GPS_NO_FIX_NOTICE =
+  'Waiting for GPS — no fix yet. Your dot appears once your phone reports a location.';
+
+/** The no-fix notice, or null when there is a fix or GPS may still arrive. */
+export function gpsNoFixNotice(noFix: boolean, elapsedMs: number): string | null {
+  return noFix && elapsedMs >= GPS_NO_FIX_WAIT_MS ? GPS_NO_FIX_NOTICE : null;
+}
+
+/**
+ * v28 fix round (Diya R2): the demo (4a) 30 s clock runs on
+ * `effectiveNow`, the wall clock minus all hidden time since mount —
+ * hidden time is frozen browser time, not time without GPS. A play
+ * page opened in a background tab is hidden from mount, so the
+ * hidden span starts at mount (see play/page.tsx — the watcher
+ * effect seeds `hiddenSinceRef` when `document.hidden` at mount);
+ * the (4a) check subtracts the accumulated gap through here.
+ */
+export function effectiveNowMs(nowMs: number, hiddenGapTotalMs: number): number {
+  return nowMs - hiddenGapTotalMs;
+}
+
+/**
+ * v28 fix round (Diya R3): the GPS-denied notice, shared by the play
+ * page and its "Try again" retry. The watch is DEAD on denial — the
+ * OS never calls back again until permission is re-granted AND the
+ * watch is recreated — so the notice names the recovery (allow it in
+ * browser settings) and the page offers the retry next to it.
+ */
+export const GPS_DENIED_NOTICE =
+  'Location is off — allow it in your browser settings.';

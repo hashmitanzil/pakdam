@@ -762,17 +762,26 @@ test('F4 RESOLVING waits out the resolve: no transfer from the re-trigger or the
   // (completeMatch transitions synchronously, so this state is only
   // reachable as a defensive case — the guard must agree with
   // `expireHostGrace`, which already refuses RESOLVING).
+  // v28: a tick on a RESTING RESOLVING room now finishes it
+  // (RESOLVING → COMPLETED, the backstop) instead of leaving it
+  // ticking at 30 s forever — but the finish is still not a
+  // transfer: no `host.transferred` is emitted, the host stays h1,
+  // and the grace is cleared because the match is over (exactly as
+  // `completeMatch` clears it), not transferred. The two expiry
+  // paths below still agree: neither transfers during the resolve.
   const store = makeStore({ phase: 'RESOLVING', grace: { hostPlayerId: 'h1', endsAtMs: T0 + 31000 } });
   store.player('h1').connectionState = 'suspended';
   const tick = store.alarmTick(T0 + 31000);
   assert.equal(transferredEvents(tick.events).length, 0, 'RESOLVING must not transfer on the tick');
-  assert.equal(store.room.hostPlayerId, 'h1', 'the host keeps host through the resolve');
-  assert.deepEqual(
+  assert.equal(store.room.phase, 'COMPLETED', 'the resting RESOLVING room must complete on the tick');
+  assert.equal(store.room.hostPlayerId, 'h1', 'the host keeps host through the resolve — completion is not a transfer');
+  assert.equal(
     store.state.hostGrace,
-    { hostPlayerId: 'h1', endsAtMs: T0 + 31000 },
-    'the grace waits out the resolve — nothing clears it here',
+    null,
+    'the grace is cleared because the match is over (as in completeMatch), not transferred',
   );
   // The resume re-trigger agrees: still no transfer while RESOLVING.
+  // (The room is terminal now, so the re-trigger is a no-op either way.)
   store.suspendSeat('r1', 'tab-hidden', T0 + 31500);
   const back = store.resumeOnHello('r1', T0 + 32000);
   assert.equal(back.resumed, true, 'the resuming seat must still resume');

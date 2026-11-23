@@ -46,6 +46,51 @@ import {
 const ROOM_DELETED_MESSAGE = 'The host cancelled — this lobby is gone.';
 const WAITING_LINE = 'Waiting for the host to reconnect…';
 
+/** Ranchi default zone centre (same as outside-zone.spec.ts) — inside the 500 m zone. */
+const CENTRE = { latitude: 23.36, longitude: 85.33, accuracy: 10 };
+/** CENTRE nudged ~1 m — a NEW position, so Chromium delivers a fresh fix to every running watch. */
+const CENTRE_NUDGED = { latitude: 23.36001, longitude: 85.33001, accuracy: 10 };
+
+/**
+ * Geolocation for these two tests (v28 follow-up on the v27 CI
+ * failures at :209/:244 — NOT H1): the tests run a live match, and a
+ * live match with no GPS ejects every fix-less seat 30 s after start
+ * (demo (4a), play/page.tsx) — both runners eject, the match
+ * COMPLETES, tickDemoRoom stops expiring the host grace, and the
+ * crown poll can never match (:209); :244's tail dies the same way
+ * if it crosses T0+30 s. In the current tree the v28 F16
+ * permission-denied path additionally suspends every seat at watch
+ * start, so the grace expires with no connected successor. Granting
+ * the permission + an emulated position makes fixes flow, so no seat
+ * suspends for GPS reasons and no (4a) ejection fires. Both the
+ * coordinates AND the permission are needed — setGeolocation alone
+ * does not grant (Playwright: permission is a separate control).
+ */
+async function grantGeolocation(context: import('@playwright/test').BrowserContext): Promise<void> {
+  await context.grantPermissions(['geolocation']);
+  await context.setGeolocation(CENTRE);
+}
+
+/** White-box demo helper: move the host grace deadline into the past so the next 1 s poll expires it (same pattern as host-grace.spec.ts). Demo-only; localStorage is the demo store. */
+async function fastForwardDemoGrace(page: Page, roomId: string): Promise<void> {
+  await page.evaluate(
+    ({ key, roomId: id }) => {
+      const rooms = JSON.parse(window.localStorage.getItem(key) ?? '[]') as Array<{
+        room: { roomId: string };
+        hostGraceEndsAtMs?: number | null;
+      }>;
+      const found = rooms.find((r) => r.room.roomId === id);
+      if (!found) throw new Error(`demo room ${id} not found in localStorage`);
+      if (found.hostGraceEndsAtMs == null) {
+        throw new Error(`demo room ${id} has no grace running to expire`);
+      }
+      found.hostGraceEndsAtMs = Date.now() - 1000;
+      window.localStorage.setItem(key, JSON.stringify(rooms));
+    },
+    { key: DEMO_ROOMS_KEY, roomId },
+  );
+}
+
 /** Simulate a tab-hidden disconnect: the play page's visibility handler suspends the seat in the demo store. */
 async function hideTab(page: Page): Promise<void> {
   await page.evaluate(() => {
@@ -209,6 +254,11 @@ test.describe('host succession: earliest joiner becomes host', () => {
   test('demo host backgrounds the tab: the crown moves to the earliest-joined connected guest', async ({
     context,
   }) => {
+    // GPS on: without fixes the (4a) no-fix ejection completes the
+    // match at T0+30 s and freezes the host grace (v27 CI failure —
+    // see grantGeolocation above); with fixes flowing, only the
+    // tab-hide suspends the host.
+    await grantGeolocation(context);
     const { hostPage, guestPages, roomId } = await startDemoMatch(context);
     const errors = collectPageErrors(hostPage);
     const firstGuest = guestPages[0]!; // Ana — joined first after the host
@@ -224,13 +274,22 @@ test.describe('host succession: earliest joiner becomes host', () => {
     // remaining CONNECTED seat. The waiting line appears first, while
     // the crown is still with the suspended host — no reload anywhere.
     await hideTab(hostPage);
+    // Fresh fix for the still-visible seats: resets their (4a) 30 s
+    // clock, so the tail below is safe even on a slow CI worker.
+    await context.setGeolocation(CENTRE_NUDGED);
     await expect(firstGuest.getByRole('status', { name: WAITING_LINE })).toBeVisible({
       timeout: 10000,
     });
+    // Fast-forward the deadline instead of waiting out the real 30 s
+    // (host-grace.spec.ts pattern): the real wait collides with the
+    // (4a) ejection boundary AND cannot fit the 60 s test timeout
+    // after setup (playwright.config.ts) — the hide → suspend →
+    // grace → expiry → transfer chain is otherwise fully exercised.
+    await fastForwardDemoGrace(firstGuest, roomId);
     const anaId = await playerIdOf(firstGuest, roomId, GUEST_NAMES[0]);
     await expect
       .poll(async () => (await getDemoRoom(firstGuest, roomId))?.room.hostPlayerId, {
-        timeout: 45000,
+        timeout: 10000,
       })
       .toBe(anaId);
 
@@ -244,6 +303,11 @@ test.describe('host succession: earliest joiner becomes host', () => {
   test('demo host leaves while the earliest joiner is suspended: the crown skips the suspended seat', async ({
     context,
   }) => {
+    // GPS on: without fixes the v28 F16 permission-denied path
+    // suspends Ben too at watch start, so the leave finds no
+    // connected successor (v27 CI failure — see grantGeolocation
+    // above); with fixes flowing, only the tab-hide suspends Ana.
+    await grantGeolocation(context);
     const { hostPage, guestPages, roomId } = await startDemoMatch(context);
     const errors = collectPageErrors(hostPage);
     const firstGuest = guestPages[0]!; // Ana — suspended below
@@ -251,6 +315,9 @@ test.describe('host succession: earliest joiner becomes host', () => {
 
     // Ana backgrounds her tab: suspended, still in the room.
     await hideTab(firstGuest);
+    // Fresh fix for the still-visible seats: resets their (4a) 30 s
+    // clock, so the tail below is safe even on a slow CI worker.
+    await context.setGeolocation(CENTRE_NUDGED);
     const anaId = await playerIdOf(firstGuest, roomId, GUEST_NAMES[0]);
     await expect
       .poll(

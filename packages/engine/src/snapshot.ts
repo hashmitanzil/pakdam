@@ -41,19 +41,30 @@ import { isPendingCatch, toCatchView } from './catch.js';
 /**
  * One seat as a viewer sees it: hash stripped, and role/team kept only for
  * the viewer's own seat — every other seat's role is `null`.
+ * `presence` (v29) is the seat's 30 s-rule presence/deadline when the
+ * caller supplies it; omitted views carry no presence fields.
  */
-export function playerViewFor(viewerPlayerId: string, player: Player): PlayerView {
+export function playerViewFor(
+  viewerPlayerId: string,
+  player: Player,
+  presence?: { reconnectEndsAtMs: number | null; presence: 'present' | 'away' },
+): PlayerView {
   const { reconnectTokenHash: _hash, ...rest } = player;
-  if (player.playerId === viewerPlayerId) return rest;
-  return { ...rest, matchRole: null, team: null };
+  const base: PlayerView =
+    player.playerId === viewerPlayerId
+      ? rest
+      : { ...rest, matchRole: null, team: null };
+  if (presence === undefined) return base;
+  return { ...base, presence: presence.presence, reconnectEndsAtMs: presence.reconnectEndsAtMs };
 }
 
 /** Every seat as this viewer sees it. */
 export function playersViewFor(
   viewerPlayerId: string,
   players: readonly Player[],
+  seatPresence?: Record<string, { reconnectEndsAtMs: number | null; presence: 'present' | 'away' }>,
 ): PlayerView[] {
-  return players.map((p) => playerViewFor(viewerPlayerId, p));
+  return players.map((p) => playerViewFor(viewerPlayerId, p, seatPresence?.[p.playerId]));
 }
 
 /**
@@ -169,6 +180,20 @@ export function buildSnapshot(input: {
    * grace is running. Passed straight through to the payload.
    */
   hostGraceEndsAtMs: number | null;
+  /**
+   * v29 — per-seat 30 s-rule presence/deadline, keyed by playerId.
+   * Optional: snapshots built without a store omit it and carry no
+   * presence fields. The DO always supplies it (see
+   * `RoomStore.seatPresenceMap`).
+   */
+  seatPresence?: Record<string, { reconnectEndsAtMs: number | null; presence: 'present' | 'away' }>;
+  /**
+   * v29 (R5 fix round) — the DO instance's memory epoch, epoch ms,
+   * stamped when the DO loads/restores durable state (changes on
+   * every wake). Carried top-level on the payload so the client can
+   * include it in its snapshot key.
+   */
+  epochMs: number;
 }): WsSnapshotPayload {
   const teammates = teammateViewFor(
     input.viewerPlayerId,
@@ -176,12 +201,30 @@ export function buildSnapshot(input: {
     input.fixes,
     input.catches,
   );
+  // v29 (R1) — durable watermark for the client snapshot key
+  // `version:serverSeq:maxLastFixAtMs:epochMs`: the newest `lastFixAt`
+  // across the roster (null when nobody has reported). `lastFixAt` is
+  // durable and persisted ≤ 30 s, so after a DO eviction the restored
+  // watermark is ≤ the cached one and the key differs. The epoch
+  // (memory only, stamped on load) covers the case the watermark
+  // cannot: durable seq + watermark unchanged across a wake while
+  // memory-only `teammateFixes` / `locationStatus` are gone.
+  let maxLastFixAtMs: number | null = null;
+  for (const p of input.players) {
+    if (p.lastFixAt === null) continue;
+    const ms = Date.parse(p.lastFixAt);
+    if (!Number.isNaN(ms) && (maxLastFixAtMs === null || ms > maxLastFixAtMs)) {
+      maxLastFixAtMs = ms;
+    }
+  }
   return {
     room: input.room,
-    players: playersViewFor(input.viewerPlayerId, input.players),
+    players: playersViewFor(input.viewerPlayerId, input.players, input.seatPresence),
     phase: input.room.phase,
     version: input.room.version,
     serverSeq: input.serverSeq,
+    maxLastFixAtMs,
+    epochMs: input.epochMs,
     locationStatus: input.locationStatus,
     activeCatches: activeCatchesFor(
       input.viewerPlayerId,

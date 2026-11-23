@@ -15,7 +15,10 @@ test.describe('smoke', () => {
   test('home loads with the headline, two actions and the footer line', async ({ page }) => {
     await page.goto('/');
     // Home header logo is the lockup wordmark image now, not text.
-    await expect(page.getByAltText('Pakdam')).toBeVisible();
+    // exact:true — plain 'Pakdam' also matches the WelcomeScreen pin art
+    // ('Pakdam pin art — …') and wordmark ('Pakdam wordmark') images
+    // (strict-mode violation since the v20–v22 branding).
+    await expect(page.getByAltText('Pakdam', { exact: true })).toBeVisible();
     await expect(page.getByText('Your city is the battlefield')).toBeVisible();
     await expect(page.getByRole('heading', { name: /You are the/ })).toBeVisible();
     await expect(page.getByText('Target.', { exact: true })).toBeVisible();

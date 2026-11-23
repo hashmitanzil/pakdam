@@ -14,6 +14,7 @@
 import {
   CLOCK_SKEW_MS,
   EARTH_RADIUS_M,
+  GPS_ANTI_CHEAT_DEFAULTS,
   LOCATION_FRESHNESS_SECONDS,
   MAX_PLAUSIBLE_SPEED_MPS,
   STALE_FIX_MS,
@@ -30,7 +31,7 @@ import {
  * and the accuracy tiers still decide what is usable.
  */
 export const MAX_FIX_ACCURACY_METERS = 1000;
-import type { GeoPoint, LocationFix, LocationQuality } from './types.js';
+import type { GeoPoint, GpsAntiCheatConfig, LocationFix, LocationQuality } from './types.js';
 import { classifyAccuracy } from './validation.js';
 
 // ---------------------------------------------------------------------------
@@ -207,6 +208,108 @@ export function formatAgeLabel(totalSeconds: number): string {
   const minutes = Math.floor(seconds / 60);
   const remainder = seconds % 60;
   return `${minutes}:${String(remainder).padStart(2, '0')}`;
+}
+
+// ---------------------------------------------------------------------------
+// GPS anti-cheat — speed + teleport only (Gap 1, reliability spec §2)
+// ---------------------------------------------------------------------------
+
+/** Effective anti-cheat settings: room overrides over the defaults. */
+export type ResolvedGpsAntiCheatConfig = {
+  enabled: boolean;
+  warnOnly: boolean;
+  action: 'warn' | 'eject';
+  maxSpeedMs: number;
+  burstMaxMs: number;
+  burstWindowMs: number;
+  teleportMaxGapM: number;
+  teleportMaxGapMs: number;
+  violationThreshold: number;
+};
+
+/** Merge a room's `gpsAntiCheat` overrides onto `GPS_ANTI_CHEAT_DEFAULTS`. */
+export function resolveGpsAntiCheatConfig(
+  overrides?: GpsAntiCheatConfig | null,
+): ResolvedGpsAntiCheatConfig {
+  const o = overrides ?? {};
+  return {
+    enabled: o.enabled ?? GPS_ANTI_CHEAT_DEFAULTS.enabled,
+    warnOnly: o.warnOnly ?? GPS_ANTI_CHEAT_DEFAULTS.warnOnly,
+    action: o.action ?? GPS_ANTI_CHEAT_DEFAULTS.action,
+    maxSpeedMs: o.maxSpeedMs ?? GPS_ANTI_CHEAT_DEFAULTS.maxSpeedMs,
+    burstMaxMs: o.burstMaxMs ?? GPS_ANTI_CHEAT_DEFAULTS.burstMaxMs,
+    burstWindowMs: o.burstWindowMs ?? GPS_ANTI_CHEAT_DEFAULTS.burstWindowMs,
+    teleportMaxGapM: o.teleportMaxGapM ?? GPS_ANTI_CHEAT_DEFAULTS.teleportMaxGapM,
+    teleportMaxGapMs: o.teleportMaxGapMs ?? GPS_ANTI_CHEAT_DEFAULTS.teleportMaxGapMs,
+    violationThreshold:
+      o.violationThreshold ?? GPS_ANTI_CHEAT_DEFAULTS.violationThreshold,
+  };
+}
+
+/** Movement between two accepted fixes (Gap 1). */
+export interface FixMovement {
+  /** Haversine distance / dt (0 when there is no previous fix or dt ≤ 0). */
+  speedMps: number;
+  /** Straight-line distance between the fixes, metres. */
+  distanceM: number;
+  /**
+   * The dt the speed/teleport tests used, ms (0 when no previous fix).
+   * v29 fix round (F3): SERVER receipt time — `currReceiptMs -
+   * prevReceiptMs` — never the device timestamps. `validateFix`
+   * allows device timestamps up to 5 min in the future and 60 s
+   * stale, so a spoofer forging timestamps could stretch a device-dt
+   * to ~360 s and defeat teleport (dt < 10 s), burst (dt ≤ 3 s) and
+   * speed simultaneously. Receipt time cannot be forged that way:
+   * it is stamped by the server on acceptance.
+   */
+  dtMs: number;
+  /**
+   * True when the jump exceeds the teleport threshold with dt under the
+   * window (> 500 m in < 10 s by default). A single wild GPS fix can do
+   * this once — the caller counts violations and only flags on 3 in
+   * 5 min, never on one jump.
+   */
+  teleport: boolean;
+}
+
+/**
+ * Speed + teleport between two consecutive ACCEPTED fixes (Gap 1).
+ * Pure: no counting here — the caller (DO) counts violations in a
+ * 5-min window. `validateFix` is untouched: its rejections and its
+ * 30 m/s warning stay exactly as they are; the counted violation
+ * starts at 50 m/s. A `null` previous fix (first fix) is never a
+ * violation. dt ≤ 0 (equal / skewed timestamps) reports speed 0 —
+ * the timestamp cannot support a speed claim — while the teleport
+ * test still applies on distance alone.
+ *
+ * v29 fix round (F3) — `receipt` is the SERVER receipt time of each
+ * fix (`nowMs` at acceptance / `lastFixAcceptedAtMs` for the
+ * previous fix). When both receipt times are given, dt is receipt
+ * dt; when omitted (pure-function callers with no server clock),
+ * dt falls back to the device timestamps, exactly as before.
+ * The DO ALWAYS passes receipt times — the device-timestamp path
+ * exists only so the pure unit tests can call this without a clock.
+ */
+export function checkFixMovement(
+  prev: LocationFix | null,
+  curr: LocationFix,
+  receipt?: { prevReceiptMs?: number | null; currReceiptMs?: number },
+): FixMovement {
+  if (prev === null || prev === undefined) {
+    return { speedMps: 0, distanceM: 0, dtMs: 0, teleport: false };
+  }
+  const distanceM = haversineMeters(prev, curr);
+  const dtMs =
+    receipt !== undefined &&
+    typeof receipt.prevReceiptMs === 'number' &&
+    typeof receipt.currReceiptMs === 'number'
+      ? receipt.currReceiptMs - receipt.prevReceiptMs
+      : curr.timestampMs - prev.timestampMs;
+  const speedMps = dtMs > 0 ? distanceM / (dtMs / 1000) : 0;
+  const teleport =
+    distanceM > GPS_ANTI_CHEAT_DEFAULTS.teleportMaxGapM &&
+    dtMs < GPS_ANTI_CHEAT_DEFAULTS.teleportMaxGapMs;
+  return { speedMps, distanceM, dtMs, teleport };
 }
 
 // ---------------------------------------------------------------------------

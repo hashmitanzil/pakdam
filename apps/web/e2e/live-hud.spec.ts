@@ -56,8 +56,23 @@ test.describe('live HUD (demo)', () => {
     // interval the first shrink is pending, so the strip shows its
     // countdown. The shortened 10-min round would put the first shrink at
     // round end and the strip correctly shows "no shrink left" instead.
-    const { hostPage, guestPages, roles } = await startDemoMatch(context, { roundShort: false });
+    const { hostPage, guestPages, roles, roomId } = await startDemoMatch(context, { roundShort: false });
     const page = hostPage;
+    // H5 (v28 CI): the host tab is backgrounded while the guest pages
+    // are created, and the play page suspends the seat on tab-hide
+    // (useRoomState visibilitychange) — so the YOU dot reads
+    // 'Suspended', not 'Location never reported'. Bring the host tab
+    // forward (tab-visible auto-resumes) and wait for the resume.
+    await page.bringToFront();
+    await expect
+      .poll(
+        async () =>
+          (await getDemoRoom(page, roomId))?.players.find(
+            (p) => p.displayName === HOST_NAME,
+          )?.connectionState,
+        { timeout: 10000 },
+      )
+      .toBe('connected');
     await expect(page.getByText('Time left')).toBeVisible();
     await expect(page.getByText('Next ping')).toBeVisible();
     await expect(page.getByText(/Runners left 2 of 2/)).toBeVisible();
@@ -181,9 +196,11 @@ test.describe('live HUD (demo)', () => {
     await sheet.getByRole('button', { name: 'Pause the match' }).click();
     await expect(sheet.getByText(/Match paused by Teo — clock frozen\./)).toBeVisible();
     await expect(sheet.getByText('Resume returns to live play.')).toBeVisible();
-    await expect(hostPage.getByText('Paused')).toBeVisible();
+    // exact:true — plain 'Paused' also matches the sheet's
+    // 'Match paused by Teo — clock frozen.' (strict-mode violation).
+    await expect(hostPage.getByText('Paused', { exact: true })).toBeVisible();
     await sheet.getByRole('button', { name: 'Resume the match' }).click();
-    await expect(hostPage.getByText('Paused')).toBeHidden();
+    await expect(hostPage.getByText('Paused', { exact: true })).toBeHidden();
     await expect(hostPage.getByText('Time left')).toBeVisible();
   });
 

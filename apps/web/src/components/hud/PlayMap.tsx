@@ -125,10 +125,9 @@
 
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { GeoPoint, GeoPolygon, LocationFix, Ping } from '@pakdam/shared';
-import { circlePolygon, polygonCentroid } from '@pakdam/engine';
+import { circlePolygon } from '@pakdam/engine';
 import {
   NO_GO_FILL_COLOR,
-  OLA_MAP_INITIAL_CENTRE,
   PING_FILL_COLOR,
   ZONE_FILL_COLOR,
   ZONE_LINE_COLOR,
@@ -142,6 +141,8 @@ import {
 // used to live inline in this file — same behaviour, one home.
 import {
   EMPTY_TILE_LEDGER,
+  RECENTRE_DEFAULT_NOTE,
+  RECENTRE_ZONE_FALLBACK_NOTE,
   TILE_ERROR_QUIET_DECAY_MS,
   boundaryChangedMaterially,
   canvasMatchesContainer,
@@ -155,13 +156,20 @@ import {
   fitEscalationReason,
   fitOutcomeAction,
   handleMapTabReturn,
+  isFixStale,
   isMaterialSizeChange,
   mapBuildDecision,
+  meAccuracyFeatures,
+  meDotMarkerStyle,
+  otherResourceStale,
   pillTextForState,
   polygonFeature,
+  recentreFailedStale,
+  recentreStaleNote,
   recordTileError,
   resetFitRetryBudget,
   resourceLabel,
+  resolveRecentreCentre,
   retryDisabled,
   rippleFrame,
   scheduleFitRetryTimer,
@@ -169,6 +177,8 @@ import {
   syncSource,
   tileLedgerStale,
   tryFitZone,
+  TRAIL_DOT_RADIUS_PX,
+  TRAIL_MIN_MOVE_DEG,
   unknownErrorDetail,
   zoneBboxInView,
   type FitRetryBudget,
@@ -227,6 +237,13 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   const outerRef = useRef<HTMLDivElement | null>(null);
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMapLike | null>(null);
+  // v29 (D): the own-position DOM marker (a real maplibre Marker, not
+  // a layer) and the latest fix for the async creation path — the
+  // marker is created once per map and removed with it (see the map
+  // creation effect's cleanup).
+  const meMarkerRef = useRef<import('maplibre-gl').Marker | null>(null);
+  const myFixRef = useRef(myFix);
+  myFixRef.current = myFix;
   const [mapState, setMapState] = useState<MapState>('loading');
   const [mapReady, setMapReady] = useState(false);
   const [mapError, setMapError] = useState<string | null>(null);
@@ -251,6 +268,25 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // other resource — Diya F4): labelled honestly, never counted in the
   // tile-error count. First one kept, like the tile detail.
   const [otherResource, setOtherResource] = useState<OtherResourceProblem | null>(null);
+  // v29 (E): the WebGL context is lost — the canvas is frozen (or
+  // blank) and the pill must never claim "Map ready" while it is.
+  // Set by the canvas listeners attached at map creation; cleared
+  // on restore and on a fresh map (Retry).
+  const [contextLost, setContextLost] = useState(false);
+  // v28 (Zara A1 + Diya F3): a failed ◎ tap is its OWN state — never
+  // recorded as a resource failure. The pill shows the allow-listed
+  // `RECENTRE_FAILED_COPY` for it, never raw error text.
+  const [recentreFailed, setRecentreFailed] = useState(false);
+  // v28 fix round (Zara V1): when the failed ◎ tap happened — the
+  // decay clock for `recentreFailed` (same 30 s quiet window as
+  // `otherResource`, see the decay effect below). Without a stamp the
+  // pill kept showing "Re-centre failed — try again" indefinitely
+  // until the next tap, Retry, or fresh map.
+  const [recentreFailedAtMs, setRecentreFailedAtMs] = useState<number | null>(null);
+  // v28 (Diya F2): the ◎ fallback note — shown under the buttons when
+  // the tap centred on the zone (no fix) or on a stale fix. Plain
+  // words, cleared by the next tap or by a fresh fix arriving.
+  const [recentreNote, setRecentreNote] = useState<string | null>(null);
   // The first zone fit never landed (Diya F1/F2): the pill must not
   // claim "Map ready" while the camera never reached the zone.
   // v26: this is the reason of the last REAL failed fit attempt (a
@@ -501,17 +537,42 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // with nothing new arriving, the slate clears on its own. Any new
   // error re-runs this effect and restarts the clock; a full Retry
   // resets immediately (retryMap / startCreation).
+  // v28 (Diya F3): the two slates clear on SEPARATE clocks. The old
+  // code cleared `otherResource` only when `tileLedgerStale(...)`
+  // was true, which requires `ledger.count > 0` — so a lone
+  // non-tile problem with zero tile errors stuck forever. Now the
+  // tile ledger clears on its own staleness and `otherResource`
+  // clears on `otherResourceStale` (its own `atMs` clock).
+  // v28 fix round (Zara V1): `recentreFailed` clears on the SAME
+  // quiet clock — its own `recentreFailedAtMs` stamp via
+  // `recentreFailedStale` — so a failed ◎ tap stops branding the
+  // pill 30 s after the last failure, like every other pill state.
   useEffect(() => {
-    if (tileLedger.count === 0 && otherResource === null) return;
+    if (tileLedger.count === 0 && otherResource === null && !recentreFailed) return;
     const ledgerAtSchedule = tileLedger;
+    const otherAtSchedule = otherResource;
+    const failedAtSchedule = recentreFailedAtMs;
+    const failedSchedule = recentreFailed;
     const timer = setTimeout(() => {
       if (tileLedgerStale(ledgerAtSchedule, Date.now())) {
         setTileLedger(EMPTY_TILE_LEDGER);
+      }
+      if (
+        otherAtSchedule !== null &&
+        otherResourceStale(otherAtSchedule.atMs, Date.now())
+      ) {
         setOtherResource(null);
+      }
+      if (
+        failedSchedule &&
+        recentreFailedStale(failedAtSchedule, Date.now())
+      ) {
+        setRecentreFailed(false);
+        setRecentreFailedAtMs(null);
       }
     }, TILE_ERROR_QUIET_DECAY_MS);
     return () => clearTimeout(timer);
-  }, [tileLedger, otherResource]);
+  }, [tileLedger, otherResource, recentreFailed, recentreFailedAtMs]);
 
   // Create the map once per mount / retry.
   useEffect(() => {
@@ -547,6 +608,10 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       setOtherResource(null);
       setFitReason(null);
       setFitLanded(false);
+      // v28: a fresh map clears the ◎ failure state too — a new map
+      // is a new chance to re-centre, not a stale failure.
+      setRecentreFailed(false);
+      setRecentreNote(null);
       setAreaDiagnosis(null);
       setZeroWidth(false);
       // v27: a fresh map gets its own one re-resize on the canvas
@@ -626,6 +691,27 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           return;
         }
         mapRef.current = map;
+        // v29 (E): a fresh map has a fresh WebGL context — a
+        // context-lost pill from the previous attempt must not survive
+        // a Retry into a healthy map.
+        setContextLost(false);
+        // v29 (E): WebGL context loss — a lost context leaves the
+        // canvas frozen on its last frame (or blank) while the pill
+        // would otherwise still say "Map ready". Listen on the
+        // canvas: on loss, prevent the default (so the context CAN be
+        // restored) and show the honest pill; on restore, clear it.
+        // No explicit removal: `map.remove()` (the creation effect's
+        // cleanup below) destroys the canvas, and the listeners die
+        // with the detached element — the same lifecycle as the
+        // `map.on` handlers below.
+        const canvas = map.getCanvas();
+        const onContextLost = (event: Event) => {
+          event.preventDefault();
+          setContextLost(true);
+        };
+        const onContextRestored = () => setContextLost(false);
+        canvas.addEventListener('webglcontextlost', onContextLost);
+        canvas.addEventListener('webglcontextrestored', onContextRestored);
         setMapDetail(`style loading… (attempt ${attempt})`);
         // Resize whenever the container gains size — but NEVER at
         // zero size: the tab switch to Radio / More collapses the
@@ -722,6 +808,13 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           // container stays mounted, so a late 'load' can still paint
           // into it.
           const classification = classifyMapError(loadedRef.current, event);
+          if (classification.kind === 'post-load-non-resource') {
+            // v28 (Diya F3): NOT a resource failure — a JS TypeError
+            // from camera / render work, not a tile/sprite/glyph.
+            // Record nothing: the map is still up and the pill must
+            // never brand it "Map resource failing".
+            return;
+          }
           if (classification.kind === 'post-load-tile-error') {
             if (classification.resource === 'tile') {
               setTileLedger((prev) =>
@@ -732,6 +825,9 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
                 prev ?? {
                   label: resourceLabel(classification.resource),
                   detail: classification.detail,
+                  // v28 (Diya F3): the decay clock for a lone
+                  // non-tile problem (see the decay effect).
+                  atMs: Date.now(),
                 },
               );
             }
@@ -802,6 +898,10 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       clearTimeout(loadTimer);
       observer?.disconnect();
       waitObserver?.disconnect();
+      // v29 (D): the DOM marker belongs to this map — remove it with
+      // the map, so a Retry never leaves a stale marker behind.
+      meMarkerRef.current?.remove();
+      meMarkerRef.current = null;
       mapRef.current?.remove();
       mapRef.current = null;
     };
@@ -1227,9 +1327,20 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     // up. The loop stops 3 s after it started regardless of progress;
     // the static ping fill (synced above) stays on screen.
     const loopStartedAtMs = Date.now();
+    // v29 (R17): ~30 fps is plenty for a 3 s expanding ring — the
+    // 60 fps loop rewrote the ping source (a GL buffer upload) twice
+    // as often as any eye can follow. Frames sooner than 33 ms after
+    // the last one just re-schedule; the 3 s wall-clock deadline
+    // above still bounds the loop.
+    let lastFrameAtMs = 0;
     const frame = () => {
       if (stopped) return;
       const now = Date.now();
+      if (now - lastFrameAtMs < 33) {
+        raf = requestAnimationFrame(frame);
+        return;
+      }
+      lastFrameAtMs = now;
       const { done } = rippleFrame(
         map,
         pingFeatures,
@@ -1269,38 +1380,98 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     );
   }, [mapReady, noGoAreas]);
 
+  // My own position: a DOM MARKER (v29 D) + the accuracy ring.
+  // The v28 dot was a MapLibre `circle` layer — a screen-space
+  // circle, round by construction — and no non-square box or wrong
+  // border-radius exists anywhere in that path, yet the founder's
+  // phone showed the GPS point as a pill. The stretched-canvas
+  // hypothesis for that has no supporting evidence (the only
+  // observed canvas/container disagreement, the v27 526×0 collapse,
+  // renders nothing, not a pill). The fix-round re-examination (M8)
+  // found the actual code-provable mechanism in the DOT TRAILS below:
+  // overlapping fading trail points merge into an elongated capsule
+  // while moving slowly, so the dot read as a pill — the trail
+  // spacing is fixed there (~11 m between points, 3 px dots). The
+  // DOM marker stays as well: an 18×18 px square with a 50% radius
+  // (`meDotMarkerStyle`, play-map-logic.ts — the same proven pattern
+  // as the setup map's orange dot), so it is round whatever the
+  // canvas does. The ring is the fix's real accuracy circle, so a
+  // rough fix shows wide and a precise fix tight; the ±50 m gate is
+  // a gameplay-usability gate, never a display gate, so ANY validated
+  // fix (up to ±1000 m) draws. A stale fix (> 60 s, STALE_FIX_MS)
+  // draws faded instead of masquerading as live. Deps include nowMs
+  // so the stale fade advances on the 5 s clock even while standing
+  // still. The marker is created once per map (the maplibre chunk is
+  // already loaded by createOlaMap, so the import resolves from
+  // cache) and removed with the map; the test fake implements
+  // MapLibreMapLike but is not a real Map (no getContainer), so no
+  // marker is created under it — the style is covered by
+  // `meDotMarkerStyle` unit tests.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !mapReady) return;
+    if (typeof (map as unknown as { getContainer?: unknown }).getContainer !== 'function') {
+      return;
+    }
+    let cancelled = false;
+    const positionMarker = (marker: import('maplibre-gl').Marker) => {
+      const fix = myFixRef.current;
+      const el = marker.getElement();
+      if (!fix || !Number.isFinite(fix.lat) || !Number.isFinite(fix.lng)) {
+        el.style.display = 'none';
+        return;
+      }
+      el.style.display = '';
+      Object.assign(el.style, meDotMarkerStyle(isFixStale(fix, nowMs ?? Date.now())));
+      marker.setLngLat([fix.lng, fix.lat]);
+    };
+    if (!meMarkerRef.current) {
+      void import('maplibre-gl')
+        .then((maplibre) => {
+          if (cancelled) return;
+          if (meMarkerRef.current) return;
+          const el = document.createElement('div');
+          el.setAttribute('aria-label', 'Your location');
+          const marker = new maplibre.Marker({ element: el }).addTo(
+            map as unknown as import('maplibre-gl').Map,
+          );
+          meMarkerRef.current = marker;
+          positionMarker(marker);
+        })
+        .catch(() => {
+          // A failed marker never throws the page — the accuracy
+          // ring still shows, and the next fix re-runs this effect
+          // (myFix is a dep) and retries.
+        });
+    } else {
+      positionMarker(meMarkerRef.current);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [mapReady, myFix, nowMs]);
+
+  // The accuracy ring (v28 Diya F5/F6): the fix's real accuracy
+  // circle, from `meAccuracyFeatures` (play-map-logic.ts) — a
+  // geodesic circle, untouched by the v29 dot change. Null /
+  // non-finite fixes yield no features, never a NaN point.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
     syncSource(
       map,
-      'pakdam-me',
+      'pakdam-me-accuracy',
       [
         {
-          id: 'pakdam-me-dot',
-          type: 'circle',
-          source: 'pakdam-me',
-          paint: {
-            'circle-color': '#EF4444',
-            'circle-radius': 8,
-            'circle-stroke-width': 2,
-            'circle-stroke-color': '#FFFFFF',
-          },
+          id: 'pakdam-me-accuracy-fill',
+          type: 'fill',
+          source: 'pakdam-me-accuracy',
+          paint: { 'fill-color': 'rgba(239, 68, 68, 0.10)' },
         },
       ],
-      collection(
-        myFix
-          ? [
-              {
-                type: 'Feature',
-                properties: {},
-                geometry: { type: 'Point', coordinates: [myFix.lng, myFix.lat] },
-              },
-            ]
-          : [],
-      ),
+      collection(meAccuracyFeatures(myFix)),
     );
-  }, [mapReady, myFix]);
+  }, [mapReady, myFix, nowMs]);
 
   // Teammates' live positions (green dots, same size/stroke as the me
   // dot). Teammates only — the caller never passes an opponent here,
@@ -1340,6 +1511,12 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // 5 s-quantised clock (mapNowMs, passed in as nowMs) so the fade
   // advances in 5 s steps even while standing still.
   // Own + teammates only — the caller never passes an opponent's fix.
+  // v29 fix round (M8): points append only after ~11 m of movement
+  // (`TRAIL_MIN_MOVE_DEG`) and are 3 px (`TRAIL_DOT_RADIUS_PX`) —
+  // the old 5.5 m / 4 px spacing let overlapping fading points merge
+  // into an elongated capsule while moving slowly, i.e. the GPS dot
+  // read as a pill (see the constants' comment in play-map-logic.ts).
+  // A stationary player still leaves a fresh dot at the same spot.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
@@ -1362,8 +1539,11 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       if (last) {
         // Don't stack a duplicate point for standing still — unless
         // 3 s passed, so a stationary player still leaves a fresh dot.
+        // `TRAIL_MIN_MOVE_DEG` (≈ 11 m) is the pill fix (M8): points
+        // closer than their own diameter merge into a capsule while
+        // moving slowly, so slow movement appends only every ~11 m.
         const movedDeg = Math.hypot(fix.lng - last.lng, fix.lat - last.lat);
-        if (movedDeg < 0.00005 && now - last.atMs < 3000) return;
+        if (movedDeg < TRAIL_MIN_MOVE_DEG && now - last.atMs < 3000) return;
       }
       list.push({ lng: fix.lng, lat: fix.lat, atMs });
       trailPointsRef.current.set(
@@ -1403,7 +1583,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           source: 'pakdam-trails',
           paint: {
             'circle-color': ['get', 'color'],
-            'circle-radius': 4,
+            'circle-radius': TRAIL_DOT_RADIUS_PX,
             'circle-opacity': ['get', 'opacity'],
           },
         },
@@ -1428,20 +1608,78 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // for a re-render to see the new state (F11/F13).
   const compassOnRef = useRef(false);
   const lastCompassBearingRef = useRef<number | null>(null);
+  // v28 (Diya F1/F2 + Zara A1): the ◎ centre, guarded end to end.
+  // The old code had three holes, all on this one path:
+  //  (1) NO load guard — `mapRef.current` is assigned as soon as
+  //      `createOlaMap` resolves, BEFORE the 'load' event, and ◎/N
+  //      were tappable the whole time (no `disabled` prop, unlike
+  //      compass). `easeTo` on an unloaded map throws or misbehaves
+  //      with no pill and no feedback. Now: no map or not ready →
+  //      return, and the buttons are disabled until ready.
+  //  (2) NO finite check — `polygonCentroid` sums raw vertices, so
+  //      one non-finite vertex yields a NaN centre and MapLibre's
+  //      `LngLat` constructor throws synchronously out of the onClick.
+  //      Now: `resolveRecentreCentre` (fix → zone → Ranchi) never
+  //      returns a non-finite centre.
+  //  (3) `bearing: undefined` was passed as a PRESENT key — `easeTo`
+  //      reads `'bearing' in options` and runs
+  //      `_normalizeBearing(undefined)` → NaN, so EVERY ◎ tap eased
+  //      toward a NaN bearing. Now: `bearing` is only included when
+  //      defined.
+  // A throw is caught here and recorded as the allow-listed
+  // `RECENTRE_FAILED_COPY` in the pill — never raw error text, never
+  // a "resource failure" (Zara A1, Diya F3). The player is TOLD when
+  // the tap fell back: zone centroid (no fix) or a stale fix get a
+  // plain note under the buttons (Diya F2) instead of silently
+  // centring somewhere the player did not ask for.
   const centreOn = useCallback(
     (bearing?: number) => {
       const map = mapRef.current;
-      if (!map) return;
-      const centre =
-        myFix !== null
-          ? { lng: myFix.lng, lat: myFix.lat }
-          : zoneBoundary.length >= 3
-            ? polygonCentroid(zoneBoundary)
-            : { lng: OLA_MAP_INITIAL_CENTRE[0], lat: OLA_MAP_INITIAL_CENTRE[1] };
-      map.easeTo({ center: [centre.lng, centre.lat], bearing, duration: 300 });
+      if (!map || !mapReady) return;
+      const { centre, source } = resolveRecentreCentre(myFix, zoneBoundary);
+      try {
+        if (bearing === undefined) {
+          map.easeTo({ center: [centre.lng, centre.lat], duration: 300 });
+        } else {
+          map.easeTo({ center: [centre.lng, centre.lat], bearing, duration: 300 });
+        }
+      } catch {
+        // A tap-handler failure is not a resource failure: record
+        // only the allow-listed copy (Zara A1) and nothing else.
+        // v28 fix round (Zara V1): stamp it — the decay effect
+        // clears the pill after the 30 s quiet window, so a failed
+        // tap never brands the map forever.
+        setRecentreFailed(true);
+        setRecentreFailedAtMs(Date.now());
+        setRecentreNote(null);
+        return;
+      }
+      setRecentreFailed(false);
+      setRecentreFailedAtMs(null);
+      if (source === 'fix' && myFix !== null) {
+        const now = nowMs ?? Date.now();
+        if (isFixStale(myFix, now)) {
+          const ageS = Math.max(0, Math.floor((now - myFix.timestampMs) / 1000));
+          setRecentreNote(recentreStaleNote(ageS));
+        } else {
+          setRecentreNote(null);
+        }
+      } else if (source === 'zone') {
+        setRecentreNote(RECENTRE_ZONE_FALLBACK_NOTE);
+      } else {
+        setRecentreNote(RECENTRE_DEFAULT_NOTE);
+      }
     },
-    [myFix, zoneBoundary],
+    [myFix, zoneBoundary, mapReady, nowMs],
   );
+
+  // A fresh fix makes a fallback/stale ◎ note obsolete — clear it so
+  // the note never outlives the GPS state it described (Diya F2).
+  useEffect(() => {
+    if (myFix !== null && !isFixStale(myFix, nowMs ?? Date.now())) {
+      setRecentreNote(null);
+    }
+  }, [myFix, nowMs]);
 
   /** Re-centre only — the ◎ button. */
   const recentre = useCallback(() => centreOn(), [centreOn]);
@@ -1607,6 +1845,9 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     setOtherResource(null);
     setFitReason(null);
     setFitLanded(false);
+    // v28: the ◎ failure state clears on Retry too.
+    setRecentreFailed(false);
+    setRecentreNote(null);
     setAreaDiagnosis(null);
     setZeroWidth(false);
     // v27: a manual Retry re-arms the canvas repair ladder's one
@@ -1666,6 +1907,11 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     fitPending,
     zeroWidth,
     areaDiagnosis,
+    // v28 (Zara A1): a failed ◎ tap is its own honest pill part —
+    // never a "resource failure", never raw error text.
+    recentreFailed,
+    // v29 (E): a lost WebGL context is never "Map ready".
+    contextLost,
   );
   // Zara 4: both Retry buttons stay disabled while a load is in flight
   // and for 2 s after a tap — spamming Retry aborts creation and can
@@ -1700,7 +1946,12 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           type="button"
           aria-label="North up — reset bearing and re-centre the map"
           onClick={resetNorth}
-          className="flex h-11 w-11 items-center justify-center rounded-full border border-[#26262B] bg-[#141416]/90 text-[15px] font-bold text-white"
+          // v28 (Diya F1): ◎ and N were tappable while the map was
+          // still loading (mapRef is set before 'load'), so a tap
+          // eased an unloaded map with no feedback. Disabled until
+          // ready, like the compass button below.
+          disabled={!mapReady}
+          className="flex h-11 w-11 items-center justify-center rounded-full border border-[#26262B] bg-[#141416]/90 text-[15px] font-bold text-white disabled:opacity-40"
         >
           N
         </button>
@@ -1708,7 +1959,8 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           type="button"
           aria-label="Re-centre on me"
           onClick={recentre}
-          className="flex h-11 w-11 items-center justify-center rounded-full border border-[#26262B] bg-[#141416]/90 text-[18px] text-white"
+          disabled={!mapReady}
+          className="flex h-11 w-11 items-center justify-center rounded-full border border-[#26262B] bg-[#141416]/90 text-[18px] text-white disabled:opacity-40"
         >
           ◎
         </button>
@@ -1730,6 +1982,11 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         {compassError ? (
           <p className="max-w-[88px] rounded-full border border-[#26262B] bg-[#141416]/90 px-2 py-1 text-center text-[11px] font-semibold text-white">
             {compassError}
+          </p>
+        ) : null}
+        {recentreNote ? (
+          <p className="max-w-[88px] rounded-full border border-[#26262B] bg-[#141416]/90 px-2 py-1 text-center text-[11px] font-semibold text-white">
+            {recentreNote}
           </p>
         ) : null}
       </div>

@@ -58,7 +58,10 @@ export const PlayerDots = memo(function PlayerDots({ dots }: PlayerDotsProps) {
       {dots.map((dot) => (
         <span
           key={dot.playerId}
-          className="flex items-center gap-1.5 rounded-full border border-[#26262B] bg-black/70 px-2 py-1 text-[12px] font-semibold text-white backdrop-blur-sm"
+          // v29 (R19): no backdrop-blur — the blur is the most expensive
+          // composite on the map overlay and buys nothing over the
+          // opaque dark chip (bg-black/70 stays).
+          className="flex items-center gap-1.5 rounded-full border border-[#26262B] bg-black/70 px-2 py-1 text-[12px] font-semibold text-white"
         >
           <span
             aria-hidden

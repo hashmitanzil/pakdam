@@ -76,8 +76,10 @@ import {
   CATCH_TOKEN_TTL_SECONDS,
   EVENT_LOG_CAP,
   GAME_EVENT_LOG_CAP,
+  GPS_VIOLATION_WINDOW_MS,
   HEARTBEAT_INTERVAL_MS,
   HTTP_RATE_LIMITS,
+  IDEMPOTENCY_TTL_MS,
   LOCATION_FRESHNESS_SECONDS,
   MAX_PLAYERS,
   MIN_PLAYERS,
@@ -89,16 +91,19 @@ import {
   WS_MESSAGE_RATE_LIMITS,
   WS_MESSAGE_RATE_LIMIT_DEFAULT,
   WS_TICKET_TTL_MS,
+  checkFixMovement,
   classifyAccuracy,
   catchTokenHash,
   hashHostToken,
   hashReconnectToken,
+  hashWsTicket,
   helloHasCredential,
   isValidCatchToken,
   isValidDisplayName,
   isValidRoomCode,
   newId,
   randomHex,
+  resolveGpsAntiCheatConfig,
   validateFix,
   validateRoomConfig,
   type Announcement,
@@ -117,6 +122,7 @@ import {
   type Room,
   type RoomConfig,
   type SafetyState,
+  type SuspensionReason,
   type WsServerMessageType,
   type WsSnapshotPayload,
 } from '@pakdam/shared';
@@ -138,7 +144,6 @@ import {
   freeRunnerIds,
   isCatchExpired,
   isCatchableRunner,
-  isDuplicateCommand,
   isPendingCatch,
   isTerminalPhase,
   issueCatchToken,
@@ -150,7 +155,6 @@ import {
   purgeIdempotency,
   randomOffsetShrinkBoundary,
   recordSuspension,
-  rememberCommand,
   requestCatch,
   resolveCatch,
   resolveModeOutcome,
@@ -161,6 +165,7 @@ import {
   scoreMatch,
   shrinkIndexAt,
   toCatchView,
+  teammateViewFor,
   transitionForEvent,
   transitionOrThrow,
   updateOutsideZone,
@@ -170,7 +175,14 @@ import {
   type OutsideZoneState,
   type RunnerQrToken,
 } from '@pakdam/engine';
-import type { PersistIntent } from './supabase.js';
+import type { LogEntry, PersistIntent } from './supabase.js';
+import { stripCoordinatesDeep } from './supabase.js';
+import {
+  OPERATION_NON_MUTATING_TYPES,
+  operationCacheEarlyReply,
+  operationEpilogue,
+  operationPrologue,
+} from './operation-wrapper.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -275,6 +287,29 @@ export interface RoomDoState {
    * actually-gone reason while suspended never restarts it.
    */
   hostGrace?: { hostPlayerId: string; endsAtMs: number } | null;
+  /**
+   * v28 — epoch ms of the first alarm tick that observed NO live
+   * WebSocket attached to this room, or null when a socket is (or was
+   * most recently) attached. Durable, for the same reason as the host
+   * grace: the DO is routinely evicted between 30 s ticks, and a
+   * memory-only clock would restart on every wake, so the idle window
+   * would never complete. Written only on transitions (set on the
+   * first no-socket tick, cleared when a socket is seen or the room is
+   * abandoned) — never on every tick (v17 split). Older durable
+   * writes / test-built states lack it — `restoreState` fills null.
+   */
+  noSocketsSinceMs?: number | null;
+  /**
+   * v29 — per-seat 30 s return deadlines (founder decision
+   * 2026-11-22): playerId -> epoch ms when the seat's return window
+   * ends. Set at `startMatch` for seats not present then, and by
+   * `suspendSeat` on an actually-gone suspension mid-game; cleared
+   * on resume / leave / ejection / replay. Durable (NOT mem): the
+   * deadline must survive a DO eviction/wake, like the host grace.
+   * Absent/empty = no window running for that seat. Older durable
+   * writes / test-built states lack it — `restoreState` fills {}.
+   */
+  disconnectDeadlineMs?: Record<string, number>;
 }
 
 /** Memory-only state — rebuilt empty after hibernation, never persisted. */
@@ -303,6 +338,16 @@ export interface RoomMemory {
   announcements: Announcement[];
   /** playerId -> epoch ms of the seat's last disconnect (for missed msgs). */
   lastDisconnectAtMs: Record<string, number>;
+  /**
+   * v28 fix round (Diya R1) — playerId -> the reason of the seat's
+   * LATEST suspension, stamped by `suspendSeat` on every call.
+   * Memory only (rebuilt empty after hibernation): the heartbeat loop
+   * needs it only while the DO is awake, and the `suspendSeat` grace
+   * gate (wasSuspended) covers the post-wake case without it. A
+   * seat's reason is read only while the seat is suspended, and a
+   * fresh suspend always re-stamps it.
+   */
+  lastSuspensionReason: Record<string, SuspensionReason>;
   /** commandId -> direct reply events, so a retry gets the original reply. */
   idempotentReplies: Map<string, OutboundEvent[]>;
   /**
@@ -319,6 +364,69 @@ export interface RoomMemory {
    * (coalesced), so the DO queue is bounded at ~1 fix/s/seat by design.
    */
   lastFixAcceptedAtMs: Record<string, number>;
+  /**
+   * v29 (Gap 1) — per-seat ring of accepted fixes (cap
+   * `GPS_FIX_HISTORY_CAP` = 10), memory only, never persisted. The
+   * anti-cheat movement check reads the previous accepted fix from
+   * here. Dropped with the seat (leave / replay clears it).
+   */
+  fixHistory: Record<string, LocationFix[]>;
+  /**
+   * v29 (Gap 1) — per-seat counted GPS violations in the current
+   * 5-min window: `{ count, firstAtMs }`, memory only. Older
+   * violations age out (a new window starts). Dies with hibernation
+   * — acceptable, it is a flag, not a punishment. Dropped with the
+   * seat.
+   */
+  gpsViolations: Record<string, { count: number; firstAtMs: number }>;
+  /**
+   * v29 (Gap 5) — buffered structured-log entries, cap 100 (see
+   * `queueLog`). Flushed piggybacked on the next persist batch or
+   * the alarm tick as one `log-batch` intent. Memory only.
+   */
+  logBuffer: LogEntry[];
+  /**
+   * v29 (Gap 4) — cached HTTP idempotent replies, memory only:
+   * key -> `{ status, body, expiresAtMs }`. Keys are
+   * `join:<roomId>:<key>` for joins (the seat does not exist yet)
+   * and `<playerId>:<op>:<key>` for start/replay. 10-min TTL
+   * (`IDEMPOTENCY_TTL_MS`). Memory-only DELIBERATELY: a cached join
+   * reply carries the raw reconnect token, and raw tokens are never
+   * persisted anywhere — a retry after a DO eviction inside the
+   * window re-executes instead of replaying (same loss class as the
+   * ≤ 60 s WS idempotency sync window). Purged on the alarm tick.
+   *
+   * v29 fix round (F11) — HONEST LIMIT: the memory-only cache means
+   * the stranded-seat fix works only while the DO stays resident.
+   * After an eviction inside the 10 min window, a retried join
+   * re-executes instead of replaying the cached reply — and a
+   * retried join for a seat that already exists (same codename, no
+   * reconnect token presented) 403s "name taken" instead of
+   * restoring the seat. Recovery: the host removes the stranded
+   * seat and the player re-joins with a different codename. No
+   * code change to the cache itself: raw tokens are never persisted
+   * — that justification stands.
+   */
+  httpIdempotentReplies: Map<string, { status: number; body: Record<string, unknown>; expiresAtMs: number }>;
+  /**
+   * v29 (R5 fix round) — the memory epoch, epoch ms, stamped when
+   * this awake instance loads/restores durable state (it changes on
+   * every wake — a fresh instance always re-stamps it in the
+   * constructor and again in `restoreDurableMemory`). Memory only,
+   * never persisted: that is the point — a key carrying the old
+   * epoch can never match after a wake, so a post-wake
+   * `snapshot.unchanged` cannot fire while memory-only
+   * `teammateFixes` / `locationStatus` are gone. 0 = never stamped
+   * (only before the constructor runs).
+   */
+  epochMs: number;
+  /**
+   * v29 (R1) — epoch ms of the last snapshot safety-valve broadcast
+   * in this awake instance (0 = never). Memory only: a wake
+   * re-arms the valve immediately, which is harmless (one extra
+   * `room.state`).
+   */
+  lastSafetyValveMs: number;
   /**
    * Per-ping recipients still awaiting delivery: pingId -> playerIds not
    * yet delivered to. Mirrors the durable `pendingPingRecipients`.
@@ -393,6 +501,53 @@ export const GPS_FIX_MIN_INTERVAL_MS = 1_000;
 export const HOST_RECONNECT_GRACE_MS = 30_000;
 
 /**
+ * v29 — seat return window (founder decision 2026-11-22, "what I
+ * meant", as in ShadowHunt/SCRAM): ONE timer, 30 seconds, everywhere.
+ * - Game start: a seat not present at `startMatch` gets 30 s to come
+ *   back onto the page and reconnect (deadline = startMs + 30 s);
+ *   still absent at the deadline, the alarm ejects it and the member
+ *   count drops.
+ * - Mid-game: a seat that suspends with an actually-gone reason
+ *   ('network-lost' / 'heartbeat-timeout', i.e. NO live socket) gets
+ *   30 s, then ejection. A tab-hidden seat WITH a live socket never
+ *   starts this timer (a call on speaker while staying on the page
+ *   counts as present — the socket is alive).
+ * - Lobby: no timer, no ejection for absence — seats stay in the
+ *   roster regardless of page presence/socket.
+ * The 10-min `ABANDONED_IDLE_MS` stays as the resource backstop
+ * (empty-room end); it never conflicts with this product rule.
+ * Stored durably per seat (`state.disconnectDeadlineMs`) so the
+ * deadline survives a DO eviction. Deliberately the same 30 s value
+ * as the host grace, but a separate rule: the grace moves HOST, this
+ * moves the SEAT.
+ */
+export const SEAT_RECONNECT_WINDOW_MS = 30_000;
+
+/**
+ * v29 (R1) — periodic snapshot safety valve: in live phases the alarm
+ * emits a `room.state` at most once per 30 s even when nothing
+ * changed, so a client that dropped a broadcast event (the WS layer
+ * drops reused seqs with no gap detection) re-fetches a correct
+ * snapshot within 30 s instead of holding a stale dot indefinitely.
+ * The valve is NOT cheap under R5: the re-fetch request itself still
+ * counts as a DO request even when the reply is the tiny
+ * `snapshot.unchanged` — cost up to 1,800 requests/game (one
+ * re-fetch per seat per 30 s: 30 seats × 60 re-fetches), counted in
+ * the meter budget. It stays because it is the safety net under the
+ * `teammate.fix` broadcast (R3 fix round): a client that missed a
+ * broadcast re-syncs within 30 s.
+ */
+export const SNAPSHOT_SAFETY_VALVE_MS = 30_000;
+
+/**
+ * v29 (Gap 1) — per-seat accepted-fix ring for the anti-cheat
+ * movement check: 10 fixes, memory only. With the 1/s server
+ * throttle, consecutive accepted fixes are ~1 s apart, so the ring
+ * covers ~10 s of movement — enough for the 3 s burst window.
+ */
+export const GPS_FIX_HISTORY_CAP = 10;
+
+/**
  * Radio content-dedupe window (Phase 4 (r)): same sender + same kind +
  * same text inside this window is dropped as a double-delivery. 5 s is
  * short enough that a genuinely repeated message still goes through,
@@ -403,6 +558,31 @@ export const RADIO_DEDUPE_WINDOW_MS = 5_000;
 
 /** Idle-lobby expiry: a LOBBY older than 24 h transitions to EXPIRED. */
 export const LOBBY_EXPIRY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * v28 — abandoned-live-room idle window: how long a live room
+ * (HEAD_START / ACTIVE / SAFETY_PAUSED, plus READY_CHECK / COUNTDOWN —
+ * see `abandonForIdle`) may go with NO live WebSocket attached before
+ * the DO ends it as terminal. 10 minutes.
+ *
+ * MUST exceed the v29 seat-hold window (founder decision 2026-11-22:
+ * 2 minutes — a player who tabs away / takes a call and comes back
+ * inside 2 min resumes straight in). 10 min = 2-min hold + 8-min
+ * margin for a slow reconnect after the hold (ticket fetch + backoff +
+ * hello) and for the host grace (30 s) to run first. A room abandoned
+ * at or below 2 min would kill a room underneath a player on a 90 s
+ * phone call (Diya F9). The margin costs almost nothing: while idle
+ * the room ticks at the 30 s cadence (20 ticks over the window), so
+ * 5 vs 10 min differs by ~10 requests.
+ *
+ * The clock is the durable `noSocketsSinceMs` on the state (NOT
+ * memory): a DO evicted between 30 s ticks wakes with the clock
+ * intact, so the window completes across hibernation. It is written
+ * only on transitions (first no-socket tick sets it, a live socket
+ * clears it, abandonment clears it) — never on every tick (v17
+ * durable/non-durable split).
+ */
+export const ABANDONED_IDLE_MS = 10 * 60 * 1000;
 
 /** Free-text caps (P2): safety pause / leave `reason`. */
 export const REASON_MAX_CHARS = 500;
@@ -483,12 +663,19 @@ export function emptyMemory(): RoomMemory {
     rawCatchTokens: new Map(),
     announcements: [],
     lastDisconnectAtMs: {},
+    lastSuspensionReason: {},
     idempotentReplies: new Map(),
     pendingPingRecipients: new Map(),
     lastPlayerPersistAtMs: {},
     lastFixAcceptedAtMs: {},
     recentRadio: new Map(),
     lastSuccession: null,
+    fixHistory: {},
+    gpsViolations: {},
+    logBuffer: [],
+    httpIdempotentReplies: new Map(),
+    epochMs: 0,
+    lastSafetyValveMs: 0,
   };
 }
 
@@ -516,6 +703,12 @@ export function durableSnapshot(state: RoomDoState): RoomDoState {
     originalZoneBoundary: state.originalZoneBoundary ?? null,
     deleted: state.deleted ?? false,
     hostGrace: state.hostGrace ?? null,
+    // v28: older durable writes lack the idle clock — null means a
+    // socket was attached (or the room never went idle), same as a
+    // fresh room.
+    noSocketsSinceMs: state.noSocketsSinceMs ?? null,
+    // v29: 30 s return deadlines — {} means no window is running.
+    disconnectDeadlineMs: state.disconnectDeadlineMs ?? {},
   };
 }
 
@@ -556,6 +749,12 @@ export function restoreState(raw: unknown): RoomDoState | null {
     // v24: older durable writes lack the grace — null means no grace
     // was running, same as a fresh room.
     hostGrace: s.hostGrace ?? null,
+    // v28: older durable writes lack the idle clock — null means a
+    // socket was attached, same as a fresh room.
+    noSocketsSinceMs: s.noSocketsSinceMs ?? null,
+    // v29: older durable writes lack return deadlines — {} means no
+    // window is running, same as a fresh room.
+    disconnectDeadlineMs: s.disconnectDeadlineMs ?? {},
   };
 }
 
@@ -575,11 +774,21 @@ export class RoomStore {
   constructor(state: RoomDoState, mem: RoomMemory = emptyMemory()) {
     this.state = state;
     this.mem = mem;
+    // v29 (R5 fix round) — stamp the memory epoch for this awake
+    // instance. Every wake creates a fresh instance (a fresh
+    // constructor call), so the epoch changes on every wake by
+    // construction; `restoreDurableMemory` re-stamps it as well, so
+    // a store restored into an existing instance still moves.
+    this.mem.epochMs = Date.now();
     // Older durable writes / test-built states lack the runner-token
     // records — default to empty rather than crashing on undefined.
     this.state.runnerQrTokens ??= [];
     // v24: same for the host grace — null means no grace is running.
     this.state.hostGrace ??= null;
+    // v28: same for the idle clock — null means a socket is attached.
+    this.state.noSocketsSinceMs ??= null;
+    // v29: same for the return deadlines — {} means no window running.
+    this.state.disconnectDeadlineMs ??= {};
   }
 
   /**
@@ -593,6 +802,10 @@ export class RoomStore {
    * re-minted on re-fetch (see `getCatchToken`).
    */
   restoreDurableMemory(): void {
+    // v29 (R5 fix round) — re-stamp the memory epoch on every
+    // restore: the epoch must change on every wake, and a restore
+    // into a long-lived instance is still a wake.
+    this.mem.epochMs = Date.now();
     this.mem.tickets = [...(this.state.tickets ?? [])];
     this.mem.idempotency = new Map(
       (this.state.idempotency ?? []).map((e) => [e.key, e.record]),
@@ -704,6 +917,16 @@ export class RoomStore {
     retryAfterSeconds?: number,
     nowMs: number = Date.now(),
   ): OutboundEvent {
+    // v29 (Gap 5) — every WS error is logged by code (no payload, no
+    // coordinates). The entry rides out with the next persist batch
+    // or alarm tick; logging never changes the reply or durability.
+    this.queueLog({
+      level: 'warn',
+      message: 'ws.error',
+      roomId: this.room.roomId,
+      playerId: toPlayerId,
+      metadata: { code },
+    });
     return this.emit(
       'error',
       {
@@ -921,23 +1144,52 @@ export class RoomStore {
       // v24: the host-grace deadline, so the client can show the
       // countdown without knowing the server constant (null = no grace).
       hostGraceEndsAtMs: this.hostGraceEndsAtMs(),
+      // v29: per-seat 30 s-rule presence + return deadlines.
+      seatPresence: this.seatPresenceMap(),
+      // v29 (R5 fix round): the memory epoch — top-level on the
+      // payload so the client can include it in its snapshot key.
+      epochMs: this.mem.epochMs,
     });
+  }
+
+  /**
+   * v29 fix round (F6, R3) — the recipients of a `teammate.fix`
+   * broadcast for a fix from `senderId`: exactly the seats whose
+   * snapshot `teammateFixes` would contain this fix. Computed by
+   * running the SAME predicate `buildSnapshot` uses
+   * (`teammateViewFor`, per viewer) over the current state — never
+   * a re-implementation — so broadcast and snapshot can never
+   * disagree about who sees whom, including the caught-Runner-
+   * loses-live-view rule (a caught Runner's own view is empty, so
+   * they receive nothing; a live teammate's view still contains a
+   * caught Runner's fix, so they still receive it). Empty in the
+   * lobby (no teams yet) and when the sender has no team.
+   */
+  teammateFixRecipients(senderId: string): string[] {
+    const out: string[] = [];
+    for (const p of this.state.players) {
+      if (p.playerId === senderId) continue;
+      const view = teammateViewFor(p.playerId, this.state.players, this.mem.latestFix, this.state.catches);
+      if (view.teammateFixes[senderId] !== undefined) out.push(p.playerId);
+    }
+    return out;
   }
 
   // -- audit log ------------------------------------------------------------
 
-  /** Redacted game-event log entry (coordinates stripped, cap 500). */
+  /** Redacted game-event log entry (coordinates stripped at any depth, cap 500). */
   logGameEvent(
     type: GameEvent['type'],
     actorId: string | null,
     payload: Record<string, unknown>,
     nowMs: number = Date.now(),
   ): PersistIntent {
-    const clean: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(payload)) {
-      if (['lat', 'lng', 'latitude', 'longitude', 'fix', 'centre'].includes(k)) continue;
-      clean[k] = v;
-    }
+    // v29 fix round (F9) — deep strip, same key list as
+    // `redactPayload` / `stripCoordinatesDeep` in supabase.ts: a
+    // nested `fix` / `centre` / `coordinates` object must never
+    // reach the log through a nested payload. All current payloads
+    // are scalar by construction — this is hardening, not a live leak.
+    const clean = stripCoordinatesDeep(payload) as Record<string, unknown>;
     const seq = this.nextSeq();
     const event: GameEvent = {
       id: newId(),
@@ -1139,6 +1391,9 @@ export class RoomStore {
       } else if (existing.leftAt === null) {
         existing.connectionState = 'connected';
       }
+      // v29 (30 s rule) — a restored seat came back: clear any return
+      // window (role/score intact, same as a hello resume).
+      this.clearDisconnectDeadline(existing.playerId);
       // v24 — a graced host restored by name + reconnect token keeps
       // host: cancel the grace. The host token was never deleted
       // during the grace, so the restored host still verifies.
@@ -1214,8 +1469,198 @@ export class RoomStore {
   playerViewFor(viewerPlayerId: string, player: Player): PlayerView {
     const { reconnectTokenHash: _hash, ...rest } = player;
     void _hash;
-    if (player.playerId === viewerPlayerId) return rest;
-    return { ...rest, matchRole: null, team: null };
+    // v29 — every view leaving the DO carries the seat's 30 s-rule
+    // presence + return deadline (contract for the client countdown).
+    const presence = {
+      presence: this.presenceFor(player),
+      reconnectEndsAtMs: this.reconnectEndsAtMs(player.playerId),
+    };
+    if (player.playerId === viewerPlayerId) return { ...rest, ...presence };
+    return { ...rest, matchRole: null, team: null, ...presence };
+  }
+
+  /**
+   * v29 — a seat's presence for the 30 s rule: 'away' = no live socket
+   * (suspended, disconnected, or left); 'present' otherwise. A
+   * tab-hidden seat reads 'away' even though its socket may still be
+   * attached — it is not on the page. The disconnect TIMER (the
+   * enforcement) is the narrower rule: it runs only for actually-gone
+   * suspensions, never for tab-hidden (see `setDisconnectDeadline`).
+   */
+  presenceFor(player: Player): 'present' | 'away' {
+    if (player.leftAt !== null) return 'away';
+    return player.connectionState === 'suspended' ||
+      player.connectionState === 'disconnected'
+      ? 'away'
+      : 'present';
+  }
+
+  /** v29 — this seat's 30 s return deadline (epoch ms), or null. */
+  reconnectEndsAtMs(playerId: string): number | null {
+    return this.state.disconnectDeadlineMs?.[playerId] ?? null;
+  }
+
+  /** v29 — per-seat presence/deadline map for the snapshot builder. */
+  seatPresenceMap(): Record<
+    string,
+    { reconnectEndsAtMs: number | null; presence: 'present' | 'away' }
+  > {
+    const out: Record<
+      string,
+      { reconnectEndsAtMs: number | null; presence: 'present' | 'away' }
+    > = {};
+    for (const p of this.state.players) {
+      out[p.playerId] = {
+        reconnectEndsAtMs: this.reconnectEndsAtMs(p.playerId),
+        presence: this.presenceFor(p),
+      };
+    }
+    return out;
+  }
+
+  /**
+   * v29 — start a seat's 30 s return window (`nowMs + 30 s`), if none
+   * is already running. Never restarts or extends a running window.
+   * No-op in the LOBBY (seats stay regardless of presence) and in
+   * terminal phases. Called from `startMatch` (seats not present at
+   * start) and `suspendSeat` (actually-gone mid-game only — the
+   * caller gates the reason).
+   */
+  setDisconnectDeadline(playerId: string, nowMs: number): boolean {
+    if (this.room.phase === 'LOBBY' || isTerminalPhase(this.room.phase)) {
+      return false;
+    }
+    const deadlines = (this.state.disconnectDeadlineMs ??= {});
+    if (deadlines[playerId] !== undefined) return false;
+    deadlines[playerId] = nowMs + SEAT_RECONNECT_WINDOW_MS;
+    return true;
+  }
+
+  /** v29 — clear a seat's return window (resume / leave / eject). */
+  clearDisconnectDeadline(playerId: string): void {
+    if (this.state.disconnectDeadlineMs) {
+      delete this.state.disconnectDeadlineMs[playerId];
+    }
+  }
+
+  /**
+   * v29 (Gap 5) — buffer one structured-log entry (memory only, cap
+   * 100). Best-effort: never throws, never blocks a game op. When
+   * full, the oldest info/debug entry is dropped first to make room;
+   * when the buffer holds only warn/error, an incoming info/debug is
+   * dropped instead; an incoming warn/error evicts the oldest entry.
+   * No entry ever carries coordinates — callers pass metadata only,
+   * and `persistLogBatch` strips coordinate keys as a backstop.
+   */
+  queueLog(entry: LogEntry): void {
+    try {
+      const buf = this.mem.logBuffer;
+      if (buf.length >= 100) {
+        const dropIdx = buf.findIndex((e) => e.level === 'info' || e.level === 'debug');
+        if (dropIdx >= 0) {
+          buf.splice(dropIdx, 1);
+        } else if (entry.level === 'info' || entry.level === 'debug') {
+          return;
+        } else {
+          buf.shift();
+        }
+      }
+      buf.push(entry);
+    } catch {
+      // Logging must never break a game op.
+    }
+  }
+
+  /**
+   * v29 (Gap 5) — drain the log buffer as one `log-batch` persist
+   * intent, or null when empty. The caller appends it to a persist
+   * batch already going out (piggyback) or to the alarm tick.
+   */
+  takeLogBatchIntent(): PersistIntent | null {
+    if (this.mem.logBuffer.length === 0) return null;
+    const entries = this.mem.logBuffer.splice(0, this.mem.logBuffer.length);
+    return { kind: 'log-batch', entries };
+  }
+
+  /**
+   * v29 (Gap 4) — read a cached HTTP idempotent reply. Returns null
+   * on a miss or an expired entry (expired entries are dropped).
+   */
+  getHttpIdempotentReply(
+    key: string,
+    nowMs: number,
+  ): { status: number; body: Record<string, unknown> } | null {
+    const hit = this.mem.httpIdempotentReplies.get(key);
+    if (!hit) return null;
+    if (nowMs >= hit.expiresAtMs) {
+      this.mem.httpIdempotentReplies.delete(key);
+      return null;
+    }
+    return { status: hit.status, body: hit.body };
+  }
+
+  /** v29 (Gap 4) — cache an HTTP reply for its idempotency key (10-min TTL). */
+  putHttpIdempotentReply(
+    key: string,
+    status: number,
+    body: Record<string, unknown>,
+    nowMs: number,
+  ): void {
+    this.mem.httpIdempotentReplies.set(key, {
+      status,
+      body,
+      expiresAtMs: nowMs + IDEMPOTENCY_TTL_MS,
+    });
+  }
+
+  /** v29 (Gap 1) — this room's effective anti-cheat settings. */
+  gpsAntiCheatConfig(): ReturnType<typeof resolveGpsAntiCheatConfig> {
+    return resolveGpsAntiCheatConfig(this.room.config.gpsAntiCheat);
+  }
+
+  /**
+   * v29 (R8) — mint + register a renewal WS ticket for a seat, DO-side
+   * (server-push renewal). The caller is the DO itself acting on an
+   * authenticated socket, so no reconnect-token check applies here —
+   * the socket already proved the seat at upgrade. The per-seat issue
+   * rate limit still applies (same table as the HTTP mint path).
+   * The raw value is returned to the caller (the class) for ONE
+   * delivery over the socket as `ticket.renewed`; only the hash is
+   * stored, exactly like the HTTP path.
+   */
+  async mintRenewalTicket(
+    playerId: string,
+    nowMs: number,
+  ): Promise<OpResult<{ ticket: string; ticketId: string; expiresAtMs: number }>> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    const seat = this.player(playerId);
+    if (!seat || seat.leftAt !== null) {
+      return errResult('Seat not found in this room.', 'FORBIDDEN', 403);
+    }
+    const issueCheck = this.checkTicketIssueRateLimit(playerId, nowMs);
+    if (!issueCheck.allowed) {
+      return errResult(
+        'Too many tries — slow down.',
+        'RATE_LIMITED',
+        429,
+        [],
+        [],
+        issueCheck.retryAfterSeconds,
+      );
+    }
+    const ticket = randomHex(32);
+    const ticketId = newId();
+    const expiresAtMs = nowMs + WS_TICKET_TTL_MS;
+    this.mem.tickets.push({
+      ticketId,
+      playerId,
+      ticketHash: await hashWsTicket(ticket),
+      purpose: 'renew',
+      expiresAtMs,
+      redeemed: false,
+      createdAtMs: nowMs,
+    });
+    return okResult({ ticket, ticketId, expiresAtMs });
   }
 
   /**
@@ -1295,6 +1740,9 @@ export class RoomStore {
     next.isHost = true;
     this.state.room.hostPlayerId = next.playerId;
     this.bumpVersion();
+    // v29 (R5) — ONE event, not two (see `transferHostToSeat`): the
+    // client re-fetches on `host.transferred`; the `room.state` only
+    // bought a second identical snapshot request per client.
     const events = [
       this.emit(
         'host.transferred',
@@ -1302,7 +1750,6 @@ export class RoomStore {
         this.allPlayerIds(),
         input.nowMs,
       ),
-      this.roomStateEvent('host-transferred', input.nowMs),
     ];
     const persist: PersistIntent[] = [
       { kind: 'room-upsert', room: this.room },
@@ -1402,6 +1849,18 @@ export class RoomStore {
       return errResult('Cannot start from this phase.', 'INVALID_STATE', 409);
     }
     this.bumpVersion();
+    // v29 (30 s rule) — seats not present at start get 30 s to come
+    // back onto the page and reconnect (deadline = startMs + 30 s).
+    // "Not present" is the store-visible proxy: connectionState
+    // 'suspended' (tab-hidden, screen-locked, or actually gone). A
+    // seat whose socket is alive but tab-hidden gets the window too —
+    // it is not on the page — and resuming inside it clears it.
+    // The alarm ejects seats still absent at the deadline.
+    for (const p of active) {
+      if (p.connectionState === 'suspended') {
+        this.setDisconnectDeadline(p.playerId, nowMs);
+      }
+    }
     const persist: PersistIntent[] = [{ kind: 'room-upsert', room: this.room }];
     for (const p of active) {
       persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: p });
@@ -2248,12 +2707,21 @@ export class RoomStore {
       startedAt: this.room.startedAt,
       endsAt: this.room.endsAt,
       nowMs,
+      // v29 fix round (F4) — the 30 s return windows shift forward
+      // by the paused duration alongside startedAt/endsAt: a
+      // deadline that passes during a pause must not eject on the
+      // first ACTIVE tick after resume — the player had zero chance
+      // to return while paused.
+      disconnectDeadlineMs: this.state.disconnectDeadlineMs ?? {},
     });
     if (!resumed.ok) {
       return errResult(resumed.reason, resumed.code, 409);
     }
     this.room.startedAt = resumed.startedAt;
     this.room.endsAt = resumed.endsAt;
+    if (resumed.disconnectDeadlineMs !== undefined) {
+      this.state.disconnectDeadlineMs = resumed.disconnectDeadlineMs;
+    }
     this.room.pausedAt = null;
     this.room.phase = resumed.phase;
     this.state.paused = false;
@@ -2467,6 +2935,12 @@ export class RoomStore {
     this.mem.latestFix = {};
     this.mem.lastFixAcceptedAtMs = {};
     this.mem.lastPlayerPersistAtMs = {};
+    // v29 — a fresh game starts with no return windows, no fix
+    // history, and no violation counts from the old match. (The log
+    // buffer is NOT cleared: buffered audit entries still flush.)
+    this.state.disconnectDeadlineMs = {};
+    this.mem.fixHistory = {};
+    this.mem.gpsViolations = {};
     const persist: PersistIntent[] = [{ kind: 'room-upsert', room: this.room }];
     for (const p of this.state.players) {
       if (p.leftAt !== null) continue;
@@ -2595,23 +3069,40 @@ export class RoomStore {
     const ejected = new Set(
       this.state.players.filter((p) => p.ejectedAt !== null).map((p) => p.playerId),
     );
+    // P1-6 (FIXED v29 — ported from the v2 track's `scoringInputs`,
+    // adapted to the live tree): `wasRunner` is set from the catch
+    // record, not from the FINAL role. A confirmed tag AS a Runner
+    // proves the seat was a Runner at some point, even when the final
+    // role is Hunter (Infection flip). The old code keyed free time
+    // on the final role only, so a flipped Runner's free time ran to
+    // the end of the match (and earned no Runner points at all, since
+    // `wasRunner` was never set). Free time now stops at the earliest
+    // confirmed tag for a flipped Runner, exactly as it stops at the
+    // tag for a Classic Runner. (The v2 copy also stops free time at
+    // the first explicit leave; the live tree has no `firstLeftAt`
+    // marker, so that half is deliberately NOT ported here.)
+    const caughtAtMs = new Map<string, number>();
+    for (const c of this.state.catches) {
+      if (c.state !== 'confirmed' || c.confirmedAt === null) continue;
+      const ms = Date.parse(c.confirmedAt);
+      const prev = caughtAtMs.get(c.runnerPlayerId);
+      if (prev === undefined || ms < prev) caughtAtMs.set(c.runnerPlayerId, ms);
+    }
     const scored = scoreMatch({
       players: this.state.players.map((p) => {
-        const freeUntil =
-          p.matchRole === 'runner'
-            ? p.ejectedAt !== null
-              ? Date.parse(p.ejectedAt)
-              : caught.has(p.playerId)
-                ? Date.parse(
-                    this.state.catches.find(
-                      (c) => c.runnerPlayerId === p.playerId && c.state === 'confirmed',
-                    )?.confirmedAt ?? new Date(endedAtMs).toISOString(),
-                  )
-                : endedAtMs
-            : endedAtMs;
+        const wasRunner = p.matchRole === 'runner' || caughtAtMs.has(p.playerId);
+        let freeUntil = endedAtMs;
+        if (wasRunner) {
+          if (p.ejectedAt !== null) {
+            freeUntil = Math.min(freeUntil, Date.parse(p.ejectedAt));
+          }
+          const caughtMs = caughtAtMs.get(p.playerId);
+          if (caughtMs !== undefined) freeUntil = Math.min(freeUntil, caughtMs);
+        }
         return {
           playerId: p.playerId,
           matchRole: p.matchRole,
+          wasRunner,
           freeSeconds:
             startedAtMs === null
               ? 0
@@ -2659,6 +3150,10 @@ export class RoomStore {
     if (r.resumed) {
       Object.assign(seat, r.player);
       resumed = true;
+      // v29 (30 s rule) — resuming inside the window clears it, so a
+      // seat that came back is never ejected for the earlier absence.
+      // Role/score are intact: resume only flips connectionState.
+      this.clearDisconnectDeadline(playerId);
       events.push(
         this.emit('player.resumed', { playerId }, this.allPlayerIds(), nowMs),
       );
@@ -2993,6 +3488,12 @@ export class RoomStore {
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
     let needsHostCheckin = false;
+    // v28 fix round (Diya R1): remember the latest suspension reason
+    // (memory only) — the alarm's heartbeat loop skips a tab-hidden
+    // seat whose socket is still attached (its heartbeat pause is
+    // expected, not a death). Stamped on every call, fresh or repeat,
+    // so it is always the latest reason for this seat.
+    this.mem.lastSuspensionReason[playerId] = reason;
     // v24 follow-up: whether the seat was ALREADY suspended before
     // this call — when it was, this call emits no `player.suspended`,
     // so a grace started below needs its own event to reach clients.
@@ -3011,6 +3512,13 @@ export class RoomStore {
       needsHostCheckin = r.needsHostCheckin;
     }
     if (reason === 'network-lost' || reason === 'heartbeat-timeout') {
+      // v29 (30 s rule) — an actually-gone suspension starts the
+      // seat's 30 s return window (never restarts one already
+      // running). The alarm ejects the seat at the deadline if it
+      // has not resumed. Tab-hidden / screen-locked / unknown never
+      // start it: the socket may still be alive (a call on speaker
+      // while staying on the page counts as present).
+      this.setDisconnectDeadline(playerId, nowMs);
       // v24 — NO immediate succession: an actually-gone HOST starts
       // the 30 s reconnect grace instead (`startHostGrace` — a no-op
       // for non-host seats, and never restarts an already-running
@@ -3020,7 +3528,18 @@ export class RoomStore {
       // passes NO batchId (fresh id), so it can never amend a
       // delivered transfer (v23 S6 lesson).
       void batchId;
-      if (this.startHostGrace(playerId, nowMs)) {
+      // v28 fix round (Diya R1, defence in depth) — a
+      // 'heartbeat-timeout' for a seat ALREADY suspended never starts
+      // a grace: the seat's suspension is already recorded, and the
+      // timeout is the heartbeat loop re-firing on a paused heartbeat
+      // (tab hidden, socket still open), not a fresh "actually gone".
+      // Without this, a merely-hidden host gets a grace at ~61-90 s
+      // and can lose the crown at ~91-120 s, inside the v29 2-min
+      // seat hold. 'network-lost' still starts one: a tab-hidden host
+      // whose socket THEN closes really is gone (v24 F1), and that
+      // path arrives here with reason 'network-lost', untouched.
+      const timeoutOnSuspendedSeat = reason === 'heartbeat-timeout' && wasSuspended;
+      if (!timeoutOnSuspendedSeat && this.startHostGrace(playerId, nowMs)) {
         // v24 follow-up — the grace start must be persisted AND
         // visible. The room-upsert persists it: without this, the
         // already-suspended case returns no persist intent at all and
@@ -3053,6 +3572,12 @@ export class RoomStore {
     seat.leftAt = new Date(nowMs).toISOString();
     seat.connectionState = 'disconnected';
     delete this.mem.latestFix[playerId];
+    // v29 — a seat that left for good carries no return window, fix
+    // history, or violation count into a later restore (a restore
+    // re-starts clean; the suspension count stays on the record).
+    this.clearDisconnectDeadline(playerId);
+    delete this.mem.fixHistory[playerId];
+    delete this.mem.gpsViolations[playerId];
     const events: OutboundEvent[] = [
       ...this.emitPlayerEvent('player.left', seat, nowMs),
     ];
@@ -3143,6 +3668,75 @@ export class RoomStore {
       }
     }
     return { events, persist };
+  }
+
+  /**
+   * v28 — end an abandoned live room (Diya F8/F11, Zara A2). Called
+   * ONLY from the DO class `alarm()` when no live WebSocket has been
+   * attached for `ABANDONED_IDLE_MS` (10 min — see the constant: it
+   * must exceed the v29 2-min seat hold plus margin). The class owns
+   * the socket observation; this method owns the transition, mirroring
+   * `leaveSeat`'s empty-room end so the two paths can never disagree:
+   * ACTIVE / SAFETY_PAUSED → ABANDONED; HEAD_START / READY_CHECK /
+   * COUNTDOWN have no ABANDONED edge, so they fall back to CANCELLED
+   * (exactly `leaveSeat`'s fallback). A paused room is the stuck
+   * shape this closes: SAFETY_PAUSED has no timeout and no
+   * auto-resume, so a host who pauses and whose phone then dies used
+   * to tick 1 s forever — now the idle window ends it. LOBBY never
+   * reaches here (its 24 h expiry owns it — the idle window must not
+   * fight it) and terminal phases refuse. Like the empty-room end,
+   * the grace is cancelled first (no transfer in a terminal room)
+   * and the result is built the same way, so snapshots + replay keep
+   * working from the terminal room.
+   */
+  abandonForIdle(
+    nowMs: number,
+  ): { events: OutboundEvent[]; persist: PersistIntent[]; abandoned: boolean } {
+    const from = this.room.phase;
+    const none = { events: [] as OutboundEvent[], persist: [] as PersistIntent[], abandoned: false };
+    if (isTerminalPhase(from) || from === 'LOBBY') return none;
+    if (
+      from !== 'HEAD_START' &&
+      from !== 'ACTIVE' &&
+      from !== 'SAFETY_PAUSED' &&
+      from !== 'READY_CHECK' &&
+      from !== 'COUNTDOWN'
+    ) {
+      return none;
+    }
+    // The room ends terminal here, so no grace survives it — same as
+    // the empty-room end in `leaveSeat`.
+    this.cancelHostGrace();
+    const moved = transitionForEvent(from, 'abandon');
+    const target = moved.ok
+      ? moved.phase
+      : transitionForEvent(from, 'cancel').ok
+        ? 'CANCELLED'
+        : null;
+    if (target === null) return none;
+    const durationSeconds =
+      this.room.startedAt === null
+        ? 0
+        : Math.max(0, Math.floor((nowMs - Date.parse(this.room.startedAt)) / 1000));
+    const result: MatchResult = {
+      outcome: target === 'CANCELLED' ? 'cancelled' : 'abandoned',
+      durationSeconds,
+      caughtRunnerIds: this.caughtRunnerIds(),
+      survivingRunnerIds: freeRunnerIds(this.state.players, this.caughtRunnerIds()),
+      tags: confirmedTags(this.state.catches),
+    };
+    this.room.phase = target;
+    this.room.result = result;
+    this.bumpVersion();
+    const events = [
+      this.emit('match.cancelled', { result }, this.allPlayerIds(), nowMs),
+      this.roomStateEvent('room-ended-idle', nowMs),
+    ];
+    const persist: PersistIntent[] = [
+      { kind: 'match-result', room: this.room },
+      { kind: 'room-upsert', room: this.room },
+    ];
+    return { events, persist, abandoned: true };
   }
 
   /**
@@ -3293,9 +3887,16 @@ export class RoomStore {
     // A lone call (no batchId) gets a fresh id, so a later call can
     // never mistake it for its own batch.
     this.mem.lastSuccession = { batchId: batchId ?? newId(), event: transfer };
+    // v29 (R5) — ONE event, not two: the client re-fetches the
+    // snapshot on `host.transferred` already, so the accompanying
+    // `room.state` only bought a second identical snapshot request
+    // per client. The version bump still rides the re-fetched
+    // snapshot. (The same-batch amend path above still returns only
+    // a `room.state` — the amended transfer is the earlier, already
+    // queued event object, not a second request.)
     return {
       transferred: true,
-      events: [transfer, this.roomStateEvent('host-transferred', nowMs)],
+      events: [transfer],
       persist,
     };
   }
@@ -3358,7 +3959,7 @@ export class RoomStore {
    */
   alarmTick(
     nowMs: number,
-    opts: { firstTickAfterWake?: boolean } = {},
+    opts: { firstTickAfterWake?: boolean; liveSocketCount?: number } = {},
   ): { events: OutboundEvent[]; persist: PersistIntent[] } {
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
@@ -3414,6 +4015,17 @@ export class RoomStore {
         if (!this.mem.idempotency.has(key)) this.mem.idempotentReplies.delete(key);
       }
     }
+    // v29 (Gap 4) — purge expired cached HTTP idempotent replies.
+    if (this.mem.httpIdempotentReplies.size > 0) {
+      for (const [key, hit] of [...this.mem.httpIdempotentReplies.entries()]) {
+        if (nowMs >= hit.expiresAtMs) this.mem.httpIdempotentReplies.delete(key);
+      }
+    }
+    // v29 (Gap 5) — flush buffered structured logs piggybacked on
+    // this tick's persist batch (or alone when the tick is otherwise
+    // quiet — the class saves when persist is non-empty).
+    const logIntent = this.takeLogBatchIntent();
+    if (logIntent !== null) persist.push(logIntent);
 
     // Lazily expire overdue pending catches on every tick.
     const sweep = this.expireOverdueCatches(nowMs);
@@ -3433,6 +4045,49 @@ export class RoomStore {
       const cleared = this.graceClearedNotice(nowMs);
       events.push(...cleared.events);
       persist.push(...cleared.persist);
+      return { events, persist };
+    }
+    // v28 — RESOLVING backstop. `completeMatch` moves RESOLVING →
+    // COMPLETED synchronously in one call, so no durable state should
+    // ever rest in RESOLVING — but IF one does (a future writer, a
+    // restored legacy row), every completion path refuses it
+    // (`canCompleteMatch` is false from RESOLVING: it requires a
+    // RESOLVING edge out of RESOLVING itself) and the tick below
+    // returns early for a non-live phase, so the room would tick at
+    // 30 s forever and never complete. Finish it on the next tick
+    // instead: the result is recomputed from the current catches
+    // (the same outcome the clock-end path would have produced), or
+    // the already-recorded result is kept. This is the only place
+    // RESOLVING is ever exited except inside `completeMatch` itself.
+    if (phase === 'RESOLVING') {
+      const durationSeconds =
+        this.room.startedAt === null
+          ? 0
+          : Math.max(0, Math.floor((nowMs - Date.parse(this.room.startedAt)) / 1000));
+      const result =
+        this.room.result ??
+        resolveModeOutcome({
+          mode: this.room.config.mode,
+          players: this.state.players,
+          caughtRunnerIds: this.caughtRunnerIds(),
+          durationSeconds,
+          tags: confirmedTags(this.state.catches),
+        });
+      this.room.phase = transitionOrThrow(this.room.phase, 'COMPLETED');
+      this.room.result = result;
+      // The match is over — no grace survives into a terminal room
+      // (same as `completeMatch`).
+      this.cancelHostGrace();
+      this.bumpVersion();
+      events.push(
+        this.emit('match.completed', { result }, this.allPlayerIds(), nowMs),
+        this.roomStateEvent('match-completed', nowMs),
+      );
+      persist.push(
+        this.logGameEvent('MATCH_COMPLETED', null, { result, room: { roomId: this.room.roomId, phase: this.room.phase } }, nowMs),
+        { kind: 'match-result', room: this.room },
+        { kind: 'room-upsert', room: this.room },
+      );
       return { events, persist };
     }
     // v23 fix round 1 (S8): hostless-room re-trigger on the tick — a
@@ -3481,6 +4136,79 @@ export class RoomStore {
       const g = this.expireHostGrace(nowMs);
       events.push(...g.events);
       persist.push(...g.persist);
+    }
+    // v28 — store-level abandoned-room end (Arjun repro, Diya F8 /
+    // F11). The class's idle clock (no live sockets, durable) is the
+    // primary trigger in production, but the store must also end a
+    // room whose seats are all suspended: a single tick long after
+    // the last disconnect must reach terminal once the class reports
+    // no live socket attached (Zara R1: the store rule takes the
+    // socket observation from the class — it never fires on socket
+    // knowledge of its own, because it has none). The two shapes it
+    // closes: a SAFETY_PAUSED room whose clock is frozen (step (3)
+    // never completes while paused, so it can never end even after
+    // `endsAt` passes) and an ACTIVE room whose suspended seats are exempt from the (4a) ejection
+    // (so nothing ever ends it before `endsAt`). The bound is the
+    // same ABANDONED_IDLE_MS (10 min): abandon only when EVERY
+    // non-left seat has been suspended for at least the window,
+    // measured from the MOST RECENT disconnect
+    // (`mem.lastDisconnectAtMs`, stamped by `suspendSeat` on the
+    // first suspend). A seat with no recorded disconnect time cannot
+    // prove the bound — the rule skips and the class's durable clock
+    // decides instead (after a DO eviction the memory map is empty,
+    // so this rule deliberately never fires on a bare wake). A
+    // running host grace defers it (F10); a lapsed grace does not
+    // block it. Placed here — after grace expiry, so a live
+    // successor can still save the room, and before the `startedAt`
+    // return, so it covers READY_CHECK (never started) and
+    // SAFETY_PAUSED (which returns early below as non-live).
+    // v28 fix round (Zara R1) — the rule may ONLY fire with NO live
+    // socket at all (`opts.liveSocketCount === 0`, observed by the
+    // class at tick start and passed in: the store cannot see
+    // sockets itself). That is the class rule's invariant ("Only a
+    // room with NO live socket at all accrues idle time"), and the
+    // store rule must agree with it: a GPS-denied suspension keeps
+    // the socket open and heartbeating, so all seats suspended for
+    // 10 min WITH sockets attached must NOT end the room under
+    // attached players. A missing count (a direct store caller that
+    // cannot see sockets) fails closed — the rule never fires on
+    // unknown attendance; the class's durable clock still ends a
+    // genuinely empty room.
+    {
+      const idlePhase =
+        this.room.phase === 'HEAD_START' ||
+        this.room.phase === 'ACTIVE' ||
+        this.room.phase === 'SAFETY_PAUSED' ||
+        this.room.phase === 'READY_CHECK' ||
+        this.room.phase === 'COUNTDOWN';
+      const active = this.activePlayers();
+      if (
+        idlePhase &&
+        opts.liveSocketCount === 0 &&
+        active.length > 0 &&
+        active.every((p) => p.connectionState === 'suspended')
+      ) {
+        const graceEndsAtMs = this.hostGraceEndsAtMs();
+        const graceRunning = graceEndsAtMs !== null && nowMs < graceEndsAtMs;
+        if (!graceRunning) {
+          let mostRecentDisconnectMs = Number.NEGATIVE_INFINITY;
+          let allKnown = true;
+          for (const p of active) {
+            const at = this.mem.lastDisconnectAtMs[p.playerId];
+            if (at === undefined) {
+              allKnown = false;
+              break;
+            }
+            if (at > mostRecentDisconnectMs) mostRecentDisconnectMs = at;
+          }
+          if (allKnown && nowMs - mostRecentDisconnectMs >= ABANDONED_IDLE_MS) {
+            const gone = this.abandonForIdle(nowMs);
+            events.push(...gone.events);
+            persist.push(...gone.persist);
+            return { events, persist };
+          }
+        }
+      }
     }
     if (this.room.startedAt === null) return { events, persist };
 
@@ -3561,7 +4289,7 @@ export class RoomStore {
     //   tab-hidden / screen-locked / network-lost is already visible as
     //   "location unknown" and blocked from confirming, and ejection is
     //   terminal — suspending for 30 s must not end a player's game
-    //   while the 60 s disconnect grace is still running. JUDGMENT
+    //   while the 30 s host reconnect grace is still running. JUDGMENT
     //   CALL: the founder's rule as written ejects any seat silent for
     //   30 s — this is the safer default, flag it for override.
     // - FIRST TICK AFTER WAKE: `firstTickAfterWake` skips this step
@@ -3630,6 +4358,54 @@ export class RoomStore {
             persist.push(...done.persist);
             return { events, persist };
           }
+        }
+      }
+    }
+
+    // (4b) v29 — 30 s return-window ejection (founder decision
+    // 2026-11-22). A seat whose return deadline passed while still
+    // suspended is ejected and the member count drops. Runs in
+    // HEAD_START and ACTIVE only — never in the LOBBY (no windows
+    // are ever set there), never while SAFETY_PAUSED (the pause
+    // freezes the game clock; v29 fix round F4 shifts every return
+    // deadline forward by the paused duration on resume, so a
+    // deadline that passed during a pause does NOT eject on the
+    // first ACTIVE tick after resume — it was extended instead).
+    // This is a DIFFERENT mechanism from (4a): (4a) ejects for a
+    // missing fix and still exempts suspended seats (v18 A3/F4,
+    // verified intact); this step ejects for an expired return
+    // window after an actually-gone suspension or an absence at
+    // start. Two guards, both learned from the v28 idle tests:
+    // - Skipped on the first tick after a wake (same staleness
+    //   reason as (4a)): a deadline is durable, and a seat whose
+    //   client is about to resume must not be ejected on the wake
+    //   tick itself. The deadline survives; the next tick ejects
+    //   if the seat is still absent.
+    // - Skipped when NOBODY is still playing (no active seat with
+    //   connectionState 'connected'): the 30 s rule drops ABSENT
+    //   members from a live game, it does not end an empty room.
+    //   Ejecting every seat of a room nobody is connected to would
+    //   complete it via the win check (COMPLETED) instead of the
+    //   idle-abandon path (ABANDONED at 10 min) — the v28 idle
+    //   tests pin the abandon, and a winner nobody is there to see
+    //   is nonsense. A room with everyone gone is abandoned, not won.
+    const anyoneConnected = this.state.players.some(
+      (p) => p.leftAt === null && p.ejectedAt === null && p.connectionState === 'connected',
+    );
+    if (
+      !opts.firstTickAfterWake &&
+      anyoneConnected &&
+      (this.room.phase === 'HEAD_START' || this.room.phase === 'ACTIVE')
+    ) {
+      const deadlines = this.state.disconnectDeadlineMs ?? {};
+      for (const [pid, endsAtMs] of Object.entries(deadlines)) {
+        if (nowMs < endsAtMs) continue;
+        const p = this.player(pid);
+        this.clearDisconnectDeadline(pid);
+        if (!p || p.ejectedAt !== null || p.leftAt !== null) continue;
+        if (p.connectionState !== 'suspended') continue;
+        if (this.ejectWithWinCheck(p, nowMs, startedAtMs, events, persist)) {
+          return { events, persist };
         }
       }
     }
@@ -3761,6 +4537,32 @@ export class RoomStore {
         );
       }
     }
+    // v29 (R1) — periodic snapshot safety valve (see
+    // `SNAPSHOT_SAFETY_VALVE_MS`): a `room.state` at most once per
+    // 30 s in live phases, so a client that dropped a broadcast event
+    // (the WS layer drops reused seqs with no gap detection)
+    // re-fetches a correct snapshot within 30 s instead of holding a
+    // stale dot indefinitely. The valve is NOT cheap under R5: the
+    // re-fetch request still counts as a DO request even when the
+    // reply is the tiny `snapshot.unchanged` — up to 1,800
+    // requests/game, counted in the budget (see the constant's
+    // comment). It stays as the safety net under the `teammate.fix`
+    // broadcast. Two guards keep it quiet: the first tick in an
+    // awake instance only stamps the clock (no emit), and it fires
+    // only when this tick emitted no `room.state` already — a tick
+    // that changed state already makes clients re-fetch, so the valve
+    // adds nothing there. (4b) early-returns above skip this line
+    // entirely.
+    if (this.mem.lastSafetyValveMs === 0) {
+      this.mem.lastSafetyValveMs = nowMs;
+    } else if (
+      !opts.firstTickAfterWake &&
+      nowMs - this.mem.lastSafetyValveMs >= SNAPSHOT_SAFETY_VALVE_MS &&
+      !events.some((e) => e.type === 'room.state')
+    ) {
+      this.mem.lastSafetyValveMs = nowMs;
+      events.push(this.roomStateEvent('snapshot-safety-valve', nowMs));
+    }
     return { events, persist };
   }
 
@@ -3844,13 +4646,12 @@ export class RoomStore {
    * reply, and no (seat, commandId) record is ever written for them.
    * Everything else keeps exactly-once via `rememberCommand`.
    */
-  private static readonly NON_MUTATING_TYPES: ReadonlySet<string> = new Set([
-    'heartbeat',
-    'location.update',
-    'snapshot.request',
-    'resync.request',
-    'voice.signal',
-  ]);
+  // v29 (Gap 2) — the canonical set lives in `operation-wrapper.ts`
+  // (the single source of truth for mutating vs non-mutating); this
+  // alias keeps `RoomStore.NON_MUTATING_TYPES` working for callers
+  // and tests.
+  private static readonly NON_MUTATING_TYPES: ReadonlySet<string> =
+    OPERATION_NON_MUTATING_TYPES;
 
   /**
    * Dispatch one client message (hello already validated by the caller).
@@ -3879,6 +4680,10 @@ export class RoomStore {
     const me = this.player(playerId);
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
+    // v29 (Gap 5) — wall-clock entry stamp for the catch-confirm
+    // duration log (the handler's `nowMs` is the receive time and does
+    // not advance inside the handler, so it cannot measure duration).
+    const receivedWallMs = Date.now();
     // v23 fix round 1 (S4): no WS traffic on a deleted room. Every op
     // below is served from the store, so one guard here covers
     // snapshot.request, radio.send, signal.send, pin.place,
@@ -3903,47 +4708,25 @@ export class RoomStore {
     const type = envelope.type;
     const payload = (envelope.payload ?? {}) as Record<string, unknown>;
 
-    // P1-9: cache the ACTUAL reply — broadcast events included, not an
-    // empty list. A genuine same-commandId replay gets the original
-    // reply (narrowed to the replier at the top of this function), never
-    // an empty `[]` that looks like success-with-nothing. Only events
-    // addressed to this player are cached: a direct event to the replier,
-    // or a broadcast the replier was among (its payload is identical for
-    // every recipient). Per-viewer events (emitPlayerEvent's role-filtered
-    // copies for OTHER seats) are never cached — replaying one to the
-    // wrong viewer would hand them another seat's view.
-    // Hoisted above the early returns (Phase 4 (q)): the !me / leftAt /
-    // rate-limit / leave returns below must cache their error reply too
-    // — previously they returned without caching, so a same-commandId
-    // retry got an empty [] that looked like success.
+    // v29 (Gap 2) — the idempotency + rate-limit + cached-reply
+    // prologue/epilogue live in `operation-wrapper.ts` (extracted
+    // verbatim from here, behaviour unchanged). The helpers are bound
+    // to this message's seat/type/commandId below; the case bodies
+    // stay inline. See the module header for the contract:
+    // a duplicate key returns the CACHED result, never an error.
+    // (P1-9 preserved: the cached reply is the ACTUAL reply —
+    // broadcast events included, narrowed to the replier — never an
+    // empty `[]` that looks like success-with-nothing. Per-viewer
+    // events for OTHER seats are never cached. Hoisted above the
+    // early returns (Phase 4 (q)) so the !me / leftAt / rate-limit /
+    // leave returns cache their error reply too.)
     const rememberReply = (evts: OutboundEvent[]): void => {
-      // Non-mutating messages never recorded a commandId (see above), so
-      // there is nothing to cache for them.
-      if (RoomStore.NON_MUTATING_TYPES.has(type)) return;
-      if (typeof envelope.commandId === 'string' && envelope.commandId.length > 0) {
-        this.mem.idempotentReplies.set(
-          `${playerId}:${envelope.commandId}`,
-          evts.filter(
-            (e) =>
-              (e.recipients.length === 1 && e.recipients[0] === playerId) ||
-              (e.recipients.length > 1 && e.recipients.includes(playerId)),
-          ),
-        );
-      }
+      operationEpilogue(this.mem, playerId, type, envelope.commandId, evts);
     };
-
-    // Phase 4 (q) — cache an early return's error as its reply. The
-    // idempotency block below has not run yet for the !me / leftAt
-    // returns, so the commandId is recorded here as well (calling
-    // rememberCommand twice — rate-limit / leave — only refreshes
-    // seenAtMs, which is harmless). A retry then reaches the cached
-    // error instead of an empty [].
     const cacheEarlyReply = (evts: OutboundEvent[]): void => {
-      if (RoomStore.NON_MUTATING_TYPES.has(type)) return;
-      if (typeof envelope.commandId === 'string' && envelope.commandId.length > 0) {
-        rememberCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs);
-        rememberReply(evts);
-      }
+      operationCacheEarlyReply(
+        this.mem, playerId, type, envelope.commandId, evts, nowMs,
+      );
     };
 
     if (!me) {
@@ -3972,30 +4755,30 @@ export class RoomStore {
     // this on every message too; this is the store-side guard.)
     // NOTE: the class passes the session ticket expiry separately.
 
-    // Idempotency: a retry reuses the same commandId; replays get the
-    // original reply without re-applying or burning rate budget. The
-    // cached reply is delivered ONLY to the replaying player (recipients
-    // narrowed below) so a broadcast op is never re-broadcast to the
-    // whole room on a retry. SKIPPED for non-mutating messages (Phase 3
-    // #3): location.update / heartbeat / snapshot / resync / voice.signal
-    // carry no mutation to dedupe, and recording them only grew the map.
-    if (
-      !RoomStore.NON_MUTATING_TYPES.has(type) &&
-      typeof envelope.commandId === 'string' &&
-      envelope.commandId.length > 0
-    ) {
-      if (isDuplicateCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs)) {
-        const cached = this.mem.idempotentReplies.get(`${playerId}:${envelope.commandId}`) ?? [];
-        const narrowed = cached.map((e) => ({ ...e, recipients: [playerId] }));
-        return { events: narrowed, persist, durable: false };
-      }
-      // In-place (Phase 3 #3): no `new Map(seen)` copy per message.
-      rememberCommand(this.mem.idempotency, playerId, envelope.commandId, nowMs);
+    // v29 (Gap 2) — idempotency prologue via the wrapper (verbatim
+    // extraction; see the module header for the contract). A duplicate
+    // key returns the CACHED reply narrowed to this seat — never an
+    // error, never a re-apply, never a re-broadcast. Skipped for
+    // non-mutating messages (Phase 3 #3): location.update / heartbeat
+    // / snapshot / resync / voice.signal carry no mutation to dedupe.
+    const prologue = operationPrologue(this.mem, playerId, type, envelope.commandId, nowMs);
+    if (prologue.duplicate) {
+      return { events: prologue.cached, persist, durable: false };
     }
 
     // Per-message rate limit (player.suspended is exempt).
     const rl = this.checkWsRateLimit(playerId, type, nowMs);
     if (!rl.allowed) {
+      // v29 (Gap 5) — rate-limit hits are logged (by operation + code,
+      // no payload). The entry rides out with the next persist batch
+      // or alarm tick.
+      this.queueLog({
+        level: 'warn',
+        message: 'ws.rate_limited',
+        roomId: this.room.roomId,
+        playerId,
+        metadata: { operation: type, code: 'RATE_LIMITED' },
+      });
       const errorEvents = [
         this.errorEvent(playerId, 'RATE_LIMITED', 'Too many messages — slow down.', true, rl.retryAfterSeconds, nowMs),
       ];
@@ -4046,7 +4829,48 @@ export class RoomStore {
       }
       case 'snapshot.request':
       case 'resync.request': {
-        events.push(this.emit('snapshot', this.snapshotFor(playerId, nowMs) as unknown as Record<string, unknown>, [playerId], nowMs));
+        // v29 (R5 — only after R1, fix round) — honour the client's
+        // snapshot key. When the seat's (version, serverSeq, durable
+        // watermark, memory epoch) key has not moved since the
+        // client's last snapshot, reply with the tiny
+        // `snapshot.unchanged` event instead of a full snapshot.
+        // Canonical key fields: `version`, `serverSeq`,
+        // `maxLastFixAtMs` (null when nobody has reported a fix —
+        // never 0), `epochMs`. The epoch is what makes the key
+        // wake-safe: durable seq + watermark can be unchanged across
+        // a wake while memory-only `teammateFixes` / `locationStatus`
+        // are gone, so a pre-wake key must never match. A fix-only
+        // serverSeq bump counts as a change (location.update advances
+        // serverSeq), so dots never go stale by answering unchanged.
+        // A client that sends no key at all — only `lastServerSeq`,
+        // or an old client — gets the full snapshot: safe default,
+        // never guess. A key missing any canonical field (e.g. an
+        // old `maxLastFixAt` spelling, or no `epochMs`) likewise
+        // gets the full snapshot.
+        const key = payload['lastSnapshotKey'] as
+          | { version?: unknown; serverSeq?: unknown; maxLastFixAtMs?: unknown; epochMs?: unknown }
+          | undefined;
+        const snapshot = this.snapshotFor(playerId, nowMs);
+        if (
+          key !== undefined &&
+          typeof key.version === 'number' &&
+          typeof key.serverSeq === 'number' &&
+          (typeof key.maxLastFixAtMs === 'number' || key.maxLastFixAtMs === null) &&
+          typeof key.epochMs === 'number' &&
+          key.version === snapshot.version &&
+          key.serverSeq === this.state.serverSeq &&
+          key.maxLastFixAtMs === (snapshot.maxLastFixAtMs ?? null) &&
+          key.epochMs === snapshot.epochMs
+        ) {
+          events.push(
+            direct('snapshot.unchanged', {
+              serverSeq: this.state.serverSeq,
+              version: snapshot.version,
+            }),
+          );
+        } else {
+          events.push(this.emit('snapshot', snapshot as unknown as Record<string, unknown>, [playerId], nowMs));
+        }
         break;
       }
       case 'ready.set': {
@@ -4101,6 +4925,11 @@ export class RoomStore {
         // fix/s/seat. A fix arriving sooner is dropped (coalesced), not
         // errored: the client streams ~1/s, so this only bites on
         // bursts, and the live fix stays at most 1 s stale.
+        // v29 (R7) — this 1/s throttle is DELIBERATELY not tightened:
+        // Gap 1's movement check samples at most 1 fix/s, so a tighter
+        // throttle would starve it (a 3 s burst window needs >= 3
+        // samples). The client-side send gate is the throttle that
+        // matters for the DO meter; the server floor stays 1/s.
         const lastAccepted = this.mem.lastFixAcceptedAtMs[playerId] ?? 0;
         if (nowMs - lastAccepted < GPS_FIX_MIN_INTERVAL_MS) {
           // Coalesced fix: no reply is cached here on purpose —
@@ -4109,7 +4938,89 @@ export class RoomStore {
           // does not apply to this return).
           return { events, persist, durable: false };
         }
+        // v29 fix round (F3) — the previous fix's SERVER receipt
+        // time, captured BEFORE this fix's receipt is stamped below.
+        // The movement check uses receipt dt, never device timestamps.
+        const prevFixReceiptMs = this.mem.lastFixAcceptedAtMs[playerId] ?? null;
         this.mem.lastFixAcceptedAtMs[playerId] = nowMs;
+        // v29 (Gap 1) — GPS anti-cheat movement check, AFTER
+        // validateFix passed and AFTER the 1/s throttle, BEFORE the
+        // fix is stored. The previous ACCEPTED fix is the reference
+        // (ring cap 10, memory only). dt comes from SERVER receipt
+        // time (`nowMs` / `lastFixAcceptedAtMs`, F3) — a spoofer
+        // forging device timestamps cannot stretch dt and defeat
+        // teleport / burst / speed. One violation is counted per
+        // accepted fix at most, kind priority teleport > burst >
+        // speed; the fix is STILL accepted either way (warn-only by
+        // default — the snapshot never exposes the flag). At 3
+        // violations inside 5 min a `GPS_VIOLATION` room event is
+        // logged (player id, kind, count — NO coordinates) and, only
+        // when the room config opts in (`action: 'eject'`), the seat
+        // is ejected through the existing machinery in a live phase.
+        {
+          const cfg = this.gpsAntiCheatConfig();
+          if (cfg.enabled) {
+            const history = (this.mem.fixHistory[playerId] ??= []);
+            const movement = checkFixMovement(history[history.length - 1] ?? null, goodFix, {
+              prevReceiptMs: prevFixReceiptMs,
+              currReceiptMs: nowMs,
+            });
+            if (movement) {
+              let kind: 'speed' | 'burst' | 'teleport' | null = null;
+              if (movement.teleport) kind = 'teleport';
+              else if (movement.dtMs <= cfg.burstWindowMs && movement.speedMps > cfg.burstMaxMs) kind = 'burst';
+              else if (movement.speedMps > cfg.maxSpeedMs) kind = 'speed';
+              if (kind !== null) {
+                const slot = (this.mem.gpsViolations[playerId] ??= {
+                  count: 0,
+                  firstAtMs: nowMs,
+                });
+                if (nowMs - slot.firstAtMs >= GPS_VIOLATION_WINDOW_MS) {
+                  slot.count = 0;
+                  slot.firstAtMs = nowMs;
+                }
+                slot.count += 1;
+                if (slot.count >= cfg.violationThreshold) {
+                  persist.push(
+                    this.logGameEvent(
+                      'GPS_VIOLATION',
+                      playerId,
+                      { playerId, kind, count: slot.count },
+                      nowMs,
+                    ),
+                  );
+                  this.queueLog({
+                    level: 'warn',
+                    message: 'gps.violation',
+                    roomId: this.room.roomId,
+                    playerId,
+                    metadata: { kind, count: slot.count },
+                  });
+                  slot.count = 0;
+                  slot.firstAtMs = nowMs;
+                  if (
+                    cfg.action === 'eject' &&
+                    (this.room.phase === 'HEAD_START' || this.room.phase === 'ACTIVE') &&
+                    me.ejectedAt === null
+                  ) {
+                    const done = this.ejectWithWinCheck(me, nowMs, Date.parse(this.room.startedAt ?? new Date(nowMs).toISOString()), events, persist);
+                    if (done) {
+                      // Ejection completes the match — stop here; the
+                      // fix is not stored (the seat is out).
+                      this.clearDisconnectDeadline(playerId);
+                      rememberReply(events);
+                      return { events, persist, durable: true };
+                    }
+                  }
+                }
+              }
+            }
+            history.push(goodFix);
+            if (history.length > GPS_FIX_HISTORY_CAP) {
+              history.splice(0, history.length - GPS_FIX_HISTORY_CAP);
+            }
+          }
+        }
         this.mem.latestFix[playerId] = goodFix;
         // Phase 4 (i) — snapshot-key fix: an accepted fix mutates
         // snapshot content (players[].lastFixAt, teammateFixes, and the
@@ -4122,6 +5033,34 @@ export class RoomStore {
         // the next durable save).
         this.nextSeq();
         me.lastFixAt = new Date(nowMs).toISOString();
+        // v29 fix round (F6, R3) — `teammate.fix` broadcast: the
+        // primary teammate-liveness mechanism (replaces the 8 s
+        // periodic re-fetch). One lightweight event per accepted fix,
+        // to the sender's teammates ONLY (same predicate as the
+        // snapshot's `teammateFixes` — see `teammateFixRecipients`).
+        // Outbound sends are not counted as DO requests under the
+        // conservative-meter reading (only inbound messages and alarm
+        // invocations count); the CPU cost of the fan-out is the open
+        // question. The R1 30 s safety valve stays as the safety net.
+        {
+          const recipients = this.teammateFixRecipients(playerId);
+          if (recipients.length > 0) {
+            events.push(
+              this.emit(
+                'teammate.fix',
+                {
+                  playerId,
+                  lat: goodFix.lat,
+                  lng: goodFix.lng,
+                  accuracyMeters: goodFix.accuracyMeters,
+                  timestampMs: goodFix.timestampMs,
+                },
+                recipients,
+                nowMs,
+              ),
+            );
+          }
+        }
         const quality: LocationQuality = check.quality ?? classifyAccuracy(goodFix.accuracyMeters);
         const qualityChanged = me.locationQuality !== quality;
         me.locationQuality = quality;
@@ -4131,6 +5070,9 @@ export class RoomStore {
           const r = resumeSuspendedPlayer(me, nowMs);
           Object.assign(me, r.player);
           resumed = true;
+          // v29 (30 s rule) — a fix from a resumed seat clears the
+          // return window, like `resumeOnHello` (role/score intact).
+          this.clearDisconnectDeadline(playerId);
           events.push(this.emit('player.resumed', { playerId }, this.allPlayerIds(), nowMs));
         } else {
           me.connectionState = 'connected';
@@ -4826,6 +5768,27 @@ export class RoomStore {
       }
     }
 
+    // v29 (Gap 5) — catch-confirm duration: how long the confirm
+    // path took, wall-clock. Only the catch ops are logged (never
+    // every fix / heartbeat / snapshot / ping).
+    if (type === 'catch.confirm' || type === 'catch.request' || type === 'catch.self-confirm') {
+      this.queueLog({
+        level: 'info',
+        message: 'catch.confirm.duration',
+        roomId: this.room.roomId,
+        playerId,
+        operation: type,
+        durationMs: Date.now() - receivedWallMs,
+      });
+    }
+    // v29 (Gap 5) — flush buffered structured logs piggybacked on
+    // this message's persist batch when one is already going out.
+    // (When there is no batch, the buffer rides the next batch or
+    // the alarm tick — never a save of its own.)
+    if (persist.length > 0) {
+      const logIntent = this.takeLogBatchIntent();
+      if (logIntent !== null) persist.push(logIntent);
+    }
     rememberReply(events);
     // Durable iff a persist intent was produced OR durable DO state
     // changed with no Supabase row (`stateDirty` — the runner-token

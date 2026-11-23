@@ -38,6 +38,9 @@ import type {
 } from '@pakdam/shared';
 import { PakdamSocket } from '@/lib/websocket';
 import { fetchLiveRoomState, LiveHttpError, readHostGraceEndsAtMs } from '@/lib/live-room-client';
+import { buildSnapshotKey } from '@/lib/snapshot-key';
+import { mergeTeammateFix } from '@/lib/teammate-fix';
+import { readReconnectEndsAtMs } from '@/lib/presence';
 import { getSessionForRoom, type PakdamSession } from '@/lib/session-credentials';
 import {
   getRoom,
@@ -146,6 +149,49 @@ const IDLE_SAFETY: SafetyState = {
 const EMPTY_STRING_ARRAY: string[] = [];
 const EMPTY_FIXES: Record<string, LocationFix> = {};
 
+/**
+ * v29 (R3, fix round M4) — teammate dots go live by BROADCAST, not by
+ * periodic re-fetch. The server fans each teammate fix out as
+ * `teammate.fix` the moment it lands (teammates only); the client
+ * applies the fix straight into the dot map — no snapshot re-fetch.
+ * The 8 s periodic re-fetch is REMOVED: it was the wrong primary
+ * mechanism under the conservative meter (cap counts actual WS
+ * messages), and a broadcast is strictly fresher. The R1 30 s safety
+ * valve stays as the safety net: a dropped broadcast is corrected
+ * within 30 s by the next valve-triggered re-fetch, and discrete
+ * events (catches, joins, zone changes) still re-fetch.
+ *
+ * Staleness target: p95 teammate-fix age ~2 s (fix sent → broadcast
+ * on arrival), bounded 30 s by the valve.
+ *
+ * Meter math, conservative reading (the cap counts ACTUAL requests —
+ * WS messages + alarm invocations — not the 20:1 billed ratio; the
+ * audit measured ~65,200 requests for a 30-player 30-min game under
+ * that reading vs ~7,600 billed). A fix-broadcast costs 0 extra DO
+ * requests: the inbound fix already counts in the fix stream, and
+ * fan-out to teammates is not metered. Per 30-player 30-min game:
+ *   fixes: 10,800 all-stationary (30 × 1800 s / 5 s — the R7 gate
+ *     ceiling when nobody moves) and realistically 15,000–25,000
+ *     (moving players send more: a runner at 3 m/s crosses 10 m
+ *     every ~3 s, so 10,800 is the all-stationary figure, NOT the
+ *     ceiling — state the two separately, as here)
+ *   heartbeats: 30 × 60 = 1,800
+ *   alarm invocations: 1/s × 1800 s = 1,800
+ *   valve re-fetches: 30 clients × 60 valve ticks = 1,800
+ *     (`snapshot.unchanged` when nothing moved — the request still
+ *     counts, the reply is tiny)
+ *   route-change socket churn (R10): ~150
+ *   tickets / joins / misc: ~1,000
+ *   broadcast fan-out: 0
+ * Total with broadcast as primary: ≈ 18,400 ceiling (all-stationary
+ * fixes: 10,800 + 7,600 fixed) and realistically ≈ 22,000–33,000
+ * (fixes 15,000–25,000 + 7,600 fixed). The removed 8 s re-fetch
+ * alone was 30 × 225 = 6,750 requests/game. If the founder's
+ * dashboard read later proves the meter counts the 20:1 billed
+ * ratio, every figure above divides by ~20 — the mechanism stays
+ * the same.
+ */
+
 function toCatchView(
   c: { catchId: string; roomId: string; hunterPlayerId: string; runnerPlayerId: string; state: CatchView['state']; requestedAt: string; confirmedAt: string | null; disputedAt: string | null; resolution: CatchView['resolution']; gpsEvidence: CatchView['gpsEvidence'] },
 ): CatchView {
@@ -246,6 +292,11 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
 
   const [socket, setSocket] = useState<PakdamSocket | null>(null);
   const socketRef = useRef<PakdamSocket | null>(null);
+  // Live teammate ids, mirrored synchronously in `applySnapshot` /
+  // `applyDemo` (fix round M4): the socket callback is created once
+  // per room/session, so state would be stale there — the `teammate.fix`
+  // handler gates on this ref, never on a closed-over list.
+  const teammateIdsRef = useRef<string[]>([]);
   // Last applied payloads, by exact content: a re-fetched snapshot (or
   // a demo poll) with byte-identical content changes nothing, so the
   // ~12 setters below — and the full play-page re-render + map overlay
@@ -254,10 +305,10 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   // change produces different JSON and applies normally.
   const lastSnapshotJsonRef = useRef<string | null>(null);
   const lastDemoJsonRef = useRef<string | null>(null);
-  // Cheap first gate (B13): (version, serverSeq) of the last applied
-  // snapshot — the same pair means the same server state, so the
-  // JSON.stringify below is skipped entirely. A different pair falls
-  // through to the stringify comparison as before.
+  // Cheap first gate (v29 R1): `version:serverSeq:maxLastFixAt` of the
+  // last applied snapshot — the same key means the same server state,
+  // so the JSON.stringify below is skipped entirely. A different key
+  // falls through to the stringify comparison as before.
   const lastSnapshotKeyRef = useRef<string | null>(null);
   // Cheap first gate for demo polls (B13): see `demoRoomChangeKey`.
   const lastDemoKeyRef = useRef<string | null>(null);
@@ -281,9 +332,19 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   myPlayerIdRef.current = myPlayerId;
 
   const applySnapshot = useCallback((snapshot: WsSnapshotPayload) => {
-    // Cheap gate first (B13): same (version, serverSeq) = same server
-    // state — skip the stringify + whole fan-out outright.
-    const key = `${snapshot.version}:${snapshot.serverSeq}`;
+    // Fix round M1: wire the snapshot's R5 key into the socket (the
+    // first-paint GET bypasses the socket, so the socket would
+    // otherwise send no key until its first envelope snapshot).
+    socketRef.current?.noteAppliedSnapshot(snapshot);
+    // Cheap gate first (v29 R1): the key is
+    // `version:serverSeq:maxLastFixAtMs:epochMs` — the durable
+    // watermark plus the DO-wake epoch in the key mean a
+    // DO-eviction restore (restored serverSeq ≤ cached, or a new
+    // epoch after a wake) can never collide with the cached key, so
+    // the client re-fetches the correct-as-restored snapshot. Same
+    // key = same server state: skip the stringify + whole fan-out
+    // outright.
+    const key = buildSnapshotKey(snapshot);
     if (key === lastSnapshotKeyRef.current) return;
     lastSnapshotKeyRef.current = key;
     // Duplicate snapshot (welcome → re-request, reconnect re-fetch):
@@ -301,8 +362,20 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     // read — an older server reads as null, never a client-computed
     // deadline).
     setHostGraceEndsAtMs(readHostGraceEndsAtMs(snapshot));
+    // v29 (A): feed the socket my seat's 30 s return-window deadline
+    // from the snapshot (tolerant read — an older server reads as null).
+    // The snapshot-fed deadline is authoritative; the socket's
+    // fallback — 30 s from the drop as this client saw it — applies
+    // ONLY when no snapshot has supplied one (see `handleClose` in
+    // websocket.ts). That fallback IS client-computed, by design: the
+    // old "client NEVER computes a deadline" claim was wrong about it.
+    // (The host grace above is different: it is never client-computed.)
+    const me = snapshot.players.find((p) => p.playerId === myPlayerIdRef.current);
+    if (me) socketRef.current?.setReconnectWindowEndsAtMs(readReconnectEndsAtMs(me));
     // Teammates' live view (teammates only, never an opponent; empty for
     // a caught Runner). `??` tolerates a server that predates these fields.
+    // The ref mirrors the list synchronously for the `teammate.fix` gate.
+    teammateIdsRef.current = snapshot.teammateIds ?? [];
     setTeammateIds(snapshot.teammateIds ?? EMPTY_STRING_ARRAY);
     setTeammateFixes(snapshot.teammateFixes ?? EMPTY_FIXES);
     // A snapshot rescues a transient first-paint GET failure (P1-23):
@@ -321,7 +394,9 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
           if (i >= 0) next[i] = a;
           else next.push(a);
         }
-        return next;
+        // v29 (R18): announcements are capped — a long game never
+        // grows the list without bound.
+        return next.slice(-50);
       });
     }
     // Decided catches (confirmed / disputed) are carried in the snapshot so
@@ -411,7 +486,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     // the ids, exactly as before.
     const me = next.players.find((p) => p.playerId === myPlayerIdRef.current);
     const myTeam = me?.team ?? null;
-    setTeammateIds(
+    const liveTeammateIds =
       myTeam === null
         ? []
         : next.players
@@ -421,8 +496,11 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
                 p.team === myTeam &&
                 p.leftAt === null,
             )
-            .map((p) => p.playerId),
-    );
+            .map((p) => p.playerId);
+    // Mirror for the `teammate.fix` gate (live mode only, but keep the
+    // ref true in demo too — a stale list must never gate a fix in).
+    teammateIdsRef.current = liveTeammateIds;
+    setTeammateIds(liveTeammateIds);
     setTeammateFixes(EMPTY_FIXES);
     setLocationStatus(
       Object.fromEntries(
@@ -433,14 +511,17 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       ) as Record<string, 'known' | 'unknown'>,
     );
     setAnnouncements(
-      next.announcements.map((a, i) => ({
-        announcementId: `demo-${i}`,
-        roomId: next.room.roomId,
-        playerId: a.byPlayerId,
-        senderName: next.players.find((p) => p.playerId === a.byPlayerId)?.displayName ?? '',
-        text: a.text,
-        sentAt: a.sentAt,
-      })),
+      next.announcements
+        .map((a, i) => ({
+          announcementId: `demo-${i}`,
+          roomId: next.room.roomId,
+          playerId: a.byPlayerId,
+          senderName: next.players.find((p) => p.playerId === a.byPlayerId)?.displayName ?? '',
+          text: a.text,
+          sentAt: a.sentAt,
+        }))
+        // v29 (R18): capped like the live appends.
+        .slice(-50),
     );
     setLoading(false);
   }, [markDeleted, session]);
@@ -480,6 +561,17 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         setLoading(false);
       });
 
+    // v29 (R10): route-change socket churn is NOT shared away — a
+    // single app-level socket/provider was judged too invasive for
+    // this build (the socket lifecycle is owned per page by this hook,
+    // and suspend/resume + catch flows re-subscribe through it), so
+    // the churn is counted in the per-game budget instead. One
+    // play → catch → play round trip costs ≈ 1 ws-ticket HTTP + 1 DO
+    // register + 1 hello + 1 full snapshot ≈ 4–5 requests + the
+    // snapshot payload; a 30-player game with ~30 round trips across
+    // the roster is ~150 requests — small next to the R7 fix stream
+    // and the R3 re-fetch, and it buys route isolation (a catch-page
+    // crash can never take the play socket with it).
     const socket = new PakdamSocket({
       roomId,
       playerId: session.playerId,
@@ -571,7 +663,50 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
           }
           case 'announcement': {
             const announcement = payload['announcement'] as Announcement | undefined;
-            if (announcement) setAnnouncements((prev) => [...prev, announcement]);
+            // v29 (R18): capped at 50 — a long game never grows the
+            // list without bound.
+            if (announcement) setAnnouncements((prev) => [...prev.slice(-49), announcement]);
+            break;
+          }
+          case 'snapshot.unchanged': {
+            // v29 (R5): the server's answer to a re-fetch when nothing
+            // moved — a no-op by contract (the payload carries
+            // { serverSeq, version } for logging only). The current
+            // snapshot is kept as-is. (The socket's ordering check may
+            // also drop this event before it reaches here when its
+            // serverSeq ≤ the last applied — also a no-op. Either path
+            // is safe precisely because the request carried
+            // `lastSnapshotKey`: an unchanged answer can only arrive
+            // for the key this client already holds.)
+            break;
+          }
+          case 'teammate.fix': {
+            // v29 (R3, fix round M4): the broadcast primary — a
+            // teammate's fix, fanned out by the server the moment it
+            // lands (CONTRACT: event `teammate.fix` with payload
+            // { playerId, lat, lng, accuracyMeters, timestampMs },
+            // teammates only; Kabir implements the fan-out against
+            // this exact event/payload). Apply the fix straight into
+            // the dot map — NO snapshot re-fetch. Membership-gated on
+            // the live teammate list: a fix for a non-teammate (a
+            // server bug, or a stale list) is dropped, never rendered
+            // — the map draws every entry in `teammateFixes`, so an
+            // ungated merge could show an opponent's dot.
+            const fixPayload = payload as {
+              playerId: unknown;
+              lat: unknown;
+              lng: unknown;
+              accuracyMeters: unknown;
+              timestampMs: unknown;
+            };
+            if (
+              typeof fixPayload.playerId === 'string' &&
+              teammateIdsRef.current.includes(fixPayload.playerId)
+            ) {
+              setTeammateFixes((prev) =>
+                mergeTeammateFix(prev, fixPayload, myPlayerIdRef.current),
+              );
+            }
             break;
           }
           case 'catch.requested':
@@ -718,6 +853,15 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     // Socket is created once per room/session. applySnapshot is stable.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId, mode, session?.playerId]);
+
+  // -- Live: teammate dots go live by `teammate.fix` broadcast (v29 R3,
+  // fix round M4) — the 8 s periodic snapshot re-fetch is REMOVED (see
+  // the R3 comment at the top of this file). No interval lives here any
+  // more: the only re-fetches are discrete events (catches, joins,
+  // zone changes — the switch above) and the server's R1 30 s safety
+  // valve, which re-fetches at most once per 30 s as the safety net
+  // for a dropped broadcast. Nothing in this hook polls on a timer
+  // in live mode.
 
   // -- Demo: 1 s poll + suspend/resume on tab visibility --------------------
   useEffect(() => {

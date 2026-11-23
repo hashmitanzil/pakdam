@@ -29,6 +29,9 @@ import {
 const CENTRE = { latitude: 23.36, longitude: 85.33, accuracy: 10 };
 const FAR = { latitude: 23.4, longitude: 85.4, accuracy: 10 };
 const FAR_ROUGH = { latitude: 23.4, longitude: 85.4, accuracy: 100 };
+// FAR nudged ~1 m — still ~7 km outside the 500 m zone, but a NEW
+// position, so Chromium delivers a fresh fix (see the eject test).
+const FAR_NUDGED = { latitude: 23.40001, longitude: 85.40001, accuracy: 10 };
 
 test.describe('outside zone (demo)', () => {
   test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
@@ -94,9 +97,26 @@ test.describe('outside zone (demo)', () => {
     test.setTimeout(120000);
     const { context, hostPage } = await startAtCentre(browser);
     await context.setGeolocation(FAR);
+    // The emulated fix is delivered ONCE: after ~10 s the app
+    // (correctly, by its stale-fix rule) freezes the outside countdown,
+    // and (4a) ejects for missing location at 30 s with the OTHER
+    // notice — so the zone ejection could never fire. Keep the fix
+    // fresh by nudging the emulated position every 4 s (both points
+    // are ~7 km outside the zone); the countdown then runs to 0.
+    const keepFresh = (async () => {
+      try {
+        for (let i = 0; i < 10; i++) {
+          await hostPage.waitForTimeout(4000);
+          await context.setGeolocation(i % 2 === 0 ? FAR_NUDGED : FAR);
+        }
+      } catch {
+        // Test ended (pass or fail) — the context is closed.
+      }
+    })();
     await expect(hostPage.getByText('You were ejected — you left the zone.')).toBeVisible({
       timeout: 60000,
     });
+    await keepFresh;
     await context.close();
   });
 

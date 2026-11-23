@@ -22,6 +22,7 @@ import {
 import { getWorkerUrl } from './websocket';
 import { clearHostToken, getSessionForRoom, storeLiveSeat } from './session-credentials';
 import { fetchHostToken, LiveHttpError, liveErrorMessage, readLiveErrorMessage } from './live-client';
+import { fetchWithRetry } from './api-client';
 import type { PakdamSocket } from './websocket';
 
 export { MIN_PLAYERS, liveErrorMessage, LiveHttpError };
@@ -73,7 +74,9 @@ export async function fetchLiveRoomState(
 ): Promise<WsSnapshotPayload> {
   const workerUrl = getWorkerUrl();
   if (!workerUrl) throw new Error('Live transport is not configured.');
-  const response = await fetch(
+  // GET via fetchWithRetry (Gap 4): a 503 on first paint retries
+  // instead of failing the room load outright.
+  const response = await fetchWithRetry(
     `${workerUrl}/v1/rooms/${roomId}?playerId=${encodeURIComponent(playerId)}`,
     { headers: { Authorization: `Bearer ${reconnectToken}` } },
   );
@@ -85,15 +88,25 @@ async function postHost<T>(
   roomId: string,
   path: string,
   body: Record<string, unknown>,
+  opts?: { idempotencyKey?: string },
 ): Promise<T> {
   const workerUrl = getWorkerUrl();
   if (!workerUrl) throw new Error('Live transport is not configured.');
   const doPost = async (payload: Record<string, unknown>): Promise<T> => {
-    const response = await fetch(`${workerUrl}/v1/rooms/${roomId}${path}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
+    // A keyed POST is retried by fetchWithRetry (Gap 4) under the
+    // SAME key; an unkeyed POST is attempted once. A 403 is never
+    // retried here, so the stale-host-token re-mint below is the ONLY
+    // retry and is never double-wrapped — and the re-mint retry
+    // reuses the same key, so it can never double-apply either.
+    const response = await fetchWithRetry(
+      `${workerUrl}/v1/rooms/${roomId}${path}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      },
+      { idempotencyKey: opts?.idempotencyKey },
+    );
     if (!response.ok) {
       throw new LiveHttpError(response.status, await readLiveErrorMessage(response));
     }
@@ -142,10 +155,22 @@ export async function startLiveMatch(
   const session = getSessionForRoom(roomId);
   if (!session) throw new Error('No live seat saved on this device for this room.');
   const hostToken = await getHostTokenLive(roomId);
-  return postHost(roomId, '/start', {
-    playerId: session.playerId,
-    hostToken,
-  });
+  // Gap 4 (fix round M3): one Idempotency-Key per start action, minted
+  // here and reused on every retry of this action — the fetchWithRetry
+  // retries AND the 403 host-token re-mint retry in `postHost` above
+  // all carry the same key. A retried start after a lost response
+  // gets the server's cached success, not a 409 for a match that
+  // already started.
+  const idempotencyKey = crypto.randomUUID();
+  return postHost(
+    roomId,
+    '/start',
+    {
+      playerId: session.playerId,
+      hostToken,
+    },
+    { idempotencyKey },
+  );
 }
 
 /** POST /v1/rooms/:id/config — host replaces the full lobby config (lobby only). */

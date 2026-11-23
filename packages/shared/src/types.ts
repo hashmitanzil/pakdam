@@ -217,6 +217,22 @@ export interface HouseRules {
   // the setup UI carried a toggle for it that did nothing). Do not re-add.
 }
 
+/** GPS anti-cheat knobs (Gap 1). Optional on the config; absent = defaults
+ * (`GPS_ANTI_CHEAT_DEFAULTS`). No host setup UI in v1 — these are set
+ * server-side / by the founder only. Eject is opt-in via
+ * `action: 'eject'`; the default `action: 'warn'` never ejects. */
+export interface GpsAntiCheatConfig {
+  enabled?: boolean;
+  warnOnly?: boolean;
+  action?: 'warn' | 'eject';
+  maxSpeedMs?: number;
+  burstMaxMs?: number;
+  burstWindowMs?: number;
+  teleportMaxGapM?: number;
+  teleportMaxGapMs?: number;
+  violationThreshold?: number;
+}
+
 /** Full room config = house rules + zone + areas + host picks. */
 export interface RoomConfig extends HouseRules {
   zone: ZoneConfig;
@@ -229,6 +245,8 @@ export interface RoomConfig extends HouseRules {
   selectedHunterIds: string[];
   /** Required: the host confirms they are on site. */
   hostOnSiteConfirmed: boolean;
+  /** GPS anti-cheat overrides (Gap 1); absent = `GPS_ANTI_CHEAT_DEFAULTS`. */
+  gpsAntiCheat?: GpsAntiCheatConfig;
 }
 
 /** Host-toggle defaults: Balance ON, Random draw ON. */
@@ -296,7 +314,21 @@ export interface Player {
  * seat sees its OWN matchRole/team only — every other seat's role is `null`
  * (enforced at runtime by the authorised snapshot, not by this type).
  */
-export type PlayerView = Omit<Player, 'reconnectTokenHash'>;
+export type PlayerView = Omit<Player, 'reconnectTokenHash'> & {
+  /**
+   * v29 — seat presence for the 30 s return rule (founder decision
+   * 2026-11-22): 'away' = no live socket (suspended / not on the page),
+   * 'present' otherwise. Optional: engine-built views without a store
+   * omit it; every view leaving the DO carries it.
+   */
+  presence?: 'present' | 'away';
+  /**
+   * v29 — epoch ms when this seat's 30 s return window ends, or null
+   * when no window is running. The client shows the countdown from
+   * here, never the server constant.
+   */
+  reconnectEndsAtMs?: number | null;
+};
 
 /**
  * One confirmed tag: who tagged whom, and when. Carried on the match
@@ -530,6 +562,27 @@ export interface WsSnapshotPayload {
    * (`HOST_RECONNECT_GRACE_MS` stays server-only).
    */
   hostGraceEndsAtMs: number | null;
+  /**
+   * v29 (R1) — durable watermark for the client snapshot key
+   * `version:serverSeq:maxLastFixAtMs:epochMs`: the newest `lastFixAt`
+   * across the roster, as epoch ms, or null when nobody has reported
+   * a fix. `lastFixAt` is durable and persisted ≤ 30 s (player-upsert
+   * throttle), so after a DO eviction the restored watermark is ≤ the
+   * cached one and the key differs — the client re-fetches instead of
+   * trusting a collided `serverSeq`. Optional: snapshots built by
+   * older callers omit it; every snapshot leaving the DO carries it.
+   */
+  maxLastFixAtMs?: number | null;
+  /**
+   * v29 (R5 fix round) — the DO instance's memory epoch, epoch ms
+   * stamped when the DO loads/restores durable state (it changes on
+   * every wake). Part of the snapshot key: durable `serverSeq` +
+   * watermark can be unchanged across a wake while memory-only state
+   * (`teammateFixes`, `locationStatus`) is gone, so a key without
+   * the epoch could falsely answer `snapshot.unchanged` after a
+   * wake. Every snapshot leaving the DO carries it.
+   */
+  epochMs: number;
 }
 
 /** Client → server envelope. Retries reuse the same `commandId`; the DO drops repeats for 10 min. */

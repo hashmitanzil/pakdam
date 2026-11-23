@@ -40,11 +40,13 @@ import {
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_MISSED_LIMIT,
   RENEWAL_WARNING_MS,
+  SAFETY_PAUSE_FAST_TICK_MS,
   hashWsTicket,
   newId,
   type WsServerMessageType,
 } from '@pakdam/shared';
 import {
+  ABANDONED_IDLE_MS,
   RoomStore,
   STATE_KEY,
   durableSnapshot,
@@ -175,6 +177,30 @@ export class RoomDO implements DurableObject {
 
   // -- state ---------------------------------------------------------------
 
+  /**
+   * v29 (R13) — what the code shows about hibernation. A Durable
+   * Object hibernates between requests when it has no pending work:
+   * the instance (and all of `RoomStore`'s memory — `mem`, the
+   * idempotency maps, the log buffer, the HTTP reply cache) is
+   * dropped, and the next request re-creates it from durable storage
+   * (`STATE_KEY` via `load()` + `restoreDurableMemory()`). What
+   * survives: the room state, the ticket registry, pending pings,
+   * the idempotency table (synced at most once/min), the host grace
+   * and the 30 s return deadlines (both durable, both written on
+   * transitions only), the idle clock. What does NOT survive: the
+   * GPS fix history / violation counters, the log buffer (unflushed
+   * entries are lost), the HTTP idempotency cache (a retry after a
+   * wake re-executes), the safety-valve clock (re-arms on wake).
+   * WebSocket attachments survive hibernation (hibernatable sockets
+   * — the runtime re-attaches them on wake); `firstAlarmTickAfterWake`
+   * exists precisely because stored heartbeat timestamps go stale
+   * across a wake. The alarm is re-armed on every mutation
+   * (`armAlarm`, deduped on delay), so a hibernated DO still ticks.
+   * UNKNOWN (needs the founder's Cloudflare dashboard — do not
+   * invent): how long a DO stays warm before hibernating, CPU/memory
+   * actually consumed per game, and whether any alarm was ever
+   * delayed or dropped by the platform.
+   */
   private async load(): Promise<void> {
     await this.ctx.blockConcurrencyWhile(async () => {
       if (this.loaded) return;
@@ -184,7 +210,20 @@ export class RoomDO implements DurableObject {
         this.store = new RoomStore(restored, emptyMemory());
         // P1-5: tickets, idempotency + replies, pending pings and the
         // pending shrink preview survive the wake with the game state.
+        // v29 (R5 fix round): `restoreDurableMemory` also re-stamps
+        // the memory epoch (`mem.epochMs = Date.now()`), so the
+        // snapshot key changes on every wake even when durable
+        // `serverSeq` + watermark did not.
         this.store.restoreDurableMemory();
+        // v29 (Gap 5) — DO wake is logged (a restore from durable
+        // storage after an eviction). Hibernation itself has no
+        // observable hook — there is no event for "going to sleep",
+        // so only the wake is logged, never the sleep.
+        this.store.queueLog({
+          level: 'info',
+          message: 'do.wake',
+          roomId: this.store.room.roomId,
+        });
         // v23 fix round 1 (S3): a restored room marked deleted is a
         // host cancel whose wipe never finished — a crash/eviction
         // after the cancel persist but before `deleteAll()`, or a
@@ -218,7 +257,39 @@ export class RoomDO implements DurableObject {
     await this.ctx.storage.put(STATE_KEY, durableSnapshot(this.store.state));
   }
 
-  private alarmDelayMs(): number | null {
+  /**
+   * v28 (Diya F7/F11) — the alarm cadence now takes attendance. The
+   * old version returned 1000 ms for HEAD_START / ACTIVE /
+   * SAFETY_PAUSED with no session or socket input at all, so a live
+   * room with zero connected sockets alarmed 86,400×/day until a
+   * terminal phase — the whole DO-cap incident. Now:
+   * - Live phase + a running host grace → 1 s. The grace deadline
+   *   must land on time (F10: the idle end must never cut a grace
+   *   short), and live ticks expire it within a second.
+   * - Live phase + at least one live socket → 1 s. A live game with
+   *   players attached keeps its real-time tick — do not slow real
+   *   gameplay.
+   * - Live phase + NO live socket + NO running grace → 30 s. Nothing
+   *   can act on a 1 s tick with nobody attached; the 30 s cadence
+   *   still runs the idle-abandon clock (`alarm()`), the lobby-style
+   *   grace expiry (there is none — a lapsed grace needs no fast
+   *   tick: with no successor attached there is nobody to transfer
+   *   to), and the RESOLVING backstop. A request to a dormant DO
+   *   re-creates/wakes it, so nothing is lost.
+   * - SAFETY_PAUSED is a live phase here on purpose (Zara A2 / Diya
+   *   F11): a paused room with players attached still ticks 1 s
+   *   (the host may resume at any moment), and a paused room with
+   *   nobody attached drops to 30 s and is ended by the idle window.
+   *   v28 fix round (Zara R2): the 1 s tick while paused is bounded
+   *   — after SAFETY_PAUSE_FAST_TICK_MS (5 min) of continuous pause
+   *   a room with sockets attached demotes to 30 s (the clock is
+   *   frozen while paused, so it is the sole unbounded phase). Resume
+   *   is message-driven and a running grace always holds 1 s, so the
+   *   demotion delays nothing a player can feel.
+   * Async because the socket count may list session storage once
+   * after a wake (warm cache afterwards — see `liveSocketCount`).
+   */
+  private async alarmDelayMs(): Promise<number | null> {
     if (!this.store) return null;
     const phase = this.store.room.phase;
     if (
@@ -234,6 +305,31 @@ export class RoomDO implements DurableObject {
       phase === 'ACTIVE' ||
       phase === 'SAFETY_PAUSED'
     ) {
+      const graceEndsAtMs = this.store.hostGraceEndsAtMs();
+      if (graceEndsAtMs !== null && Date.now() < graceEndsAtMs) {
+        return 1000;
+      }
+      const liveSockets = await this.liveSocketCount();
+      if (liveSockets === 0) return 30_000;
+      // v28 fix round (Zara R2) — SAFETY_PAUSED demotion: the clock
+      // is frozen while paused, so a paused room with a socket
+      // attached is the sole unbounded 1 s phase (86,400 DO requests
+      // / day for a room in which nothing happens). After
+      // SAFETY_PAUSE_FAST_TICK_MS (5 min) of continuous pause the
+      // tick demotes to the 30 s cadence. Nothing is lost: resume is
+      // message-driven (`safety.resume` arrives on the socket, not
+      // on the tick), a running grace always holds the 1 s tick
+      // above, and the no-socket abandon path still ends the room if
+      // everyone leaves. `pausedAt` is durable and stamped once per
+      // pause, so the demotion survives a DO eviction; a null /
+      // unparseable stamp (legacy state) keeps the fast tick.
+      if (phase === 'SAFETY_PAUSED') {
+        const pausedAtMs =
+          this.store.room.pausedAt === null ? NaN : Date.parse(this.store.room.pausedAt);
+        if (!Number.isNaN(pausedAtMs) && Date.now() - pausedAtMs >= SAFETY_PAUSE_FAST_TICK_MS) {
+          return 30_000;
+        }
+      }
       return 1000;
     }
     // RESOLVING ticks at 30 s, not 1 s: the match clock has stopped and
@@ -241,8 +337,31 @@ export class RoomDO implements DurableObject {
     return 30_000;
   }
 
+  /**
+   * v28 — distinct seats with at least one attached WebSocket right
+   * now. A socket always carries its seat's playerId tag (set at
+   * upgrade from the redeemed ticket), so the session records are the
+   * live set: a session whose seat has no socket is a dead tab, not a
+   * live player. Uses the heartbeat cache while awake (no storage
+   * read); after a wake it lists storage once, which also warms the
+   * cache. A never-hello socket counts until the alarm's sweep closes
+   * it (F12) — a socket that connected but never hello'd is closed
+   * once its ticket is dead, so it can hold the 1 s tick for at most
+   * ~60 s past its ticket, never forever.
+   */
+  private async liveSocketCount(): Promise<number> {
+    const sessions = await this.sessionsForHeartbeatCheck();
+    const live = new Set<string>();
+    for (const session of sessions) {
+      if (this.ctx.getWebSockets(session.playerId).length > 0) {
+        live.add(session.playerId);
+      }
+    }
+    return live.size;
+  }
+
   private async armAlarm(): Promise<void> {
-    const delay = this.alarmDelayMs();
+    const delay = await this.alarmDelayMs();
     // v24 — one-shot grace alarm (LOBBY and READY_CHECK): both phases
     // tick every 30 s, so a tick-only grace check could transfer up
     // to ~60 s after disconnect — the 30 s promise must hold in the
@@ -768,6 +887,28 @@ export class RoomDO implements DurableObject {
     return this.dispatchOp(op, body);
   }
 
+  /**
+   * v29 (Gap 4) — HTTP idempotency cache key for one op call. Joins
+   * are keyed by room (the seat does not exist yet);
+   * start/replay by seat + op. Returns null when the request carried
+   * no usable key (absent, empty, or over 64 chars — the Worker
+   * validates the same bounds; the DO re-validates because it can
+   * also be called directly in tests).
+   */
+  private httpIdempotencyCacheKey(
+    op: string,
+    body: Record<string, unknown>,
+    playerId: string | null,
+  ): string | null {
+    const key = body['idempotencyKey'];
+    if (typeof key !== 'string' || key.length === 0 || key.length > 64) return null;
+    if (op === 'add-player') {
+      return `join:${this.store?.room.roomId ?? 'unknown'}:${key}`;
+    }
+    if (playerId === null) return null;
+    return `${playerId}:${op}:${key}`;
+  }
+
   private async dispatchOp(op: string, body: Record<string, unknown>): Promise<Response> {
     const nowMs = Date.now();
     const asString = (v: unknown): string | null => (typeof v === 'string' ? v : null);
@@ -823,6 +964,25 @@ export class RoomDO implements DurableObject {
     const reconnectTokenHash = asString(body['reconnectTokenHash']);
     const hostTokenHash = asString(body['hostTokenHash']);
 
+    // v29 (Gap 4) — HTTP idempotency, phase 1 (join) + phase 2
+    // (start/replay): a retried call with the same key returns the
+    // cached reply with the original status — for join, including the
+    // ORIGINAL reconnectToken. Only successes are cached (an error
+    // must re-execute: the client may have fixed the input). The
+    // cache is memory-only (the join reply carries a raw token, which
+    // is never persisted) — a retry after a DO eviction re-executes
+    // instead of replaying. Keys are client-minted once per user
+    // action; a key reused across seats returns the first seat's
+    // reply, so clients must mint a fresh UUID per action.
+    const httpCacheKey =
+      op === 'add-player' || op === 'start' || op === 'replay'
+        ? this.httpIdempotencyCacheKey(op, body, playerId)
+        : null;
+    if (httpCacheKey !== null) {
+      const cached = store.getHttpIdempotentReply(httpCacheKey, nowMs);
+      if (cached !== null) return json(cached.body, cached.status);
+    }
+
     switch (op) {
       case 'room-exists': {
         // P1-15: intake validation — does this room exist at all? No
@@ -850,12 +1010,19 @@ export class RoomDO implements DurableObject {
         await this.afterMutation(r.events, r.persist);
         // addPlayerAsync already returns the subject's PlayerView (hash
         // stripped) — pass it through, do not re-derive from a raw Player.
-        return json({
+        const joinBody = {
           ok: true,
           player: r.value.player,
           reconnectToken: r.value.reconnectToken,
           restored: r.value.restored,
-        });
+        };
+        // v29 (Gap 4) — cache the success reply for the key (with the
+        // ORIGINAL reconnectToken, so a lost-response retry does not
+        // mint a second seat).
+        if (httpCacheKey !== null) {
+          store.putHttpIdempotentReply(httpCacheKey, 200, joinBody, nowMs);
+        }
+        return json(joinBody);
       }
       case 'verify-reconnect': {
         if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
@@ -891,7 +1058,12 @@ export class RoomDO implements DurableObject {
         const r = store.startMatch({ playerId, hostTokenHash, nowMs });
         if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
         await this.afterMutation(r.events, r.persist);
-        return json({ ok: true, ...r.value });
+        const startBody = { ok: true, ...r.value };
+        // v29 (Gap 4) — cache the success reply for the key.
+        if (httpCacheKey !== null) {
+          store.putHttpIdempotentReply(httpCacheKey, 200, startBody, nowMs);
+        }
+        return json(startBody);
       }
       case 'replay': {
         // v18: host-only reset of a finished room to LOBBY (same room /
@@ -931,7 +1103,12 @@ export class RoomDO implements DurableObject {
           return json({ ok: false, error: r.error, code: r.code }, r.status);
         }
         await this.afterMutation(r.events, r.persist);
-        return json({ ok: true, ...r.value });
+        const replayBody = { ok: true, ...r.value };
+        // v29 (Gap 4) — cache the success reply for the key.
+        if (httpCacheKey !== null) {
+          store.putHttpIdempotentReply(httpCacheKey, 200, replayBody, nowMs);
+        }
+        return json(replayBody);
       }
       case 'update-config': {
         if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
@@ -1254,6 +1431,39 @@ export class RoomDO implements DurableObject {
       session.missedHeartbeats = 0;
     }
 
+    // v29 (R10) — a repeat `hello` on an already-hello'd socket is
+    // cheap and idempotent: the socket survived a route change (the
+    // shared-socket client keeps one socket across routes), so there
+    // is nothing to re-authenticate and no new ticket HTTP. Re-deliver
+    // the welcome + snapshot (the same two events as the first hello),
+    // resume if the seat was suspended (same as the first hello), and
+    // return — no pending-ping re-send (nothing was lost: the socket
+    // never dropped). Previously a repeat hello fell through to the
+    // store's default case ("Unknown message type") — harmless, but
+    // an error where a re-sync belongs.
+    if (type === 'hello' && session.helloDone) {
+      const resumed = this.store.resumeOnHello(playerId, nowMs);
+      const welcome = this.store.emit(
+        'welcome',
+        { playerId, protocolVersion: 1 },
+        [playerId],
+        nowMs,
+      );
+      const snapshot = this.store.emit(
+        'snapshot',
+        this.store.snapshotFor(playerId, nowMs) as unknown as Record<string, unknown>,
+        [playerId],
+        nowMs,
+      );
+      await this.deliver([welcome, snapshot, ...resumed.events], nowMs);
+      if (resumed.persist.length > 0) {
+        this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, resumed.persist));
+        await this.save();
+      }
+      await this.armAlarm();
+      return;
+    }
+
     if (!session.helloDone) {
       if (type !== 'hello') {
         closeSocket(4400, 'hello must be the first message.');
@@ -1371,12 +1581,46 @@ export class RoomDO implements DurableObject {
     await this.armAlarm();
   }
 
-  /** Warn once when the socket's ticket expires within 30 s. */
+  /**
+   * v29 (R8) — server-push ticket renewal (preferred over the HTTP
+   * renew call). When the socket's ticket expires within 30 s
+   * (`RENEWAL_WARNING_MS`), the DO mints + registers a fresh ticket
+   * itself and pushes it over the existing authenticated socket as
+   * `ticket.renewed` — the client stores it without an HTTP call and
+   * uses it on its next reconnect. The current socket keeps working
+   * until its own ticket expires; the client then reconnects with the
+   * pushed ticket, no HTTP round trip. The old
+   * `ticket.renewal-required` warning is still sent alongside, for
+   * clients that have not implemented `ticket.renewed` yet — they
+   * renew over HTTP as before. Mints once per ticket cycle
+   * (`renewalWarned`); if minting fails (rate limit, seat gone),
+   * only the warning goes out and the client falls back to HTTP
+   * renew. The ticket record syncs to durable storage on the next
+   * save — an eviction between mint and save loses the pushed
+   * ticket, and the client falls back to HTTP renew on its 4401
+   * (same as before). Acceptance for this build: 0 HTTP renewals in
+   * the steady state (the ~30 s renewal cadence is unchanged).
+   */
   private async maybeWarnRenewal(session: SessionRecord, nowMs: number): Promise<void> {
     if (session.renewalWarned) return;
     if (session.ticketExpiresAtMs - nowMs > RENEWAL_WARNING_MS) return;
     session.renewalWarned = true;
     await this.putSession(session);
+    const seat = this.store?.player(session.playerId);
+    if (seat !== undefined && seat.leftAt === null) {
+      const minted = await this.store?.mintRenewalTicket(session.playerId, nowMs);
+      if (minted !== undefined && minted.ok) {
+        // v29 fix round (F2) — the payload carries `expiresAtMs`
+        // (the 60 s TTL, never 10 min): without it the client cannot
+        // know when the pushed ticket itself dies.
+        await this.sendToPlayer(
+          session.playerId,
+          'ticket.renewed',
+          { ticket: minted.value.ticket, expiresAtMs: minted.value.expiresAtMs },
+          nowMs,
+        );
+      }
+    }
     await this.sendToPlayer(
       session.playerId,
       'ticket.renewal-required',
@@ -1475,7 +1719,17 @@ export class RoomDO implements DurableObject {
     // the first tick would otherwise mass-eject players whose phones
     // are alive and about to report. The heartbeat grace above uses
     // the same flag for the same reason.
-    const tick = this.store.alarmTick(nowMs, { firstTickAfterWake });
+    // v28 fix round (Zara R1) — the store-level abandon rule may only
+    // fire with NO live socket at all (its invariant, matching the
+    // class idle clock below). The count is observed here, at tick
+    // start, and passed in: the store cannot see sockets itself.
+    // A missing count fails the rule closed, so the class is the only
+    // production caller and must always pass it.
+    const liveSocketsAtTickStart = await this.liveSocketCount();
+    const tick = this.store.alarmTick(nowMs, {
+      firstTickAfterWake,
+      liveSocketCount: liveSocketsAtTickStart,
+    });
     await this.deliver(tick.events, nowMs);
     if (tick.persist.length > 0) {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, tick.persist));
@@ -1505,7 +1759,33 @@ export class RoomDO implements DurableObject {
     const suspendPersist: PersistIntent[] = [];
     const batchId = newId();
     for (const session of sessions) {
-      if (!session.helloDone) continue;
+      if (!session.helloDone) {
+        // v28 (Diya F12) — never-hello sweep: a socket that connected
+        // but never sent `hello` holds a redeemed ticket and, worse
+        // for the idle fix, counts as a live socket forever (the
+        // heartbeat check above skips it, and nothing else ever
+        // closes it — no session TTL existed). The connect ticket
+        // lives 60 s (`WS_TICKET_TTL_MS`); past it the socket can
+        // never hello usefully, and the client contract already
+        // closes an expired ticket 4401 (fresh ticket, reconnect
+        // once) — so close it here (4401) and drop the session. A
+        // client merely slow to hello (> 60 s) just reconnects with
+        // a fresh ticket, exactly as on any expired ticket. Until
+        // this sweep runs the socket holds the 1 s tick for at most
+        // ~60 s past its ticket, never indefinitely.
+        if (nowMs > session.ticketExpiresAtMs) {
+          for (const ws of this.ctx.getWebSockets(`tab:${session.sessionId}`)) {
+            try {
+              ws.close(4401, 'Ticket expired — fetch a fresh ticket and reconnect once.');
+            } catch {
+              // Already gone.
+            }
+          }
+          await this.deleteSession(session.playerId, session.sessionId);
+          sessionDirty = true;
+        }
+        continue;
+      }
       const missed = Math.floor((nowMs - session.lastHeartbeatAtMs) / HEARTBEAT_INTERVAL_MS);
       if (missed >= HEARTBEAT_MISSED_LIMIT) {
         // Phase 4 (s) — first-tick-after-wake grace: the stored
@@ -1518,6 +1798,57 @@ export class RoomDO implements DurableObject {
         // A seat with NO socket attached gets no grace — a genuinely
         // dead seat still suspends on the first tick.
         if (firstTickAfterWake && this.ctx.getWebSockets(session.playerId).length > 0) {
+          session.lastHeartbeatAtMs = nowMs;
+          session.missedHeartbeats = 0;
+          await this.putSession(session);
+          sessionDirty = true;
+          continue;
+        }
+        // v29 fix round (F5) — a suspended seat with a LIVE socket
+        // attached is never closed 1011 and never starts a 30 s
+        // window. The skip depends on SOCKET-ATTACHED state, not on
+        // the memory-only `lastSuspensionReason` map: after a DO
+        // eviction `restoreDurableMemory` does not restore that map,
+        // so the old reason-gated guard let a merely-hidden tab's
+        // live socket be closed 1011 after ~90 s of missed
+        // heartbeats and `suspendSeat('heartbeat-timeout')` start a
+        // 30 s ejection window for a player who never left. A live
+        // socket is proof of life — the heartbeats stopped on
+        // purpose (tab hidden), not a death — so reset the clock
+        // (same shape as the first-tick-after-wake grace above) and
+        // move on; the seat stays suspended. A suspended seat with
+        // NO socket attached still times out below.
+        const seat = this.store.player(session.playerId);
+        if (
+          seat !== undefined &&
+          seat.connectionState === 'suspended' &&
+          this.ctx.getWebSockets(session.playerId).length > 0
+        ) {
+          // v29 (H) — ghost-host investigation: NO server-side fix was
+          // applied here, deliberately. A socket that died with NO
+          // close event delivered would reset this clock forever and
+          // leave a ghost host (no grace, no abandon — the idle path
+          // counts the ghost socket as live). But a time bound on the
+          // skip (e.g. "presume dead after 10 min of silence") is NOT
+          // safe: a live hidden tab is INDISTINGUISHABLE from a dead
+          // socket from the server — both are a listed socket with no
+          // heartbeats — and the v28 Zara-R1 test pins that a hidden
+          // host's socket is never closed 1011, even after 11 min.
+          // A bound would close a live host who merely locked their
+          // phone for 10 min and start a grace that could transfer
+          // the crown away from a live player. The runtime is the
+          // party that can tell a dead TCP from a quiet one: a dead
+          // socket is removed from `getWebSockets()` and delivers
+          // `webSocketClose`/`webSocketError` when the runtime
+          // notices, and no evidence in this repo shows it failing
+          // to. The safe fix direction is client-side (a hidden-tab
+          // liveness proof, e.g. a ~60 s heartbeat while hidden —
+          // Meera's side, and a battery/design call for the founder),
+          // not a server-side time bound. So the skip stays
+          // unconditional, exactly as v28 designed it; the residual
+          // failure mode (a ghost host that never transfers and a
+          // room the idle path can never abandon) is documented in
+          // the v29 report as an open platform-assumption risk.
           session.lastHeartbeatAtMs = nowMs;
           session.missedHeartbeats = 0;
           await this.putSession(session);
@@ -1571,10 +1902,81 @@ export class RoomDO implements DurableObject {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, suspendPersist));
     }
 
+    // v28 — idle / abandoned-room handling (Diya F7/F8/F10/F11).
+    // Runs AFTER the heartbeat loop above, so a seat just suspended
+    // for timeout no longer counts as live. Precedence (F10): a
+    // running host grace beats the idle clock — while the grace runs
+    // the clock is left UNTOUCHED (neither set nor cleared) and the
+    // room is never abandoned, so the idle end can never cut a 30 s
+    // grace short. It only DEFERS: the clock resumes (or starts) on
+    // the first tick after the grace lapses, and a host who returns
+    // inside it revives the room cleanly (`resumeOnHello` cancels
+    // the grace; the re-attached socket clears the clock below).
+    // Only a room with NO live socket at all accrues idle time, and
+    // only in a phase the idle end covers (live phases + READY_CHECK
+    // / COUNTDOWN — see `abandonForIdle`); a LOBBY keeps its 24 h
+    // expiry and a terminal phase is already done. The clock itself
+    // is durable (`state.noSocketsSinceMs`): the DO is routinely
+    // evicted between 30 s ticks, and a memory-only clock would
+    // restart on every wake and never complete. It is written only
+    // on transitions (first no-socket tick sets it, a live socket
+    // clears it, abandonment clears it) — the quiet 30 s ticks in
+    // between write nothing.
+    const idleEvents: OutboundEvent[] = [];
+    const idlePersist: PersistIntent[] = [];
+    let idleChanged = false;
+    {
+      const phase = this.store.room.phase;
+      const idlePhase =
+        phase === 'HEAD_START' ||
+        phase === 'ACTIVE' ||
+        phase === 'SAFETY_PAUSED' ||
+        phase === 'READY_CHECK' ||
+        phase === 'COUNTDOWN';
+      const graceEndsAtMs = this.store.hostGraceEndsAtMs();
+      const graceRunning = graceEndsAtMs !== null && nowMs < graceEndsAtMs;
+      const liveSockets = await this.liveSocketCount();
+      if (liveSockets > 0) {
+        if (this.store.state.noSocketsSinceMs !== null && this.store.state.noSocketsSinceMs !== undefined) {
+          this.store.state.noSocketsSinceMs = null;
+          idleChanged = true;
+        }
+      } else if (!idlePhase) {
+        // Not a phase the idle end covers (LOBBY / terminal /
+        // RESOLVING, which the backstop just completed): the clock
+        // is meaningless here, keep the state clean.
+        if (this.store.state.noSocketsSinceMs !== null && this.store.state.noSocketsSinceMs !== undefined) {
+          this.store.state.noSocketsSinceMs = null;
+          idleChanged = true;
+        }
+      } else if (graceRunning) {
+        // F10: defer, do not reset — the clock is left exactly as
+        // it was, and no abandonment is checked on this tick.
+      } else {
+        const since = this.store.state.noSocketsSinceMs;
+        if (since === null || since === undefined) {
+          this.store.state.noSocketsSinceMs = nowMs;
+          idleChanged = true;
+        } else if (nowMs - since >= ABANDONED_IDLE_MS) {
+          const gone = this.store.abandonForIdle(nowMs);
+          if (gone.abandoned) {
+            idleEvents.push(...gone.events);
+            idlePersist.push(...gone.persist);
+            this.store.state.noSocketsSinceMs = null;
+            idleChanged = true;
+          }
+        }
+      }
+    }
+    if (idleEvents.length > 0) await this.deliver(idleEvents, nowMs);
+    if (idlePersist.length > 0) {
+      this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, idlePersist));
+    }
+
     // Skip the save when the tick produced nothing durable: no events, no
     // persist, no session change. A quiet 1 s tick is then deliver-
     // nothing, write-nothing (Phase 3 #5).
-    const changed = tick.events.length > 0 || tick.persist.length > 0 || sessionDirty;
+    const changed = tick.events.length > 0 || tick.persist.length > 0 || sessionDirty || idleChanged || idleEvents.length > 0 || idlePersist.length > 0;
     if (changed) {
       await this.save();
       await this.maybeUnregisterCode();

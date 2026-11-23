@@ -396,4 +396,16 @@ export class FakeMapLibreMap {
     this.record('removeSource', { id });
     this.sources.delete(id);
   }
+
+  // v29 (E): the interface now declares `getCanvas()` — the fake
+  // returns a stub canvas (no real listeners; the context-loss
+  // wiring is exercised through `pillTextForState` in
+  // play-map-logic.test.mjs, and the real canvas path only runs in
+  // the browser against a real Map).
+  getCanvas() {
+    return {
+      addEventListener() {},
+      removeEventListener() {},
+    };
+  }
 }

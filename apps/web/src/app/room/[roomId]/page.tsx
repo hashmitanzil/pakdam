@@ -50,6 +50,8 @@ import {
   getRoom,
   leaveRoom,
   pollDemoRoom,
+  recordPlayerSuspension,
+  resumePlayer,
   setSelectedHunters,
   setTeamAssignment,
   startDemoMatch,
@@ -61,6 +63,10 @@ import {
   getSessionForRoom,
   type PakdamSession,
 } from '../../../lib/session-credentials';
+import { clearRejoinToken } from '../../../lib/rejoin-token';
+import { buildSnapshotKey } from '../../../lib/snapshot-key';
+import { readReconnectEndsAtMs } from '../../../lib/presence';
+import { prefetchMapAssets } from '../../../components/map/maplibre';
 import { Button } from '../../../components/ui/Button';
 import { Sheet } from '../../../components/ui/Sheet';
 import { RoomCodeCard } from '../../../components/lobby/RoomCodeCard';
@@ -88,6 +94,10 @@ export default function LobbyPage() {
 
   const [session, setSession] = useState<PakdamSession | null | undefined>(undefined);
   const [lobby, setLobby] = useState<LobbyState | null>(null);
+  // v29 (A): the lobby clock for the 30 s return countdowns on away
+  // seats (passed to Roster). It ticks only while a window is open
+  // — see the effect below.
+  const [lobbyNowMs, setLobbyNowMs] = useState(() => Date.now());
   const [loadError, setLoadError] = useState<string | null>(null);
   const [conn, setConn] = useState<string>('connecting');
   const [notice, setNotice] = useState<string | null>(null);
@@ -214,7 +224,13 @@ export default function LobbyPage() {
   const me = lobby?.players.find((p) => p.playerId === session?.playerId);
   const isHost = me?.isHost ?? session?.isHost ?? false;
   const config = lobby?.room.config ?? null;
-  const activePlayers = (lobby?.players ?? []).filter((p) => p.leftAt === null);
+  const activePlayers = (lobby?.players ?? []).filter(
+    // v29 (A): the member count comes from the server snapshot and
+    // must DROP when someone is ejected — an ejected seat is no
+    // longer a member (the roster below still shows them, labelled
+    // "Ejected", from the full `lobby.players` list).
+    (p) => p.leftAt === null && p.ejectedAt === null,
+  );
   // v24 (D1): host-reconnect grace — the host is suspended and the
   // server/demo says the grace is running, so the room is hostless
   // until the host returns or the grace expires and the crown moves.
@@ -225,6 +241,27 @@ export default function LobbyPage() {
     (lobby?.hostGraceEndsAtMs ?? null) !== null &&
     hostPlayer?.connectionState === 'suspended' &&
     hostPlayer.playerId !== session?.playerId;
+
+  // v29 (A): the 1 s clock for the 30 s return countdowns — it runs
+  // ONLY while at least one seat has a return window open, so an
+  // idle lobby ticks nothing. The countdown itself is rendered from
+  // the server's `reconnectEndsAtMs`, never computed here.
+  const anyReconnectWindow = (lobby?.players ?? []).some(
+    (p) => readReconnectEndsAtMs(p) !== null,
+  );
+  useEffect(() => {
+    if (!anyReconnectWindow) return;
+    const timer = window.setInterval(() => setLobbyNowMs(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [anyReconnectWindow]);
+
+  // v29 (R11): prefetch the map assets from the lobby — everyone in
+  // the lobby will open the map, and the welcome screen no longer
+  // prefetches (play-map readiness is protected here instead).
+  // Gated inside `prefetchMapAssets` on data-saver / 2G.
+  useEffect(() => {
+    prefetchMapAssets();
+  }, []);
 
   // -- Load the seat, then live state / socket or demo polling (F2). ------
   useEffect(() => {
@@ -259,9 +296,12 @@ export default function LobbyPage() {
             goPlay();
             return;
           }
-          // B14: identical-skip — same (version, serverSeq) = same
-          // server state; a re-delivered snapshot changes nothing.
-          const key = `${snapshot.version}:${snapshot.serverSeq}`;
+          // B14 (v29 R1, fix round M1): identical-skip — the key is
+          // `version:serverSeq:maxLastFixAtMs:epochMs`, so a DO-eviction
+          // restore can never collide with the cached key. Same key
+          // = same server state; a re-delivered snapshot changes
+          // nothing.
+          const key = buildSnapshotKey(snapshot);
           if (key === lastSnapshotKeyRef.current) return;
           lastSnapshotKeyRef.current = key;
           // A snapshot over the socket rescues a lobby whose first HTTP
@@ -400,6 +440,46 @@ export default function LobbyPage() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [roomId]);
+
+  // H1 (v28 fix round): demo suspend/resume on tab visibility. The
+  // lobby never mounted useRoomState, so its visibilitychange handler
+  // (useRoomState.ts:722-740) never ran here: hideTab() in the lobby
+  // suspended nothing — no 'suspended' state, no 30 s host grace, no
+  // waiting line, no crown move (host-grace.spec.ts demo tests + the
+  // H1 pin in v28-repro-ci-e2e.test.mjs). Live needs no page handler:
+  // the PakdamSocket reports `player.suspended` ('tab-hidden') on
+  // hide itself (websocket.ts:658-681, attached on open) and the DO
+  // resumes the seat on hello/reconnect — the same path the play page
+  // uses, and a second page-level report would only duplicate it.
+  // Demo has no socket, so tab-hidden IS the disconnect signal
+  // (demo-store: recordPlayerSuspension starts the host grace for a
+  // suspended host): suspend on hide, resume on return, and refresh
+  // the roster at once so the Suspended row / waiting line move
+  // without waiting for the 1 s poll.
+  useEffect(() => {
+    if (isLive || !session) return;
+    const playerId = session.playerId;
+    const refresh = (): void => {
+      const current = getRoom(roomId);
+      if (current) {
+        setLobby({ room: current.room, players: current.players, hostGraceEndsAtMs: current.hostGraceEndsAtMs ?? null });
+      }
+    };
+    const onVisibility = (): void => {
+      const current = getRoom(roomId);
+      if (!current) return;
+      if (document.hidden) {
+        recordPlayerSuspension(current, playerId, 'tab-hidden');
+      } else {
+        resumePlayer(current, playerId);
+      }
+      refresh();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [roomId, isLive, session]);
 
   // -- Lobby fix stream (P1-7): the server start gate requires every
   //    active player to have a fix ≤ 120 s old, and the lobby is the only
@@ -719,6 +799,8 @@ export default function LobbyPage() {
       if (demo && session) leaveRoom(demo, session.playerId);
     }
     clearSession(roomId);
+    // v29 (A): leaving clears the rejoin token — the seat is gone.
+    clearRejoinToken(roomId);
     router.push('/');
   }, [isLive, roomId, session, router]);
 
@@ -951,6 +1033,7 @@ export default function LobbyPage() {
             hunterCount={effectiveHunterCount(config, activePlayers.length)}
             onToggleHunter={toggleHunter}
             onRemove={handleRemovePlayer}
+            nowMs={lobbyNowMs}
           />
           {activePlayers.length === 0 ? (
             <p className="mt-3 text-[13px] text-[#A1A1AA]">

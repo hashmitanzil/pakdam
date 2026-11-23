@@ -42,6 +42,8 @@ import { use, useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useRoomState } from '@/components/match/useRoomState';
 import { CatchQR } from '@/components/catch/CatchQR';
+import { ErrorBoundary } from '@/components/ErrorBoundary';
+import { ErrorBoundaryThrowTest } from '@/components/ErrorBoundaryThrowTest';
 import { ClaimPicker } from '@/components/catch/ClaimPicker';
 import { Button } from '@/components/ui/Button';
 import { Sheet } from '@/components/ui/Sheet';
@@ -70,10 +72,14 @@ export default function CatchPage({
   searchParams,
 }: {
   params: Promise<{ roomId: string }>;
-  searchParams: Promise<{ runner?: string; scan?: string }>;
+  searchParams: Promise<{ runner?: string; scan?: string; errorBoundaryTest?: string }>;
 }) {
   const { roomId } = use(params);
   const query = use(searchParams);
+  // TEST-ONLY (`e2e/error-boundary.spec.ts`): renders the throwing test
+  // component inside the catch boundary so the fallback can be asserted.
+  // Never set in normal use.
+  const errorBoundaryTestCatch = query?.errorBoundaryTest === 'catch';
   const router = useRouter();
 
   const {
@@ -909,25 +915,30 @@ export default function CatchPage({
             </p>
           )}
           {openClaim ? (
-            <CatchQR
-              mode="show"
-              token={qrToken}
-              runnerName={myPlayer?.displayName ?? 'You'}
-              onScan={() => undefined}
-              onManualFallback={() => undefined}
-            />
+            <ErrorBoundary kind="catch" roomId={roomId} playerId={myPlayerId}>
+              <CatchQR
+                mode="show"
+                token={qrToken}
+                runnerName={myPlayer?.displayName ?? 'You'}
+                onScan={() => undefined}
+                onManualFallback={() => undefined}
+              />
+              {errorBoundaryTestCatch ? <ErrorBoundaryThrowTest /> : null}
+            </ErrorBoundary>
           ) : mintedToken ? (
             // The minted QR + its countdown — it refreshes itself on
             // expiry (new token, old QR dead at once). The raw token is
             // a QR only, never text.
             <div className="flex flex-col gap-3">
-              <CatchQR
-                mode="show"
-                token={mintedToken.token}
-                runnerName={myPlayer?.displayName ?? 'You'}
-                onScan={() => undefined}
-                onManualFallback={() => undefined}
-              />
+              <ErrorBoundary kind="catch" roomId={roomId} playerId={myPlayerId}>
+                <CatchQR
+                  mode="show"
+                  token={mintedToken.token}
+                  runnerName={myPlayer?.displayName ?? 'You'}
+                  onScan={() => undefined}
+                  onManualFallback={() => undefined}
+                />
+              </ErrorBoundary>
               <p className="text-center text-[14px] text-[#A1A1AA]">
                 QR refreshes in {formatClock(Math.max(0, Date.parse(mintedToken.expiresAt) - nowMs))}
               </p>
@@ -987,13 +998,15 @@ export default function CatchPage({
           ) : (
             <p className="text-[15px] text-white">Scan a Runner&apos;s QR</p>
           )}
-          <CatchQR
-            mode="scan"
-            token={null}
-            runnerName={claimRunnerName}
-            onScan={handleScan}
-            onManualFallback={() => setManualMode(true)}
-          />
+          <ErrorBoundary kind="catch" roomId={roomId} playerId={myPlayerId}>
+            <CatchQR
+              mode="scan"
+              token={null}
+              runnerName={claimRunnerName}
+              onScan={handleScan}
+              onManualFallback={() => setManualMode(true)}
+            />
+          </ErrorBoundary>
           {manualMode || !openClaim ? (
             // Column: manual fallback / picker. `?scan=1` with no open
             // claim lands here too (never a dead end).

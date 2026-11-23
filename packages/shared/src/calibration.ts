@@ -54,6 +54,21 @@ export const HEARTBEAT_INTERVAL_MS = 30_000;
  */
 export const HEARTBEAT_MISSED_LIMIT = 3;
 
+/**
+ * Safety-pause fast-tick window: a SAFETY_PAUSED room with players attached
+ * ticks every 1 s for this long after the pause starts, then demotes to the
+ * 30 s cadence (v28 fix round, Zara R2). 5 min is deliberate: a safety pause
+ * is a short incident hold (seconds to a couple of minutes); 5 min is well
+ * past any legitimate "hold on a moment" pause, while keeping full 1 s
+ * responsiveness through the plausible window. Nothing is lost by the
+ * demotion: resume is message-driven (`safety.resume` arrives on the socket,
+ * not on the tick), a running host grace always holds the 1 s tick, and the
+ * no-socket abandon path still ends the room if everyone leaves. Measured
+ * from the durable `room.pausedAt` (stamped once per pause), so the demotion
+ * survives a DO eviction. OPEN — measure in the field.
+ */
+export const SAFETY_PAUSE_FAST_TICK_MS = 5 * 60 * 1000;
+
 /** Latest fixes older than this are purged every DO tick; fixes purge at match end. */
 export const FIX_TTL_MS = 120_000;
 
@@ -282,6 +297,31 @@ export const STALE_FIX_MS = 60_000;
 /** Impossible movement: > 30 m/s from the previous fix warns only, never rejects. OPEN. */
 export const MAX_PLAUSIBLE_SPEED_MPS = 30;
 
+/**
+ * GPS anti-cheat defaults (Gap 1, founder-decided 2026-11-21 — tunable
+ * via config, calibrate on real phones in real parks). Warn-only by
+ * default: `action: 'warn'` + `warnOnly: true`. Eject is a config
+ * opt-in only (`action: 'eject'` on the room config); there is no host
+ * setup UI for these in v1. The counted violation starts at 50 m/s —
+ * looser than `validateFix`'s 30 m/s warning, so city/park multipath
+ * does not false-flag. A spoofer under 50 m/s passes: accepted
+ * trade-off (see the reliability spec §2).
+ */
+export const GPS_ANTI_CHEAT_DEFAULTS = {
+  enabled: true,
+  warnOnly: true,
+  action: 'warn',
+  maxSpeedMs: 50,
+  burstMaxMs: 80,
+  burstWindowMs: 3000,
+  teleportMaxGapM: 500,
+  teleportMaxGapMs: 10000,
+  violationThreshold: 3,
+} as const;
+
+/** Window a seat's violations are counted in: 3 in 5 min flags (Gap 1). */
+export const GPS_VIOLATION_WINDOW_MS = 5 * 60 * 1000;
+
 /** WRONG_SCAN_MAX / WRONG_SCAN_LOCK_SECONDS: DELETED — dead calibration
  * with no engine/worker reference. Failed confirms are already limited
  * by the WS `catch.confirm` 5/min/seat limit; do not re-add a separate
@@ -427,6 +467,7 @@ export const CALIBRATION_OPEN = {
   reconnectBackoffCeilingMs: RECONNECT_BACKOFF_CEILING_MS,
   heartbeatIntervalMs: HEARTBEAT_INTERVAL_MS,
   heartbeatMissedLimit: HEARTBEAT_MISSED_LIMIT,
+  safetyPauseFastTickMs: SAFETY_PAUSE_FAST_TICK_MS,
   balancedHunterTable: BALANCED_HUNTER_TABLE,
   wsMessageRateLimits: WS_MESSAGE_RATE_LIMITS,
   httpRateLimits: HTTP_RATE_LIMITS,

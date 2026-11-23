@@ -13,7 +13,12 @@ import { isValidDisplayName, isValidRoomCode } from '@pakdam/shared';
 import { isLiveTransportEnabled } from '../../lib/websocket';
 import { joinLiveRoomByCode } from '../../lib/live-client';
 import { getRoomByCode, joinRoom as joinDemoRoom } from '../../lib/demo-store';
-import { getSessionForRoomCode, storeDemoSeat } from '../../lib/session-credentials';
+import {
+  getSessionForRoomCode,
+  storeDemoSeat,
+  storeLiveSeat,
+} from '../../lib/session-credentials';
+import { getRejoinTokenForCode } from '../../lib/rejoin-token';
 
 export default function JoinPage() {
   const router = useRouter();
@@ -21,6 +26,26 @@ export default function JoinPage() {
   const [codename, setCodename] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [joining, setJoining] = useState(false);
+
+  // v29 (A): a stored rejoin token for the code being typed — a
+  // "Rejoin your game" entry that restores the seat and navigates
+  // to the room, so the existing resume path runs (role/score
+  // intact). Read on render: localStorage is the source of truth
+  // and the read is pure + cheap.
+  const rejoinEntry = code.trim() ? getRejoinTokenForCode(code.trim().toUpperCase()) : null;
+  const handleRejoin = (): void => {
+    if (!rejoinEntry) return;
+    storeLiveSeat({
+      mode: 'live',
+      roomId: rejoinEntry.roomId,
+      playerId: rejoinEntry.playerId,
+      displayName: rejoinEntry.displayName,
+      reconnectToken: rejoinEntry.reconnectToken,
+      isHost: rejoinEntry.isHost,
+      roomCode: rejoinEntry.roomCode,
+    });
+    router.push(`/room/${rejoinEntry.roomId}`);
+  };
 
   const join = async (): Promise<void> => {
     const normalizedCode = code.trim().toUpperCase();
@@ -108,6 +133,31 @@ export default function JoinPage() {
         />
       </label>
       {error ? <p className="mt-2 text-[13px] text-[#EF4444]">{error}</p> : null}
+
+      {/* v29 (A): "Rejoin your game" — a stored seat for this code.
+          One tap restores it with role and score intact, instead of
+          joining as a new player. */}
+      {rejoinEntry ? (
+        <div className="mt-6">
+          <button
+            type="button"
+            onClick={handleRejoin}
+            className="flex w-full items-center justify-between rounded-[14px] border border-[#EF4444]/50 bg-[#141416] px-4 py-3 text-left"
+          >
+            <span>
+              <span className="block text-[15px] font-bold text-white">
+                Rejoin your game — {rejoinEntry.displayName}
+              </span>
+              <span className="mt-0.5 block text-[13px] text-[#A1A1AA]">
+                Room {rejoinEntry.roomCode} · tap to rejoin with your role and score
+              </span>
+            </span>
+            <span aria-hidden className="text-[20px] text-[#EF4444]">
+              →
+            </span>
+          </button>
+        </div>
+      ) : null}
 
       <div className="mt-6">
         <button

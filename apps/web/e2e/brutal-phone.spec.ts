@@ -61,7 +61,7 @@ test.describe('brutal phone end-to-end (demo)', () => {
     const tagBtn = hunterPage.getByRole('button', { name: 'Scan their QR first' });
     await expect(tagBtn).toBeDisabled();
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await runnerPage.getByRole('button', { name: 'Self Confirm', exact: true }).click();
+    await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });

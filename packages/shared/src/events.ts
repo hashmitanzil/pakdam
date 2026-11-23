@@ -2,7 +2,7 @@
  * Pakdam WS event catalogue — frozen contract v2.1, as amended by v18
  * and the v18 follow-up (claim-less runner QR token).
  *
- * 22 client→server message types, 33 server→client types.
+ * 22 client→server message types, 35 server→client types.
  *
  * v18 removals (founder decisions — do not re-add):
  * - `safety.sos` / `sos.raised`: SOS removed entirely, server + shared.
@@ -26,6 +26,13 @@
  * added both ways — the Runner mints it (client→server, empty payload)
  * and receives the raw token back (server→client, direct-only) — so the
  * count is now 22 client / 33 server types.
+ *
+ * v29: `snapshot.unchanged` (R5 — server honours lastServerSeq) and
+ * `ticket.renewed` (R8 — server-push ticket renewal) are added, so the
+ * count is now 22 client / 35 server types. v29 fix round:
+ * `teammate.fix` (R3 — fix broadcast replaces the 8 s periodic
+ * re-fetch as the primary liveness mechanism) is added, so the count
+ * is now 22 client / 36 server types.
  *
  * Broadcast scoping (server-side, must be preserved): direct messages
  * (`welcome`, `snapshot`, `error`, `heartbeat.ack`, `auth.refreshed`,
@@ -188,10 +195,33 @@ export interface ReadySetPayload {
 
 export interface SnapshotRequestPayload {
   lastServerSeq: number;
+  /**
+   * v29 (R5, fix round) — the client's last snapshot key, first-class.
+   * Canonical field names: `{ version, serverSeq, maxLastFixAtMs,
+   * epochMs }`. `maxLastFixAtMs` is null when no seat has reported a
+   * fix (never 0 — null on both sides). `epochMs` is the DO instance's
+   * memory epoch (see `WsSnapshotPayload.epochMs`): a key from before
+   * a wake never matches. Absent entirely (old client, or a request
+   * carrying only `lastServerSeq`) → the server returns a full
+   * snapshot, never guesses.
+   */
+  lastSnapshotKey?: SnapshotKey;
+}
+
+/** v29 (R5) — the snapshot-unchanged key, shared by request + snapshot. */
+export interface SnapshotKey {
+  version: number;
+  serverSeq: number;
+  /** Newest `lastFixAt` across the roster, epoch ms, or null. */
+  maxLastFixAtMs: number | null;
+  /** The DO instance's memory epoch (changes on every wake). */
+  epochMs: number;
 }
 
 export interface ResyncRequestPayload {
   lastServerSeq: number;
+  /** Same key as `snapshot.request` (see `SnapshotRequestPayload`). */
+  lastSnapshotKey?: SnapshotKey;
 }
 
 export interface PlayerSuspendedPayload {
@@ -257,7 +287,7 @@ export function isWsClientMessageType(value: string): value is WsClientMessageTy
 }
 
 // ---------------------------------------------------------------------------
-// Server → client (33 enumerated types; see note at the top of this file)
+// Server → client (36 enumerated types; see note at the top of this file)
 // ---------------------------------------------------------------------------
 
 export interface WelcomePayload {
@@ -385,6 +415,62 @@ export interface TicketRenewalRequiredPayload {
   serverSeq: number;
 }
 
+/**
+ * v29 (R8) — server-push ticket renewal: the DO minted + registered a
+ * renewal ticket itself and pushes the raw value over the existing
+ * authenticated socket, shortly before expiry. The client stores it
+ * and presents it via `auth.refresh` — no HTTP ticket call. Sent
+ * alongside `ticket.renewal-required` (old clients ignore this event
+ * and keep fetching over HTTP).
+ */
+export interface TicketRenewedPayload {
+  ticket: string;
+  /**
+   * v29 (R8 fix round) — epoch ms when the pushed ticket expires.
+   * The client needs it to know when the pushed ticket itself dies
+   * (the 60 s TTL is unchanged — never 10 min); without it the
+   * client could not schedule its next renewal.
+   */
+  expiresAtMs: number;
+  serverSeq: number;
+}
+
+/**
+ * v29 (R5 fix round) — `teammate.fix`: the primary teammate-liveness
+ * mechanism (replaces the 8 s periodic re-fetch). On each accepted
+ * fix the server emits this lightweight event to the sender's
+ * teammates ONLY, using exactly the same visibility predicate as
+ * `buildSnapshot`'s per-viewer `teammateFixes` (so broadcast and
+ * snapshot can never disagree about who sees whom — including the
+ * caught-Runner-loses-live-view rule). Outbound sends are not
+ * counted as DO requests under the conservative-meter reading
+ * (only inbound messages and alarm invocations count); the CPU
+ * cost of the fan-out is the open question. The R1 30 s safety
+ * valve stays as the safety net. CONTRACT (client implements
+ * against this exact event/payload).
+ */
+export interface TeammateFixPayload {
+  playerId: string;
+  lat: number;
+  lng: number;
+  accuracyMeters: number;
+  /** Device timestamp of the fix, epoch ms. */
+  timestampMs: number;
+  serverSeq: number;
+}
+
+/**
+ * v29 (R5) — the server honours `lastServerSeq`: when the seat's
+ * (version, serverSeq, durable watermark) key has not moved, the
+ * snapshot request is answered with this tiny event instead of a full
+ * snapshot. `serverSeq` / `version` are the current values (the
+ * envelope carries the same serverSeq).
+ */
+export interface SnapshotUnchangedPayload {
+  serverSeq: number;
+  version: number;
+}
+
 export interface AuthRefreshedPayload {
   expiresAt: number;
   /** ISO-8601 timestamp — the DO emits a string here, not epoch ms. */
@@ -402,8 +488,11 @@ export interface HeartbeatAckPayload {
 export interface WsServerPayloads {
   welcome: WelcomePayload;
   snapshot: WsSnapshotPayload;
+  'snapshot.unchanged': SnapshotUnchangedPayload;
   'room.state': RoomStatePayload;
   'ticket.renewal-required': TicketRenewalRequiredPayload;
+  'ticket.renewed': TicketRenewedPayload;
+  'teammate.fix': TeammateFixPayload;
   'auth.refreshed': AuthRefreshedPayload;
   'heartbeat.ack': HeartbeatAckPayload;
   error: WsErrorPayload;
@@ -451,8 +540,11 @@ export type WsServerMessageType = keyof WsServerPayloads;
 export const WS_SERVER_TYPES: readonly WsServerMessageType[] = [
   'welcome',
   'snapshot',
+  'snapshot.unchanged',
   'room.state',
   'ticket.renewal-required',
+  'ticket.renewed',
+  'teammate.fix',
   'auth.refreshed',
   'heartbeat.ack',
   'error',
@@ -494,10 +586,12 @@ export function isWsServerMessageType(value: string): value is WsServerMessageTy
 export const WS_DIRECT_SERVER_TYPES: readonly WsServerMessageType[] = [
   'welcome',
   'snapshot',
+  'snapshot.unchanged',
   'error',
   'heartbeat.ack',
   'auth.refreshed',
   'ticket.renewal-required',
+  'ticket.renewed',
   'catch.runner-token',
 ] as const;
 
@@ -505,13 +599,14 @@ export const WS_DIRECT_SERVER_TYPES: readonly WsServerMessageType[] = [
 export const WS_TEAM_ONLY_SERVER_TYPES: readonly WsServerMessageType[] = [
   'voice.signal',
   'radio',
+  'teammate.fix',
 ] as const;
 
 /** Server→client types sent only to the ping's recipient role (a Runner ping to Hunters, a Hunter ping to Runners). */
 export const WS_ROLE_SCOPED_SERVER_TYPES: readonly WsServerMessageType[] = ['ping'] as const;
 
 // ---------------------------------------------------------------------------
-// Game events (audit log) — 10 types
+// Game events (audit log) — 11 types
 // ---------------------------------------------------------------------------
 
 export type GameEventType =
@@ -524,6 +619,7 @@ export type GameEventType =
   | 'ZONE_UPDATED'
   | 'PLAYER_DISCONNECTED'
   | 'PLAYER_RECONNECTED'
+  | 'GPS_VIOLATION'
   | 'MATCH_COMPLETED';
 
 export const GAME_EVENT_TYPES: readonly GameEventType[] = [
@@ -536,6 +632,7 @@ export const GAME_EVENT_TYPES: readonly GameEventType[] = [
   'ZONE_UPDATED',
   'PLAYER_DISCONNECTED',
   'PLAYER_RECONNECTED',
+  'GPS_VIOLATION',
   'MATCH_COMPLETED',
 ] as const;
 
@@ -555,6 +652,12 @@ export interface GameEventPayloads {
   ZONE_UPDATED: { zone: ZoneConfig };
   PLAYER_DISCONNECTED: { playerId: string; reason?: string };
   PLAYER_RECONNECTED: { playerId: string };
+  /**
+   * v29 (Gap 1) — a seat reached 3 GPS violations in 5 min. Coordinates
+   * NEVER appear here (player id, kind and count only); the
+   * `room_events` trigger rejects coordinate keys at any depth.
+   */
+  GPS_VIOLATION: { playerId: string; kind: 'speed' | 'burst' | 'teleport'; count: number };
   MATCH_COMPLETED: { result: MatchResult; room: Pick<Room, 'roomId' | 'phase'> };
 }
 

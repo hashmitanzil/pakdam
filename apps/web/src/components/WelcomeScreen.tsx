@@ -14,24 +14,28 @@
  * loading bar, no step list, no percentage, no fake progress. The
  * real work still runs behind the screen, never fake:
  *
- *   (a) map asset prefetch — the real prefetchMapAssets(). It returns
- *       void and is fire-and-forget (requestIdleCallback, 3 s timeout,
- *       else a 500 ms setTimeout), so the work settles after a short
- *       delay that covers the 500 ms fallback path.
- *   (b) GPS warm-up — ONE getCurrentPosition, 1 s timeout, no watch,
+ *   (a) GPS warm-up — ONE getCurrentPosition, 1 s timeout, no watch,
  *       and ONLY when location permission is already 'granted'
  *       (navigator.permissions.query). When the state is 'prompt' or
  *       'denied', or the Permissions API is unavailable, the work is
  *       skipped silently — the home page never pops the system
  *       location prompt. Failure (denied / unavailable / timeout)
  *       is fine.
- *   (c) connection check — a GET to the Worker root via the existing
+ *   (b) connection check — a GET to the Worker root via the existing
  *       getWorkerUrl() helper. Any HTTP response counts as reachable;
  *       a network error counts as not reachable. In demo mode (no
  *       Worker URL configured) there is nothing to reach, so the work
  *       resolves immediately. No room, no ticket, no game state touched.
  *
- * The three jobs run concurrently. A job that fails just settles —
+ * v29 (R11): the map asset prefetch used to be job (a) here — it is
+ * REMOVED from this screen. The welcome screen shows before the
+ * player has chosen to play, so prefetching ~1 MB of map assets here
+ * spends data on a screen that may never open a map. Play-map
+ * readiness is protected another way: the lobby prefetches on mount
+ * (everyone in the lobby will open the map), and host setup /
+ * create-mode still prefetch.
+ *
+ * The two jobs run concurrently. A job that fails just settles —
  * never an error state, never a retry prompt.
  *
  * NEVER BLOCKS: a hard cap of 2.5 s from mount forces the fade even if
@@ -43,19 +47,17 @@
  * path used to fire at ~0.5 s, while the tagline was still opacity 0.
  *
  * SPEED (founder reference: ShadowHunt's loader lasts ~1 s): the
- * normal path targets ~1 s. Each job has a short budget — map
- * prefetch settles in 500 ms, GPS gets 1 s, the connection check gets
- * 1 s — and the staging gate holds the fade until ~1 s, so the fade
- * normally starts at ~1 s and the screen is gone by ~1.4 s. A slow
- * job never holds the screen: its budget expiry settles it and the
- * 2.5 s cap is only the ceiling.
+ * normal path targets ~1 s. Each job has a short budget — GPS gets
+ * 1 s, the connection check gets 1 s — and the staging gate holds
+ * the fade until ~1 s, so the fade normally starts at ~1 s and the
+ * screen is gone by ~1.4 s. A slow job never holds the screen: its
+ * budget expiry settles it and the 2.5 s cap is only the ceiling.
  *
  * Shows on EVERY home-page mount / reload, like ShadowHunt — there is
  * deliberately no once-per-session guard (no sessionStorage, no
  * in-memory once-only flag). Navigating back to home shows it again.
  */
 import { useEffect, useRef, useState } from 'react';
-import { prefetchMapAssets } from './map/maplibre';
 import { getWorkerUrl } from '../lib/websocket';
 
 export const WELCOME_CAP_MS = 2500;
@@ -67,8 +69,6 @@ const WELCOME_FADE_MS_REDUCED_MOTION = 150;
  * would cut the tagline off while it is still opacity 0. The fade
  * fires at max(all-jobs-settled, this gate), capped by WELCOME_CAP_MS. */
 const WELCOME_STAGING_MS = 1000;
-/** Settle delay for the fire-and-forget map prefetch (covers its 500 ms fallback timer). */
-const MAP_PREFETCH_SETTLE_MS = 500;
 /** GPS warm-up budget: one fix attempt, then give up quietly. */
 const GPS_TIMEOUT_MS = 1000;
 /** Connection-check budget for the Worker root GET. */
@@ -116,19 +116,7 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
       fadeTimer = window.setTimeout(() => onDoneRef.current(), fadeMs);
     };
 
-    // (a) Map prefetch — real call; fire-and-forget, so settle after a
-    // short delay rather than awaiting a promise that does not exist.
-    const mapWork = (async () => {
-      try {
-        prefetchMapAssets();
-      } catch {
-        // Prefetch never throws by design; a failure here just means
-        // the map path retries on its own later.
-      }
-      await later(MAP_PREFETCH_SETTLE_MS);
-    })();
-
-    // (b) GPS warm-up — a single fix, never a watch, never blocking,
+    // (a) GPS warm-up — a single fix, never a watch, never blocking,
     // and ONLY when permission is already 'granted'. A bare
     // getCurrentPosition on mount would pop the system location
     // prompt over the loader on every home visit while undecided,
@@ -207,13 +195,13 @@ export function WelcomeScreen({ onDone }: { onDone: () => void }) {
       }
     })();
 
-    // The three jobs run concurrently. The fade fires only once all three have
+    // The two jobs run concurrently. The fade fires only once both have
     // settled AND the staging gate (~1 s) has elapsed — whichever is
     // later — so the full pin → wordmark → tagline sequence is always
     // visible. The hard cap below forces the fade even if any job
     // is still pending or failed.
     const stagingWork = later(WELCOME_STAGING_MS);
-    void Promise.allSettled([mapWork, gpsWork, connectionWork, stagingWork]).then(
+    void Promise.allSettled([gpsWork, connectionWork, stagingWork]).then(
       finish,
     );
     const capTimer = window.setTimeout(finish, WELCOME_CAP_MS);

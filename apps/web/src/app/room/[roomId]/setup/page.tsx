@@ -40,6 +40,7 @@ import {
   getSessionForRoom,
   type PakdamSession,
 } from '../../../../lib/session-credentials';
+import { buildSnapshotKey } from '../../../../lib/snapshot-key';
 import { canZoneAutoCentreOn, getCurrentFix, watchLocation } from '../../../../lib/geolocation';
 import { distanceMeters, formatDistance, haversineMeters } from '../../../../lib/utils';
 import { prefetchMapAssets } from '../../../../components/map/maplibre';
@@ -261,9 +262,12 @@ export default function SetupPage() {
             goPlay();
             return;
           }
-          // B14: identical-skip — same (version, serverSeq) = same
-          // server state; a re-delivered snapshot changes nothing.
-          const key = `${snapshot.version}:${snapshot.serverSeq}`;
+          // B14 (v29 R1, fix round M1): identical-skip — the key is
+          // `version:serverSeq:maxLastFixAtMs:epochMs`, so a
+          // DO-eviction restore can never collide with the cached
+          // key. Same key = same server state; a re-delivered
+          // snapshot changes nothing.
+          const key = buildSnapshotKey(snapshot);
           if (key === lastSnapshotKeyRef.current) return;
           lastSnapshotKeyRef.current = key;
           const state = snapshotToLiveRoomState(snapshot);

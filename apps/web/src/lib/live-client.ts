@@ -19,6 +19,9 @@ import {
 } from '@pakdam/shared';
 import { getWorkerUrl, isLiveTransportEnabled } from './websocket';
 import { clearHostToken, getSessionForRoom, storeLiveSeat, type PakdamSession } from './session-credentials';
+import { fetchWithRetry } from './api-client';
+import { clearJoinKey, getOrCreateJoinKey } from './join-key';
+import { storeRejoinToken } from './rejoin-token';
 
 export { isLiveTransportEnabled, getWorkerUrl };
 export { DEFAULT_ROOM_CONFIG };
@@ -68,33 +71,67 @@ export async function readLiveErrorMessage(response: Response): Promise<string |
   }
 }
 
+/**
+ * POST via `fetchWithRetry` (Gap 4): an unkeyed POST is attempted once
+ * (same as the old plain fetch); a keyed POST is retried under the
+ * retry rules. The key is generated ONCE per user action by the caller
+ * and reused across retries — never minted per attempt. A 403 is never
+ * retried here, so the host-token re-mint retry in `postHost` /
+ * `replayLiveRoom` / `endLiveMatch` is never double-wrapped.
+ */
 async function postJson<T>(
   path: string,
   body: Record<string, unknown>,
   init?: RequestInit,
+  opts?: { idempotencyKey?: string },
 ): Promise<T> {
   const workerUrl = getWorkerUrl();
   if (!workerUrl) throw new Error('Live transport is not configured.');
-  const response = await fetch(`${workerUrl}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
-    body: JSON.stringify(body),
-    ...init,
-  });
+  const response = await fetchWithRetry(
+    `${workerUrl}${path}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(init?.headers ?? {}) },
+      body: JSON.stringify(body),
+      ...init,
+    },
+    { idempotencyKey: opts?.idempotencyKey },
+  );
   if (!response.ok) {
     throw new LiveHttpError(response.status, await readLiveErrorMessage(response));
   }
   return (await response.json()) as T;
 }
 
+/** GET via `fetchWithRetry` (Gap 4): retried, max 3 attempts, backoff 500 ms → 5 s on 408/429/5xx. */
 async function getJson<T>(path: string, headers?: Record<string, string>): Promise<T> {
   const workerUrl = getWorkerUrl();
   if (!workerUrl) throw new Error('Live transport is not configured.');
-  const response = await fetch(`${workerUrl}${path}`, { headers });
+  const response = await fetchWithRetry(`${workerUrl}${path}`, { headers });
   if (!response.ok) {
     throw new LiveHttpError(response.status);
   }
   return (await response.json()) as T;
+}
+
+/**
+ * Mirror a stored live seat's reconnect token into the rejoin store
+ * (founder decision: rejoin must survive the app being killed). The
+ * seat in sessionStorage is the source of truth — a restored seat
+ * returns an EMPTY token, so the stored (good) token is mirrored, never
+ * the empty one.
+ */
+function mirrorRejoinToken(roomId: string): void {
+  const stored = getSessionForRoom(roomId);
+  if (!stored?.reconnectToken) return;
+  storeRejoinToken({
+    roomId: stored.roomId,
+    roomCode: stored.roomCode ?? '',
+    playerId: stored.playerId,
+    displayName: stored.displayName ?? '',
+    reconnectToken: stored.reconnectToken,
+    isHost: stored.isHost,
+  });
 }
 
 export interface CreateRoomResponse {
@@ -143,6 +180,7 @@ export async function createLiveRoom(
     roomCode: data.roomCode,
   };
   storeLiveSeat(session);
+  mirrorRejoinToken(data.roomId);
   return session;
 }
 
@@ -175,22 +213,36 @@ export async function joinLiveRoom(
   if (!isValidDisplayName(displayName)) {
     throw new Error('Enter a name between 1 and 30 characters.');
   }
-  const data = await postJson<JoinRoomResponse>(`/v1/rooms/${roomId}/join`, {
-    displayName: displayName.trim(),
-    kind: 'guest',
-    roomCode: roomCode.trim().toUpperCase(),
-    ...(reconnectToken ? { reconnectToken } : {}),
-  });
+  // Gap 4 (join dedupe): one key per join attempt, stored BEFORE
+  // sending, reused by a retry after a lost response — the server
+  // returns the cached join (same seat + token) instead of 403 "name
+  // taken". The key is per room+codename; the seat is obtained below,
+  // so the key is cleared on success.
+  const name = displayName.trim();
+  const joinKey = getOrCreateJoinKey(roomId, name);
+  const data = await postJson<JoinRoomResponse>(
+    `/v1/rooms/${roomId}/join`,
+    {
+      displayName: name,
+      kind: 'guest',
+      roomCode: roomCode.trim().toUpperCase(),
+      ...(reconnectToken ? { reconnectToken } : {}),
+    },
+    undefined,
+    { idempotencyKey: joinKey },
+  );
+  clearJoinKey(roomId, name);
   const session: PakdamSession = {
     mode: 'live',
     roomId,
     playerId: data.player.playerId,
-    displayName: displayName.trim(),
+    displayName: name,
     reconnectToken: data.reconnectToken,
     isHost: data.player.isHost,
     roomCode: roomCode.trim().toUpperCase(),
   };
   storeLiveSeat(session);
+  mirrorRejoinToken(roomId);
   // A2: join never returns a host token, so a host who rejoined in a
   // fresh tab used to pay a second round-trip (POST /host/token) on
   // every host action — including START. Mint it here, in the
@@ -228,22 +280,33 @@ export async function joinLiveRoomByCode(
     throw new Error('Enter a name between 1 and 30 characters.');
   }
   const code = roomCode.trim().toUpperCase();
-  const data = await postJson<JoinRoomResponse & { roomId: string }>('/v1/rooms/join-by-code', {
-    displayName: displayName.trim(),
-    kind: 'guest',
-    roomCode: code,
-    ...(reconnectToken ? { reconnectToken } : {}),
-  });
+  // Gap 4 (join dedupe, same as joinLiveRoom — keyed on the CODE here,
+  // the room id is unknown until the server resolves it).
+  const name = displayName.trim();
+  const joinKey = getOrCreateJoinKey(code, name);
+  const data = await postJson<JoinRoomResponse & { roomId: string }>(
+    '/v1/rooms/join-by-code',
+    {
+      displayName: name,
+      kind: 'guest',
+      roomCode: code,
+      ...(reconnectToken ? { reconnectToken } : {}),
+    },
+    undefined,
+    { idempotencyKey: joinKey },
+  );
+  clearJoinKey(code, name);
   const session: PakdamSession = {
     mode: 'live',
     roomId: data.roomId,
     playerId: data.player.playerId,
-    displayName: displayName.trim(),
+    displayName: name,
     reconnectToken: data.reconnectToken,
     isHost: data.player.isHost,
     roomCode: code,
   };
   storeLiveSeat(session);
+  mirrorRejoinToken(data.roomId);
   // A2 (same background mint as joinLiveRoom — this is the join path
   // both join pages actually use): a host who joined in a fresh tab
   // mints the host token now, so START is a single POST by the time
@@ -311,14 +374,12 @@ export async function fetchLiveResults(
   playerId: string,
   reconnectToken: string,
 ): Promise<LiveResultsResponse> {
-  const workerUrl = getWorkerUrl();
-  if (!workerUrl) throw new Error('Live transport is not configured.');
-  const response = await fetch(
-    `${workerUrl}/v1/rooms/${roomId}/results?playerId=${encodeURIComponent(playerId)}`,
-    { headers: { Authorization: `Bearer ${reconnectToken}` } },
+  // GET via getJson (Gap 4 retries) — the Bearer token stays in the
+  // header, never in the query string.
+  return getJson<LiveResultsResponse>(
+    `/v1/rooms/${roomId}/results?playerId=${encodeURIComponent(playerId)}`,
+    { Authorization: `Bearer ${reconnectToken}` },
   );
-  if (!response.ok) throw new LiveHttpError(response.status);
-  return (await response.json()) as LiveResultsResponse;
 }
 
 /** Recover the host token when the stored one is missing (join never returns one). */
@@ -347,12 +408,23 @@ export interface ReplayLiveRoomResponse {
  * to the lobby; the caller navigates on the response itself.
  */
 export async function replayLiveRoom(roomId: string): Promise<ReplayLiveRoomResponse> {
+  // Gap 4 (fix round M3): one Idempotency-Key per replay action,
+  // minted here and reused by BOTH sends below — the fetchWithRetry
+  // retries inside `postJson` AND the 403 host-token re-mint retry.
+  // A retried replay after a lost response gets the server's cached
+  // success, not a 409 for a room that already replayed.
+  const idempotencyKey = crypto.randomUUID();
   const send = async (): Promise<ReplayLiveRoomResponse> => {
     const { playerId, hostToken } = await getHostTokenForRoom(roomId);
-    return postJson<ReplayLiveRoomResponse>(`/v1/rooms/${roomId}/replay`, {
-      playerId,
-      hostToken,
-    });
+    return postJson<ReplayLiveRoomResponse>(
+      `/v1/rooms/${roomId}/replay`,
+      {
+        playerId,
+        hostToken,
+      },
+      undefined,
+      { idempotencyKey },
+    );
   };
   try {
     return await send();

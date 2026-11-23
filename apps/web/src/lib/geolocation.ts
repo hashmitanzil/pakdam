@@ -2,15 +2,27 @@
  * Foreground GPS — PROTOCOL-MAP §4.10 (R11).
  *
  * Foreground-only `watchPosition` (enableHighAccuracy, maximumAge 0,
- * timeout 15 s). Transient errors are swallowed; only permission-denied is
- * terminal. Live send rule: only fixes accurate to ±50 m or better are ever
- * sent (`ZONE_AUTO_CENTRE_MAX_ACCURACY_M`); a worse fix is never sent and
- * the UI says so plainly. Poor accuracy is warned, never treated as
- * cheating. Location stops when the tab hides.
+ * timeout 15 s). Transient errors are swallowed; only permission-denied
+ * (and position-unavailable, v28) is terminal. Live send rule (B1,
+ * v18 — liveness decoupled from usability): a fix is SENT whenever it
+ * is within the server validity bound (±1000 m), so a poor-but-present
+ * GPS still stamps `lastFixAt`; only fixes accurate to ±50 m are
+ * USABLE for gameplay, and that gate lives server-side. Poor accuracy
+ * is warned, never treated as cheating.
+ *
+ * v28 (Diya F13): the header used to claim "Location stops when the
+ * tab hides" — `watchLocation` itself never implemented any such
+ * pause, and no caller paused it either, so a phone left on the play
+ * screen kept sending ~1 fix/s all night. The pause lives with the
+ * CALLER now: the play page stops the watcher on terminal phase and
+ * when the tab hides, and restarts it on visible (see play/page.tsx
+ * — `shouldWatchLocation`). This helper stays a plain watch: it
+ * starts, delivers validated fixes, and stops on `stop()`.
  */
 import {
   ZONE_AUTO_CENTRE_MAX_ACCURACY_M,
   canAutoCentreZone,
+  haversineMeters,
   isFixSendable,
   locationFreshnessLabel,
   validateFix,
@@ -57,7 +69,7 @@ function toError(error: GeolocationPositionError): GeolocationError {
     case error.POSITION_UNAVAILABLE:
       return {
         kind: 'position-unavailable',
-        message: 'GPS is too rough here — tap the map to place the zone.',
+        message: 'GPS is unavailable right now — tap the map to place the zone.',
       };
     default:
       return {
@@ -73,10 +85,17 @@ export interface WatchHandle {
 
 /**
  * Foreground-only watch. Calls `onFix` for every fresh fix that passes
- * validation (deduped by timestamp); `onError` only for terminal
- * (permission-denied) errors — transient errors are swallowed silently.
- * The caller decides whether to send the fix (only ≤ ±50 m fixes are ever
- * sent — see `isFixSendable`).
+ * validation (deduped by timestamp); `onError` for terminal errors —
+ * permission-denied (the watch is dead: the OS will not call back
+ * again until permission is re-granted and the watch is recreated)
+ * and position-unavailable (v28, Diya F16: GPS off / unavailable is
+ * a VISIBLE state for the player, not silence — the old code
+ * swallowed it and the dot froze with no explanation). Timeouts stay
+ * swallowed (transient: the play page's 15 s no-fix notice covers a
+ * fix that simply never arrives). The caller decides whether to send
+ * the fix (only ≤ ±1000 m fixes are ever sent — see `isFixSendable`).
+ * The caller ALSO owns pausing: this helper never pauses on hide
+ * itself (v28, Diya F13) — the play page stops/starts the watch.
  */
 export function watchLocation(
   onFix: (fix: LocationFix) => void,
@@ -101,8 +120,13 @@ export function watchLocation(
     },
     (error) => {
       const mapped = toError(error);
-      // Only permission-denied is terminal; the rest are transient.
-      if (mapped.kind === 'permission-denied') onError?.(mapped);
+      // Permission-denied is terminal (the watch is dead); so is a
+      // reported position-unavailable (GPS off / no signal — the
+      // player must see it, not silence). Timeouts are transient and
+      // stay swallowed.
+      if (mapped.kind === 'permission-denied' || mapped.kind === 'position-unavailable') {
+        onError?.(mapped);
+      }
     },
     WATCH_OPTIONS,
   );
@@ -217,6 +241,57 @@ export async function getCurrentFix(): Promise<LocationFix> {
   }
   if (bestHolder.fix !== null) return bestHolder.fix;
   throw new Error('GPS is too rough here — tap the map to place the zone.');
+}
+
+/**
+ * GPS send gate — performance roadmap R7 (P1, client side).
+ *
+ * Send at most 1 fix / 5 s OR on ≥ 10 m movement, whichever first.
+ * The movement leg is LOAD-BEARING (anti-cheat burst evidence): a
+ * 240 m burst triggers an immediate send, preserving the burst the
+ * server's speed/teleport checks need — a pure 5 s time gate would
+ * destroy sub-5 s burst-duration resolution and out-and-back
+ * teleports. Do NOT ship a pure time gate. Stationary players still
+ * send a periodic fix (the 5 s leg) so `lastFixAt` stays fresh and
+ * the no-fix ejection never fires for a player who is simply standing
+ * still. The server 1 s throttle is untouched (Kabir owns it; it
+ * stays) — this gate only cuts what the client sends.
+ *
+ * Meter math (conservative reading — the cap counts ACTUAL WS
+ * messages, ~65,200 requests per 30-player 30-min game): the fix
+ * stream is the biggest leg (~30,000–50,000/game at ~1 fix/s). At the
+ * 5 s ceiling a game sends ≤ 10,800 fixes; moving players send more
+ * (a runner at 3 m/s crosses 10 m every ~3 s), so the real saving is
+ * < 5× — roughly 15,000–25,000 fixes/game. The gate never delays a
+ * fix the display needs: display throttling is separate (play page).
+ */
+export const GPS_SEND_MIN_INTERVAL_MS = 5_000;
+export const GPS_SEND_MIN_MOVEMENT_M = 10;
+
+/** Last fix actually sent, for the gate below. */
+export interface LastSentFix {
+  fix: LocationFix;
+  sentAtMs: number;
+}
+
+/**
+ * May this fix be sent now? First fix always sends; afterwards send
+ * when ≥ 5 s passed since the last sent fix OR the player moved
+ * ≥ 10 m since it — whichever first. Pure function (unit-tested).
+ */
+export function shouldSendFix(
+  fix: LocationFix,
+  lastSent: LastSentFix | null,
+  nowMs: number,
+): boolean {
+  if (lastSent === null) return true;
+  if (nowMs - lastSent.sentAtMs >= GPS_SEND_MIN_INTERVAL_MS) return true;
+  return (
+    haversineMeters(
+      { lat: lastSent.fix.lat, lng: lastSent.fix.lng },
+      { lat: fix.lat, lng: fix.lng },
+    ) >= GPS_SEND_MIN_MOVEMENT_M
+  );
 }
 
 /**

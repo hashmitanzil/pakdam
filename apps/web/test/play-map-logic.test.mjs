@@ -1551,3 +1551,49 @@ test('v27 FIX ROUND (F3): the pill-boundary re-sanitisation does NOT mangle legi
     'Map error — HTTP 401 — tile failed',
   );
 });
+
+test('v29 R17: syncSource skips setData when the serialised payload is unchanged, and writes when it changes', () => {
+  const map = new FakeMapLibreMap();
+  const layers = [{ id: 'pakdam-r17-fill', type: 'fill', source: 'pakdam-r17-test' }];
+  const data = collection([polygonFeature(REAL_BOUNDARY)]);
+  assert.equal(syncSource(map, 'pakdam-r17-test', layers, data), true);
+  assert.equal(map.getSource('pakdam-r17-test').setDataCount, 1);
+  // Identical payload (a fresh object with the same content — the
+  // 5 s clock re-render path): no second GL write.
+  assert.equal(syncSource(map, 'pakdam-r17-test', layers, collection([polygonFeature(REAL_BOUNDARY)])), true);
+  assert.equal(map.getSource('pakdam-r17-test').setDataCount, 1, 'an unchanged payload must not rewrite the source');
+  // A changed payload writes.
+  assert.equal(syncSource(map, 'pakdam-r17-test', layers, collection([])), true);
+  assert.equal(map.getSource('pakdam-r17-test').setDataCount, 2);
+});
+
+test('v29 R17: a freshly created source always writes, even when the payload matches the old map\'s last write', () => {
+  const layers = [{ id: 'pakdam-r17b-fill', type: 'fill', source: 'pakdam-r17b-test' }];
+  const data = collection([polygonFeature(REAL_BOUNDARY)]);
+  const oldMap = new FakeMapLibreMap();
+  assert.equal(syncSource(oldMap, 'pakdam-r17b-test', layers, data), true);
+  oldMap.remove();
+  // A rebuilt map starts empty — skipping here would leave the new
+  // source blank on Retry / remount.
+  const newMap = new FakeMapLibreMap();
+  assert.equal(syncSource(newMap, 'pakdam-r17b-test', layers, collection([polygonFeature(REAL_BOUNDARY)])), true);
+  assert.equal(newMap.getSource('pakdam-r17b-test').setDataCount, 1, 'a fresh source must receive its first write');
+  assert.equal(newMap.getSource('pakdam-r17b-test').data.features.length, 1);
+});
+
+test('v29 E: a lost WebGL context is its own honest pill — never "Map ready"', () => {
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, false, false, null, false, true),
+    'Map graphics lost — try Retry',
+  );
+  // It outranks tile errors too — a frozen canvas is the whole story.
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 2, 'HTTP 500 — tile failed', false, false, null, null, false, false, null, false, true),
+    'Map graphics lost — try Retry',
+  );
+  // And a healthy context still reads ready.
+  assert.equal(
+    pillTextForState('ready', 'ready', false, null, 0, null, false, false, null, null, false, false, null, false, false),
+    'Map ready',
+  );
+});
