@@ -328,6 +328,17 @@ export interface RoomMemory {
    * itself (DO memory, not `storage.put`).
    */
   ticketIssues: Map<string, number[]>;
+  /**
+   * v31 FIX ROUND (Zara (c)) — per-seat WS-ticket REVOKE timestamps:
+   * key `playerId` -> revoke times. Same shape and durability class
+   * as `ticketIssues`: the revoke route's Worker limiter is
+   * per-isolate in-memory, so a valid seat holder spreading revoke
+   * calls across isolates could force more than 10 `save()`s/min
+   * (the class saves unconditionally after a revoke, so each call
+   * is a write). The DO check below is the authoritative window;
+   * a DO wake resets it, exactly as for the issue limit.
+   */
+  ticketRevokes: Map<string, number[]>;
   /** Per-seat WS rate-limit windows: key `${playerId}:${type}` -> timestamps. */
   wsRate: Map<string, number[]>;
   /** (seat, commandId) idempotency records, 10 min TTL. */
@@ -658,6 +669,7 @@ export function emptyMemory(): RoomMemory {
     pendingPings: [],
     tickets: [],
     ticketIssues: new Map(),
+    ticketRevokes: new Map(),
     wsRate: new Map(),
     idempotency: new Map(),
     rawCatchTokens: new Map(),
@@ -1694,7 +1706,30 @@ export class RoomStore {
 
   // -- host token -----------------------------------------------------------
 
-  /** Mint / rotate the host token for the host seat (previous token dies). */
+  /**
+   * Mint / rotate the host token for the host seat (previous token dies).
+   *
+   * v31 FIX ROUND (F6) — investigated, NOT changed. Two tabs restoring
+   * the same host seat ping-pong: host tokens live in sessionStorage
+   * (`pakdam.session.v1`, one copy per tab — see
+   * apps/web/src/lib/session-credentials.ts), so each tab holds its
+   * own cached token and this unconditional overwrite kills the other
+   * tab's token on every mint; `postHost` (live-room-client.ts) then
+   * re-mints once per 403, which kills the first tab's token in turn.
+   * The obvious server fix — "return the existing valid token instead
+   * of minting" — is IMPOSSIBLE here: only the HASH is stored
+   * (`hashHostToken`, below), never the raw token, and the raw value
+   * exists only in the minting tab's sessionStorage. Returning it
+   * would require persisting a raw bearer credential in durable
+   * state. The remaining server-side shape (keep the previous hash
+   * valid as a grace) changes the durable `hostTokens` record, needs
+   * a migration for stored states, and weakens the "previous token
+   * dies" rotation guarantee — not a change to make unilaterally in
+   * this round. The churn is bounded meanwhile by the Worker limiter
+   * (5/min/seat on POST /v1/rooms/:id/host/token) and each tab's
+   * action still succeeds via the one re-mint retry. See the fix-round
+   * report for the candidate design and its pinning test.
+   */
   async issueHostToken(input: {
     playerId: string;
     reconnectTokenHash: string | null;
@@ -1706,6 +1741,18 @@ export class RoomStore {
     }
     if (!seat.isHost) {
       return errResult('Only the host can mint a host token.', 'FORBIDDEN', 403);
+    }
+    // v31 FIX ROUND (F3, hello-path audit) — a seat that left must not
+    // mint. A sole host who leaves with no successor keeps `isHost`
+    // (leaveSeat deletes the token but not the flag), so without this
+    // the check above passes and a fresh token is minted for a left
+    // seat. The token would be dead on arrival (`verifyHost` refuses
+    // `leftAt` seats), so this is hardening, not a live hole — but a
+    // left seat minting fresh credentials is the same resurrection
+    // class F3 closes, and no legitimate flow mints while `leftAt`
+    // is set (a restore clears `leftAt` first, in `addPlayerAsync`).
+    if (seat.leftAt !== null) {
+      return errResult('That seat has left the room.', 'FORBIDDEN', 403);
     }
     const raw = randomHex(16);
     this.state.hostTokens[input.playerId] = await hashHostToken(raw);
@@ -2036,10 +2083,31 @@ export class RoomStore {
   revokeTickets(input: {
     playerId: string;
     reconnectTokenHash: string | null;
+    nowMs?: number;
   }): OpResult<{ revoked: number }> {
     const seat = this.verifyReconnect(input.playerId, input.reconnectTokenHash);
     if (!seat) {
       return errResult('Seat not found or reconnect token does not match.', 'FORBIDDEN', 403);
+    }
+    // v31 FIX ROUND (Zara (c)) — DO-side revoke rate limit. The class
+    // saves unconditionally after a successful revoke, so an unlimited
+    // revoke stream is write amplification (one `save()` per call);
+    // the Worker's HTTP limiter for this route is per-isolate
+    // in-memory and can be spread across isolates. Same table entry
+    // (10/min/seat) and same sliding-window shape as
+    // `checkTicketIssueRateLimit`; a 429 returns BEFORE mutating, so
+    // it also costs no save (the class error path never saves).
+    const nowMs = input.nowMs ?? Date.now();
+    const revokeCheck = this.checkTicketRevokeRateLimit(input.playerId, nowMs);
+    if (!revokeCheck.allowed) {
+      return errResult(
+        'Too many tries — slow down.',
+        'RATE_LIMITED',
+        429,
+        [],
+        [],
+        revokeCheck.retryAfterSeconds,
+      );
     }
     const before = this.mem.tickets.length;
     this.mem.tickets = this.mem.tickets.filter((t) => t.playerId !== input.playerId);
@@ -3037,6 +3105,44 @@ export class RoomStore {
     const seat = this.verifyReconnect(input.playerId, input.reconnectTokenHash);
     if (!seat) {
       return errResult('Seat not found or reconnect token does not match.', 'FORBIDDEN', 403);
+    }
+    // v31 FIX ROUND (F3) — a seat that left the room (host-removed in
+    // the lobby via `removePlayer`, or voluntary `leaveSeat`) must not
+    // read state anymore. Its reconnect token still verifies — by
+    // design, so the seat can be RESTORED by name + token
+    // (`addPlayerAsync` clears `leftAt`) — but a snapshot landing is
+    // what resurrects the seat on the client: the lobby / play first
+    // paint treats any landed snapshot as "I am in". A discarded tab
+    // has no live socket to close with 4403, so this HTTP read was
+    // the only hole left (ticket register / redeem, hello resume and
+    // WS messages already refuse `leftAt` seats — see below).
+    //
+    // Why refuse here instead of carrying `leftAt` in the response
+    // (the other option): the snapshot ALREADY carries it — every
+    // player view spreads the seat's `leftAt` (`playerViewFor` in
+    // @pakdam/engine snapshot.ts, via `RoomStore.snapshotFor`), and
+    // the client already filters on it. The data was never missing;
+    // the server was still SERVING it to a seat that is out. Refusing
+    // is the only half that closes the hole server-side; the client
+    // half (banner + mirror-clear on learning the seat is out) keys
+    // off this refusal.
+    //
+    // Why NOT in `verifyReconnect` (the shared verifier): that would
+    // also close `resultsFor` (a mid-game leaver can still read their
+    // scores — pinned by test) and the `verify-reconnect` probe, and
+    // `addPlayerAsync` restores by comparing the token hash directly.
+    // The refusal belongs on this op only. Callers checked:
+    // `get-state` is first-paint / re-sync for one's OWN seat only
+    // (GET /v1/rooms/:id); results use the separate `get-results` op;
+    // the lobby's socket-close probe only acts on 404, so a 403 here
+    // is ignored there; a deleted room still 404s first (above).
+    // Status 403 (not 409): the sibling read-guard `verifyReconnect`
+    // fails 403, and the WS analog closes a left seat 4403. The
+    // distinct code `SEAT_REMOVED` (passed through by `doError` in
+    // http.ts) is what the client branches on — a bare 403 also
+    // covers a bad token.
+    if (seat.leftAt !== null) {
+      return errResult('That seat has left the room.', 'SEAT_REMOVED', 403);
     }
     return okResult(this.snapshotFor(input.playerId, input.nowMs));
   }
@@ -4610,6 +4716,39 @@ export class RoomStore {
     }
     seen.push(nowMs);
     this.mem.ticketIssues.set(playerId, seen);
+    return { allowed: true, retryAfterSeconds: 0 };
+  }
+
+  /**
+   * v31 FIX ROUND (Zara (c)) — per-seat WS-ticket REVOKE limit,
+   * enforced in the DO. Deliberate mirror of
+   * `checkTicketIssueRateLimit` (same sliding-window shape, own
+   * memory map, own table entry) — the issue path is untouched.
+   * Same table entry as the Worker's HTTP limiter
+   * (`POST /v1/rooms/:id/ws-ticket/revoke`, 10/min/seat): one
+   * source of truth, two enforcement points. Counts CALLS, not
+   * revocations — a revoke of zero tickets still costs the class a
+   * `save()`, so the bucket must count the call.
+   */
+  private checkTicketRevokeRateLimit(
+    playerId: string,
+    nowMs: number,
+  ): { allowed: boolean; retryAfterSeconds: number } {
+    const entry = HTTP_RATE_LIMITS['POST /v1/rooms/:id/ws-ticket/revoke'];
+    const limit = entry?.limit ?? 10;
+    const windowSeconds = entry?.windowSeconds ?? 60;
+    const cutoff = nowMs - windowSeconds * 1000;
+    const seen = (this.mem.ticketRevokes.get(playerId) ?? []).filter((t) => t > cutoff);
+    if (seen.length >= limit) {
+      const oldest = seen[0] ?? nowMs;
+      this.mem.ticketRevokes.set(playerId, seen);
+      return {
+        allowed: false,
+        retryAfterSeconds: Math.max(1, Math.ceil((oldest + windowSeconds * 1000 - nowMs) / 1000)),
+      };
+    }
+    seen.push(nowMs);
+    this.mem.ticketRevokes.set(playerId, seen);
     return { allowed: true, retryAfterSeconds: 0 };
   }
 

@@ -47,9 +47,47 @@ export function liveErrorMessage(status: number): string {
 
 export class LiveHttpError extends Error {
   readonly status: number;
-  constructor(status: number, message?: string) {
+  /**
+   * v31 fix round (F3, Kabir's server half): the DO's machine-readable
+   * error code, passed through by `doError` in workers/src/http.ts
+   * (`{ error, code }`). `undefined` when the body carried none — a
+   * bare 403 (bad token) and a 403 `SEAT_REMOVED` (seat left the room)
+   * share the status but not the code, and only the code tells them
+   * apart. Callers branch on `err.code === 'SEAT_REMOVED'`, never on
+   * the status alone.
+   */
+  readonly code?: string;
+  constructor(status: number, message?: string, code?: string) {
     super(message ?? liveErrorMessage(status));
     this.status = status;
+    this.code = code;
+  }
+}
+
+/**
+ * Read the server's error envelope out of an error response body
+ * (`{ error: '…', code: '…' }`). Returns `{}` when the body is
+ * missing, not JSON, or carries neither — the caller then falls back
+ * to the generic status mapping in `LiveHttpError`. The body is read
+ * ONCE here, so message and code always come from the same envelope
+ * (reading the body twice would throw — a `Response` body is a
+ * single-use stream).
+ */
+export async function readLiveErrorEnvelope(
+  response: Response,
+): Promise<{ message?: string; code?: string }> {
+  try {
+    const data = (await response.json()) as { error?: string; code?: string };
+    return {
+      ...(typeof data.error === 'string' && data.error.length > 0
+        ? { message: data.error }
+        : {}),
+      ...(typeof data.code === 'string' && data.code.length > 0
+        ? { code: data.code }
+        : {}),
+    };
+  } catch {
+    return {};
   }
 }
 
@@ -63,12 +101,7 @@ export class LiveHttpError extends Error {
  * generic "Full, or no longer open." instead.
  */
 export async function readLiveErrorMessage(response: Response): Promise<string | undefined> {
-  try {
-    const data = (await response.json()) as { error?: string };
-    return typeof data.error === 'string' && data.error.length > 0 ? data.error : undefined;
-  } catch {
-    return undefined;
-  }
+  return (await readLiveErrorEnvelope(response)).message;
 }
 
 /**
@@ -98,7 +131,8 @@ async function postJson<T>(
     { idempotencyKey: opts?.idempotencyKey },
   );
   if (!response.ok) {
-    throw new LiveHttpError(response.status, await readLiveErrorMessage(response));
+    const envelope = await readLiveErrorEnvelope(response);
+    throw new LiveHttpError(response.status, envelope.message, envelope.code);
   }
   return (await response.json()) as T;
 }
@@ -109,7 +143,11 @@ async function getJson<T>(path: string, headers?: Record<string, string>): Promi
   if (!workerUrl) throw new Error('Live transport is not configured.');
   const response = await fetchWithRetry(`${workerUrl}${path}`, { headers });
   if (!response.ok) {
-    throw new LiveHttpError(response.status);
+    // v31 fix round (F3): the GET path used to throw the bare status
+    // and discard the envelope — a 403 `SEAT_REMOVED` read exactly
+    // like a 403 bad token. The code is carried now, same as POST.
+    const envelope = await readLiveErrorEnvelope(response);
+    throw new LiveHttpError(response.status, envelope.message, envelope.code);
   }
   return (await response.json()) as T;
 }

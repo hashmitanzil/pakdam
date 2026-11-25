@@ -1094,7 +1094,16 @@ export async function handleWsUpgrade(
     let reason = 'Ticket invalid — fetch a fresh ticket and reconnect once.';
     try {
       const data = (await doRes.json()) as { error?: string; code?: string };
-      if (data.code === 'FORBIDDEN') {
+      if (data.code === 'ROOM_NOT_FOUND') {
+        // v31 (FIX 1) — room truly gone is NOT a ticket problem: a
+        // distinct close code so the client can tell "room gone, go
+        // home" from "ticket invalid, retry once" (4401) and "seat
+        // removed" (4403). The DO answers ROOM_NOT_FOUND both when no
+        // room exists for the id and when the room was host-deleted.
+        // See WS_CLOSE_CODE_ACTION[4404] (do-not-reconnect).
+        code = 4404;
+        reason = 'Room not found — the game has ended.';
+      } else if (data.code === 'FORBIDDEN') {
         code = 4403;
         reason = 'Forbidden — this seat is no longer in the room.';
       } else if (typeof data.error === 'string' && data.error.length > 0) {

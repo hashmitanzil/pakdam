@@ -139,6 +139,8 @@ export type WsCloseAction =
  * Close-code table (frozen contract). 4400: fresh ticket, reconnect once, AND
  * surface the failure — a malformed hello will not be fixed by a fresh ticket.
  * 4401: fresh ticket, reconnect once; a second 4401 → closed.
+ * 4404 (v31 FIX 1): room gone — the room never existed or was host-deleted.
+ * Do not reconnect: a fresh ticket cannot help, the room is gone.
  * 4413: back off, never before the server's `retryAfterSeconds`.
  */
 export const WS_CLOSE_CODE_ACTION: Readonly<Record<number, WsCloseAction>> = {
@@ -149,6 +151,7 @@ export const WS_CLOSE_CODE_ACTION: Readonly<Record<number, WsCloseAction>> = {
   4400: 'fresh-ticket-reconnect-once',
   4401: 'fresh-ticket-reconnect-once',
   4403: 'do-not-reconnect',
+  4404: 'do-not-reconnect',
   4409: 'do-not-reconnect',
   4413: 'backoff-after-retry-after',
 } as const;

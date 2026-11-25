@@ -60,10 +60,10 @@ import {
 } from '../../../lib/demo-store';
 import {
   clearSession,
-  getSessionForRoom,
+  getOrRestoreSessionForRoom,
   type PakdamSession,
 } from '../../../lib/session-credentials';
-import { clearRejoinToken } from '../../../lib/rejoin-token';
+import { clearRejoinToken, refreshRejoinToken } from '../../../lib/rejoin-token';
 import { buildSnapshotKey } from '../../../lib/snapshot-key';
 import { readReconnectEndsAtMs } from '../../../lib/presence';
 import { prefetchMapAssets } from '../../../components/map/maplibre';
@@ -99,6 +99,10 @@ export default function LobbyPage() {
   // — see the effect below.
   const [lobbyNowMs, setLobbyNowMs] = useState(() => Date.now());
   const [loadError, setLoadError] = useState<string | null>(null);
+  // v31 fix round (F3): my seat was removed — the state fetch refused
+  // it with 403 `SEAT_REMOVED`. The mirror dies with the seat and the
+  // removal screen below renders instead of the generic dead-end.
+  const [seatRemoved, setSeatRemoved] = useState(false);
   const [conn, setConn] = useState<string>('connecting');
   const [notice, setNotice] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -220,8 +224,31 @@ export default function LobbyPage() {
     goHomeAfterRoomDeleted(router, roomId);
   }, [roomId, router]);
 
+  // v31 fix round (F3/F4): my own seat's state in any live state
+  // arrival decides the mirror's fate — `leftAt` set = the seat was
+  // removed while this tab was away (discarded / killed), so the
+  // mirror dies at once and "Rejoin your game" is never offered for
+  // a dead seat; a still-live seat's 12 h clock refreshes on the
+  // successful resume instead (the mirror was written only at
+  // create/join). Live only — demo seats have no mirror. Called from
+  // the first-paint fetch and the socket snapshot in the load effect
+  // below. The banner renders from `myLeftAt`.
+  const noteLiveSeatState = useCallback(
+    (players: PlayerView[], playerId: string): void => {
+      const seat = players.find((p) => p.playerId === playerId);
+      if (!seat) return;
+      if (seat.leftAt !== null) clearRejoinToken(roomId);
+      else if (seat.ejectedAt === null) refreshRejoinToken(roomId);
+    },
+    [roomId],
+  );
+
   const isLive = session?.mode === 'live';
   const me = lobby?.players.find((p) => p.playerId === session?.playerId);
+  // v31 fix round (F3): my seat removed while this tab was away —
+  // the banner below renders from this; the mirror dies in
+  // `noteLiveSeatState` on every live state arrival.
+  const myLeftAt = me?.leftAt ?? null;
   const isHost = me?.isHost ?? session?.isHost ?? false;
   const config = lobby?.room.config ?? null;
   const activePlayers = (lobby?.players ?? []).filter(
@@ -265,7 +292,13 @@ export default function LobbyPage() {
 
   // -- Load the seat, then live state / socket or demo polling (F2). ------
   useEffect(() => {
-    const found = getSessionForRoom(roomId);
+    // v31 (Fix 1 — same defect as the play page): a discarded tab
+    // comes back with no sessionStorage, and this effect used to read
+    // sessionStorage only — a live seat with a stored rejoin token
+    // read as "no seat". Restore from the rejoin mirror first, so a
+    // reload after a tab discard resumes the live lobby instead of
+    // the "No live seat" dead-end.
+    const found = getOrRestoreSessionForRoom(roomId);
     setSession(found);
     if (!found) return;
     if (found.mode === 'live') {
@@ -274,6 +307,7 @@ export default function LobbyPage() {
         .then((state) => {
           if (cancelled) return;
           setLobby({ room: state.room, players: state.players, hostGraceEndsAtMs: readHostGraceEndsAtMs(state) });
+          noteLiveSeatState(state.players, found.playerId);
           if (state.room.phase !== 'LOBBY') goPlay();
         })
         .catch((err: unknown) => {
@@ -283,6 +317,19 @@ export default function LobbyPage() {
           // message, not on a stale lobby or an error screen.
           if (err instanceof LiveHttpError && err.status === 404) {
             goHomeDeleted();
+            return;
+          }
+          // v31 fix round (F3): 403 `SEAT_REMOVED` = my seat left the
+          // room — the mirror dies with the seat and the removal screen
+          // renders, never the generic "Game not found or ended.". A
+          // bare 403 (bad token, no code) keeps the old error.
+          if (
+            err instanceof LiveHttpError &&
+            err.status === 403 &&
+            err.code === 'SEAT_REMOVED'
+          ) {
+            clearRejoinToken(roomId);
+            setSeatRemoved(true);
             return;
           }
           setLoadError(err instanceof Error ? err.message : 'Game not found or ended.');
@@ -311,6 +358,7 @@ export default function LobbyPage() {
           // ready flip is answered by it (see pendingReadyRef).
           pendingReadyRef.current = null;
           const state = snapshotToLiveRoomState(snapshot);
+          noteLiveSeatState(state.players, found.playerId);
           // Don't let a stale server echo clobber a config push in flight.
           if (pendingPushRef.current && lobbyRef.current) {
             setLobby({ room: { ...state.room, config: lobbyRef.current.room.config }, players: state.players, hostGraceEndsAtMs: state.hostGraceEndsAtMs });
@@ -364,6 +412,16 @@ export default function LobbyPage() {
               .catch((err: unknown) => {
                 if (cancelled) return;
                 if (err instanceof LiveHttpError && err.status === 404) goHomeDeleted();
+                // v31 fix round (F3): the seat is out — mirror dies,
+                // removal screen (a removed seat never probes again).
+                else if (
+                  err instanceof LiveHttpError &&
+                  err.status === 403 &&
+                  err.code === 'SEAT_REMOVED'
+                ) {
+                  clearRejoinToken(roomId);
+                  setSeatRemoved(true);
+                }
               });
           }
         },
@@ -620,10 +678,20 @@ export default function LobbyPage() {
   const retryConnection = useCallback((): void => {
     if (!session) return;
     if (session.mode === 'live') {
+      // v31 fix round (F5): SERIALISED — the state fetch runs FIRST
+      // and the socket retry only runs after it settles. The old code
+      // fired the fetch and `socket.retry()` concurrently, so `retry()`
+      // reset the deadline / fresh-ticket flag and fetched a new ticket
+      // against a room the in-flight 404 probe was about to declare
+      // deleted. A 404 goes home with no socket retry at all; any other
+      // failure keeps the old recovery (socket retry after the fetch).
+      // The socket's own terminal guard (Zara a) refuses `retry()` after
+      // a 4404/4403 close as the backstop.
       void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken ?? '')
         .then((state) => {
           setLobby({ room: state.room, players: state.players, hostGraceEndsAtMs: readHostGraceEndsAtMs(state) });
           if (state.room.phase !== 'LOBBY') goPlay();
+          void socketRef.current?.retry();
         })
         .catch((err: unknown) => {
           // 404 = the room is gone (host cancelled, server deleted it).
@@ -631,9 +699,21 @@ export default function LobbyPage() {
             goHomeDeleted();
             return;
           }
+          // v31 fix round (F3): the seat is out — mirror dies,
+          // removal screen, and no socket retry (it could only fail
+          // against the same refusal).
+          if (
+            err instanceof LiveHttpError &&
+            err.status === 403 &&
+            err.code === 'SEAT_REMOVED'
+          ) {
+            clearRejoinToken(roomId);
+            setSeatRemoved(true);
+            return;
+          }
           showNotice(err instanceof Error ? err.message : 'Could not reload the lobby — try again.');
+          void socketRef.current?.retry();
         });
-      void socketRef.current?.retry();
     } else {
       const demo = getRoom(roomId);
       if (demo) setLobby({ room: demo.room, players: demo.players, hostGraceEndsAtMs: demo.hostGraceEndsAtMs ?? null });
@@ -927,6 +1007,25 @@ export default function LobbyPage() {
       </main>
     );
   }
+  // v31 fix round (F3): my seat was removed — the state fetch refused
+  // it with 403 `SEAT_REMOVED`. No Retry: a removed seat can never
+  // reload, and the mirror is already dead — home, to join a new game.
+  if (seatRemoved) {
+    return (
+      <main className="mx-auto w-full max-w-[560px] px-4 pb-6 pt-6">
+        <p className="text-[15px] font-semibold text-white">You were removed from the game.</p>
+        <p className="mt-2 text-[14px] text-[#A1A1AA]">
+          The host removed you from this game. The game goes on without you — you can join a new
+          game from home.
+        </p>
+        <div className="mt-4">
+          <Button variant="primary" onClick={() => router.push('/')}>
+            Go home
+          </Button>
+        </div>
+      </main>
+    );
+  }
   if (!lobby || !config) {
     return (
       <main className="mx-auto w-full max-w-[560px] px-4 pb-6 pt-6">
@@ -988,6 +1087,17 @@ export default function LobbyPage() {
         <p className="mt-3 text-[13px] text-[#F59E0B]" role="status">
           {notice}
         </p>
+      ) : null}
+      {/* v31 fix round (F3): removed by the host while this tab was
+          away — the seat is gone, so the game goes on without you. */}
+      {myLeftAt ? (
+        <div className="mt-3 rounded-[16px] border border-[#26262B] bg-[#141416] p-4" role="status">
+          <p className="text-[15px] font-bold text-white">You were removed from the game.</p>
+          <p className="mt-1 text-[13px] text-[#A1A1AA]">
+            The host removed you from this game. The game goes on without you — you can join a
+            new game from home.
+          </p>
+        </div>
       ) : null}
 
       <div className="mt-4 flex flex-col gap-3">

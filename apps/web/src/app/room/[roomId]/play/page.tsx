@@ -161,6 +161,7 @@ export default function PlayPage({
     loading,
     error,
     roomDeleted,
+    seatRemoved,
     retryConnection,
     refreshDemo,
     sendRadio,
@@ -430,6 +431,14 @@ export default function PlayPage({
   useEffect(() => {
     if (ejectedAt) clearRejoinToken(roomId);
   }, [ejectedAt, roomId]);
+
+  // v31 fix round (F3): my seat was REMOVED (host `removePlayer`
+  // sets `leftAt`) while this tab was away — the mirror dies with
+  // the seat via `useRoomState`'s snapshot handling, and this banner
+  // says so in plain words instead of leaving the player on a match
+  // they are no longer in. Distinct from `ejectedAt` above (away too
+  // long / location stopped): a removal is the host's decision.
+  const removedAt = myPlayer?.leftAt ?? null;
 
   // v30 (Zara F2 — BROKEN in v29): an ejected seat kept live team
   // voice for the rest of the match. The ejected banner keeps the
@@ -1394,6 +1403,26 @@ export default function PlayPage({
       </main>
     );
   }
+  // v31 fix round (F3): my seat was removed — the state fetch refused
+  // it with 403 `SEAT_REMOVED` (or a snapshot landed with `leftAt`
+  // set). No Retry: a removed seat can never reload, and the mirror
+  // is already dead — home, to join a new game.
+  if (seatRemoved) {
+    return (
+      <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pt-3">
+        <p className="py-6 text-center text-[15px] font-semibold text-white">
+          You were removed from the game.
+        </p>
+        <p className="text-center text-[14px] text-[#A1A1AA]">
+          The host removed you from this game. The game goes on without you — you can join a
+          new game from home.
+        </p>
+        <Button variant="primary" onClick={() => router.push('/')}>
+          Go home
+        </Button>
+      </main>
+    );
+  }
   if (error || !session || !room) {
     return (
       <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pt-3">
@@ -1476,6 +1505,20 @@ export default function PlayPage({
           <p className="mt-1 text-[13px] text-[#A1A1AA]">
             You were away too long or your location stopped updating. The game goes on without
             you — you can watch the results when the round ends, or join a new game.
+          </p>
+        </div>
+      ) : null}
+
+      {/* v31 fix round (F3): removed by the host while this tab was
+          away — the seat is gone, so the game goes on without you. */}
+      {removedAt ? (
+        <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3" role="status">
+          <p className="text-[14px] font-semibold text-white">
+            You were removed from the game.
+          </p>
+          <p className="mt-1 text-[13px] text-[#A1A1AA]">
+            The host removed you from this game. The game goes on without you — you can watch
+            the results when the round ends, or join a new game.
           </p>
         </div>
       ) : null}

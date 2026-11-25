@@ -16,6 +16,7 @@
  * nothing.
  */
 import { SESSION_STORAGE_KEY, type PakdamSession } from '@pakdam/shared';
+import { getRejoinToken } from './rejoin-token';
 
 export type { PakdamSession };
 
@@ -49,6 +50,58 @@ function writeAll(sessions: PakdamSession[]): void {
 export function getSessionForRoom(roomId: string): PakdamSession | null {
   const found = readAll().find((s) => s.roomId === roomId);
   return found ?? null;
+}
+
+/**
+ * v31 (Fix 1 — rejoin does not survive a dropped tab): the session for
+ * this room, restored from the localStorage rejoin mirror when
+ * sessionStorage has nothing for it.
+ *
+ * ROOT CAUSE (founder-confirmed live, v30): the v29 mirror
+ * (`pakdam.rejoin.v1.<roomId>`, written at join/create by
+ * `mirrorRejoinToken` in live-client.ts) WAS written, but NOTHING on
+ * a room page ever read it back — only the two join pages offered
+ * "Rejoin your game" (`getRejoinTokenForCode`). A discarded tab
+ * (Android, 20 tabs open) comes back with no sessionStorage, so
+ * `useRoomState` read a null session, fell back to `mode: 'demo'`,
+ * polled the demo store, found no demo room, and set the dead-end
+ * error "Game not found on this device." — while a live seat token
+ * sat in localStorage, never tried. Retry in that state just
+ * re-polled the demo store and could never restore the seat.
+ *
+ * This is the read side the v29 design was missing, and it runs
+ * FIRST — synchronously, in the `useState` initializer that decides
+ * the mode, so the demo fallback can never win the race: a stored
+ * rejoin entry becomes a live session in sessionStorage BEFORE any
+ * fetch, socket, or error is decided. "Game not found" now appears
+ * ONLY when there is neither a session nor a restorable entry.
+ *
+ * The restored session carries the seat credential ONLY (the rejoin
+ * entry never holds a host token, by design) — a restored host
+ * lazy-mints its host token via `getHostTokenForRoom`, exactly as a
+ * host joining in a fresh tab already does. An empty token never
+ * restores (a restored seat with an empty token is a dead seat).
+ * A stale entry (older than the 12 h max age) reads as null via
+ * `getRejoinToken` and is deleted there, so it never restores.
+ * A demo session, when one exists, is returned untouched — demo
+ * rooms have no rejoin entry, so this never converts demo to live.
+ */
+export function getOrRestoreSessionForRoom(roomId: string): PakdamSession | null {
+  const existing = getSessionForRoom(roomId);
+  if (existing) return existing;
+  const entry = getRejoinToken(roomId);
+  if (!entry || !entry.reconnectToken) return null;
+  const session: PakdamSession = {
+    mode: 'live',
+    roomId: entry.roomId,
+    playerId: entry.playerId,
+    displayName: entry.displayName,
+    reconnectToken: entry.reconnectToken,
+    isHost: entry.isHost,
+    roomCode: entry.roomCode,
+  };
+  storeLiveSeat(session);
+  return session;
 }
 
 /** The live session for a room code, or null (join-by-code restore lookup, Phase 3 #9). */

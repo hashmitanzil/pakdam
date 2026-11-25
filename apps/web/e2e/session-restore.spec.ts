@@ -99,4 +99,25 @@ test.describe('session restore (live)', () => {
     await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
     await expect(hostPage.locator('section[aria-label="Game code"] .pakdam-code')).toHaveText(code);
   });
+
+  test('v31: a discarded tab restores the live seat from the rejoin mirror (no re-join)', async ({
+    context,
+  }) => {
+    // Founder field report (2026-11-25, live v30): game started →
+    // opened a different app for 2-3 s → switched back → "Game not
+    // found on this device". Android had discarded the tab, so the
+    // return had no sessionStorage — and the play page never tried
+    // the localStorage rejoin mirror. Clearing sessionStorage here
+    // is the discarded-tab stand-in: on reload the seat must come
+    // back from the mirror with role/score intact, never the
+    // "Game not found" dead-end.
+    const hostPage = await context.newPage();
+    const { code } = await createHostRoom(hostPage);
+    await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
+    await hostPage.evaluate((key) => window.sessionStorage.removeItem(key), SESSION_STORAGE_KEY);
+    await hostPage.reload();
+    await expect(hostPage.getByRole('heading', { name: 'Lobby' })).toBeVisible();
+    await expect(hostPage.locator('section[aria-label="Game code"] .pakdam-code')).toHaveText(code);
+    await expect(hostPage.getByText('Game not found')).toBeHidden();
+  });
 });

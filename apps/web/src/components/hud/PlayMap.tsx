@@ -174,6 +174,7 @@ import {
   retryDisabled,
   rippleFrame,
   scheduleFitRetryTimer,
+  shouldOfferMapRetry,
   shrinkFrame,
   syncSource,
   tileLedgerStale,
@@ -654,7 +655,18 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       loadTimer = setTimeout(() => {
       if (!cancelled && !loadedRef.current) setSlowLoad(true);
     }, 12_000);
-    createOlaMap({ container, signal: abort.signal })
+    createOlaMap({
+      container,
+      signal: abort.signal,
+      // v31 (Fix 2): the context-loss listeners attach inside
+      // `createOlaMap`, on the fresh canvas, before this promise
+      // resolves — a loss during construction / style load is caught
+      // instead of missed. No listener attach here any more (one
+      // attach point, earliest); the `setContextLost(false)` below
+      // still clears the previous attempt's pill on a fresh map.
+      onContextLost: () => setContextLost(true),
+      onContextRestored: () => setContextLost(false),
+    })
       .then((map) => {
         if (cancelled) {
           // Belt-and-braces with the abort signal above: a map
@@ -703,25 +715,10 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         mapRef.current = map;
         // v29 (E): a fresh map has a fresh WebGL context — a
         // context-lost pill from the previous attempt must not survive
-        // a Retry into a healthy map.
+        // a Retry into a healthy map. (The listeners themselves now
+        // attach inside `createOlaMap` — see the call above — so a
+        // loss during construction / style load is caught too.)
         setContextLost(false);
-        // v29 (E): WebGL context loss — a lost context leaves the
-        // canvas frozen on its last frame (or blank) while the pill
-        // would otherwise still say "Map ready". Listen on the
-        // canvas: on loss, prevent the default (so the context CAN be
-        // restored) and show the honest pill; on restore, clear it.
-        // No explicit removal: `map.remove()` (the creation effect's
-        // cleanup below) destroys the canvas, and the listeners die
-        // with the detached element — the same lifecycle as the
-        // `map.on` handlers below.
-        const canvas = map.getCanvas();
-        const onContextLost = (event: Event) => {
-          event.preventDefault();
-          setContextLost(true);
-        };
-        const onContextRestored = () => setContextLost(false);
-        canvas.addEventListener('webglcontextlost', onContextLost);
-        canvas.addEventListener('webglcontextrestored', onContextRestored);
         setMapDetail(`style loading… (attempt ${attempt})`);
         // Resize whenever the container gains size — but NEVER at
         // zero size: the tab switch to Radio / More collapses the
@@ -795,6 +792,20 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           // Resize only at a real size: a 'load' landing while the
           // player is on the Radio tab must not resize to 0.
           if (containerHasSize(container)) map.resize();
+          // v31 (Fix 2 — map blank on refresh): force one paint frame
+          // now that the style is loaded. MapLibre renders on demand
+          // and a resize schedules a render, but on a refresh-created
+          // map the first frame can be skipped (stalled render loop)
+          // while the pill already says "ready" — the founder's exact
+          // state: style loaded, nothing painted, no error. An
+          // explicit repaint here makes the refresh path paint like
+          // the first-load path (which gets its repaint from the
+          // role-reveal dismissal). One extra frame on a healthy map.
+          try {
+            map.triggerRepaint();
+          } catch {
+            // Dead map: the verify below still runs.
+          }
           // Diya F3: measure the area at ready — a 0-height container
           // or canvas surfaces in the pill instead of "Map ready".
           checkMapAreaHeight();
@@ -914,6 +925,17 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       meMarkerRef.current = null;
       mapRef.current?.remove();
       mapRef.current = null;
+      // v31 (Fix 2): a removed map must never present as 'ready'.
+      // The old cleanup left `mapReady` / `mapState` / `loadedRef`
+      // untouched, so any effect re-run that did not go through
+      // `retryMap` (which resets them) left the UI believing a live
+      // map existed — ◎ enabled, centreOn guard passing, zone/fit
+      // effects gated on a `mapReady` no map backs — while
+      // `mapRef.current` was null. On unmount these are no-ops; on a
+      // re-run they mark the old map gone before the new attempt.
+      loadedRef.current = false;
+      setMapReady(false);
+      setMapState('loading');
     };
     // Re-created only when the user taps Retry (checkMapAreaHeight,
     // verifyCanvasPainted and measureAreaDiagnosis are stable
@@ -1653,6 +1675,17 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           map.easeTo({ center: [centre.lng, centre.lat], bearing, duration: 300 });
         }
       } catch {
+        // v31 (Fix 2): a failed easeTo on a ready map with a finite
+        // centre means the instance is wedged (stalled render loop
+        // or lost context), not bad input. One best-effort repaint
+        // first — a stalled loop may revive from it; a dead instance
+        // throws again here and is caught by the inner try, so the
+        // failure below is still recorded either way.
+        try {
+          map.triggerRepaint();
+        } catch {
+          // Dead map: the failure below is the honest record.
+        }
         // A tap-handler failure is not a resource failure: record
         // only the allow-listed copy (Zara A1) and nothing else.
         // v28 fix round (Zara V1): stamp it — the decay effect
@@ -1935,6 +1968,25 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     // v29 (E): a lost WebGL context is never "Map ready".
     contextLost,
   );
+  // v31 (Fix 2): the Retry affordance is ONE tested mapping
+  // (`shouldOfferMapRetry`) — a failed ◎ tap on a 'ready' map offers
+  // Retry like every other failure state. The v25 trap was an inline
+  // condition here that did not include `recentreFailed`, so the
+  // founder's blank-but-'ready' map showed no recovery at all.
+  // v31 fix round (Diya, F2): the same trap for a lost GL context —
+  // the pill says "try Retry" but the mapping never saw `contextLost`,
+  // so no button rendered. It is passed here like `recentreFailed`.
+  const offerRetry = shouldOfferMapRetry({
+    mapState,
+    tileErrorCount: tileLedger.count,
+    fitFailed,
+    fitPending,
+    zeroHeight,
+    zeroWidth,
+    hasOtherResource: otherResource !== null,
+    recentreFailed,
+    contextLost,
+  });
   // Zara 4: both Retry buttons stay disabled while a load is in flight
   // and for 2 s after a tap — spamming Retry aborts creation and can
   // 429 the shared Ola key for everyone. v27 fix round (Diya AT RISK
@@ -2072,7 +2124,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           readable. */}
       <div className="absolute bottom-3 left-3 z-10 flex max-w-[calc(100%-6.5rem)] items-center gap-2 rounded-full border border-[#26262B] bg-[#141416]/90 py-1.5 pl-3 pr-1.5">
         <p className="line-clamp-2 min-w-0 break-words text-[12px] font-semibold leading-snug text-white">{pillText}</p>
-        {mapState !== 'ready' || tileLedger.count > 0 || fitFailed || fitPending || zeroHeight || zeroWidth || otherResource !== null ? (
+        {offerRetry ? (
           <button
             type="button"
             onClick={retryMap}

@@ -38,10 +38,11 @@ import type {
 } from '@pakdam/shared';
 import { PakdamSocket } from '@/lib/websocket';
 import { fetchLiveRoomState, LiveHttpError, readHostGraceEndsAtMs } from '@/lib/live-room-client';
+import { clearRejoinToken, refreshRejoinToken } from '@/lib/rejoin-token';
 import { buildSnapshotKey } from '@/lib/snapshot-key';
 import { mergeTeammateFix } from '@/lib/teammate-fix';
 import { readReconnectEndsAtMs } from '@/lib/presence';
-import { getSessionForRoom, type PakdamSession } from '@/lib/session-credentials';
+import { getOrRestoreSessionForRoom, type PakdamSession } from '@/lib/session-credentials';
 import {
   getRoom,
   demoRoomChangeKey,
@@ -125,6 +126,18 @@ export interface RoomStateData {
    * cleared by a later snapshot, because a deleted room never sends one.
    */
   roomDeleted: boolean;
+  /**
+   * v31 fix round (F3, Kabir's server half): MY seat was removed —
+   * `getStateOp` refuses a `leftAt` seat with 403 `SEAT_REMOVED`.
+   * Set from that refusal on the first-paint fetch, the manual Retry,
+   * or the socket-close probe (and from a snapshot that lands with my
+   * own seat's `leftAt` set). The rejoin mirror dies with the seat,
+   * and pages show the plain-words removal notice instead of the
+   * generic error — a bare 403 (bad token) is NOT this: only the
+   * `SEAT_REMOVED` code sets it. It is never cleared by a later
+   * snapshot, because a removed seat never receives one.
+   */
+  seatRemoved: boolean;
   /** Manual retry after `reconnect-failed` (live) or a fresh poll (demo). */
   retryConnection: () => void;
   /** Re-read the demo store immediately (after a demo mutation). */
@@ -221,7 +234,14 @@ function demoSafety(demo: DemoRoom): SafetyState {
 }
 
 export function useRoomState(roomId: string, options?: UseRoomStateOptions): RoomStateData {
-  const [session] = useState<PakdamSession | null>(() => getSessionForRoom(roomId));
+  // v31 (Fix 1): a mount with no sessionStorage (discarded tab, killed
+  // app) restores the live seat from the localStorage rejoin mirror
+  // FIRST, synchronously, before the mode is decided — a restored seat
+  // is a live seat, never the demo fallback. Without this the null
+  // session fell through to demo mode and the demo poll set the
+  // dead-end "Game not found on this device." while a live token sat
+  // in localStorage, never tried.
+  const [session] = useState<PakdamSession | null>(() => getOrRestoreSessionForRoom(roomId));
   const mode: 'live' | 'demo' = session?.mode ?? 'demo';
   const myPlayerId = session?.playerId ?? '';
 
@@ -256,6 +276,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [roomDeleted, setRoomDeleted] = useState(false);
+  const [seatRemoved, setSeatRemoved] = useState(false);
   // A demo room was seen alive at least once — only then does a later
   // null poll mean "deleted" (a first paint with no demo room is just
   // a bad id, and keeps the old "not found" error).
@@ -291,6 +312,35 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     setLastRunnerToken(null);
     setHostGraceEndsAtMs(null);
   }, []);
+
+  /**
+   * v31 fix round (F3, Kabir's server half): MY seat is out — the
+   * state fetch refused it with 403 `SEAT_REMOVED`, or a snapshot
+   * landed with my own seat's `leftAt` set. The mirror dies with the
+   * seat (a discarded tab returning to a removed seat must never be
+   * offered "Rejoin your game" for it), the snapshot-derived state is
+   * cleared like `markDeleted` (a removed seat must not keep rendering
+   * its last roster), and pages show the removal notice instead of the
+   * generic error. A bare 403 never calls this — only the
+   * `SEAT_REMOVED` code does.
+   */
+  const markSeatRemoved = useCallback(() => {
+    clearRejoinToken(roomId);
+    setSeatRemoved(true);
+    setLoading(false);
+    setRoom(null);
+    setPlayers([]);
+    setPhase('LOBBY');
+    setSafetyState(IDLE_SAFETY);
+    setActiveCatches([]);
+    setSessionCatches([]);
+    setLocationStatus({});
+    setTeammateIds([]);
+    setTeammateFixes({});
+    setPings([]);
+    setLastRunnerToken(null);
+    setHostGraceEndsAtMs(null);
+  }, [roomId]);
 
   const [socket, setSocket] = useState<PakdamSocket | null>(null);
   const socketRef = useRef<PakdamSocket | null>(null);
@@ -354,6 +404,17 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     const json = JSON.stringify(snapshot);
     if (json === lastSnapshotJsonRef.current) return;
     lastSnapshotJsonRef.current = json;
+    // v31 fix round (F3, backstop): a snapshot that lands with my own
+    // seat already left must never be applied as "I am in" — the seat
+    // is out. The 403 `SEAT_REMOVED` refusal is the primary signal
+    // (first paint / Retry / probe); this covers a snapshot raced
+    // ahead of the 4403 close. The mirror dies with the seat, same as
+    // `markSeatRemoved`, and nothing below applies.
+    const meLeft = snapshot.players.find((p) => p.playerId === myPlayerIdRef.current);
+    if (meLeft && meLeft.leftAt !== null) {
+      markSeatRemoved();
+      return;
+    }
     setRoom(snapshot.room);
     setPlayers(snapshot.players);
     setPhase(snapshot.phase);
@@ -373,7 +434,18 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     // old "client NEVER computes a deadline" claim was wrong about it.
     // (The host grace above is different: it is never client-computed.)
     const me = snapshot.players.find((p) => p.playerId === myPlayerIdRef.current);
-    if (me) socketRef.current?.setReconnectWindowEndsAtMs(readReconnectEndsAtMs(me));
+    if (me) {
+      socketRef.current?.setReconnectWindowEndsAtMs(readReconnectEndsAtMs(me));
+      // v31 fix round (F3/F4): a `leftAt` seat never reaches here —
+      // the early return above marks it removed first. A still-live
+      // seat's 12 h mirror clock refreshes on this successful resume
+      // instead (the mirror was written only at create/join, so
+      // without this a game running past 12 h from join time would
+      // read as stale mid-match). An ejected seat refreshes nothing
+      // (its mirror is already dead — see the play page's ejected
+      // effect — and must not be revived).
+      if (me.ejectedAt === null) refreshRejoinToken(roomId);
+    }
     // Teammates' live view (teammates only, never an opponent; empty for
     // a caught Runner). `??` tolerates a server that predates these fields.
     // The ref mirrors the list synchronously for the `teammate.fix` gate.
@@ -434,7 +506,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       }
     }
     setLoading(false);
-  }, []);
+  }, [markSeatRemoved, roomId]);
 
   const applyDemo = useCallback((next: DemoRoom | null) => {
     if (!next) {
@@ -557,6 +629,19 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         // Any other failure keeps the old retryable error.
         if (err instanceof LiveHttpError && err.status === 404) {
           markDeleted();
+          return;
+        }
+        // v31 fix round (F3): 403 `SEAT_REMOVED` = my seat left the
+        // room (host-removed, or I left in another tab) — the mirror
+        // dies with the seat and the page shows the removal notice,
+        // never the generic "Could not load the room". A bare 403
+        // (bad token, no code) is NOT this and keeps the old error.
+        if (
+          err instanceof LiveHttpError &&
+          err.status === 403 &&
+          err.code === 'SEAT_REMOVED'
+        ) {
+          markSeatRemoved();
           return;
         }
         setError('Could not load the room — check your connection and try again.');
@@ -794,9 +879,11 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         // room was deleted out from under this client — the socket dies
         // with the room, and no `room.deleted` event may arrive first.
         // Probe the state fetch: 404 = deleted (home with the one
-        // plain message); anything else (403 for a removed seat, a
-        // network failure) is NOT a deletion and re-arms the probe, so
-        // a transient blip never permanently disables the backstop.
+        // plain message); 403 `SEAT_REMOVED` = my seat is out (mirror
+        // dies, removal notice — no re-arm, a removed seat never
+        // probes again); anything else (a network failure) is NOT a
+        // deletion and re-arms the probe, so a transient blip never
+        // permanently disables the backstop.
         if (
           (state === 'closed' || state === 'reconnect-failed') &&
           !deletedProbeRef.current &&
@@ -811,7 +898,13 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
             .catch((err: unknown) => {
               if (cancelled) return;
               if (err instanceof LiveHttpError && err.status === 404) markDeleted();
-              else deletedProbeRef.current = false;
+              else if (
+                err instanceof LiveHttpError &&
+                err.status === 403 &&
+                err.code === 'SEAT_REMOVED'
+              ) {
+                markSeatRemoved();
+              } else deletedProbeRef.current = false;
             });
         }
       },
@@ -892,25 +985,52 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       refreshDemo();
       return;
     }
+    // v31 fix round (Zara a): a deleted room never retries — the
+    // socket refuses `retry()` after a terminal 4404/4403 close, and
+    // this hook refuses while `roomDeleted` is latched, so the
+    // play-page error screen's Retry cannot mint a fresh ticket
+    // against a gone room in the window before home navigation lands.
+    // v31 fix round (F3): a removed seat never retries either — the
+    // state fetch already refused it with 403 `SEAT_REMOVED`, so a
+    // socket retry could only fail again.
+    if (roomDeleted || seatRemoved) return;
     setSocketError(null);
-    // Manual Retry re-fetches state, not just the socket (W1): a room
-    // deleted while the socket was down is discovered here — 404 goes
-    // home with the one plain message, exactly like the lobby's Retry —
-    // and a live snapshot repopulates a stale roster. A non-404 failure
-    // keeps the player on the match with a retryable message.
-    if (session?.reconnectToken) {
-      void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken)
-        .then((state) => applySnapshot(state))
-        .catch((err: unknown) => {
-          if (err instanceof LiveHttpError && err.status === 404) {
-            markDeleted();
-            return;
-          }
-          setSocketError('Could not reload the room — try again.');
-        });
+    if (!session?.reconnectToken) {
+      void socketRef.current?.retry();
+      return;
     }
-    void socketRef.current?.retry();
-  }, [mode, refreshDemo, roomId, session, applySnapshot, markDeleted]);
+    // v31 fix round (F5): SERIALISED — the state fetch runs FIRST and
+    // the socket retry only runs after it settles. The old code fired
+    // the fetch and `socket.retry()` concurrently, so `retry()` reset
+    // the deadline / fresh-ticket flag and fetched a new ticket
+    // against a room the in-flight 404 probe was about to declare
+    // deleted. A 404 goes home with no socket retry at all; any other
+    // failure keeps the old recovery (socket retry after the fetch).
+    void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken)
+      .then((state) => {
+        applySnapshot(state);
+        void socketRef.current?.retry();
+      })
+      .catch((err: unknown) => {
+        if (err instanceof LiveHttpError && err.status === 404) {
+          markDeleted();
+          return;
+        }
+        // v31 fix round (F3): the seat is out — mark it removed
+        // (mirror dies, removal notice) and retry nothing: the socket
+        // retry could only fail against the same refusal.
+        if (
+          err instanceof LiveHttpError &&
+          err.status === 403 &&
+          err.code === 'SEAT_REMOVED'
+        ) {
+          markSeatRemoved();
+          return;
+        }
+        setSocketError('Could not reload the room — try again.');
+        void socketRef.current?.retry();
+      });
+  }, [mode, refreshDemo, roomId, roomDeleted, seatRemoved, session, applySnapshot, markDeleted, markSeatRemoved]);
 
   const sendRadio = useCallback(
     (text: string, kind: 'quick' | 'text' = 'text'): boolean => {
@@ -999,6 +1119,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     loading,
     error,
     roomDeleted,
+    seatRemoved,
     retryConnection,
     refreshDemo,
     sendRadio,

@@ -12,8 +12,11 @@
  * - Close codes follow the CONTRACT (`WS_CLOSE_CODE_ACTION`), not the old
  *   client's 4400 branch: 4400 → fresh ticket, reconnect once, AND surface
  *   the failure; 4401 → fresh ticket, reconnect once, a second 4401 → closed;
- *   1000/4403/4409 never auto-reconnect; 1001/1006/1011/4413 back off
- *   (1 s base, doubling, 30 s ceiling, jitter ×0.5–1.0).
+ *   4404 → room gone, terminal (distinct from 4401: a fresh ticket cannot
+ *   help, the room is gone — the hook's closed-probe turns the 404 into
+ *   the home navigation); 1000/4403/4409 never auto-reconnect;
+ *   1001/1006/1011/4413 back off (1 s base, doubling, 30 s ceiling,
+ *   jitter ×0.5–1.0).
  * - v29 (founder's 30 s rule, 2026-11-22): reconnect keeps trying until
  *   the seat's 30 s return window ends — the old "max 5 attempts, then
  *   'reconnect failed — Retry'" gave up INSIDE the window. The deadline
@@ -22,8 +25,8 @@
  *   has supplied one, the fallback is 30 s from the moment this client
  *   noticed the drop. Past the deadline the socket enters
  *   'reconnect-failed' with manual Retry as before. Terminal close
- *   codes (4403 seat removed, 4409, 1000) still never auto-reconnect,
- *   window or not. A retry reuses the same `commandId` per the rule
+ *   codes (4403 seat removed, 4404 room gone, 4409, 1000) still never
+ *   auto-reconnect, window or not. A retry reuses the same `commandId` per the rule
  *   below — reconnect itself mints nothing (it only fetches a ticket).
  * - Commands sent while disconnected are discarded, never queued (R12).
  * - On tab-hide the client sends best-effort `player.suspended`
@@ -147,6 +150,16 @@ export class PakdamSocket {
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private missedHeartbeats = 0;
   private freshTicketReconnectUsed = false;
+  /**
+   * v31 fix round (Zara a): the last TERMINAL close code (a
+   * `do-not-reconnect` close: 4403 seat removed, 4404 room gone,
+   * 4409, 1000). `retry()` refuses after 4403/4404 — a fresh ticket
+   * cannot revive a removed seat or a deleted room — so the
+   * play-page error screen's Retry cannot mint a ticket against a
+   * gone room in the window before the home navigation lands.
+   * Cleared on `welcome` (a live connection proves the seat is back).
+   */
+  private lastTerminalCloseCode: number | null = null;
   private closedByClient = false;
   private visibilityHandler: (() => void) | null = null;
   /**
@@ -208,6 +221,11 @@ export class PakdamSocket {
     return this.lastSnapshotKey;
   }
 
+  /** The last terminal (`do-not-reconnect`) close code, or null when no terminal close has landed (or a later `welcome` cleared it). */
+  get terminalCloseCode(): number | null {
+    return this.lastTerminalCloseCode;
+  }
+
   /**
    * Record a snapshot the page applied outside the socket (the
    * first-paint GET) as the key `requestSnapshot` / `resync` send.
@@ -235,6 +253,19 @@ export class PakdamSocket {
 
   /** Manual retry after `reconnect-failed`: resets attempts, fetches a fresh ticket. */
   async retry(): Promise<void> {
+    // v31 fix round (Zara a): terminal guard — after a 4404 (room
+    // gone) or 4403 (seat removed) close, no retry can ever succeed:
+    // the room / seat is gone, and a fresh ticket fetch against it
+    // only races the 404 probe that declares it deleted. Refuse
+    // outright (a no-op resolved promise), so the play-page error
+    // screen's Retry in the window before home navigation lands
+    // cannot mint a ticket against a dead room. `retryConnection`
+    // (useRoomState) adds the same refusal while `roomDeleted` is
+    // latched; this is the socket-level backstop for a 4404/4403
+    // that arrived without the latch (probe still in flight).
+    if (this.lastTerminalCloseCode === 4403 || this.lastTerminalCloseCode === 4404) {
+      return;
+    }
     this.reconnectAttempts = 0;
     this.reconnectDeadlineMs = null;
     this.freshTicketReconnectUsed = false;
@@ -574,6 +605,10 @@ export class PakdamSocket {
       this.reconnectAttempts = 0;
       this.reconnectDeadlineMs = null;
       this.freshTicketReconnectUsed = false;
+      // v31 fix round (Zara a): a live connection proves the seat is
+      // back — a terminal close from an earlier incarnation no longer
+      // bars a manual retry.
+      this.lastTerminalCloseCode = null;
       // On a reconnect (or any welcome with a prior seq), re-request the snapshot.
       if (this.lastServerSeq > 0) this.requestSnapshot();
       this.options.onServerMessage?.(envelope);
@@ -687,13 +722,27 @@ export class PakdamSocket {
     const action = WS_CLOSE_CODE_ACTION[event.code];
     switch (action) {
       case 'do-not-reconnect':
+        // v31 fix round (Zara a): record the terminal close — a later
+        // manual `retry()` refuses after 4403/4404 (see `retry()`).
+        this.lastTerminalCloseCode = event.code;
+        // v31 (FIX 1): 4404 is room-gone, terminal — and DISTINCT from
+        // 4401 (retryable ticket). The server's own reason string is
+        // the detail here, so a 4404 close reads "Room not found —
+        // the game has ended." instead of a bare closed socket. The
+        // hook's closed-probe then turns the 404 into the home
+        // navigation; this detail is the visible wording if that
+        // probe ever misses (4401, by contrast, goes through the
+        // fresh-ticket-reconnect-once branch below and stays
+        // retryable, including manual Retry after a second 4401).
         this.setState(
           'closed',
           event.code === 4409
             ? 'Protocol unsupported — upgrade the client.'
             : event.code === 4403
               ? 'Seat removed or revoked.'
-              : undefined,
+              : event.code === 4404
+                ? 'Room not found — the game has ended.'
+                : undefined,
         );
         break;
       case 'fresh-ticket-reconnect-once':

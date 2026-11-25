@@ -1257,12 +1257,33 @@ export class RoomDO implements DurableObject {
             r.status,
           );
         }
+        // v31 (FIX 1) — persist the registry here. Every other mutating
+        // op saves (afterMutation / save), but this case used to return
+        // without one, so the ticket lived only in `mem.tickets` until
+        // the next mutation save. A DO eviction between registration
+        // and the WS upgrade that redeems it then lost the ticket and
+        // the upgrade failed 4401 'Ticket invalid' — and the rejoin
+        // after a dropped tab is exactly register-then-upgrade. The
+        // class header claims the ticket registry survives a wake;
+        // without this save that was false for this window.
+        await this.save();
         return json({ ok: true, ...r.value });
       }
       case 'revoke-tickets': {
         if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
-        const r = store.revokeTickets({ playerId, reconnectTokenHash });
-        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        const r = store.revokeTickets({ playerId, reconnectTokenHash, nowMs });
+        if (!r.ok) {
+          // v31 FIX ROUND (Zara (c)) — carry `retryAfterSeconds`
+          // through so the Worker can set the `Retry-After` header on
+          // a DO-enforced rate limit (same as register-ticket).
+          return json(
+            { ok: false, error: r.error, code: r.code, retryAfterSeconds: r.retryAfterSeconds },
+            r.status,
+          );
+        }
+        // v31 (FIX 1) — same as register-ticket: a revoked ticket must
+        // stay revoked across a wake, or it resurrects from storage.
+        await this.save();
         return json({ ok: true, ...r.value });
       }
       default:
@@ -1315,6 +1336,13 @@ export class RoomDO implements DurableObject {
       return json({ ok: false, error: redeemed.error, code: redeemed.code, status }, 401);
     }
     const { playerId, ticketId, expiresAtMs } = redeemed.value;
+    // v31 (FIX 1) — persist the redeem before the socket opens. Without
+    // this the spent flag lived only in `mem.tickets`, so a DO eviction
+    // before the next save resurrected the ticket as unredeemed and it
+    // could be redeemed a second time inside its 60 s TTL (single-use
+    // bypass). The hello-resume save below used to be the only thing
+    // that could persist it, and only when the seat was suspended.
+    await this.save();
     const pair = new WebSocketPair();
     const [client, server] = [pair[0] as WebSocket, pair[1] as WebSocket];
     // P1-4: each socket gets its own tab session — the tag carries the

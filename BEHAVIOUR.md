@@ -143,6 +143,7 @@ WS **4401** close frame, not an HTTP 401.
 | 4400 | Bad request | Fresh ticket, reconnect once; surface the failure |
 | 4401 | Ticket invalid / reused / expired | Fresh ticket, reconnect **once**; a second 4401 → closed |
 | 4403 | Forbidden (seat removed / revoked) | Do not reconnect |
+| 4404 | Room gone (never existed / host-deleted) | Do not reconnect — the game has ended, go home |
 | 4409 | Protocol unsupported | Do not reconnect — upgrade the client |
 | 4413 | Rate-limited | Backoff, never before the server's `retryAfterSeconds` |
 

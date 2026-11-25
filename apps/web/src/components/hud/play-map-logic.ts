@@ -1643,6 +1643,61 @@ export function retryDisabled(
   return retryCooldownActive(nowMs, lastRetryAtMs);
 }
 
+/**
+ * v31 (Fix 2 — map blank on refresh): whether the pill Retry button
+ * is offered. This is the ONE mapping between map state and the
+ * Retry affordance — the component renders the button from this,
+ * never from an inline condition, so the two can never drift apart
+ * again (the v25 trap was exactly that drift: the pill said "Map
+ * ready" on a blank canvas with no Retry anywhere).
+ *
+ * The founder's v30 refresh state was `ready` + a failed ◎ tap
+ * (`recentreFailed`) + a blank canvas — and the old inline condition
+ * (`mapState !== 'ready' || tile errors || fit || zero-size ||
+ * otherResource`) did NOT include `recentreFailed`, so a 'ready' map
+ * whose camera operation just threw offered NO recovery except
+ * reopening the PWA. A failed `easeTo` on a ready map with a finite
+ * centre (the resolver guarantees one) means the map instance itself
+ * is wedged — a stalled render loop or a lost GL context — and the
+ * only in-app escape is a rebuild (fresh style fetch, fresh GL
+ * context), which is what Retry does. So a failed ◎ tap offers Retry
+ * like every other failure state; a clean 'ready' map still offers
+ * none. `retryDisabled` above still governs whether the button is
+ * tappable (cooldown only, in the ready state).
+ *
+ * v31 fix round (Diya, F2 BROKEN): the pill promised the same Retry
+ * for a lost GL context (`pillTextForStateRaw`: ready + `contextLost`
+ * → "Map graphics lost — try Retry") but this mapping never saw
+ * `contextLost` — the input had no such field and the call site
+ * passed none — so the button never rendered and the promise was a
+ * dead end. `contextLost` is a Retry trigger like `recentreFailed`:
+ * the canvas is frozen on its last frame and only a rebuild (fresh
+ * GL context) can recover it.
+ */
+export function shouldOfferMapRetry(input: {
+  mapState: MapState;
+  tileErrorCount: number;
+  fitFailed: boolean;
+  fitPending: boolean;
+  zeroHeight: boolean;
+  zeroWidth: boolean;
+  hasOtherResource: boolean;
+  recentreFailed: boolean;
+  contextLost: boolean;
+}): boolean {
+  if (input.mapState !== 'ready') return true;
+  return (
+    input.tileErrorCount > 0 ||
+    input.fitFailed ||
+    input.fitPending ||
+    input.zeroHeight ||
+    input.zeroWidth ||
+    input.hasOtherResource ||
+    input.recentreFailed ||
+    input.contextLost
+  );
+}
+
 // ---------------------------------------------------------------------------
 // v28 — ◎ re-centre, GPS-dot staleness + accuracy, client fix-stop.
 // ---------------------------------------------------------------------------

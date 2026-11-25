@@ -281,6 +281,22 @@ export interface CreateOlaMapOptions {
    * detached container.
    */
   signal?: AbortSignal;
+  /**
+   * v31 (Fix 2 — map blank on refresh): WebGL context-loss hooks,
+   * attached to the canvas IMMEDIATELY after `new Map` — inside this
+   * function, not by the caller after the promise resolves. A context
+   * lost during construction / style load (e.g. a refresh with the
+   * old page's context not yet collected and 20 tabs open) used to
+   * fire with NO listener attached — the caller's listeners only
+   * attach after `createOlaMap` resolves — so the map sat 'ready'
+   * and black with no honest pill and no recovery. These callbacks
+   * are optional; callers that pass none get today's behaviour.
+   * The listeners die with the canvas on `map.remove()`, the same
+   * lifecycle as a caller-attached pair. `preventDefault()` on the
+   * loss event is what lets the context be restored at all.
+   */
+  onContextLost?: () => void;
+  onContextRestored?: () => void;
 }
 
 /**
@@ -349,6 +365,25 @@ export async function createOlaMap(
       dragRotate: false,
       touchPitch: false,
     }) as unknown as MapLibreMapLike;
+    // v31 (Fix 2): attach the context-loss listeners HERE, on the
+    // fresh canvas, before the promise resolves — a loss during
+    // construction / style load must be reported, not missed because
+    // the caller had not attached yet. No explicit removal: the
+    // listeners die with the canvas on `map.remove()`.
+    if (options.onContextLost || options.onContextRestored) {
+      const canvas = map.getCanvas();
+      if (options.onContextLost) {
+        canvas.addEventListener('webglcontextlost', (event: Event) => {
+          event.preventDefault();
+          options.onContextLost?.();
+        });
+      }
+      if (options.onContextRestored) {
+        canvas.addEventListener('webglcontextrestored', () => {
+          options.onContextRestored?.();
+        });
+      }
+    }
     return map;
   } finally {
     importGuard.cancel();

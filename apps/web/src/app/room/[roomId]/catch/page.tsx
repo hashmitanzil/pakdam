@@ -49,6 +49,7 @@ import { Button } from '@/components/ui/Button';
 import { Sheet } from '@/components/ui/Sheet';
 import { fetchLiveCatchToken } from '@/lib/live-client';
 import { resolveLiveCatch } from '@/lib/live-room-client';
+import { clearRejoinToken } from '@/lib/rejoin-token';
 import { getSessionForRoom } from '@/lib/session-credentials';
 import { goHomeAfterRoomDeleted } from '@/lib/room-deleted';
 import { formatClock } from '@/lib/utils';
@@ -99,6 +100,7 @@ export default function CatchPage({
     loading,
     error,
     roomDeleted,
+    seatRemoved,
     retryConnection,
     refreshDemo,
   } = useRoomState(roomId);
@@ -187,6 +189,18 @@ export default function CatchPage({
     if (!roomDeleted) return;
     goHomeAfterRoomDeleted(router, roomId);
   }, [roomDeleted, roomId, router]);
+
+  // v31 fix round (F3): this page had NO self-ejected/removed
+  // handling at all — an ejected or host-removed seat kept the catch
+  // screen with no explanation. The mirror dies with the seat (the
+  // hook's snapshot handling clears it too; this is the page-level
+  // backstop, mirroring the play page's ejected effect), and the
+  // banner below says so in plain words.
+  const ejectedAt = myPlayer?.ejectedAt ?? null;
+  const removedAt = myPlayer?.leftAt ?? null;
+  useEffect(() => {
+    if (ejectedAt || removedAt) clearRejoinToken(roomId);
+  }, [ejectedAt, removedAt, roomId]);
 
   // A9 (v18 fix round): replay-reset — when the room returns to LOBBY
   // (after a replay), go back to the lobby, like the results and play
@@ -767,6 +781,26 @@ export default function CatchPage({
       </main>
     );
   }
+  // v31 fix round (F3): my seat was removed — the state fetch refused
+  // it with 403 `SEAT_REMOVED` (or a snapshot landed with `leftAt`
+  // set). No Retry: a removed seat can never reload, and the mirror
+  // is already dead — home, to join a new game.
+  if (seatRemoved) {
+    return (
+      <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pt-3">
+        <p className="py-6 text-center text-[15px] font-semibold text-white">
+          You were removed from the game.
+        </p>
+        <p className="text-center text-[14px] text-[#A1A1AA]">
+          The host removed you from this game. The game goes on without you — you can join a
+          new game from home.
+        </p>
+        <Button variant="primary" onClick={() => router.push('/')}>
+          Go home
+        </Button>
+      </main>
+    );
+  }
   if (error || !room) {
     return (
       <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pt-3">
@@ -823,6 +857,27 @@ export default function CatchPage({
         <p className="rounded-2xl border border-[#26262B] bg-[#141416] p-3 text-[14px] text-[#EF4444]">
           {notice}
         </p>
+      ) : null}
+
+      {/* v31 fix round (F3): ejected or host-removed while this tab
+          was away — the seat is gone; the game goes on without you. */}
+      {ejectedAt ? (
+        <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3" role="status">
+          <p className="text-[14px] font-semibold text-white">You were removed from the game.</p>
+          <p className="mt-1 text-[13px] text-[#A1A1AA]">
+            You were away too long or your location stopped updating. The game goes on without
+            you — you can watch the results when the round ends, or join a new game.
+          </p>
+        </div>
+      ) : null}
+      {removedAt ? (
+        <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3" role="status">
+          <p className="text-[14px] font-semibold text-white">You were removed from the game.</p>
+          <p className="mt-1 text-[13px] text-[#A1A1AA]">
+            The host removed you from this game. The game goes on without you — you can watch
+            the results when the round ends, or join a new game.
+          </p>
+        </div>
       ) : null}
 
       {phase === 'COMPLETED' || phase === 'CANCELLED' || phase === 'ABANDONED' || phase === 'EXPIRED' ? (

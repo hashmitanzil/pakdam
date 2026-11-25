@@ -111,4 +111,36 @@ test.describe('play map blank — v25 regression', () => {
     expect(pillText).not.toBeNull();
     expect(pillText).not.toMatch(/tile error/i);
   });
+
+  test('v31: a plain refresh in play repaints the map (ready, non-zero canvas, no error overlay)', async ({
+    context,
+  }) => {
+    // Founder field report (2026-11-25, live v30): the map painted at
+    // game start and went blank after a plain refresh in the same tab
+    // — black area, no tiles, no zone polygon, no dot, pill
+    // "Re-centre failed — try again". The refresh path never got the
+    // repaint the first-load path gets from the role-reveal dismissal
+    // (no reveal on refresh — sessionStorage already holds it), so the
+    // load handler now forces one paint frame, and a failed ◎ tap
+    // offers Retry instead of dead-ending. DOM-level pin only: a
+    // pixel-level tile assertion still needs the founder's phone
+    // against the real Ola tiles.
+    const { hostPage } = await startDemoMatch(context);
+    await expect(hostPage.getByText('Map ready', { exact: true })).toBeVisible({
+      timeout: 30000,
+    });
+    await hostPage.reload();
+    await expect(hostPage.getByText('Time left')).toBeVisible();
+    await expect(hostPage.getByText('Map ready', { exact: true })).toBeVisible({
+      timeout: 30000,
+    });
+    const box = await hostPage
+      .locator('[aria-label="Play map"] canvas')
+      .boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.width).toBeGreaterThan(0);
+    expect(box!.height).toBeGreaterThan(0);
+    await expect(hostPage.getByText('Map load failed')).toBeHidden();
+    await expect(hostPage.getByText('Map unavailable')).toBeHidden();
+  });
 });

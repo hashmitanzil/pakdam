@@ -21,7 +21,7 @@ import {
 } from '@pakdam/shared';
 import { getWorkerUrl } from './websocket';
 import { clearHostToken, getSessionForRoom, storeLiveSeat } from './session-credentials';
-import { fetchHostToken, LiveHttpError, liveErrorMessage, readLiveErrorMessage } from './live-client';
+import { fetchHostToken, LiveHttpError, liveErrorMessage, readLiveErrorEnvelope } from './live-client';
 import { fetchWithRetry } from './api-client';
 import type { PakdamSocket } from './websocket';
 
@@ -80,7 +80,16 @@ export async function fetchLiveRoomState(
     `${workerUrl}/v1/rooms/${roomId}?playerId=${encodeURIComponent(playerId)}`,
     { headers: { Authorization: `Bearer ${reconnectToken}` } },
   );
-  if (!response.ok) throw new LiveHttpError(response.status);
+  if (!response.ok) {
+    // v31 fix round (F3, Kabir's server half): the GET path used to
+    // throw the bare status and discard the envelope, so the
+    // `SEAT_REMOVED` code (403, "That seat has left the room.") was
+    // lost and the client could not tell a removed seat from any
+    // other 403. The envelope is read here — message + code — so
+    // callers can branch on `err.code === 'SEAT_REMOVED'`.
+    const envelope = await readLiveErrorEnvelope(response);
+    throw new LiveHttpError(response.status, envelope.message, envelope.code);
+  }
   return (await response.json()) as WsSnapshotPayload;
 }
 
@@ -108,7 +117,8 @@ async function postHost<T>(
       { idempotencyKey: opts?.idempotencyKey },
     );
     if (!response.ok) {
-      throw new LiveHttpError(response.status, await readLiveErrorMessage(response));
+      const envelope = await readLiveErrorEnvelope(response);
+      throw new LiveHttpError(response.status, envelope.message, envelope.code);
     }
     return (await response.json()) as T;
   };

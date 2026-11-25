@@ -105,6 +105,12 @@ function readRejoinToken(roomId: string): RejoinEntry | null {
     ) {
       return null;
     }
+    // v31 fix round (Zara b): the entry's own `roomId` must match the
+    // key it was read under — a hand-crafted entry under key `room-1`
+    // stamped `room-2` must never restore a session stamped `room-2`.
+    // (Entries this store writes always match; only a foreign or
+    // hand-edited value can disagree, and it reads as absent.)
+    if ((parsed as RejoinEntry).roomId !== roomId) return null;
     return parsed as RejoinEntry;
   } catch {
     return null;
@@ -152,6 +158,36 @@ export function getRejoinToken(roomId: string): RejoinEntry | null {
     return null;
   }
   return entry;
+}
+
+/**
+ * v31 fix round (F4): refresh a stored entry's 12 h clock after a
+ * successful resume — re-stamp `storedAtMs` to now, keeping the seat
+ * itself untouched. The mirror is written only at create/join, so
+ * without this a seat that stays live past 12 h from join time reads
+ * as stale (`getRejoinToken` deletes it) even though the game is
+ * still running. A missing entry stays missing (nothing to refresh);
+ * a stale entry is deleted, never revived — a dead seat's clock is
+ * not restarted. Returns true only when an entry was actually
+ * re-stamped.
+ */
+export function refreshRejoinToken(roomId: string): boolean {
+  const entry = readRejoinToken(roomId);
+  if (!entry) return false;
+  if (isRejoinTokenStale(entry)) {
+    clearRejoinTokenOnly(roomId);
+    return false;
+  }
+  if (!isBrowser()) return false;
+  try {
+    window.localStorage.setItem(
+      keyFor(roomId),
+      JSON.stringify({ ...entry, storedAtMs: Date.now() } satisfies RejoinEntry),
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** The stored rejoin entry for a room code, or null (join-screen lookup). */
