@@ -14,7 +14,9 @@
  *   the failure; 4401 → fresh ticket, reconnect once, a second 4401 → closed;
  *   4404 → room gone, terminal (distinct from 4401: a fresh ticket cannot
  *   help, the room is gone — the hook's closed-probe turns the 404 into
- *   the home navigation); 1000/4403/4409 never auto-reconnect;
+ *   the home navigation); 4405 → ejected, terminal, with the ejected
+ *   copy (distinct from 4403: never the removed copy, never a retry);
+ *   1000/4403/4409 never auto-reconnect;
  *   1001/1006/1011/4413 back off (1 s base, doubling, 30 s ceiling,
  *   jitter ×0.5–1.0).
  * - v29 (founder's 30 s rule, 2026-11-22): reconnect keeps trying until
@@ -28,11 +30,17 @@
  *   codes (4403 seat removed, 4404 room gone, 4409, 1000) still never
  *   auto-reconnect, window or not. A retry reuses the same `commandId` per the rule
  *   below — reconnect itself mints nothing (it only fetches a ticket).
- * - Commands sent while disconnected are discarded, never queued (R12).
+ * - Commands sent while disconnected are discarded, never queued (R12)
+ *   — with ONE exception: `player.suspended` is queued (one slot,
+ *   latest reason wins) and flushed on `welcome`, because a lost
+ *   suspension ejects the seat under the 30 s rule (v33 FIX 1).
  * - On tab-hide the client sends best-effort `player.suspended`
  *   ('tab-hidden'); on visible it re-requests a snapshot.
  * - The DO resumes a suspended player on hello/reconnect (P0-1) — the
- *   client only has to reconnect and re-request the snapshot.
+ *   client only has to reconnect and re-request the snapshot. The
+ *   play page re-asserts the suspension on (re)connect while the GPS
+ *   watch is dead/denied (v33 FIX 1): the hello-resume would
+ *   otherwise silently un-suspend a seat that still has no GPS.
  */
 import {
   CLIENT_VERSION,
@@ -153,13 +161,30 @@ export class PakdamSocket {
   /**
    * v31 fix round (Zara a): the last TERMINAL close code (a
    * `do-not-reconnect` close: 4403 seat removed, 4404 room gone,
-   * 4409, 1000). `retry()` refuses after 4403/4404 — a fresh ticket
-   * cannot revive a removed seat or a deleted room — so the
-   * play-page error screen's Retry cannot mint a ticket against a
-   * gone room in the window before the home navigation lands.
-   * Cleared on `welcome` (a live connection proves the seat is back).
+   * 4405 ejected, 4409, 1000). `retry()` refuses after 4403/4404/4405
+   * — a fresh ticket cannot revive a removed/ejected seat or a
+   * deleted room — so the play-page error screen's Retry cannot mint
+   * a ticket against a gone room in the window before the home
+   * navigation lands. Cleared on `welcome` (a live connection proves
+   * the seat is back).
    */
   private lastTerminalCloseCode: number | null = null;
+  /**
+   * v33 FIX 1 (suspend delivery): the ONE queued suspension — the
+   * latest `player.suspended` reason reported while the socket was
+   * down. `sendCommand` still discards every other command while
+   * disconnected (R12), but a suspension lost that way ejects the
+   * seat under the 30 s rule, so this one is held and flushed on
+   * `welcome` (see `reportSuspended` / `flushPendingSuspend`). A
+   * single slot, latest reason wins: 'tab-hidden' / 'screen-locked' /
+   * 'unknown' are all non-actually-gone reasons (no grace, no host
+   * succession), and a re-suspend of an already-suspended seat is a
+   * server no-op (`suspendSeat`, room-do.ts) — so a duplicate flush
+   * can never double-apply. Cleared when flushed, on a terminal
+   * close (the seat is gone; nothing will ever reconnect), and on a
+   * client close.
+   */
+  private pendingSuspendReason: SuspensionReason | null = null;
   private closedByClient = false;
   private visibilityHandler: (() => void) | null = null;
   /**
@@ -263,7 +288,14 @@ export class PakdamSocket {
     // (useRoomState) adds the same refusal while `roomDeleted` is
     // latched; this is the socket-level backstop for a 4404/4403
     // that arrived without the latch (probe still in flight).
-    if (this.lastTerminalCloseCode === 4403 || this.lastTerminalCloseCode === 4404) {
+    // v33 (F2b): 4405 (ejected) joins the guard — an ejected seat
+    // has no live-socket business, and a fresh ticket fetch against
+    // it only races the probe.
+    if (
+      this.lastTerminalCloseCode === 4403 ||
+      this.lastTerminalCloseCode === 4404 ||
+      this.lastTerminalCloseCode === 4405
+    ) {
       return;
     }
     this.reconnectAttempts = 0;
@@ -308,6 +340,9 @@ export class PakdamSocket {
     void reason;
     this.closedByClient = true;
     this.reconnectDeadlineMs = null;
+    // v33 FIX 1: a client close ends this socket for good — a queued
+    // suspension will never flush, so drop it with the socket.
+    this.pendingSuspendReason = null;
     this.clearTimers();
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.close(1000, 'client closed');
@@ -510,7 +545,31 @@ export class PakdamSocket {
 
   /** Best-effort suspension notice (exempt from WS rate limits). */
   reportSuspended(reason: SuspensionReason): boolean {
-    return this.sendCommand('player.suspended', { reason });
+    if (this.sendCommand('player.suspended', { reason })) return true;
+    // v33 FIX 1: the socket is down — QUEUE it instead of dropping
+    // it (R12's discard would let the 30 s rule eject a seat whose
+    // phone location was on). One slot, latest reason wins; flushed
+    // once on `welcome` (after the DO's hello-resume, so the
+    // suspension sticks). Still returns false (not yet sent). Never
+    // queued after a terminal close — that seat is gone and nothing
+    // will reconnect to flush it.
+    if (this.lastTerminalCloseCode !== null) return false;
+    this.pendingSuspendReason = reason;
+    return false;
+  }
+
+  /**
+   * v33 FIX 1: flush the queued suspension (if any) on `welcome` —
+   * the hello already resumed the seat server-side, so the suspend
+   * must land after it. Drains the slot first, so a later reconnect
+   * without a new report sends nothing again. Called from the
+   * `welcome` handler only.
+   */
+  private flushPendingSuspend(): void {
+    const reason = this.pendingSuspendReason;
+    if (reason === null) return;
+    this.pendingSuspendReason = null;
+    this.sendCommand('player.suspended', { reason });
   }
 
   // -- Connection machinery -------------------------------------------------
@@ -609,6 +668,10 @@ export class PakdamSocket {
       // back — a terminal close from an earlier incarnation no longer
       // bars a manual retry.
       this.lastTerminalCloseCode = null;
+      // v33 FIX 1: flush a suspension queued while the socket was
+      // down — the hello already resumed the seat server-side, so
+      // the suspend lands after the resume and sticks.
+      this.flushPendingSuspend();
       // On a reconnect (or any welcome with a prior seq), re-request the snapshot.
       if (this.lastServerSeq > 0) this.requestSnapshot();
       this.options.onServerMessage?.(envelope);
@@ -723,8 +786,12 @@ export class PakdamSocket {
     switch (action) {
       case 'do-not-reconnect':
         // v31 fix round (Zara a): record the terminal close — a later
-        // manual `retry()` refuses after 4403/4404 (see `retry()`).
+        // manual `retry()` refuses after 4403/4404/4405 (see `retry()`).
         this.lastTerminalCloseCode = event.code;
+        // v33 FIX 1: a terminal close strands nothing — a suspension
+        // queued while down will never flush (nothing reconnects), so
+        // drop it instead of letting it sit for a socket that is gone.
+        this.pendingSuspendReason = null;
         // v31 (FIX 1): 4404 is room-gone, terminal — and DISTINCT from
         // 4401 (retryable ticket). The server's own reason string is
         // the detail here, so a 4404 close reads "Room not found —
@@ -734,6 +801,11 @@ export class PakdamSocket {
         // probe ever misses (4401, by contrast, goes through the
         // fresh-ticket-reconnect-once branch below and stays
         // retryable, including manual Retry after a second 4401).
+        // v33 (F2b): 4405 is ejected — DISTINCT from 4403 (removed
+        // by the host). The detail is the ejected copy (the server's
+        // reason: 'You were ejected from the game.'), never the
+        // 4403 "Seat removed or revoked." copy — the pages branch on
+        // this wording and on the code.
         this.setState(
           'closed',
           event.code === 4409
@@ -742,7 +814,9 @@ export class PakdamSocket {
               ? 'Seat removed or revoked.'
               : event.code === 4404
                 ? 'Room not found — the game has ended.'
-                : undefined,
+                : event.code === 4405
+                  ? 'You were ejected from the game.'
+                  : undefined,
         );
         break;
       case 'fresh-ticket-reconnect-once':

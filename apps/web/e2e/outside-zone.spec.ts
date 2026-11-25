@@ -122,17 +122,54 @@ test.describe('outside zone (demo)', () => {
 
   test('no fix for 30 s ejects the player (v18 missing-fix rule)', async ({ browser }) => {
     test.setTimeout(120000);
-    // No geolocation at all: no fix is ever reported for any seat.
-    // v18 item 4(a): the match STARTS anyway — there is no GPS-freshness
-    // refusal at the gate. v18 item 4(b): 30 s with no fix at all ejects,
-    // following the out-of-zone rule. A poor-but-present fix still freezes
-    // the countdown instead (see 'poor GPS freezes the countdown at 0:30').
+    // v32 (Arjun-vs-Diya adjudication — Diya right that bringToFront
+    // ALONE does not fix this; Arjun right that it is half the fix).
+    // No geolocation at all is NOT a fix-less seat: without a grant
+    // the watch errors permission-denied at start and the v28 F16
+    // rule suspends the seat instead of letting the 30 s ejection
+    // take it — and shouldEjectForMissingFix never ejects a suspended
+    // seat (play-map-logic.ts), so ejectedAt could never fire. Worse,
+    // bringToFront alone cannot hold the seat connected: the play
+    // page mounts hidden, so no watch exists yet, and the return
+    // creates a FRESH watch that errors denied again and re-suspends
+    // within a second — long before the 30 s (4a) clock runs out.
+    // The rule under test governs a seat whose watch is ALIVE but
+    // silent, so grant the permission with NO position: the watch
+    // starts, the provider fails (position-unavailable / timeout),
+    // neither of which suspends (play/page.tsx onError — only
+    // permission-denied suspends), no fix ever arrives, and the
+    // (4a) clock runs. bringToFront (below) is the other half: it
+    // resumes the tab-hidden suspension from setup, so the seat is
+    // connected while the clock runs. Assertion unchanged.
+    //
+    // v32 fix round (Diya A7 — ASSUMPTION, stated explicitly): this
+    // test's grant sufficiency rests on unpinned provider behaviour —
+    // the headless geolocation provider must NEVER deliver a fix when
+    // no position is emulated. If it ever delivered one unprompted,
+    // `lastFixAt` would be stamped, the (4a) clock would never run,
+    // and this test would time out on the ejectedAt poll instead of
+    // passing. No code can pin that; if this test ever flakes that
+    // way, the provider assumption is the first suspect.
     const context = await browser.newContext();
+    await context.grantPermissions(['geolocation']);
     const { hostPage, guestPages, roomId } = await setupThreePlayerLobby(context);
     await readyAll([hostPage, ...guestPages]);
     await startMatchAsHost(hostPage);
     await waitForPlay(hostPage);
     await dismissRoleReveal(hostPage);
+    // v32: front the host so the tab-hidden suspension from setup
+    // resumes — a suspended seat never ejects (see above) — and the
+    // poll below proves the seat is connected before the clock runs.
+    await hostPage.bringToFront();
+    await expect
+      .poll(
+        async () => {
+          const room = await getDemoRoom(hostPage, roomId);
+          return room?.players.find((p) => p.displayName === HOST_NAME)?.connectionState ?? null;
+        },
+        { timeout: 10000 },
+      )
+      .toBe('connected');
     // The ejection is asserted as a store fact (ejectedAt), not copy: the
     // notice wording for a missing-fix ejection is the app's choice, so
     // this test does not assert on it.

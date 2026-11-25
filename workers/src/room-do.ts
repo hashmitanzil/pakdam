@@ -499,6 +499,17 @@ export const PLAYER_PERSIST_INTERVAL_MS = 30_000;
 export const GPS_FIX_MIN_INTERVAL_MS = 1_000;
 
 /**
+ * v33 (F2b) — WS close for an ejected seat: 4405 (ejected, do-not-reconnect),
+ * DISTINCT from 4403 (removed by the host). The client branches on code:
+ * 4403 would make it treat an ejected seat as removed, clear the rejoin
+ * token and lock the seat out of results/replay. The close is delivered
+ * AFTER the `player-ejected` snapshot (snapshot-before-close), never
+ * before it.
+ */
+export const EJECTED_CLOSE_CODE = 4405;
+export const EJECTED_CLOSE_REASON = 'You were ejected from the game.';
+
+/**
  * v24 — host reconnect grace (founder decision D1, 2026-11-21): a host
  * who ACTUALLY disconnects (`'network-lost'` / `'heartbeat-timeout'`)
  * keeps host for this long. If they resume inside the window the grace
@@ -1284,7 +1295,35 @@ export class RoomStore {
     // pointing at an absent host. Rejoin-by-name restore clears
     // `leftAt`, so a genuinely restored host still verifies.
     if (p.leftAt !== null) return null;
+    // v33 (Diya): an ejected host's token must not verify WHILE the
+    // match is live — an ejected host can otherwise still call
+    // mid-match host ops (`lifecycleOp('end')`, resume, config).
+    // Live-phase only, deliberately: in a terminal phase the same
+    // token must still verify so the host can `replayMatch` the
+    // finished room — ejection never transfers host, so a blanket
+    // gate would strand a room whose host was ejected with nobody
+    // able to replay it.
+    if (this.ejectedWhileLive(p)) return null;
     return this.state.hostTokens[playerId] === hostTokenHash ? p : null;
+  }
+
+  /**
+   * v33 (F2a/F3b) — an ejected seat is out while the match is live
+   * (HEAD_START / ACTIVE / SAFETY_PAUSED / RESOLVING — i.e. not
+   * terminal, not LOBBY). In a terminal phase the snapshot is history
+   * and `get-results` is the read path; in the LOBBY `ejectedAt` is
+   * always null (`replayMatch` clears it), so the LOBBY exclusion is
+   * vacuous but explicit.
+   *
+   * Public (not private) since the v33 fix round: `RoomDO`'s hello
+   * path needs the same check, and hello never reaches the store.
+   */
+  ejectedWhileLive(player: Player): boolean {
+    return (
+      player.ejectedAt !== null &&
+      !isTerminalPhase(this.room.phase) &&
+      this.room.phase !== 'LOBBY'
+    );
   }
 
   // -- create / join --------------------------------------------------------
@@ -1393,6 +1432,20 @@ export class RoomStore {
     if (existing) {
       if (input.reconnectTokenHash === null || input.reconnectTokenHash !== existing.reconnectTokenHash) {
         return errResult('That name is taken — reconnect with its saved seat to restore it.', 'FORBIDDEN', 403);
+      }
+      // v33 (F3b): an ejected seat cannot restore while the match is
+      // live — a restore would hand it a connected seat, ticket
+      // minting and snapshot reads mid-match. (After `replayMatch`
+      // clears the ejection the seat restores normally.)
+      if (this.ejectedWhileLive(existing)) {
+        return errResult('An ejected seat cannot rejoin while the match is live.', 'FORBIDDEN', 403);
+      }
+      // v33 (F3c): a seat that left (host-removed in the lobby, or a
+      // voluntary leave) restores in the LOBBY only — a mid-match
+      // restore would seat a null-role ghost with no role, no team
+      // and no way back into play.
+      if (existing.leftAt !== null && this.room.phase !== 'LOBBY') {
+        return errResult('This room is no longer open for new players.', 'CONFLICT', 409);
       }
       if (existing.leftAt !== null && existing.ejectedAt === null) {
         existing.leftAt = null;
@@ -1646,7 +1699,7 @@ export class RoomStore {
   ): Promise<OpResult<{ ticket: string; ticketId: string; expiresAtMs: number }>> {
     if (this.isDeleted()) return this.deletedRefusal();
     const seat = this.player(playerId);
-    if (!seat || seat.leftAt !== null) {
+    if (!seat || seat.leftAt !== null || seat.ejectedAt !== null) {
       return errResult('Seat not found in this room.', 'FORBIDDEN', 403);
     }
     const issueCheck = this.checkTicketIssueRateLimit(playerId, nowMs);
@@ -1753,6 +1806,16 @@ export class RoomStore {
     // is set (a restore clears `leftAt` first, in `addPlayerAsync`).
     if (seat.leftAt !== null) {
       return errResult('That seat has left the room.', 'FORBIDDEN', 403);
+    }
+    // v33 fix round (Zara final review, REQUIRED) — an ejected host
+    // must not mint a fresh host token while the match is live
+    // (credential issuance to an out seat). Live-phase only,
+    // deliberately, like `verifyHost` above: in a terminal phase the
+    // same host must still be able to mint so it can `replayMatch`
+    // the finished room — ejection never transfers host, so a
+    // blanket gate would strand the room unreplayable.
+    if (this.ejectedWhileLive(seat)) {
+      return errResult('That seat has been ejected from the game.', 'FORBIDDEN', 403);
     }
     const raw = randomHex(16);
     this.state.hostTokens[input.playerId] = await hashHostToken(raw);
@@ -1943,7 +2006,7 @@ export class RoomStore {
     // NOTE: no clearing of `selectedHunterIds` here. An earlier version
     // wiped the pick whenever hunterCount or teamAssignment changed — but
     // the incoming config already carries the pick the host just made
-    // against the NEW values (the lobby's normaliseConfig fills/trims it
+    // against the NEW values (the lobby's normaliseConfig trims it
     // on every edit), so wiping it made 'selected' unstartable: the host
     // picked 1 Hunter (the effective count), the DO stored 0, and start
     // failed with "Pick exactly 1 Hunter." A stale pick cannot survive
@@ -2052,6 +2115,14 @@ export class RoomStore {
     if (seat.leftAt !== null) {
       return errResult('That seat has left the room.', 'CONFLICT', 409);
     }
+    // v33 (F2c): an ejected seat mints no fresh sockets — its
+    // reconnect token stays valid for `get-results` only. No phase
+    // gate here: a ticket is a live-socket credential, and an ejected
+    // seat has no live-socket business in any phase until
+    // `replayMatch` clears the ejection.
+    if (seat.ejectedAt !== null) {
+      return errResult('That seat has been ejected from the game.', 'FORBIDDEN', 403);
+    }
     const issueCheck = this.checkTicketIssueRateLimit(input.playerId, input.nowMs);
     if (!issueCheck.allowed) {
       return errResult(
@@ -2142,7 +2213,7 @@ export class RoomStore {
       return errResult('A renewal ticket cannot open a socket — fetch a connect ticket.', 'TICKET_INVALID', 4401);
     }
     const seat = this.player(rec.playerId);
-    if (!seat || seat.leftAt !== null) {
+    if (!seat || seat.leftAt !== null || seat.ejectedAt !== null) {
       return errResult('That seat is no longer in the room.', 'FORBIDDEN', 4403);
     }
     rec.redeemed = true;
@@ -2167,6 +2238,14 @@ export class RoomStore {
     }
     if (rec.purpose !== 'renew') {
       return errResult('Only a renewal ticket can refresh a socket.', 'TICKET_INVALID', 4401);
+    }
+    // v33 (F2c): an ejected seat renews no socket (its socket was
+    // closed at ejection; a second tab's renewal dies the same way).
+    // This also closes the adjacent hole the old code had for LEFT
+    // seats, which were never looked up here at all.
+    const seat = this.player(playerId);
+    if (!seat || seat.leftAt !== null || seat.ejectedAt !== null) {
+      return errResult('That seat is no longer in the room.', 'FORBIDDEN', 4403);
     }
     rec.redeemed = true;
     return okResult({ ticketId: rec.ticketId, expiresAtMs: rec.expiresAtMs });
@@ -2247,6 +2326,7 @@ export class RoomStore {
     startedAtMs: number,
     events: OutboundEvent[],
     persist: PersistIntent[],
+    disconnect: Array<{ playerId: string; code: number; reason: string }>,
   ): boolean {
     const ejected = applyOutsideZoneEjection(p, nowMs);
     Object.assign(p, ejected);
@@ -2254,6 +2334,15 @@ export class RoomStore {
     this.bumpVersion();
     events.push(this.roomStateEvent('player-ejected', nowMs));
     persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: p });
+    // v33 (F2b): the ejection closes the seat's socket(s) — 4405
+    // (ejected), never 4403. The caller delivers `events` first and
+    // closes after, so the seat still receives its `player-ejected`
+    // notice before the close lands.
+    disconnect.push({
+      playerId: p.playerId,
+      code: EJECTED_CLOSE_CODE,
+      reason: EJECTED_CLOSE_REASON,
+    });
     const durationSeconds = Math.max(0, Math.floor((nowMs - startedAtMs) / 1000));
     const win = maybeCompleteOnWin({
       mode: this.room.config.mode,
@@ -2262,10 +2351,33 @@ export class RoomStore {
       durationSeconds,
       tags: confirmedTags(this.state.catches),
     });
-    if (!win) return false;
+    if (!win) {
+      // v33 (F2b, snapshot-before-close): the seat learns `ejectedAt`
+      // only from a snapshot — push one now, while its socket is still
+      // open. Pushed after the win check so it carries the final phase.
+      events.push(
+        this.emit(
+          'snapshot',
+          this.snapshotFor(p.playerId, nowMs) as unknown as Record<string, unknown>,
+          [p.playerId],
+          nowMs,
+        ),
+      );
+      return false;
+    }
     const done = this.completeMatch(win, nowMs);
     events.push(...done.events);
     persist.push(...done.persist);
+    // v33 (F2b, snapshot-before-close): as above, after the match
+    // completed, so the snapshot carries the terminal phase + result.
+    events.push(
+      this.emit(
+        'snapshot',
+        this.snapshotFor(p.playerId, nowMs) as unknown as Record<string, unknown>,
+        [p.playerId],
+        nowMs,
+      ),
+    );
     return true;
   }
 
@@ -3069,6 +3181,15 @@ export class RoomStore {
         if (!seat) {
           return errResult('Seat not found or reconnect token does not match.', 'FORBIDDEN', 403);
         }
+        // v33 fix round (Zara final review, BLOCKING) — an ejected
+        // seat must not pause the live match with its still-valid
+        // reconnect token (ejection clears only the localStorage
+        // rejoin mirror, never the sessionStorage credential, and
+        // pause is ANY player). Same refusal shape as `getStateOp`
+        // below (`SEAT_REMOVED` / 403), live-phase only.
+        if (this.ejectedWhileLive(seat)) {
+          return errResult('That seat has been ejected from the game.', 'SEAT_REMOVED', 403);
+        }
         const r = this.doSafetyPause(input.playerId, null, input.nowMs);
         if (!r.ok) return r;
         return okResult({ paused: true }, r.events, r.persist);
@@ -3143,6 +3264,17 @@ export class RoomStore {
     // covers a bad token.
     if (seat.leftAt !== null) {
       return errResult('That seat has left the room.', 'SEAT_REMOVED', 403);
+    }
+    // v33 (F2a): an ejected seat reads no live state while the match
+    // is live — same refusal shape as the `leftAt` check above. The
+    // code stays `SEAT_REMOVED`: the client branches on that code for
+    // its removal screen (a new code would fall through to "Game not
+    // found"), and the message names the ejection. `get-results`
+    // stays open (separate op, playerIds only). The seat already got
+    // its ejection snapshot pushed before its socket closed, so the
+    // refusal never strands it without `ejectedAt`.
+    if (this.ejectedWhileLive(seat)) {
+      return errResult('That seat has been ejected from the game.', 'SEAT_REMOVED', 403);
     }
     return okResult(this.snapshotFor(input.playerId, input.nowMs));
   }
@@ -3589,6 +3721,17 @@ export class RoomStore {
   ): { events: OutboundEvent[]; persist: PersistIntent[]; needsHostCheckin: boolean } {
     const seat = this.player(playerId);
     if (!seat) {
+      return { events: [], persist: [], needsHostCheckin: false };
+    }
+    // v33 fix round (Zara final review, RECOMMENDED) — an out seat
+    // (left or ejected) is never suspended: suspension would stamp a
+    // return window — and, for a host, a reconnect grace — for a seat
+    // that can never come back. Defence in depth: every current
+    // caller already filters out seats (the class close-sweep skips
+    // ejected seats, `handleWsMessage` refuses them before the
+    // `player.suspended` case), but the shared primitive must not
+    // depend on its callers never regressing.
+    if (seat.leftAt !== null || seat.ejectedAt !== null) {
       return { events: [], persist: [], needsHostCheckin: false };
     }
     const events: OutboundEvent[] = [];
@@ -4066,9 +4209,15 @@ export class RoomStore {
   alarmTick(
     nowMs: number,
     opts: { firstTickAfterWake?: boolean; liveSocketCount?: number } = {},
-  ): { events: OutboundEvent[]; persist: PersistIntent[] } {
+  ): {
+    events: OutboundEvent[];
+    persist: PersistIntent[];
+    /** v33 (F2b): seats ejected on this tick — the class closes their sockets AFTER delivering `events`. */
+    disconnect: Array<{ playerId: string; code: number; reason: string }>;
+  } {
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
+    const disconnect: Array<{ playerId: string; code: number; reason: string }> = [];
     const phase = this.room.phase;
 
     // (1) Purge stale fixes + expired pending pings + stale idempotency.
@@ -4151,7 +4300,7 @@ export class RoomStore {
       const cleared = this.graceClearedNotice(nowMs);
       events.push(...cleared.events);
       persist.push(...cleared.persist);
-      return { events, persist };
+      return { events, persist, disconnect };
     }
     // v28 — RESOLVING backstop. `completeMatch` moves RESOLVING →
     // COMPLETED synchronously in one call, so no durable state should
@@ -4194,7 +4343,7 @@ export class RoomStore {
         { kind: 'match-result', room: this.room },
         { kind: 'room-upsert', room: this.room },
       );
-      return { events, persist };
+      return { events, persist, disconnect };
     }
     // v23 fix round 1 (S8): hostless-room re-trigger on the tick — a
     // host that disconnected while every remaining seat was suspended
@@ -4223,7 +4372,7 @@ export class RoomStore {
           events.push(this.roomStateEvent('lobby-expired', nowMs));
           persist.push({ kind: 'room-upsert', room: this.room });
         }
-        return { events, persist };
+        return { events, persist, disconnect };
       }
     }
     // v24 — host reconnect grace expiry. Runs in LOBBY, READY_CHECK
@@ -4311,12 +4460,12 @@ export class RoomStore {
             const gone = this.abandonForIdle(nowMs);
             events.push(...gone.events);
             persist.push(...gone.persist);
-            return { events, persist };
+            return { events, persist, disconnect };
           }
         }
       }
     }
-    if (this.room.startedAt === null) return { events, persist };
+    if (this.room.startedAt === null) return { events, persist, disconnect };
 
     const startedAtMs = Date.parse(this.room.startedAt);
     const endsAtMs = this.room.endsAt === null ? null : Date.parse(this.room.endsAt);
@@ -4338,7 +4487,7 @@ export class RoomStore {
     }
 
     const livePhase = this.room.phase === 'HEAD_START' || this.room.phase === 'ACTIVE';
-    if (!livePhase) return { events, persist };
+    if (!livePhase) return { events, persist, disconnect };
 
     // (3) Match end — only from a live phase, never while paused.
     if (endsAtMs !== null && nowMs >= endsAtMs) {
@@ -4352,7 +4501,7 @@ export class RoomStore {
       const done = this.completeMatch(result, nowMs);
       events.push(...done.events);
       persist.push(...done.persist);
-      return { events, persist };
+      return { events, persist, disconnect };
     }
 
     // (4a) Missing-fix ejection (v18 — the replacement for the removed
@@ -4414,8 +4563,8 @@ export class RoomStore {
           activeAtMs,
         );
         if (nowMs - lastSeenMs >= LOCATION_FRESHNESS_SECONDS * 1000) {
-          if (this.ejectWithWinCheck(p, nowMs, startedAtMs, events, persist)) {
-            return { events, persist };
+          if (this.ejectWithWinCheck(p, nowMs, startedAtMs, events, persist, disconnect)) {
+            return { events, persist, disconnect };
           }
         }
       }
@@ -4447,6 +4596,12 @@ export class RoomStore {
           this.bumpVersion();
           events.push(this.roomStateEvent('player-ejected', nowMs));
           persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: p });
+          // v33 (F2b): same 4405 disconnect as `ejectWithWinCheck`.
+          disconnect.push({
+            playerId: p.playerId,
+            code: EJECTED_CLOSE_CODE,
+            reason: EJECTED_CLOSE_REASON,
+          });
           const durationSeconds = Math.max(
             0,
             Math.floor((nowMs - startedAtMs) / 1000),
@@ -4462,8 +4617,29 @@ export class RoomStore {
             const done = this.completeMatch(win, nowMs);
             events.push(...done.events);
             persist.push(...done.persist);
-            return { events, persist };
+            // v33 (F2b, snapshot-before-close): after the match
+            // completed, so the snapshot carries the terminal phase.
+            events.push(
+              this.emit(
+                'snapshot',
+                this.snapshotFor(p.playerId, nowMs) as unknown as Record<string, unknown>,
+                [p.playerId],
+                nowMs,
+              ),
+            );
+            return { events, persist, disconnect };
           }
+          // v33 (F2b, snapshot-before-close): the seat learns
+          // `ejectedAt` only from a snapshot — push one now, while
+          // its socket is still open.
+          events.push(
+            this.emit(
+              'snapshot',
+              this.snapshotFor(p.playerId, nowMs) as unknown as Record<string, unknown>,
+              [p.playerId],
+              nowMs,
+            ),
+          );
         }
       }
     }
@@ -4510,8 +4686,8 @@ export class RoomStore {
         this.clearDisconnectDeadline(pid);
         if (!p || p.ejectedAt !== null || p.leftAt !== null) continue;
         if (p.connectionState !== 'suspended') continue;
-        if (this.ejectWithWinCheck(p, nowMs, startedAtMs, events, persist)) {
-          return { events, persist };
+        if (this.ejectWithWinCheck(p, nowMs, startedAtMs, events, persist, disconnect)) {
+          return { events, persist, disconnect };
         }
       }
     }
@@ -4669,7 +4845,7 @@ export class RoomStore {
       this.mem.lastSafetyValveMs = nowMs;
       events.push(this.roomStateEvent('snapshot-safety-valve', nowMs));
     }
-    return { events, persist };
+    return { events, persist, disconnect };
   }
 
   // -- WS message handling ------------------------------------------------------
@@ -4814,11 +4990,14 @@ export class RoomStore {
     persist: PersistIntent[];
     durable: boolean;
     close?: { code: number; reason: string };
+    /** v33 (F2b): seats ejected by this message — the class closes their sockets AFTER delivering `events`. */
+    disconnect?: Array<{ playerId: string; code: number; reason: string }>;
   }> {
     const playerId = session.playerId;
     const me = this.player(playerId);
     const events: OutboundEvent[] = [];
     const persist: PersistIntent[] = [];
+    const disconnect: Array<{ playerId: string; code: number; reason: string }> = [];
     // v29 (Gap 5) — wall-clock entry stamp for the catch-confirm
     // duration log (the handler's `nowMs` is the receive time and does
     // not advance inside the handler, so it cannot measure duration).
@@ -4888,6 +5067,30 @@ export class RoomStore {
         persist,
         durable: false,
         close: { code: 4403, reason: 'Seat has left the room.' },
+      };
+    }
+    // v33 fix round (Zara final review, REQUIRED) — an ejected seat
+    // serves nothing on a surviving socket (ticket redeemed before
+    // the ejection, or a second tab): no `snapshot.request` /
+    // `resync.request` snapshot, no fix, no radio, nothing. Same
+    // shape as the `leftAt` guard above, but close 4405 (ejected),
+    // never 4403. Code `FORBIDDEN`, like the `leftAt` guard and the
+    // v30-pinned ejected `voice.signal` refusal — the client branches
+    // on the 4405 close, not on this code (unlike the HTTP
+    // `getStateOp` refusal, whose `SEAT_REMOVED` code the client
+    // does branch on). Live-phase only, like `getStateOp`: in a
+    // terminal phase the snapshot is history, and the socket is
+    // closed at match end anyway. The ejection snapshot itself is
+    // NOT served here — it was already pushed before the 4405 close
+    // at ejection time.
+    if (this.ejectedWhileLive(me)) {
+      const errorEvents = [this.errorEvent(playerId, 'FORBIDDEN', 'That seat has been ejected from the game.', false, undefined, nowMs)];
+      cacheEarlyReply(errorEvents);
+      return {
+        events: errorEvents,
+        persist,
+        durable: false,
+        close: { code: EJECTED_CLOSE_CODE, reason: EJECTED_CLOSE_REASON },
       };
     }
     // A socket past its ticket expiry is closed 4401. (The class checks
@@ -5142,13 +5345,13 @@ export class RoomStore {
                     (this.room.phase === 'HEAD_START' || this.room.phase === 'ACTIVE') &&
                     me.ejectedAt === null
                   ) {
-                    const done = this.ejectWithWinCheck(me, nowMs, Date.parse(this.room.startedAt ?? new Date(nowMs).toISOString()), events, persist);
+                    const done = this.ejectWithWinCheck(me, nowMs, Date.parse(this.room.startedAt ?? new Date(nowMs).toISOString()), events, persist, disconnect);
                     if (done) {
                       // Ejection completes the match — stop here; the
                       // fix is not stored (the seat is out).
                       this.clearDisconnectDeadline(playerId);
                       rememberReply(events);
-                      return { events, persist, durable: true };
+                      return { events, persist, durable: true, disconnect };
                     }
                   }
                 }
@@ -5254,6 +5457,14 @@ export class RoomStore {
             this.bumpVersion();
             events.push(this.roomStateEvent('player-ejected', nowMs));
             persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: me });
+            // v33 (F2b): same 4405 disconnect as `ejectWithWinCheck`,
+            // plus the snapshot-before-close push below (after the
+            // win check, so it carries the final phase).
+            disconnect.push({
+              playerId,
+              code: EJECTED_CLOSE_CODE,
+              reason: EJECTED_CLOSE_REASON,
+            });
             const durationSeconds = Math.max(
               0,
               Math.floor((nowMs - Date.parse(this.room.startedAt ?? new Date(nowMs).toISOString())) / 1000),
@@ -5270,6 +5481,17 @@ export class RoomStore {
               events.push(...done.events);
               persist.push(...done.persist);
             }
+            // v33 (F2b, snapshot-before-close): the seat learns
+            // `ejectedAt` only from a snapshot — push one now, while
+            // its socket is still open.
+            events.push(
+              this.emit(
+                'snapshot',
+                this.snapshotFor(playerId, nowMs) as unknown as Record<string, unknown>,
+                [playerId],
+                nowMs,
+              ),
+            );
           }
         }
         if (qualityChanged) {
@@ -5956,7 +6178,7 @@ export class RoomStore {
     // mint). Everything else — heartbeat ack, snapshot, GPS fix,
     // radio/signal/voice/pin relay — is transient: the caller skips
     // putSession + save + re-arm for it.
-    return { events, persist, durable: persist.length > 0 || stateDirty };
+    return { events, persist, durable: persist.length > 0 || stateDirty, disconnect };
   }
 }
 

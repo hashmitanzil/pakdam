@@ -50,6 +50,8 @@ import {
   HOST_NAME,
   createHostRoom,
   dismissRoleReveal,
+  newCentredDemoContext,
+  resumeSeatViaCatchPage,
   startDemoMatch,
 } from './helpers';
 import type { Page } from '@playwright/test';
@@ -120,6 +122,11 @@ test.describe('catch flow (demo)', () => {
     runnerName: string,
     hunterName: string,
   ) {
+    // v32: the Runner's seat is suspended in the headless multi-page
+    // setup (backgrounded tab) and the Hunter's claim rejects a
+    // suspended Runner — mount the Runner on the catch page first
+    // (P0-1 resume), so the claim below lands.
+    await resumeSeatViaCatchPage(runnerPage, roomId, runnerName);
     await openHunterCatch(hunterPage, roomId);
     await hunterPage.getByRole('button', { name: "Runner can't show a QR?" }).click();
     await expect(hunterPage.getByText('Who did you tag?')).toBeVisible();
@@ -147,17 +154,32 @@ test.describe('catch flow (demo)', () => {
     await expect(tagBtn).toBeDisabled();
     // The Runner confirms on their phone (Self Confirm) — the tag
     // completes with no Hunter scan and no QR at all.
-    await selfConfirmAsRunner(runnerPage, roomId, hunterName);
+    await selfConfirmAsRunner(runnerPage, roomId, hunterName, hunterPage, runnerName);
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
   }
 
   /**
-   * Way 2 (Self Confirm): the Runner taps "Self Confirm" below their QR,
+   * Way 2 (Self Confirm): the Runner taps "Self confirm" below their QR,
    * picks the Hunter who tagged them from the Hunter list, taps OK — the
    * tag completes with no Hunter confirmation needed.
+   *
+   * v32: the Hunter's seat is suspended in the headless multi-page
+   * setup (backgrounded tab) and the self-confirm creates its claim
+   * through `requestCatch`, which rejects a suspended Hunter — so the
+   * Hunter mounts the catch page first (P0-1 resume). That is
+   * navigation only, not a catch action: the Hunter still never
+   * claims, scans, or confirms anything. The Runner mounts (or is
+   * already on) the catch page the same way, which resumes them.
    */
-  async function selfConfirmAsRunner(runnerPage: Page, roomId: string, hunterName: string) {
-    await runnerPage.goto(`/room/${roomId}/catch`);
+  async function selfConfirmAsRunner(
+    runnerPage: Page,
+    roomId: string,
+    hunterName: string,
+    hunterPage: Page,
+    runnerName: string,
+  ) {
+    await resumeSeatViaCatchPage(hunterPage, roomId, hunterName);
+    await resumeSeatViaCatchPage(runnerPage, roomId, runnerName);
     await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await expect(runnerPage.getByRole('button', { name: hunterName, exact: true })).toBeVisible();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
@@ -176,8 +198,9 @@ test.describe('catch flow (demo)', () => {
   });
 
   test('Way 1: manual fallback → name claim → Runner confirms on their phone → Catch confirmed', async ({
-    context,
+    browser,
   }) => {
+    const context = await newCentredDemoContext(browser);
     const { hunterPage, runnerPage, roomId, hunterName, runnerName } = await setupCatch(context);
     await tagRunnerViaFallback(hunterPage, runnerPage, roomId, runnerName, hunterName);
     await expect(hunterPage.getByText(`${runnerName} was tagged by ${hunterName}.`)).toBeVisible();
@@ -188,6 +211,7 @@ test.describe('catch flow (demo)', () => {
     await expect(runnerPage.getByText(`You were tagged by ${hunterName}.`)).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Back to home' })).toBeVisible();
+    await context.close();
   });
 
   test('scanner view in headless: camera error, hint, manual-fallback link', async ({
@@ -218,12 +242,17 @@ test.describe('catch flow (demo)', () => {
   });
 
   test('Way 2: Self Confirm → Hunter list → OK completes the tag with no hunter action', async ({
-    context,
+    browser,
   }) => {
+    const context = await newCentredDemoContext(browser);
     const { hunterPage, runnerPage, roomId, hunterName, runnerName, otherRunnerName } =
       await setupCatch(context);
     // The Hunter does nothing at all — the Runner drives the whole tag.
-    await runnerPage.goto(`/room/${roomId}/catch`);
+    // (v32: the Hunter still mounts the catch page first — navigation
+    // only, so their suspended seat resumes via P0-1; they never
+    // claim, scan, or confirm anything.)
+    await resumeSeatViaCatchPage(hunterPage, roomId, hunterName);
+    await resumeSeatViaCatchPage(runnerPage, roomId, runnerName);
     await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     // The list holds the Hunters in this game only — not the other Runner.
     await expect(runnerPage.getByRole('button', { name: hunterName, exact: true })).toBeVisible();
@@ -239,6 +268,7 @@ test.describe('catch flow (demo)', () => {
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
     await expect(hunterPage.getByText(`${runnerName} was tagged by ${hunterName}.`)).toBeVisible();
     await expect(hunterPage.getByRole('button', { name: 'Tag someone else' })).toBeVisible();
+    await context.close();
   });
 
   test('no catch code anywhere in the catch UI', async ({ context }) => {
@@ -268,20 +298,24 @@ test.describe('catch flow (demo)', () => {
   });
 
   test('P1-17: runner confirms instead of disputing — after-tagged screen, no Disputes section', async ({
-    context,
+    browser,
   }) => {
-    const { hostPage, runnerPage, roomId, hunterName } = await setupCatch(context);
+    const context = await newCentredDemoContext(browser);
+    const { hostPage, hunterPage, runnerPage, roomId, hunterName, runnerName } =
+      await setupCatch(context);
     await runnerPage.goto(`/room/${roomId}/catch`);
     await expect(runnerPage.getByRole('button', { name: 'NO — DISPUTE' })).toBeHidden();
-    await selfConfirmAsRunner(runnerPage, roomId, hunterName);
+    await selfConfirmAsRunner(runnerPage, roomId, hunterName, hunterPage, runnerName);
     await hostPage.goto(`/room/${roomId}/catch`);
     await expect(hostPage.getByText('Disputes')).toBeHidden();
+    await context.close();
   });
 
   test('P0-1: a suspended runner is resumed on catch-page arrival and can confirm', async ({
-    context,
+    browser,
   }) => {
-    const { runnerPage, roomId, hunterName } = await setupCatch(context);
+    const context = await newCentredDemoContext(browser);
+    const { hunterPage, runnerPage, roomId, hunterName } = await setupCatch(context);
     // Suspend the runner on the play screen (tab-hide).
     await runnerPage.goto(`/room/${roomId}/play`);
     await dismissRoleReveal(runnerPage);
@@ -297,6 +331,11 @@ test.describe('catch flow (demo)', () => {
     });
     await expect(runnerPage.getByText("You're suspended — reconnect to confirm.")).toBeHidden();
     await expect(runnerPage.getByRole('button', { name: 'Self confirm', exact: true })).toBeEnabled();
+    // v32: the Hunter's seat is suspended too (backgrounded tab) and
+    // the self-confirm creates its claim through `requestCatch`,
+    // which rejects a suspended Hunter — mount the Hunter on the
+    // catch page first (P0-1 resume; navigation only).
+    await resumeSeatViaCatchPage(hunterPage, roomId, hunterName);
     // Way 2: pick the Hunter, OK — the tag completes.
     await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
@@ -305,6 +344,7 @@ test.describe('catch flow (demo)', () => {
     // hunter's "Catch confirmed" card.
     await expect(runnerPage.getByText('You were tagged')).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
+    await context.close();
   });
 
   test('catch page in the lobby redirects back to the lobby (v18 A9)', async ({

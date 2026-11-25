@@ -127,10 +127,16 @@ test('source pin: the load handler forces one paint frame after resize', () => {
 });
 
 test('source pin: a failed re-centre attempts one repaint before recording the failure', () => {
+  // Re-pointed (v33): `applyRecentreSuccess` now holds the first
+  // `setRecentreFailed(false)` and sits before the try/catch, so the
+  // old slice (centreOn → first success) ended before the catch.
+  // The landed shape: the catch repaints, then records the failure.
   const centreStart = playMapSrc.indexOf('const centreOn = useCallback');
-  const successMark = playMapSrc.indexOf('setRecentreFailed(false);', centreStart);
-  const centreBlock = playMapSrc.slice(centreStart, successMark);
-  assert.match(centreBlock, /map\.triggerRepaint\(\)/);
+  const catchAt = playMapSrc.indexOf('} catch {', centreStart);
+  const failAt = playMapSrc.indexOf('setRecentreFailed(true);', catchAt);
+  assert.ok(catchAt >= 0 && failAt > catchAt, 'centreOn must catch a failed easeTo and record the failure');
+  const catchBlock = playMapSrc.slice(catchAt, failAt);
+  assert.match(catchBlock, /map\.triggerRepaint\(\)/, 'the catch repaints before recording the failure');
 });
 
 test('source pin: context-loss listeners attach inside createOlaMap, at construction', () => {

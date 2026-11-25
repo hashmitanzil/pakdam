@@ -55,7 +55,7 @@ import { Button } from '@/components/ui/Button';
 import { formatSuspendedLabel, formatOutsideCountdown } from '@/components/match/freshness';
 import { formatDurationShort, ageLabelFromTimestamp, haversineMeters } from '@/lib/utils';
 import { watchLocation, shouldSendFix, type GeolocationError, type LastSentFix, type WatchHandle } from '@/lib/geolocation';
-import { effectiveNowMs, GPS_DENIED_NOTICE, gpsNoFixNoticeForWatch, gpsStaleFixNotice, shouldEjectForMissingFix, shouldWatchLocation } from '@/components/hud/play-map-logic';
+import { effectiveNowMs, GPS_DENIED_NOTICE, gpsNoFixNoticeForWatch, gpsStaleFixNotice, shouldEjectForMissingFix, shouldReassertSuspension, shouldWatchLocation } from '@/components/hud/play-map-logic';
 import { requestWakeLock } from '@/lib/wake-lock';
 import { clearSession } from '@/lib/session-credentials';
 import { clearRejoinToken } from '@/lib/rejoin-token';
@@ -137,6 +137,24 @@ export default function PlayPage({
     // there). No periodic re-fetch: the play page passes no dot
     // option any more.
   });
+  // v33 FIX 2 (fresh join, never restore): the way back to the lobby
+  // for a removed/ejected seat is a FRESH join with the room code
+  // (`/join/{code}`, lobby phase only — the server rejects the join
+  // while the match is live, so it can never resurrect an ejected
+  // seat mid-match). The stored session + rejoin token are cleared
+  // FIRST: the join-by-code page passes a restore token whenever a
+  // stored session with the same display name exists, and a restore
+  // of an ejected seat mid-match returns 403 server-side (Zara F3b)
+  // — clearing both guarantees the join mints a new seat instead.
+  const joinLobbyAgain = useCallback(
+    (roomCode: string) => {
+      clearSession(roomId);
+      clearRejoinToken(roomId);
+      router.push(`/join/${roomCode}`);
+    },
+    [roomId, router],
+  );
+
   const {
     session,
     mode,
@@ -183,6 +201,11 @@ export default function PlayPage({
   // watcher effect on an explicit tap, so it can never spam a
   // permission prompt.
   const [gpsDenied, setGpsDenied] = useState(false);
+  // v33 FIX 1 (re-assert): the socket state BEFORE the latest change,
+  // so the re-assert effect below fires only on the (re)connect
+  // transition — not on every snapshot that still reads 'connected'
+  // while the suspension is in flight.
+  const prevSocketStateRef = useRef<string | null>(null);
   // v30 (Meera): true while a VISIBLE, non-denied GPS error is on
   // record — position-unavailable, timeout, or unsupported — so the
   // "Try again" retry below shows for those too, not only for a
@@ -665,6 +688,53 @@ export default function PlayPage({
     // fresh run creates a new one — `startWatch` alone would refuse
     // while the dead handle is still held.
   }, [roomId, myPlayerId, mode, phase, gpsRetryNonce]);
+
+  // v33 FIX 1 (suspend delivery — re-assert): the socket-side queue
+  // covers a suspension reported while DOWN, but a suspension that
+  // already LANDED is wiped by the next hello — the DO resumes a
+  // suspended seat on every hello/reconnect (`resumeOnHello`,
+  // room-do.ts), and nothing re-asserted it while the watch stayed
+  // dead. With the seat `connected` again and no fix arriving, the
+  // (4a) alarm ejects it after 30 s — the founder's live-v31
+  // ejection. So on every (re)connect while the watch is still
+  // dead/denied (`gpsDenied`), re-send `player.suspended('unknown')`.
+  // Gated on the transition (not on every render) and on the latest
+  // snapshot not already reading 'suspended' — a re-send while
+  // suspended is a server no-op, but there is no reason to spam it.
+  // A fresh fix clears `gpsDenied` (onFix above) and the re-assert
+  // stops; the fix itself resumes the seat server-side.
+  useEffect(() => {
+    const prev = prevSocketStateRef.current;
+    prevSocketStateRef.current = socketState;
+    if (
+      shouldReassertSuspension({
+        mode,
+        gpsDenied,
+        socketState,
+        prevSocketState: prev,
+        connectionState: myPlayer?.connectionState,
+        ejectedAt: myPlayer?.ejectedAt,
+      })
+    ) {
+      socketRef.current?.reportSuspended('unknown');
+    }
+  }, [socketState, gpsDenied, mode, myPlayer?.connectionState, myPlayer?.ejectedAt]);
+
+  // v33 (4405 companion / constraint 3): a terminal socket close
+  // (4403 removed, 4405 ejected, 4404 room gone) ends the seat's
+  // live participation — stop the GPS watch with it, so no fix is
+  // polled or offered for sending after the removal/ejection screen
+  // shows. `sendLocationUpdate` already refuses while disconnected,
+  // so nothing leaves the device either way; this is the battery +
+  // honesty half (a moving dot on a dead seat is a lie). The watcher
+  // effect above is untouched (its deps are pinned): this effect only
+  // stops, never starts. Demo never reaches 'closed' (no socket),
+  // so the demo watch is unaffected.
+  useEffect(() => {
+    if (socketState !== 'closed') return;
+    watchHandleRef.current?.stop();
+    watchHandleRef.current = null;
+  }, [socketState]);
 
   // Outside-zone countdown (display; demo enforces at 0, live is server-enforced).
   // B20: computed from the wall clock (Date.now() - outsideSinceMs),
@@ -1407,18 +1477,30 @@ export default function PlayPage({
   // it with 403 `SEAT_REMOVED` (or a snapshot landed with `leftAt`
   // set). No Retry: a removed seat can never reload, and the mirror
   // is already dead — home, to join a new game.
+  // v33 FIX 2 (Diya b): a removed (leftAt) seat also gets the way
+  // back to the SAME lobby — a fresh join with the room code (the
+  // server admits it only in LOBBY, so mid-match it fails plainly on
+  // the join page instead of resurrecting the seat). The code comes
+  // from the stored session; without it, only the fresh-game route
+  // is offered.
   if (seatRemoved) {
     return (
       <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pt-3">
         <p className="py-6 text-center text-[15px] font-semibold text-white">
-          You were removed from the game.
+          {ejectedAt ? 'You were ejected from the game.' : 'You were removed from the game.'}
         </p>
         <p className="text-center text-[14px] text-[#A1A1AA]">
-          The host removed you from this game. The game goes on without you — you can join a
-          new game from home.
+          {ejectedAt
+            ? 'You were away too long or your location stopped updating. The game goes on without you — you can join a new game from home.'
+            : 'The host removed you from this game. The game goes on without you — you can join a new game from home.'}
         </p>
-        <Button variant="primary" onClick={() => router.push('/')}>
-          Go home
+        {session?.roomCode ? (
+          <Button variant="primary" onClick={() => { const code = session?.roomCode; if (code) joinLobbyAgain(code); }}>
+            Join the lobby again
+          </Button>
+        ) : null}
+        <Button variant="outline" onClick={() => router.push('/')}>
+          Start a fresh game
         </Button>
       </main>
     );
@@ -1496,7 +1578,10 @@ export default function PlayPage({
       ) : null}
 
       {/* v29 (A): an ejected player gets a plain-words message, not a
-          silent disappearance — the game goes on without them. */}
+          silent disappearance — the game goes on without them.
+          v33 FIX 2 (Diya c): the socket-independent path to results —
+          the socket is closed (4405) and no snapshot will ever arrive,
+          so the banner itself carries the way out. */}
       {ejectedAt ? (
         <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3" role="status">
           <p className="text-[14px] font-semibold text-white">
@@ -1506,6 +1591,13 @@ export default function PlayPage({
             You were away too long or your location stopped updating. The game goes on without
             you — you can watch the results when the round ends, or join a new game.
           </p>
+          <Button
+            variant="outline"
+            className="mt-3"
+            onClick={() => router.push(`/room/${roomId}/results`)}
+          >
+            See results
+          </Button>
         </div>
       ) : null}
 
@@ -1520,6 +1612,9 @@ export default function PlayPage({
             The host removed you from this game. The game goes on without you — you can watch
             the results when the round ends, or join a new game.
           </p>
+          <Button variant="outline" className="mt-3" onClick={() => router.push('/')}>
+            Go home
+          </Button>
         </div>
       ) : null}
 

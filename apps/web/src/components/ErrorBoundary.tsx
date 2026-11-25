@@ -59,6 +59,12 @@ const DEVICE_INFO_MAX_CHARS = 500;
  * URL is configured). Never set in production; ignored unless it is an
  * http(s) URL. Production behaviour is unchanged: the report goes to the
  * Worker via `getWorkerUrl()`.
+ *
+ * The override MUST be an origin the app's CSP `connect-src`
+ * allow-lists (same-origin in the spec): a report to any other origin
+ * is blocked by CSP in the browser, so the fetch never reaches the
+ * mocked route and the report is silently lost — that was the v31
+ * failure, when the spec used `https://worker.example`.
  */
 function testWorkerUrlOverride(): string {
   try {

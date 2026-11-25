@@ -169,8 +169,9 @@ export function validateZoneBoundary(
  * hunterCount 1..maxPlayers−1, zone radius ≥ 100 m with no maximum,
  * finalSizePercent null (Auto) or a finite 1–100 (NaN rejected),
  * hostOnSiteConfirmed required, catchConfirmationRequired forced true,
- * and the pick invariant (teamAssignment 'selected' ⇒ at least 1 and at
- * most maxPlayers − 1 picked ids — the exact count is decided at start
+ * and the pick invariant (teamAssignment 'selected' ⇒ at most
+ * maxPlayers − 1 picked ids — 0 allowed, the transient hand-pick
+ * state; the exact count is decided at start
  * from the roster, so this validator cannot demand it; 'random' ⇒ no
  * picked ids — switching to Random clears the pick). The zone boundary
  * must be placed (≥ 3 points, ≤ 64 points, span ≤ 100 km); geometry
@@ -323,16 +324,21 @@ export function validateRoomConfig(config: unknown): string[] {
     // 'selected' needs a pick the roster COULD satisfy — but the exact
     // count is decided at start from the roster (balance table when
     // Balance is ON), which this roster-blind validator cannot know. So
-    // it enforces only the knowable bounds (≥ 1 pick, ≤ maxPlayers − 1);
+    // it enforces only the knowable upper bound (≤ maxPlayers − 1);
     // demanding exactly `hunterCount` here made Balance-ON configs
     // unstartable: the validator wanted the stored stepper value while
     // the draw wanted the table value. The exact count is enforced at
     // start (assignRoles, plain-words error) and by the lobby gate.
+    // A 0-pick 'selected' config is VALID: it is the transient
+    // hand-pick state — Random OFF starts with nobody picked and the
+    // host taps roster rows to fill it (host-setup:150/:168). The
+    // start gate blocks until exactly the effective count is picked,
+    // so a 0-pick config can never start a match.
     if (c.teamAssignment === 'selected') {
       const maxPick = typeof c.maxPlayers === 'number' ? c.maxPlayers - 1 : 29;
-      if (c.selectedHunterIds.length < 1 || c.selectedHunterIds.length > maxPick) {
+      if (c.selectedHunterIds.length > maxPick) {
         issues.push(
-          'with teamAssignment selected, pick at least 1 Hunter and at most maxPlayers − 1',
+          'with teamAssignment selected, pick at most maxPlayers − 1 Hunters',
         );
       }
     }

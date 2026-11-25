@@ -9,6 +9,9 @@ import {
   GUEST_NAMES,
   HOST_NAME,
   forceDemoMatchEnd,
+  newCentredDemoContext,
+  resumeSeatViaCatchPage,
+  startCentreFixKeepFresh,
   startDemoMatch,
 } from './helpers';
 
@@ -18,10 +21,18 @@ test.describe('brutal phone end-to-end (demo)', () => {
   test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
 
   test('create → join → ready → start → play → catch → confirm → results → fresh game', async ({
-    context,
+    browser,
   }) => {
     test.setTimeout(180000);
+    const context = await newCentredDemoContext(browser);
     const { hostPage, guestPages, roomId, roles } = await startDemoMatch(context);
+    // v32 fix round (Diya A1): the untouched Runner is never harboured
+    // in this flow, so if it is the front tab its one centred fix goes
+    // stale at ACTIVE+30 s and the (4a) clock ejects it mid-test. The
+    // 4 s nudge loop re-stamps the front seat's `lastFixAt` for the
+    // whole ACTIVE span (see `startCentreFixKeepFresh`); stop it just
+    // before the context closes.
+    const stopKeepFresh = startCentreFixKeepFresh(context);
     const names = [HOST_NAME, ...GUEST_NAMES];
     const pages = [hostPage, ...guestPages];
     const hunterIdx = names.findIndex((n) => roles.get(n) === 'hunter');
@@ -46,6 +57,13 @@ test.describe('brutal phone end-to-end (demo)', () => {
     // runner confirms on their own phone (Self Confirm) — a Hunter Tag
     // with no scan cannot confirm (Runner confirmation is always
     // required, BEHAVIOUR.md).
+    // v32: the Runner's seat is suspended in the headless multi-page
+    // setup (backgrounded tab) and the Hunter's claim rejects a
+    // suspended Runner — mount the Runner on the catch page first
+    // (P0-1 resume), so the claim below lands. The Hunter mounts the
+    // catch page by tapping "Tag a runner", which resumes them the
+    // same way.
+    await resumeSeatViaCatchPage(runnerPage, roomId, runnerName);
     await hunterPage.getByRole('button', { name: 'Tag a runner', exact: true }).click();
     await expect(hunterPage.getByText("Point at the runner's QR")).toBeVisible();
     await hunterPage.getByRole('button', { name: "Runner can't show a QR?" }).click();
@@ -82,6 +100,8 @@ test.describe('brutal phone end-to-end (demo)', () => {
     await hostPage.getByRole('button', { name: 'START A FRESH GAME' }).click();
     await expect(hostPage).toHaveURL(/\/$/);
     await expect(hostPage.getByRole('button', { name: /HOST A GAME/ })).toBeVisible();
+    stopKeepFresh();
+    await context.close();
   });
 
   test('phone HUD basics: reveal, tabs, More sheet', async ({ context }) => {

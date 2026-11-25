@@ -50,7 +50,7 @@ import { Sheet } from '@/components/ui/Sheet';
 import { fetchLiveCatchToken } from '@/lib/live-client';
 import { resolveLiveCatch } from '@/lib/live-room-client';
 import { clearRejoinToken } from '@/lib/rejoin-token';
-import { getSessionForRoom } from '@/lib/session-credentials';
+import { clearSession, getSessionForRoom } from '@/lib/session-credentials';
 import { goHomeAfterRoomDeleted } from '@/lib/room-deleted';
 import { formatClock } from '@/lib/utils';
 import {
@@ -101,9 +101,26 @@ export default function CatchPage({
     error,
     roomDeleted,
     seatRemoved,
+    session,
     retryConnection,
     refreshDemo,
   } = useRoomState(roomId);
+
+  // v33 FIX 2 (fresh join, never restore): the way back to the lobby
+  // for a removed seat — a FRESH join with the room code (lobby phase
+  // only; the server rejects it while the match is live, so it can
+  // never resurrect an ejected seat mid-match). The stored session +
+  // rejoin token are cleared FIRST (see the play page — a stored
+  // session would pass a restore token, and a restore of an ejected
+  // seat mid-match returns 200 server-side, Zara F3b).
+  const joinLobbyAgain = useCallback(
+    (roomCode: string) => {
+      clearSession(roomId);
+      clearRejoinToken(roomId);
+      router.push(`/join/${roomCode}`);
+    },
+    [roomId, router],
+  );
 
   const [pickerChoice, setPickerChoice] = useState<string | null>(null);
   // Manual fallback: force the name picker into the column below the
@@ -785,18 +802,28 @@ export default function CatchPage({
   // it with 403 `SEAT_REMOVED` (or a snapshot landed with `leftAt`
   // set). No Retry: a removed seat can never reload, and the mirror
   // is already dead — home, to join a new game.
+  // v33 FIX 2 (Diya b): a removed (leftAt) seat also gets the way
+  // back to the SAME lobby — a fresh join with the room code (the
+  // server admits it only in LOBBY). Without a stored code, only the
+  // fresh-game route is offered.
   if (seatRemoved) {
     return (
       <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pt-3">
         <p className="py-6 text-center text-[15px] font-semibold text-white">
-          You were removed from the game.
+          {myPlayer?.ejectedAt ? 'You were ejected from the game.' : 'You were removed from the game.'}
         </p>
         <p className="text-center text-[14px] text-[#A1A1AA]">
-          The host removed you from this game. The game goes on without you — you can join a
-          new game from home.
+          {myPlayer?.ejectedAt
+            ? 'You were away too long or your location stopped updating. The game goes on without you — you can join a new game from home.'
+            : 'The host removed you from this game. The game goes on without you — you can join a new game from home.'}
         </p>
-        <Button variant="primary" onClick={() => router.push('/')}>
-          Go home
+        {session?.roomCode ? (
+          <Button variant="primary" onClick={() => { const code = session?.roomCode; if (code) joinLobbyAgain(code); }}>
+            Join the lobby again
+          </Button>
+        ) : null}
+        <Button variant="outline" onClick={() => router.push('/')}>
+          Start a fresh game
         </Button>
       </main>
     );
@@ -860,7 +887,11 @@ export default function CatchPage({
       ) : null}
 
       {/* v31 fix round (F3): ejected or host-removed while this tab
-          was away — the seat is gone; the game goes on without you. */}
+          was away — the seat is gone; the game goes on without you.
+          v33 FIX 2 (Diya c): the ejected banner carries the
+          socket-independent path to results (the socket is closed,
+          4405 — no snapshot will ever arrive); the removed banner
+          carries the fresh-game route. */}
       {ejectedAt ? (
         <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3" role="status">
           <p className="text-[14px] font-semibold text-white">You were removed from the game.</p>
@@ -868,6 +899,13 @@ export default function CatchPage({
             You were away too long or your location stopped updating. The game goes on without
             you — you can watch the results when the round ends, or join a new game.
           </p>
+          <Button
+            variant="outline"
+            className="mt-3"
+            onClick={() => router.push(`/room/${roomId}/results`)}
+          >
+            See results
+          </Button>
         </div>
       ) : null}
       {removedAt ? (
@@ -877,6 +915,9 @@ export default function CatchPage({
             The host removed you from this game. The game goes on without you — you can watch
             the results when the round ends, or join a new game.
           </p>
+          <Button variant="outline" className="mt-3" onClick={() => router.push('/')}>
+            Go home
+          </Button>
         </div>
       ) : null}
 

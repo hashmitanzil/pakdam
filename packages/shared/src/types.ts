@@ -141,7 +141,13 @@ export type WsCloseAction =
  * 4401: fresh ticket, reconnect once; a second 4401 → closed.
  * 4404 (v31 FIX 1): room gone — the room never existed or was host-deleted.
  * Do not reconnect: a fresh ticket cannot help, the room is gone.
- * 4413: back off, never before the server's `retryAfterSeconds`.
+ * 4405 (v33 F2b): ejected — the seat was ejected mid-match (missing fix,
+ * outside zone, GPS violation). Do not reconnect: the seat is out, and
+ * a fresh ticket cannot help until the host replays the room. DISTINCT
+ * from 4403 (removed by the host): the client branches on code, and
+ * 4403 would clear the rejoin token and lock the seat out of
+ * results/replay. The ejected copy itself lives in the client close
+ * handler (Meera's half).
  */
 export const WS_CLOSE_CODE_ACTION: Readonly<Record<number, WsCloseAction>> = {
   1000: 'do-not-reconnect',
@@ -152,6 +158,7 @@ export const WS_CLOSE_CODE_ACTION: Readonly<Record<number, WsCloseAction>> = {
   4401: 'fresh-ticket-reconnect-once',
   4403: 'do-not-reconnect',
   4404: 'do-not-reconnect',
+  4405: 'do-not-reconnect',
   4409: 'do-not-reconnect',
   4413: 'backoff-after-retry-after',
 } as const;

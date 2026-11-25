@@ -188,10 +188,14 @@ test('source pin: the hook keys removal off the CODE in exactly three places —
 
 test('source pin: the hook latches seatRemoved and refuses Retry for a removed seat', () => {
   assert.match(useRoomStateSrc, /if \(roomDeleted \|\| seatRemoved\) return;/);
+  // Re-pointed (v33 F2b): the latch is gated on the seat NOT already
+  // being known-ejected — a 403 for an ejected seat keeps the EJECTED
+  // state (the server reuses SEAT_REMOVED for ejected reads while
+  // live). A genuine removal still latches and retries nothing.
   assert.match(
     useRoomStateSrc,
-    /err\.status === 403 &&\n\s*err\.code === 'SEAT_REMOVED'\n\s*\) \{\n\s*markSeatRemoved\(\);/,
-    'the Retry catch marks the seat removed instead of retrying the socket',
+    /err\.status === 403 &&\n\s*err\.code === 'SEAT_REMOVED'\n\s*\) \{\n\s*if \(ejectedAtRef\.current === null\) markSeatRemoved\(\);/,
+    'the Retry catch marks the seat removed instead of retrying the socket — unless the seat is already known ejected',
   );
 });
 

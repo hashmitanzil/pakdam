@@ -289,6 +289,22 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
   // (Fix round 1, W1/W2: the old once-per-mount guard let one blip
   // silence every later probe.)
   const deletedProbeRef = useRef(false);
+  // v33 (F2b, Kabir's server half): the ejected state my seat is
+  // known to be in, from the latest applied snapshot. The server
+  // 403s an EJECTED seat while the match is live with the SAME code
+  // as a removed seat (`SEAT_REMOVED`, room-do.ts) — so a 403 alone
+  // cannot tell them apart. This ref is the client's memory: the
+  // pushed ejection snapshot (snapshot-before-close) sets it, and
+  // the 403 sites below consult it before latching `seatRemoved`.
+  // Synced (not just set) in `applySnapshot`: a host replay clears
+  // `ejectedAt`, so a stale "ejected" would wrongly guard a later
+  // genuine removal.
+  const ejectedAtRef = useRef<string | null>(null);
+  // v33 (F2b): ref mirror of the `seatRemoved` latch, so
+  // `applySnapshot` can UN-latch it when a snapshot proves ejection
+  // (a 403 that raced ahead of the pushed snapshot latched a removal
+  // that was never true).
+  const seatRemovedRef = useRef(false);
 
   /**
    * The room is gone: latch it and stop showing "Loading…". The
@@ -326,6 +342,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
    */
   const markSeatRemoved = useCallback(() => {
     clearRejoinToken(roomId);
+    seatRemovedRef.current = true;
     setSeatRemoved(true);
     setLoading(false);
     setRoom(null);
@@ -404,6 +421,22 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     const json = JSON.stringify(snapshot);
     if (json === lastSnapshotJsonRef.current) return;
     lastSnapshotJsonRef.current = json;
+    // v33 (F2b): sync the ejected ref from my own seat on every
+    // applied snapshot — and UN-latch a removal that a racing 403
+    // latched before this snapshot arrived. The pushed ejection
+    // snapshot carries `ejectedAt` (snapshot-before-close); a seat
+    // with `ejectedAt` set was never removed (the server skips left
+    // seats when ejecting), so a latched removal here is a race
+    // artefact, not a fact. The snapshot below re-fills room/players
+    // from the truth it carries, so no mirror is lost by unlatching.
+    const me = snapshot.players.find((p) => p.playerId === myPlayerIdRef.current);
+    if (me) {
+      ejectedAtRef.current = me.ejectedAt ?? null;
+      if (me.ejectedAt !== null && seatRemovedRef.current) {
+        seatRemovedRef.current = false;
+        setSeatRemoved(false);
+      }
+    }
     // v31 fix round (F3, backstop): a snapshot that lands with my own
     // seat already left must never be applied as "I am in" — the seat
     // is out. The 403 `SEAT_REMOVED` refusal is the primary signal
@@ -433,7 +466,8 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     // websocket.ts). That fallback IS client-computed, by design: the
     // old "client NEVER computes a deadline" claim was wrong about it.
     // (The host grace above is different: it is never client-computed.)
-    const me = snapshot.players.find((p) => p.playerId === myPlayerIdRef.current);
+    // `me` is the same lookup as the ejectedAt sync above (same
+    // snapshot, same seat) — reused, not redeclared (TS2451).
     if (me) {
       socketRef.current?.setReconnectWindowEndsAtMs(readReconnectEndsAtMs(me));
       // v31 fix round (F3/F4): a `leftAt` seat never reaches here —
@@ -636,12 +670,21 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         // dies with the seat and the page shows the removal notice,
         // never the generic "Could not load the room". A bare 403
         // (bad token, no code) is NOT this and keeps the old error.
+        // v33 (F2b): the server 403s an EJECTED seat while the match
+        // is live with the SAME code — but the client may already
+        // know `ejectedAt` from a snapshot that won the race (the
+        // socket connects in parallel with this fetch). When it
+        // does, keep the EJECTED state: flipping to removed would
+        // render the degraded results view and refuse retries.
+        // When the 403 wins the race the removal latches — and the
+        // pushed snapshot un-latches it in `applySnapshot` when it
+        // arrives.
         if (
           err instanceof LiveHttpError &&
           err.status === 403 &&
           err.code === 'SEAT_REMOVED'
         ) {
-          markSeatRemoved();
+          if (ejectedAtRef.current === null) markSeatRemoved();
           return;
         }
         setError('Could not load the room — check your connection and try again.');
@@ -881,7 +924,12 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         // Probe the state fetch: 404 = deleted (home with the one
         // plain message); 403 `SEAT_REMOVED` = my seat is out (mirror
         // dies, removal notice — no re-arm, a removed seat never
-        // probes again); anything else (a network failure) is NOT a
+        // probes again), UNLESS the client already knows the seat was
+        // ejected (v33 F2b — the pushed snapshot set `ejectedAt`, and
+        // the server 403s an ejected seat with the same code); a 200
+        // APPLIES the snapshot (v33 F2b — after a 4405 close this is
+        // the only way the client learns the match ended or the host
+        // replayed); anything else (a network failure) is NOT a
         // deletion and re-arms the probe, so a transient blip never
         // permanently disables the backstop.
         if (
@@ -891,9 +939,19 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         ) {
           deletedProbeRef.current = true;
           void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken)
-            .then(() => {
+            .then((fetched) => {
+              if (cancelled) return;
               // Room alive — re-arm so a later close probes again.
+              // v33 (F2b, Diya): APPLY the fetched snapshot instead
+              // of discarding it. After a 4405 close no snapshot
+              // will ever arrive over the dead socket, so this fetch
+              // is the only way the client learns the match ended
+              // (terminal routing to results) or the host replayed
+              // (LOBBY effect). A successful fetch after any other
+              // close is the same fresh truth a reconnect re-fetch
+              // would have delivered.
               deletedProbeRef.current = false;
+              applySnapshot(fetched);
             })
             .catch((err: unknown) => {
               if (cancelled) return;
@@ -903,7 +961,16 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
                 err.status === 403 &&
                 err.code === 'SEAT_REMOVED'
               ) {
-                markSeatRemoved();
+                // v33 (F2b, Kabir's server half): an ejected seat
+                // 403s here while the match is live — but the client
+                // already knows `ejectedAt` from the pushed snapshot
+                // (snapshot-before-close). Keep the EJECTED state:
+                // flipping to removed would render the degraded
+                // results branch (no names, no replay waiting line)
+                // and make `retryConnection` refuse. A genuine
+                // removal (no `ejectedAt` known) still latches.
+                if (ejectedAtRef.current === null) markSeatRemoved();
+                else deletedProbeRef.current = false;
               } else deletedProbeRef.current = false;
             });
         }
@@ -1019,12 +1086,17 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
         // v31 fix round (F3): the seat is out — mark it removed
         // (mirror dies, removal notice) and retry nothing: the socket
         // retry could only fail against the same refusal.
+        // v33 (F2b): unless the client already knows the seat was
+        // EJECTED (pushed snapshot) — then the 403 is the live-match
+        // ejection refusal, not a removal: keep the EJECTED state and
+        // retry nothing (the socket is terminal-closed after 4405
+        // anyway; `retry()` is a no-op there).
         if (
           err instanceof LiveHttpError &&
           err.status === 403 &&
           err.code === 'SEAT_REMOVED'
         ) {
-          markSeatRemoved();
+          if (ejectedAtRef.current === null) markSeatRemoved();
           return;
         }
         setSocketError('Could not reload the room — try again.');

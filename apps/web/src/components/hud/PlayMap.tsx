@@ -182,6 +182,7 @@ import {
   TRAIL_DOT_RADIUS_PX,
   unknownErrorDetail,
   zoneBboxInView,
+  fixInView,
   type FitRetryBudget,
   type MapAreaHeightDiagnosis,
   type MapState,
@@ -274,6 +275,33 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // Set by the canvas listeners attached at map creation; cleared
   // on restore and on a fresh map (Retry).
   const [contextLost, setContextLost] = useState(false);
+  // v33 FIX 4: the context came back but the style is still
+  // reloading (`setStyle` is async) — the canvas is blank until
+  // `style.load` lands, so the pill must not claim "Map ready" in
+  // the meantime. Set by the restore callback below; cleared by the
+  // `style.load` handler in the creation effect.
+  const [contextRestoring, setContextRestoring] = useState(false);
+  // v33 FIX 4: a repaint was requested but no `render` frame
+  // followed within the stall window — the loop is stalled on a
+  // canvas that HAS size, so every size-only check passes while
+  // nothing paints. Set by the stall-guard effect below; cleared by
+  // the next `render` frame, or by Retry / a fresh map.
+  const [paintStalled, setPaintStalled] = useState(false);
+  // v33 FIX 4: bumped on every `style.load` (first load AND every
+  // style reload, including the one after a context restore) — the
+  // six overlay effects depend on it, so the runtime sources/layers
+  // re-sync after a restore. `syncSource` already writes when a
+  // source does not exist, so no cache invalidation is needed; the
+  // re-run IS the fix.
+  const [styleNonce, setStyleNonce] = useState(0);
+  // v33 FIX 4 (stall guard): the last `render` frame the map
+  // produced, and the last moment a repaint was explicitly
+  // requested. A requested repaint with no later frame is the
+  // paint-aware signal the size-only checks cannot give (a canvas
+  // can have size and still be black).
+  const lastRenderAtMsRef = useRef<number>(0);
+  const repaintRequestedAtMsRef = useRef<number | null>(null);
+  const paintStalledRef = useRef(false);
   // v28 (Zara A1 + Diya F3): a failed ◎ tap is its OWN state — never
   // recorded as a resource failure. The pill shows the allow-listed
   // `RECENTRE_FAILED_COPY` for it, never raw error text.
@@ -623,6 +651,13 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       setRecentreFailed(false);
       setRecentreNote(null);
       setRecentreFallback(null);
+      // v33 FIX 4: a fresh map clears the restore/stall states too —
+      // a new map is a new render loop, not the stalled one.
+      setContextLost(false);
+      setContextRestoring(false);
+      setPaintStalled(false);
+      paintStalledRef.current = false;
+      repaintRequestedAtMsRef.current = null;
       setAreaDiagnosis(null);
       setZeroWidth(false);
       // v27: a fresh map gets its own one re-resize on the canvas
@@ -664,8 +699,16 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       // instead of missed. No listener attach here any more (one
       // attach point, earliest); the `setContextLost(false)` below
       // still clears the previous attempt's pill on a fresh map.
+      // v33 FIX 4: a restore does NOT clear the loss at once — the
+      // style reloads asynchronously (`setStyle`), so the canvas is
+      // blank until `style.load` lands. `contextRestoring` keeps the
+      // pill honest in that window ("restored — reloading…") and the
+      // `style.load` handler below clears both flags.
       onContextLost: () => setContextLost(true),
-      onContextRestored: () => setContextLost(false),
+      onContextRestored: () => {
+        setContextLost(false);
+        setContextRestoring(true);
+      },
     })
       .then((map) => {
         if (cancelled) {
@@ -780,6 +823,40 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           prevHasSizeRef.current = hasSize;
         });
         observer.observe(container);
+        // v33 FIX 4 (stall guard): every frame the map produces
+        // stamps the clock — a requested repaint with no later frame
+        // is a stalled loop, which no size-only check can see. The
+        // listener also clears a stall flag the moment frames resume.
+        // MapLibre fires 'render' at the end of every frame
+        // (installed maplibre-gl 5.24.1, `_render`).
+        map.on('render', () => {
+          lastRenderAtMsRef.current = Date.now();
+          if (paintStalledRef.current) {
+            paintStalledRef.current = false;
+            setPaintStalled(false);
+          }
+        });
+        // v33 FIX 4 (context restore): `style.load` fires on the
+        // first load AND on every style (re)load, including the one
+        // MapLibre triggers after a context restore (`_loaded` stays
+        // true, so 'load' never re-fires and the v31 load repaint
+        // never runs again). The restore re-syncs the runtime
+        // sources (via `styleNonce` — the overlay effects re-run and
+        // `syncSource` re-adds what the destroyed style took) and
+        // repaints; it also ends the restoring window the pill
+        // names while the reload is in flight.
+        map.on('style.load', () => {
+          if (cancelled) return;
+          setContextLost(false);
+          setContextRestoring(false);
+          setStyleNonce((n) => n + 1);
+          try {
+            map.triggerRepaint();
+          } catch {
+            // Dead map: the stall guard / Retry below still covers it.
+          }
+          repaintRequestedAtMsRef.current = Date.now();
+        });
         map.on('load', () => {
           if (cancelled) return;
           clearTimeout(loadTimer);
@@ -806,6 +883,10 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           } catch {
             // Dead map: the verify below still runs.
           }
+          // v33 FIX 4 (stall guard): the load repaint is a requested
+          // frame — stamp it so the guard can tell a first-load stall
+          // from a painting map.
+          repaintRequestedAtMsRef.current = Date.now();
           // Diya F3: measure the area at ready — a 0-height container
           // or canvas surfaces in the pill instead of "Map ready".
           checkMapAreaHeight();
@@ -1032,6 +1113,15 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // the WebGL context while hidden) and viewport changes (resize).
   // Resize-then-measure, at a real size only; the canvas verify runs
   // without an auto-rebuild here.
+  // v33 FIX 4 (Diya): `Map.resize()` resizes the canvas/painter/
+  // transform but requests NO frame (installed maplibre-gl 5.24.1
+  // `resize()` — no `triggerRepaint`, no `_update`) — so a return
+  // from an app-switch resized a stalled canvas and left it black
+  // while every size check passed. The remeasure now requests a
+  // frame explicitly, and a window `focus` return (which fires
+  // without a visibilitychange when the window regains focus while
+  // already visible) remeasures too — there was no focus listener
+  // at all before this.
   useEffect(() => {
     if (!mapReady) return;
     const remeasure = () => {
@@ -1043,6 +1133,12 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         } catch {
           // Dead map: the re-measure below still runs.
         }
+        try {
+          map.triggerRepaint();
+        } catch {
+          // Dead map: the re-measure below still runs.
+        }
+        repaintRequestedAtMsRef.current = Date.now();
       }
       checkMapAreaHeight();
       verifyCanvasPainted(false);
@@ -1050,13 +1146,47 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     const onVisibility = () => {
       if (!document.hidden) remeasure();
     };
+    const onFocus = () => {
+      remeasure();
+    };
     window.addEventListener('resize', remeasure);
+    window.addEventListener('focus', onFocus);
     document.addEventListener('visibilitychange', onVisibility);
     return () => {
       window.removeEventListener('resize', remeasure);
+      window.removeEventListener('focus', onFocus);
       document.removeEventListener('visibilitychange', onVisibility);
     };
   }, [mapReady, checkMapAreaHeight, verifyCanvasPainted]);
+
+  // v33 FIX 4 (stall guard): a repaint was requested (load, tab
+  // return, Retry, re-centre) but no `render` frame followed within
+  // 5 s while the tab is visible and the container has size — the
+  // loop is stalled and the pill must say so instead of "Map ready".
+  // Checked on the 5 s clock (`nowMs`); a healthy map renders within
+  // a frame of the request, so the only way to trip this is a loop
+  // that never fires again. The `render` listener clears the flag
+  // the moment frames resume. A canvas can have size and still be
+  // black — this is the paint-aware check the size-only verifies
+  // cannot give (pixel sampling is not feasible: the WebGL buffer
+  // is not readable without `preserveDrawingBuffer`, which MapLibre
+  // does not set — so frame production, not pixel content, is the
+  // signal).
+  useEffect(() => {
+    if (!mapReady) return;
+    const requestedAt = repaintRequestedAtMsRef.current;
+    if (requestedAt === null) return;
+    if (document.hidden) return;
+    const container = containerRef.current;
+    if (!container || !containerHasSize(container)) return;
+    const now = nowMs ?? Date.now();
+    if (now - requestedAt >= 5000 && lastRenderAtMsRef.current < requestedAt) {
+      if (!paintStalledRef.current) {
+        paintStalledRef.current = true;
+        setPaintStalled(true);
+      }
+    }
+  }, [nowMs, mapReady]);
 
   // Ping circles (64-pt geodesic) are built once per ping set, not once
   // per clock tick — the old single overlay effect rebuilt every circle
@@ -1177,7 +1307,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     return () => {
       cancelAnim?.();
     };
-  }, [mapReady, zoneBoundary]);
+  }, [mapReady, zoneBoundary, styleNonce]);
 
   // First-fit effect (separate from the zone-overlay effect above —
   // see A6): fit the whole zone in view on first load with a valid
@@ -1392,7 +1522,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       stopped = true;
       cancelAnimationFrame(raf);
     };
-  }, [mapReady, pingFeatures, pings]);
+  }, [mapReady, pingFeatures, pings, styleNonce]);
 
   useEffect(() => {
     const map = mapRef.current;
@@ -1410,7 +1540,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       ],
       collection(noGoAreas.filter((a) => a.length >= 3).map((a) => polygonFeature(a))),
     );
-  }, [mapReady, noGoAreas]);
+  }, [mapReady, noGoAreas, styleNonce]);
 
   // My own position: a DOM MARKER (v29 D) + the accuracy ring.
   // The v28 dot was a MapLibre `circle` layer — a screen-space
@@ -1483,7 +1613,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     return () => {
       cancelled = true;
     };
-  }, [mapReady, myFix, nowMs]);
+  }, [mapReady, myFix, nowMs, resizeNonce]);
 
   // The accuracy ring (v28 Diya F5/F6): the fix's real accuracy
   // circle, from `meAccuracyFeatures` (play-map-logic.ts) — a
@@ -1505,7 +1635,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       ],
       collection(meAccuracyFeatures(myFix)),
     );
-  }, [mapReady, myFix, nowMs]);
+  }, [mapReady, myFix, nowMs, styleNonce]);
 
   // Teammates' live positions (green dots, same size/stroke as the me
   // dot). Teammates only — the caller never passes an opponent here,
@@ -1537,7 +1667,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         })),
       ),
     );
-  }, [mapReady, teammateFixes]);
+  }, [mapReady, teammateFixes, styleNonce]);
 
   // Dot trails (10 s fade, in-memory only): each new fix appends a
   // point for me and for each teammate; points older than 10 s are
@@ -1619,7 +1749,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       ],
       collection(features),
     );
-  }, [mapReady, myFix, teammateFixes, nowMs]);
+  }, [mapReady, myFix, teammateFixes, nowMs, styleNonce]);
 
   // Compass lock: rotate the map with the device heading. OFF restores
   // north-up. Fails soft ("Compass unavailable") when no heading is
@@ -1668,6 +1798,42 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       const map = mapRef.current;
       if (!map || !mapReady) return;
       const { centre, source } = resolveRecentreCentre(myFix, zoneBoundary);
+      // Shared by the direct ease and the one retry below — the
+      // fallback/stale note for the centre that actually landed.
+      const applyRecentreSuccess = (landedSource: 'fix' | 'zone' | 'default') => {
+        setRecentreFailed(false);
+        setRecentreFailedAtMs(null);
+        if (landedSource === 'fix' && myFix !== null) {
+          const now = nowMs ?? Date.now();
+          setRecentreFallback(null);
+          if (isFixStale(myFix, now)) {
+            const ageS = Math.max(0, Math.floor((now - myFix.timestampMs) / 1000));
+            setRecentreNote(recentreStaleNote(ageS));
+          } else {
+            setRecentreNote(null);
+          }
+        } else if (landedSource === 'zone') {
+          // v30 follow-up (item C): loud pill, not the footnote.
+          setRecentreNote(null);
+          setRecentreFallback('zone');
+        } else {
+          setRecentreNote(null);
+          setRecentreFallback('default');
+        }
+      };
+      const easeToCentre = (target: MapLibreMapLike, targetBearing?: number) => {
+        if (targetBearing === undefined) {
+          target.easeTo({ center: [centre.lng, centre.lat], duration: 300 });
+        } else {
+          target.easeTo({ center: [centre.lng, centre.lat], bearing: targetBearing, duration: 300 });
+        }
+      };
+      // v28 (hole 3): never pass `bearing: undefined` as a PRESENT key —
+      // installed MapLibre reads bearing by key presence and normalises
+      // undefined to NaN. Two branches: no key at all when undefined.
+      // (`easeToCentre` below shares this shape for the retry; the
+      // direct path keeps the literal `map.easeTo` so the v28 pin —
+      // which asserts on the call site — keeps seeing it.)
       try {
         if (bearing === undefined) {
           map.easeTo({ center: [centre.lng, centre.lat], duration: 300 });
@@ -1686,6 +1852,33 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         } catch {
           // Dead map: the failure below is the honest record.
         }
+        // v33 FIX 3 (Diya: retry-after-repaint): the repaint above is
+        // ASYNC — it schedules a frame — so a synchronous second ease
+        // right here would throw against the same wedged loop. Retry
+        // the SAME ease once, on the next animation frame, after the
+        // repaint has had its frame. If it lands, the tap succeeds
+        // (failure cleared, the normal fallback/stale note set); if
+        // it throws again, the failure recorded below stands. The
+        // pill shows the failure until the retry resolves — one
+        // frame, imperceptible — and the retry is identity-guarded
+        // (same map instance) so a Retry rebuild in between never
+        // re-eases a dead map. No `requestAnimationFrame` (SSR /
+        // node tests) degrades to the v31 behaviour: repaint, then
+        // record the failure.
+        if (typeof requestAnimationFrame === 'function') {
+          const retryMap = map;
+          const retryBearing = bearing;
+          const retrySource = source;
+          requestAnimationFrame(() => {
+            if (mapRef.current !== retryMap || !mapReady) return;
+            try {
+              easeToCentre(retryMap, retryBearing);
+            } catch {
+              return;
+            }
+            applyRecentreSuccess(retrySource);
+          });
+        }
         // A tap-handler failure is not a resource failure: record
         // only the allow-listed copy (Zara A1) and nothing else.
         // v28 fix round (Zara V1): stamp it — the decay effect
@@ -1697,25 +1890,7 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
         setRecentreFallback(null);
         return;
       }
-      setRecentreFailed(false);
-      setRecentreFailedAtMs(null);
-      if (source === 'fix' && myFix !== null) {
-        const now = nowMs ?? Date.now();
-        setRecentreFallback(null);
-        if (isFixStale(myFix, now)) {
-          const ageS = Math.max(0, Math.floor((now - myFix.timestampMs) / 1000));
-          setRecentreNote(recentreStaleNote(ageS));
-        } else {
-          setRecentreNote(null);
-        }
-      } else if (source === 'zone') {
-        // v30 follow-up (item C): loud pill, not the footnote.
-        setRecentreNote(null);
-        setRecentreFallback('zone');
-      } else {
-        setRecentreNote(null);
-        setRecentreFallback('default');
-      }
+      applyRecentreSuccess(source);
     },
     [myFix, zoneBoundary, mapReady, nowMs],
   );
@@ -1733,6 +1908,28 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
 
   /** Re-centre only — the ◎ button. */
   const recentre = useCallback(() => centreOn(), [centreOn]);
+
+  // v33 FIX 5: on a tab return (resizeNonce bump) the marker effect
+  // above re-positions the dot — and if the fix drifted off screen
+  // while the tab was hidden, pull the camera back so the YOU dot is
+  // on screen. Only on return, never on a fresh fix: free panning is
+  // never fought in general. The check is `fixInView` (the point form
+  // of `zoneBboxInView`); the move is the ◎ path itself, so the pill
+  // bookkeeping stays the same as a manual tap.
+  const prevReturnNonceRef = useRef(resizeNonce);
+  useEffect(() => {
+    if (!mapReady) return;
+    const prev = prevReturnNonceRef.current;
+    prevReturnNonceRef.current = resizeNonce;
+    if (prev === resizeNonce) return;
+    const map = mapRef.current;
+    const fix = myFixRef.current;
+    const container = containerRef.current;
+    if (!map || !fix || !container) return;
+    const { clientWidth: width, clientHeight: height } = container;
+    if (width <= 0 || height <= 0) return;
+    if (!fixInView(map, fix, width, height)) centreOn();
+  }, [mapReady, resizeNonce, centreOn]);
   /** North-up + re-centre — the N button is NOT a duplicate of re-centre. */
   const resetNorth = useCallback(() => {
     // F11: N turns the compass lock OFF first — otherwise the next
@@ -1967,6 +2164,10 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     recentreFailed,
     // v29 (E): a lost WebGL context is never "Map ready".
     contextLost,
+    // v33 FIX 4: a restoring style and a stalled paint loop are
+    // never "Map ready" either.
+    contextRestoring,
+    paintStalled,
   );
   // v31 (Fix 2): the Retry affordance is ONE tested mapping
   // (`shouldOfferMapRetry`) — a failed ◎ tap on a 'ready' map offers
@@ -1986,6 +2187,8 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     hasOtherResource: otherResource !== null,
     recentreFailed,
     contextLost,
+    contextRestoring,
+    paintStalled,
   });
   // Zara 4: both Retry buttons stay disabled while a load is in flight
   // and for 2 s after a tap — spamming Retry aborts creation and can

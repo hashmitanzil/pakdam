@@ -264,6 +264,20 @@ test.describe('host succession: earliest joiner becomes host', () => {
     const firstGuest = guestPages[0]!; // Ana — joined first after the host
     const secondGuest = guestPages[1]!; // Ben
 
+    // v32: reset the host BEFORE anything reads host controls.
+    // Creating the guest pages backgrounded the host tab, so the play
+    // page's useRoomState handler already suspended it (and started
+    // the 30 s grace) in the lobby, before this test's hideTab. Without
+    // the reset the grace is stale: it can expire mid-test (crown to
+    // Ben, the only connected seat) before hideTab runs, so the waiting
+    // line never appears — and the expectEndRound(host, true) below
+    // would already fail on a host who lost the crown. Fronting
+    // resumes the host and cancels the stale grace; the hideTab below
+    // then starts a fresh one. (Same mechanism as host-grace.spec.ts
+    // resetHostBeforeHide; geolocation is granted here, so fixes flow
+    // and the resume holds.)
+    await hostPage.bringToFront();
+
     // Before: only the host can end the round.
     await expectEndRound(hostPage, true);
     await expectEndRound(firstGuest, false);
@@ -274,6 +288,21 @@ test.describe('host succession: earliest joiner becomes host', () => {
     // remaining CONNECTED seat. The waiting line appears first, while
     // the crown is still with the suspended host — no reload anywhere.
     await hideTab(hostPage);
+    // v32: Ana must be the CONNECTED successor at expiry. Creating
+    // Ben's page backgrounded her, so she is suspended from setup and
+    // expiry would hand the crown to Ben instead. Front her now — the
+    // host stays suspended (its hide was faked) and Ben being
+    // backgrounded is harmless. The poll below proves the premise:
+    // Ana is observably connected before the grace expires.
+    await firstGuest.bringToFront();
+    await expect
+      .poll(
+        async () =>
+          (await getDemoRoom(firstGuest, roomId))?.players.find((p) => p.displayName === GUEST_NAMES[0])
+            ?.connectionState,
+        { timeout: 5000 },
+      )
+      .toBe('connected');
     // Fresh fix for the still-visible seats: resets their (4a) 30 s
     // clock, so the tail below is safe even on a slow CI worker.
     await context.setGeolocation(CENTRE_NUDGED);
@@ -313,12 +342,39 @@ test.describe('host succession: earliest joiner becomes host', () => {
     const firstGuest = guestPages[0]!; // Ana — suspended below
     const secondGuest = guestPages[1]!; // Ben — earliest-joined CONNECTED seat
 
+    // v32 — pin the mechanism (it was never pinned: the old test hid
+    // Ana without ever showing she was connected first, so her
+    // suspension could have come from setup-time backgrounding
+    // instead of the test's own hideTab, and the leave would have
+    // skipped her vacuously). Reset the room to a known state first:
+    // front the host (resumes it, cancels the stale setup-time grace
+    // — the crown must still be Teo's when he leaves), then front Ana
+    // (resumes her — the poll below proves she is observably
+    // connected), then the test's own hideTab suspends her for real.
+    // Front Ben LAST, before the leave: fronting Ana backgrounded
+    // him, and the leave must find him CONNECTED — he is the
+    // earliest-joined connected seat the crown skips to. Only one
+    // page is front at a time, so the order is load-bearing: host,
+    // then Ana (hide), then Ben (leave). Geolocation is granted, so
+    // fixes flow and every resume holds.
+    await hostPage.bringToFront();
+    await firstGuest.bringToFront();
+    const anaId = await playerIdOf(firstGuest, roomId, GUEST_NAMES[0]);
+    await expect
+      .poll(
+        async () =>
+          (await getDemoRoom(firstGuest, roomId))?.players.find((p) => p.playerId === anaId)
+            ?.connectionState,
+        { timeout: 5000 },
+      )
+      .toBe('connected');
+
     // Ana backgrounds her tab: suspended, still in the room.
     await hideTab(firstGuest);
+    await secondGuest.bringToFront();
     // Fresh fix for the still-visible seats: resets their (4a) 30 s
     // clock, so the tail below is safe even on a slow CI worker.
     await context.setGeolocation(CENTRE_NUDGED);
-    const anaId = await playerIdOf(firstGuest, roomId, GUEST_NAMES[0]);
     await expect
       .poll(
         async () =>

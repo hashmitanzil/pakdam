@@ -20,6 +20,9 @@ import {
   forceDemoMatchEnd,
   forceDemoShrink,
   getDemoRoom,
+  newCentredDemoContext,
+  resumeSeatViaCatchPage,
+  startCentreFixKeepFresh,
   startDemoMatch,
 } from './helpers';
 import type { Page } from '@playwright/test';
@@ -45,7 +48,14 @@ test.describe('catch → results (demo)', () => {
    * → tap the Hunter → OK. The Hunter does nothing; the tag completes.
    */
   async function catchRunner(hunterPage: Page, runnerPage: Page, roomId: string, runnerName: string, hunterName: string) {
-    await runnerPage.goto(`/room/${roomId}/catch`);
+    // v32: both seats are suspended in the headless multi-page setup
+    // (backgrounded tabs) and the self-confirm creates its claim
+    // through `requestCatch`, which rejects a suspended Hunter — so
+    // the Hunter mounts the catch page first (P0-1 resume; navigation
+    // only, they never claim, scan, or confirm anything). The Runner
+    // mounts it next (same resume) and confirms there.
+    await resumeSeatViaCatchPage(hunterPage, roomId, hunterName);
+    await resumeSeatViaCatchPage(runnerPage, roomId, runnerName);
     await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
@@ -63,10 +73,18 @@ test.describe('catch → results (demo)', () => {
   }
 
   test('one tag then time up: Runners Win, one-line stats, timeline, fresh game', async ({
-    context,
+    browser,
   }) => {
+    const context = await newCentredDemoContext(browser);
     const { hostPage, roomId, hunterPage, runnerPages, runnerNames, hunterName } =
       await setupMatch(context);
+    // v32 fix round (Diya A1): the free Runner is never harboured in
+    // this test, so if it is the front tab its one centred fix goes
+    // stale at ACTIVE+30 s and the (4a) clock ejects it mid-test.
+    // The 4 s nudge loop re-stamps the front seat's `lastFixAt` for
+    // the whole ACTIVE span (see `startCentreFixKeepFresh`); stop it
+    // just before the context closes.
+    const stopKeepFresh = startCentreFixKeepFresh(context);
     await catchRunner(hunterPage, runnerPages[0]!, roomId, runnerNames[0]!, hunterName);
     await forceDemoMatchEnd(hostPage, roomId);
     await goToResults(hostPage, roomId);
@@ -83,14 +101,26 @@ test.describe('catch → results (demo)', () => {
     await hostPage.getByRole('button', { name: 'START A FRESH GAME' }).click();
     await expect(hostPage).toHaveURL(/\/$/);
     await expect(hostPage.getByRole('button', { name: /HOST A GAME/ })).toBeVisible();
+    stopKeepFresh();
+    await context.close();
   });
 
   test('all runners caught: Hunters Win, Last runner caught, no never-caught line', async ({
-    context,
+    browser,
   }) => {
+    const context = await newCentredDemoContext(browser);
     const { hostPage, roomId, hunterPage, runnerPages, runnerNames, hunterName } = await setupMatch(context);
+    // v32 fix round (Diya A1): the second Runner is unharboured until
+    // the second claim, so if it is the front tab its one centred fix
+    // goes stale at ACTIVE+30 s — the 4 s nudge loop re-stamps the
+    // front seat's `lastFixAt` until the context closes.
+    const stopKeepFresh = startCentreFixKeepFresh(context);
     await catchRunner(hunterPage, runnerPages[0]!, roomId, runnerNames[0]!, hunterName);
     // Tag someone else: the hunter's done card offers the next claim.
+    // v32: the second Runner's seat is suspended too (backgrounded
+    // tab) and the Hunter's claim rejects a suspended Runner — mount
+    // them on the catch page first (P0-1 resume) so the claim lands.
+    await resumeSeatViaCatchPage(runnerPages[1]!, roomId, runnerNames[1]!);
     // Way 1 via the manual fallback — camera view → pick the runner by
     // name → the runner lands in the column with a Tag button (disabled
     // until a scan) → the runner confirms on their own phone (Self
@@ -107,7 +137,9 @@ test.describe('catch → results (demo)', () => {
     await expect(hunterPage.getByText(`Claim open — ${runnerNames[1]}`)).toBeVisible();
     const tagBtn = hunterPage.getByRole('button', { name: 'Scan their QR first' });
     await expect(tagBtn).toBeDisabled();
-    await runnerPages[1]!.goto(`/room/${roomId}/catch`);
+    // (v32: the second Runner is already on the catch page from the
+    // harbour above — no second goto; a reload would wipe that tab's
+    // in-memory raw catch tokens.)
     await runnerPages[1]!.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPages[1]!.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPages[1]!.getByRole('button', { name: 'OK', exact: true }).click();
@@ -131,19 +163,42 @@ test.describe('catch → results (demo)', () => {
     await expect(hostPage.getByText(/never caught/)).toBeHidden();
     await expect(hostPage.getByText('Last runner caught')).toBeVisible();
     await expect(hostPage.locator('.border-l-2')).toHaveCount(4);
+    stopKeepFresh();
+    await context.close();
   });
 
   test('Replay — back to the lobby: same room and code, players and config kept, everyone un-ready', async ({
-    context,
+    browser,
   }) => {
+    const context = await newCentredDemoContext(browser);
     // v18 Item 3: when the match ends, the results screen has a host-only
     // "Replay — back to the lobby" button. The host taps it → the room
     // resets to LOBBY → the client returns to the lobby with the SAME
     // room and SAME room code (players + config kept, match state
     // cleared, everyone un-ready). Scores / tag list / winners stay on
     // the results screen until Replay is tapped.
+    //
+    // v32: the (4a) hypothesis for this test is DISPROVEN — the match
+    // cannot be completed early by the missing-fix ejection here, on
+    // EITHER branch for the free Runner. If the free Runner is a
+    // backgrounded tab, its seat stays suspended on the play page and
+    // a suspended seat never ejects (`shouldEjectForMissingFix`
+    // returns false for a suspended seat). If it is the front tab, it
+    // is connected with the one centred fix — which goes stale at
+    // ACTIVE+30 s, so that branch is held off ONLY by the 4 s nudge
+    // loop started below (`startCentreFixKeepFresh`, Diya A1). The
+    // harboured seats cannot eject either: the (4a) check lives only
+    // on the play page (play/page.tsx:735), and the catch page mounts
+    // no such check. This test failed at the catch (`catchRunner`)
+    // like the others, before ever reaching the forced end — the
+    // harbour in `catchRunner` is the fix.
     const { hostPage, guestPages, roomId, code, hunterPage, runnerPages, runnerNames, hunterName } =
       await setupMatch(context);
+    // v32 fix round (Diya A1): the free Runner is never harboured in
+    // this test, and its ACTIVE span (catch + shrink poll + results)
+    // can cross 30 s — the 4 s nudge loop re-stamps the front seat's
+    // `lastFixAt` for the whole span; stop it before the close.
+    const stopKeepFresh = startCentreFixKeepFresh(context);
     await catchRunner(hunterPage, runnerPages[0]!, roomId, runnerNames[0]!, hunterName);
     // B2: the replayed game must start on the ORIGINAL configured zone,
     // not the shrunk one — so shrink the zone once first, then replay.
@@ -206,6 +261,8 @@ test.describe('catch → results (demo)', () => {
       await expect(page.getByRole('button', { name: /I'm ready — tap to change/ })).toBeHidden();
     }
     await expect(hostPage.getByRole('button', { name: 'START GAME', exact: true })).toBeVisible();
+    stopKeepFresh();
+    await context.close();
   });
 
   test('results before the match finishes says so and links back to the match', async ({

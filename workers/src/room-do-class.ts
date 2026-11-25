@@ -47,6 +47,8 @@ import {
 } from '@pakdam/shared';
 import {
   ABANDONED_IDLE_MS,
+  EJECTED_CLOSE_CODE,
+  EJECTED_CLOSE_REASON,
   RoomStore,
   STATE_KEY,
   durableSnapshot,
@@ -1459,6 +1461,26 @@ export class RoomDO implements DurableObject {
       session.missedHeartbeats = 0;
     }
 
+    // v33 fix round (Zara final review, REQUIRED) — an ejected seat
+    // must not hello, first or repeat: no welcome + snapshot for a
+    // seat that is out while the match is live. ONE check here covers
+    // both hello branches below (a repeat hello returns early, a
+    // first hello stamps helloDone + resumes via `resumeOnHello`) —
+    // and the store-side `handleWsMessage` guard is the second half,
+    // covering `snapshot.request` and every other message on a
+    // surviving socket. Close 4405 (ejected), never 4403. Live-phase
+    // only, like `getStateOp`: in a terminal phase the snapshot is
+    // history. (A hello never stamps the liveness timer above — only
+    // heartbeat / location.update do — so sitting after that block
+    // changes nothing.)
+    if (type === 'hello') {
+      const seat = this.store.player(playerId);
+      if (seat && this.store.ejectedWhileLive(seat)) {
+        closeSocket(EJECTED_CLOSE_CODE, EJECTED_CLOSE_REASON);
+        return;
+      }
+    }
+
     // v29 (R10) — a repeat `hello` on an already-hello'd socket is
     // cheap and idempotent: the socket survived a route change (the
     // shared-socket client keeps one socket across routes), so there
@@ -1593,14 +1615,29 @@ export class RoomDO implements DurableObject {
     if (result.persist.length > 0) {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, result.persist));
     }
-    if (result.close) {
+    if (result.disconnect !== undefined && result.disconnect.length > 0) {
+      // v33 (F2b): ejection closes EVERY tab's socket for the seat
+      // (and deletes every session) — after the delivery above, so
+      // the seat still receives its `player-ejected` snapshot before
+      // the 4405 close lands. A result never carries both `disconnect`
+      // and `close`: `disconnect` is the ejection superset.
+      await this.disconnectPlayers(result.disconnect);
+    } else if (result.close) {
       // P1-4: leaving/closing removes THIS tab's session only — a second
       // tab's session (and socket) is untouched. The seat itself left,
       // so the other tab's next message gets a 4403 close.
       await this.deleteSession(playerId, session.sessionId);
       closeSocket(result.close.code, result.close.reason);
     }
-    await this.maybeWarnRenewal(session, nowMs);
+    // v33 (F2b): no renewal warning after a close/disconnect — the
+    // session record is gone, and `maybeWarnRenewal` would `putSession`
+    // it back (resurrecting a left/ejected seat's session).
+    const terminalClose =
+      result.close !== undefined ||
+      (result.disconnect !== undefined && result.disconnect.length > 0);
+    if (!terminalClose) {
+      await this.maybeWarnRenewal(session, nowMs);
+    }
     if (result.durable) {
       await this.save();
       await this.maybeUnregisterCode();
@@ -1697,6 +1734,14 @@ export class RoomDO implements DurableObject {
         await this.deleteSessionsForPlayer(session.playerId);
         continue;
       }
+      // v33 (F2b): an ejected seat is already out — closing its socket
+      // must never suspend it (a suspend would start a 30 s return
+      // window and, for a host, a reconnect grace for a seat that can
+      // never come back). Drop its sessions only.
+      if (seat.ejectedAt !== null) {
+        await this.deleteSessionsForPlayer(session.playerId);
+        continue;
+      }
       // This tab is gone only when its own tag has no socket left.
       if (this.ctx.getWebSockets(`tab:${session.sessionId}`).length > 0) continue;
       await this.deleteSession(session.playerId, session.sessionId);
@@ -1759,6 +1804,12 @@ export class RoomDO implements DurableObject {
       liveSocketCount: liveSocketsAtTickStart,
     });
     await this.deliver(tick.events, nowMs);
+    // v33 (F2b): ejection closes the seat's socket(s) — AFTER the
+    // delivery above, so the ejected seat still receives its
+    // `player-ejected` snapshot before the 4405 close lands.
+    if (tick.disconnect.length > 0) {
+      await this.disconnectPlayers(tick.disconnect);
+    }
     if (tick.persist.length > 0) {
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, tick.persist));
     }

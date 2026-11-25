@@ -11,12 +11,15 @@ const {
   isValidGeoPoint,
   isValidGeoPolygon,
   validateZoneBoundary,
+  validateRoomConfig,
   balancedHunterCount,
   suggestZoneRadiusMeters,
   classifyAccuracy,
   isValidCatchToken,
   helloHasCredential,
 } = await import('../src/validation.ts');
+
+const { DEFAULT_ROOM_CONFIG } = await import('../src/types.ts');
 
 test('room code: exactly 6 uppercase alphanumerics', () => {
   assert.equal(isValidRoomCode('ABC123'), true);
@@ -150,4 +153,70 @@ test('hello credential scan: finds credential keys at any depth or casing', () =
   assert.equal(helloHasCredential({ Token: 'x' }), true);
   assert.equal(helloHasCredential({ nested: { password: 'x' } }), true);
   assert.equal(helloHasCredential({ data: ['a', { ticket: 'y' }] }), true);
+});
+
+// -- v32 (Meera): 'selected' with 0 picks is a valid config. -------------
+// Random OFF starts with nobody picked and the host taps roster rows to
+// fill it (host-setup:150/:168) — that transient 0-pick state must pass
+// validation, or the lobby/setup pages' single `updateRoomConfig` save
+// of the Random-OFF edit is rejected and rolled back. The exact count
+// is enforced at start (assignRoles / lobby gate), never here.
+const PLACED_ZONE = {
+  boundary: [
+    { lat: 23.36, lng: 85.33 },
+    { lat: 23.37, lng: 85.33 },
+    { lat: 23.365, lng: 85.34 },
+  ],
+  shrinkPhases: [],
+};
+
+function baseConfig(overrides = {}) {
+  return {
+    ...DEFAULT_ROOM_CONFIG,
+    hostOnSiteConfirmed: true,
+    zone: PLACED_ZONE,
+    ...overrides,
+  };
+}
+
+test('room config: the default config (placed zone) is valid', () => {
+  assert.deepEqual(validateRoomConfig(baseConfig()), []);
+});
+
+test('room config: selected with 0 picks is valid (transient hand-pick state)', () => {
+  assert.deepEqual(
+    validateRoomConfig(
+      baseConfig({ teamAssignment: 'selected', selectedHunterIds: [] }),
+    ),
+    [],
+  );
+});
+
+test('room config: selected with a partial pick is valid', () => {
+  assert.deepEqual(
+    validateRoomConfig(
+      baseConfig({ teamAssignment: 'selected', selectedHunterIds: ['p1'] }),
+    ),
+    [],
+  );
+});
+
+test('room config: selected with more picks than maxPlayers - 1 is invalid', () => {
+  const issues = validateRoomConfig(
+    baseConfig({
+      teamAssignment: 'selected',
+      maxPlayers: 3,
+      selectedHunterIds: ['p1', 'p2', 'p3'],
+    }),
+  );
+  assert.equal(issues.length, 1);
+  assert.match(issues[0], /at most maxPlayers/);
+});
+
+test('room config: random with picks is still invalid', () => {
+  const issues = validateRoomConfig(
+    baseConfig({ teamAssignment: 'random', selectedHunterIds: ['p1'] }),
+  );
+  assert.equal(issues.length, 1);
+  assert.match(issues[0], /no Hunters may be picked/);
 });

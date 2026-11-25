@@ -11,7 +11,7 @@
  * several pages in ONE browser context (localStorage is shared across pages
  * in a context; each page keeps its own seat in sessionStorage).
  */
-import { expect, type BrowserContext, type Page } from '@playwright/test';
+import { expect, type Browser, type BrowserContext, type Page } from '@playwright/test';
 
 export const DEMO_ROOMS_KEY = 'pakdam.demo.rooms.v1';
 export const SESSION_STORAGE_KEY = 'pakdam.session.v1';
@@ -23,6 +23,128 @@ export const OLA_KEY_SET = Boolean(process.env.NEXT_PUBLIC_OLA_MAPS_API_KEY);
 
 export const HOST_NAME = 'Teo';
 export const GUEST_NAMES = ['Ana', 'Ben'] as const;
+
+/**
+ * v32 (catch cluster): emulated GPS at the Ranchi zone centre
+ * (23.36, 85.33) — the same CENTRE the outside-zone and
+ * host-cancel-room-deleted specs use. The demo zone is a 500 m circle
+ * on exactly this point (create/mode page), so a fix here is inside
+ * the zone: no outside-zone countdown.
+ *
+ * What this does NOT do (v32 fix round, Diya A1 — the old comment
+ * claimed otherwise): a centred context delivers exactly ONE emulated
+ * fix to the visible tab's watch. A static position never fires again,
+ * so nothing re-stamps `lastFixAt` and the front seat WOULD be ejected
+ * by the demo (4a) 30 s missing-fix clock at ~ACTIVE+30 s. The (4a)
+ * clock is held off only by `startCentreFixKeepFresh` below (a 4 s
+ * nudge loop, same pattern as outside-zone.spec.ts), for the front
+ * seat — backgrounded seats are suspended and therefore exempt
+ * (`shouldEjectForMissingFix` returns false for a suspended seat),
+ * and harboured seats sit on the catch page, where no (4a) check
+ * exists at all (the check lives on the play page only).
+ */
+export const CENTRE_GPS = { latitude: 23.36, longitude: 85.33, accuracy: 10 };
+
+/** CENTRE nudged ~1 m — a NEW position, so Chromium delivers a fresh fix to every running watch. */
+export const CENTRE_NUDGED = { latitude: 23.36001, longitude: 85.33001, accuracy: 10 };
+
+/**
+ * v32 fix round (Diya A1): keep the visible tab's fix fresh for the
+ * whole test by re-emulating the centre position every 4 s,
+ * alternating CENTRE / CENTRE_NUDGED (same pattern as
+ * outside-zone.spec.ts's keep-fresh loop and host-cancel's
+ * CENTRE_NUDGED). Each nudge is a new position, so Chromium delivers
+ * a fresh fix to the front tab's watch, re-stamping `lastFixAt`.
+ *
+ * Why this closes the (4a) hole — the proof, from the code:
+ * the (4a) check lives only on the play page (play/page.tsx demo
+ * tick → `shouldEjectForMissingFix`, play-map-logic.ts) and fires
+ * only when the seat is connected, the phase is ACTIVE, and
+ * effectiveNow − baseline ≥ 30 s. Every seat in a catch spec is in
+ * exactly one of three states: (a) harboured on the catch page — no
+ * play-page (4a) check mounts for it; (b) backgrounded on the play
+ * page — suspended, so the check returns false; (c) the one front
+ * tab on the play page — connected with a live watch, and this loop
+ * re-stamps its `lastFixAt` at most ~4–6 s apart, so the 30 s gap
+ * can never accumulate. The loop starts right after `startDemoMatch`
+ * (ACTIVE began seconds earlier) and runs until `stop()` is called —
+ * call it just before `context.close()`.
+ */
+export function startCentreFixKeepFresh(context: BrowserContext): () => void {
+  let stopped = false;
+  void (async () => {
+    try {
+      let i = 0;
+      while (!stopped) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 4000));
+        if (stopped) break;
+        await context.setGeolocation(i % 2 === 0 ? CENTRE_NUDGED : CENTRE_GPS);
+        i++;
+      }
+    } catch {
+      // Test ended (pass or fail) — the context is closed.
+    }
+  })();
+  return () => {
+    stopped = true;
+  };
+}
+
+/** A demo context with emulated GPS at the zone centre (see CENTRE_GPS). */
+export async function newCentredDemoContext(browser: Browser): Promise<BrowserContext> {
+  return browser.newContext({ geolocation: CENTRE_GPS, permissions: ['geolocation'] });
+}
+
+/**
+ * v32 (catch cluster): resume a demo seat by mounting the catch page
+ * (P0-1, `resumePlayerOnCatchPageArrival`).
+ *
+ * Why the catch page, not bringToFront: in the headless multi-page
+ * setup only one tab is visible — creating the guest pages
+ * backgrounds the earlier tabs, and `useRoomState` suspends each
+ * backgrounded seat ('tab-hidden'); the one visible tab suspends
+ * itself on GPS denial (no permission granted). A catch claim
+ * (`demo-store requestCatch`) rejects a suspended Hunter AND a
+ * suspended Runner, so a claim/confirm across two seats can never
+ * land while both seats are suspended — that is the v31 CI failure
+ * of every catch test (catch-nav 178/220/270/281, catch-results
+ * 65/88/136, brutal-phone 20). The catch page is the suspension-safe
+ * harbour: mounting it resumes the seat (P0-1) and it runs NO GPS
+ * watcher, so there is no gps-denied error and no (4a) clock — the
+ * (4a) check lives on the play page only. BUT the harbour is
+ * conditional, not absolute: the catch page still mounts
+ * `useRoomState` (catch/page.tsx), whose visibility handler suspends
+ * the seat on tab-hide (useRoomState.ts) — so if another tab is
+ * brought to the front AFTER a seat is harboured, that harboured
+ * seat IS re-suspended. The harbour holds in these specs only
+ * because no spec fronts another tab after harbouring; callers
+ * re-harbour before every claim/confirm, so a re-suspension can
+ * never survive into a claim. `page.goto` does not change tab
+ * frontness, so mounting the catch page on one seat never suspends
+ * the other. Skips the
+ * navigation when the seat is already on the catch page (a reload
+ * would wipe that tab's in-memory raw catch tokens). Waits for the
+ * resume to land in the store before returning, so the caller can
+ * claim/confirm at once.
+ */
+export async function resumeSeatViaCatchPage(
+  page: Page,
+  roomId: string,
+  displayName: string,
+): Promise<void> {
+  if (!page.url().includes(`/room/${roomId}/catch`)) {
+    await page.goto(`/room/${roomId}/catch`);
+  }
+  await expect
+    .poll(
+      async () =>
+        (await getDemoRoom(page, roomId))?.players.find(
+          (p) => p.displayName === displayName,
+        )?.connectionState,
+      { timeout: 10000 },
+    )
+    .toBe('connected');
+}
 
 /** Minimal shape of a demo room as stored in localStorage. */
 export interface DemoPlayer {

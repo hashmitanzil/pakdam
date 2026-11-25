@@ -16,14 +16,17 @@
  */
 'use client';
 
-import { use, useEffect, useMemo, useState } from 'react';
+import { use, useCallback, useEffect, useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { scoreMatch } from '@pakdam/engine';
 import { useRoomState } from '@/components/match/useRoomState';
 import { ResultsTimeline, type TimelineEvent } from '@/components/catch/ResultsTimeline';
 import { Button } from '@/components/ui/Button';
 import { fetchLiveResults, LiveHttpError, replayLiveRoom } from '@/lib/live-client';
+import { fetchLiveRoomState } from '@/lib/live-room-client';
 import { goHomeAfterRoomDeleted } from '@/lib/room-deleted';
+import { clearSession } from '@/lib/session-credentials';
+import { clearRejoinToken } from '@/lib/rejoin-token';
 import { getRoom, replayDemoRoom } from '@/lib/demo-store';
 import { formatDurationShort } from '@/lib/utils';
 
@@ -33,7 +36,25 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
 
   // The socket is closed after a match, so results also works from a plain
   // state fetch (live) or the demo store — the hook's first paint covers it.
-  const { mode, room, players, phase, loading, error, roomDeleted, seatRemoved, demo, session, myPlayer, myPlayerId, retryConnection, refreshDemo } = useRoomState(roomId);
+  const { mode, room, players, phase, loading, error, roomDeleted, seatRemoved, demo, session, myPlayer, myPlayerId, socketState, retryConnection, refreshDemo } = useRoomState(roomId);
+
+  // v33 FIX 2 (fresh join, never restore): the way back to the lobby
+  // for a non-host / removed seat is a FRESH join with the room code
+  // (`/join/{code}`, lobby phase only — the server rejects the join
+  // while the match is live, so it can never resurrect an ejected
+  // seat mid-match). The stored session + rejoin token are cleared
+  // FIRST: the join-by-code page passes a restore token whenever a
+  // stored session with the same display name exists, and a restore
+  // of an ejected seat mid-match returns 403 server-side (Zara F3b)
+  // — clearing both guarantees the join mints a new seat instead.
+  const joinLobbyAgain = useCallback(
+    (roomCode: string) => {
+      clearSession(roomId);
+      clearRejoinToken(roomId);
+      router.push(`/join/${roomCode}`);
+    },
+    [roomId, router],
+  );
 
   // Room deleted (founder decision, 2026-11-21): the host cancelled
   // and the room is gone — home with the one plain message. Declared
@@ -60,6 +81,54 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
       router.replace(`/room/${roomId}`);
     }
   }, [loading, room, phase, roomDeleted, roomId, router]);
+
+  // v33 FIX 2 (Diya c): the LOBBY effect above resolves via socket
+  // snapshots only — after a 4405 close (ejected seat) or a dead
+  // socket there are no snapshots, so a non-host waiting for the
+  // host's replay would wait forever on the waiting line. The
+  // dead-socket fallback is an HTTP state poll (5 s, live only,
+  // non-host only, terminal phase only): a LOBBY phase redirects
+  // like the effect; a 404 goes home; a 403 stops the poll (an
+  // ejected seat cannot learn LOBBY this way — the state fetch
+  // refuses it while live — so the "Join the lobby again" button
+  // below is its path instead). A live socket never polls.
+  const [lobbyPollBlocked, setLobbyPollBlocked] = useState(false);
+  useEffect(() => {
+    if (mode !== 'live' || !session?.reconnectToken) return;
+    if (loading || !room || roomDeleted || seatRemoved) return;
+    if (myPlayer?.isHost) return;
+    if (
+      phase !== 'COMPLETED' &&
+      phase !== 'CANCELLED' &&
+      phase !== 'ABANDONED' &&
+      phase !== 'EXPIRED'
+    ) {
+      return;
+    }
+    if (socketState !== 'closed' && socketState !== 'reconnect-failed') return;
+    if (lobbyPollBlocked) return;
+    // Capture the token: the early return above proves it is set, but
+    // TS does not carry that narrowing into the interval closure.
+    const token = session.reconnectToken;
+    const id = setInterval(() => {
+      if (document.hidden) return;
+      void fetchLiveRoomState(roomId, session.playerId, token)
+        .then((state) => {
+          if (state.phase === 'LOBBY') router.replace(`/room/${roomId}`);
+        })
+        .catch((err: unknown) => {
+          if (err instanceof LiveHttpError && err.status === 404) {
+            goHomeAfterRoomDeleted(router, roomId);
+          } else if (err instanceof LiveHttpError && err.status === 403) {
+            // Ejected (or removed) while live — this fetch can never
+            // see the replay; stop polling, the button is the path.
+            setLobbyPollBlocked(true);
+          }
+          // Any other failure: ignore, the next tick retries.
+        });
+    }, 5000);
+    return () => clearInterval(id);
+  }, [mode, session, loading, room, roomDeleted, seatRemoved, myPlayer?.isHost, phase, socketState, lobbyPollBlocked, roomId, router]);
 
   // Host-only replay (the server 403s a non-host; the demo store throws
   // the same way). On success the host navigates at once; every other
@@ -220,11 +289,12 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
     return (
       <main className="mx-auto flex min-h-dvh w-full max-w-[560px] flex-col gap-3 px-4 pt-3">
         <p className="py-6 text-center text-[15px] font-semibold text-white">
-          You were removed from the game.
+          {myPlayer?.ejectedAt ? 'You were ejected from the game.' : 'You were removed from the game.'}
         </p>
         <p className="text-center text-[14px] text-[#A1A1AA]">
-          The host removed you from this game. Your result is still recorded — here is how your
-          match ended.
+          {myPlayer?.ejectedAt
+            ? 'You were away too long or your location stopped updating. Your result is still recorded — here is how your match ended.'
+            : 'The host removed you from this game. Your result is still recorded — here is how your match ended.'}
         </p>
         {removedResult ? (
           <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
@@ -255,8 +325,20 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
         ) : (
           <p className="py-6 text-center text-[15px] text-[#A1A1AA]">Loading your result…</p>
         )}
-        <Button variant="primary" onClick={() => router.push('/')}>
-          Go home
+        {/* v33 FIX 2 (Diya a/b): a removed seat is not a dead end —
+            the way back to the SAME lobby is a fresh join with the
+            room code (the server admits it only in LOBBY — mid-match
+            it fails plainly on the join page, so it can never
+            resurrect an ejected seat). The code comes from the stored
+            session (the `get-results` payload carries no code); a
+            fresh game needs no code at all. */}
+        {session?.roomCode ? (
+          <Button variant="primary" onClick={() => { const code = session?.roomCode; if (code) joinLobbyAgain(code); }}>
+            Join the lobby again
+          </Button>
+        ) : null}
+        <Button variant={session?.roomCode ? 'outline' : 'primary'} onClick={() => router.push('/')}>
+          Start a fresh game
         </Button>
       </main>
     );
@@ -448,15 +530,24 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
       {/* Replay — same room, same code, fresh game. Host-only: the
           server 403s a non-host, so non-hosts get the waiting line
           instead of a dead button, and return to the lobby when the host
-          replays (the LOBBY effect above). */}
+          replays (the LOBBY effect above). v33 FIX 2: non-hosts ALSO
+          get the fresh-join button — after a 4405 close there are no
+          snapshots, so the LOBBY effect can never fire for them; the
+          button is the manual way back (fresh join, lobby phase
+          only — the server rejects it while the match is live). */}
       {isHost ? (
         <Button variant="primary" onClick={() => void handleReplay()} disabled={replaying}>
           {replaying ? 'Replaying…' : 'Replay — back to the lobby'}
         </Button>
       ) : (
-        <p className="text-center text-[14px] text-[#A1A1AA]">
-          Only the host can replay — waiting for the host.
-        </p>
+        <>
+          <p className="text-center text-[14px] text-[#A1A1AA]">
+            Only the host can replay — waiting for the host.
+          </p>
+          <Button variant="outline" onClick={() => joinLobbyAgain(room.roomCode)}>
+            Join the lobby again
+          </Button>
+        </>
       )}
       {replayError ? (
         <p className="text-center text-[14px] text-[#EF4444]">{replayError}</p>

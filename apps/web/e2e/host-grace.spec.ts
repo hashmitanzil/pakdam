@@ -61,6 +61,28 @@ async function showTab(page: Page): Promise<void> {
   });
 }
 
+/**
+ * v32: reset the host to a known-connected state before the test's own
+ * hideTab. Creating the guest pages backgrounds the host tab in the
+ * headless multi-page setup, so the lobby H1 handler
+ * (room/[roomId]/page.tsx) already suspended the host — and started
+ * the 30 s grace — at setup time, before the test's hideTab runs.
+ * hideTab would then be a no-op on an already-suspended seat
+ * (recordPlayerSuspension early-returns) and the test would race a
+ * stale grace: expiry mid-test moves the crown to Ben (the only
+ * connected seat) or clears the grace the test then tries to
+ * fast-forward. Fronting the host resumes the seat (tab-visible
+ * handler) and cancels the stale grace, so the hideTab below starts a
+ * fresh suspension + fresh grace. Best-effort by design: where pages
+ * are never backgrounded on creation there is nothing stale to cancel
+ * and the call is a no-op. No assertion changes — this only
+ * establishes the premise the test states ("the host backgrounds the
+ * tab NOW"). Same pattern as live-hud.spec.ts H5 (bringToFront).
+ */
+async function resetHostBeforeHide(page: Page): Promise<void> {
+  await page.bringToFront();
+}
+
 /** White-box demo helper: move the host grace deadline into the past so the next 1 s poll expires it. Demo-only; localStorage is the demo store. */
 async function fastForwardDemoGrace(page: Page, roomId: string): Promise<void> {
   await page.evaluate(
@@ -106,6 +128,10 @@ test.describe('host grace (demo)', () => {
     const benPage = guestPages[1]!; // Ben
     const anaErrors = collectPageErrors(anaPage);
     const hostId = await playerIdOf(hostPage, roomId, HOST_NAME);
+
+    // v32: cancel any setup-time suspension/grace before asserting the
+    // pre-hide state — a stale grace would already show the line.
+    await resetHostBeforeHide(hostPage);
 
     // Before: no waiting line anywhere, and only the host has host controls.
     await expect(anaPage.getByRole('status', { name: WAITING_LINE })).toHaveCount(0);
@@ -155,6 +181,10 @@ test.describe('host grace (demo)', () => {
     const anaErrors = collectPageErrors(anaPage);
     const hostId = await playerIdOf(hostPage, roomId, HOST_NAME);
 
+    // v32: fresh suspension/grace from the hideTab below, not the
+    // stale setup-time one (see resetHostBeforeHide).
+    await resetHostBeforeHide(hostPage);
+
     await hideTab(hostPage);
     await expect(anaPage.getByRole('status', { name: WAITING_LINE })).toBeVisible({
       timeout: 10000,
@@ -195,7 +225,25 @@ test.describe('host grace (demo)', () => {
     const anaErrors = collectPageErrors(anaPage);
     const anaId = await playerIdOf(anaPage, roomId, GUEST_NAMES[0]);
 
+    // v32: fresh suspension/grace from the hideTab below, not the
+    // stale setup-time one (see resetHostBeforeHide).
+    await resetHostBeforeHide(hostPage);
+
     await hideTab(hostPage);
+    // v32: Ana must be the CONNECTED successor at expiry. Creating
+    // Ben's page backgrounded her, so she is suspended from setup and
+    // expiry would hand the crown to Ben instead. Front her now — the
+    // host stays suspended (its hide was faked) and Ben being
+    // backgrounded is harmless, Ana is the earliest joiner.
+    await anaPage.bringToFront();
+    await expect
+      .poll(
+        async () =>
+          (await getDemoRoom(anaPage, roomId))?.players.find((p) => p.playerId === anaId)
+            ?.connectionState,
+        { timeout: 5000 },
+      )
+      .toBe('connected');
     await expect(anaPage.getByRole('status', { name: WAITING_LINE })).toBeVisible({
       timeout: 10000,
     });
@@ -236,6 +284,12 @@ test.describe('host grace (demo)', () => {
     const anaErrors = collectPageErrors(anaPage);
     const hostId = await playerIdOf(hostPage, roomId, HOST_NAME);
     const anaId = await playerIdOf(anaPage, roomId, GUEST_NAMES[0]);
+
+    // v32: fresh grace from the hideTab below, not the stale
+    // setup-time one — otherwise the fast-forward throws ("no grace
+    // running to expire") when the stale grace already expired, or
+    // the crown already moved (see resetHostBeforeHide).
+    await resetHostBeforeHide(hostPage);
 
     // Both joiners background first, then the host: the grace starts
     // with nobody connected to take the crown.

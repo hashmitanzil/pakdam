@@ -17,6 +17,17 @@
  * `src/components/ErrorBoundary.tsx`) so the mocked POST can be
  * observed. The override never exists in production.
  *
+ * The override MUST be same-origin (`window.location.origin`): the
+ * app's CSP `connect-src` allow-lists only 'self', the real Worker
+ * origin and the Ola origins (next.config.ts), so a report to a
+ * non-allowlisted origin is blocked by CSP in the browser and the
+ * mocked route never sees it — that was the v31 failure
+ * (`reportArrived` timed out while the fallback itself rendered
+ * fine). Same-origin stays inside `connect-src 'self'`, so the
+ * report flows through the real reporting code under the real
+ * CSP, and the Playwright route still intercepts it before it
+ * reaches the Next.js server.
+ *
  * Do NOT run `playwright test` in the sandbox VM (Chromium cannot
  * launch there); CI is the verdict.
  */
@@ -45,8 +56,11 @@ test.describe('error boundary (demo)', () => {
       await route.fulfill({ status: 200, body: '{}' });
     });
     await page.addInitScript(() => {
+      // Same-origin on purpose: the app's CSP connect-src allow-lists
+      // only 'self' + the real Worker / Ola origins, so a report to
+      // any other origin is CSP-blocked and this route never fires.
       (window as unknown as { __pakdamTestWorkerUrl?: string }).__pakdamTestWorkerUrl =
-        'https://worker.example';
+        window.location.origin;
     });
 
     const reportArrived = page.waitForRequest('**/v1/support/bugs', { timeout: 10000 });

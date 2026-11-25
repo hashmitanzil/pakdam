@@ -323,18 +323,35 @@ export class VoiceRadio {
     if (signal.fromPlayerId === this.myPlayerId) return; // own echo
     if (!this.teammates.includes(signal.fromPlayerId)) return; // not a teammate
     if (this.status !== 'ready' && this.status !== 'talking') return;
-    const nonce = `${signal.fromPlayerId}:${signal.kind}:${typeof signal.sdp === 'string' ? signal.sdp.slice(0, 32) : ''}:${JSON.stringify(signal.candidate ?? null)}`;
-    if (this.handledSignals.has(nonce)) return;
-    this.handledSignals.add(nonce);
-    if (this.handledSignals.size > 500) {
-      // Bound the set; ICE bursts are short-lived.
-      this.handledSignals.clear();
+    // v33 FIX 6 (Diya, code-proven): 'join' / 'leave' are EXEMPT
+    // from the exactly-once dedup below. Their nonce was
+    // `${from}:join::null` — identical on every join — and the set
+    // only clears past 500 entries, so after `disable()` → `enable()`
+    // the peer dropped the re-`join` as a duplicate, never replied
+    // with an offer, and voice stayed dead until a page reload. A
+    // duplicate join is harmless (re-offer converges; see the glare
+    // rule in `answerOffer`), and a duplicate leave re-closes an
+    // already-closed peer (idempotent). Only offer/answer/ICE —
+    // where bursts and retries are real — are deduped.
+    const deduped = signal.kind !== 'join' && signal.kind !== 'leave';
+    if (deduped) {
+      const nonce = `${signal.fromPlayerId}:${signal.kind}:${typeof signal.sdp === 'string' ? signal.sdp.slice(0, 32) : ''}:${JSON.stringify(signal.candidate ?? null)}`;
+      if (this.handledSignals.has(nonce)) return;
+      this.handledSignals.add(nonce);
+      if (this.handledSignals.size > 500) {
+        // Bound the set; ICE bursts are short-lived.
+        this.handledSignals.clear();
+      }
     }
 
     switch (signal.kind) {
       case 'join': {
-        // A teammate already voice-enabled replies with an offer — exactly
-        // one side offers, so there is no glare.
+        // A teammate already voice-enabled replies with an offer.
+        // Sequential joins offer from exactly one side; SIMULTANEOUS
+        // joins offer from both (glare) — the tie-break in
+        // `answerOffer` resolves that (polite side rolls back and
+        // answers; impolite side's offer stands), so neither side
+        // ends `failed`.
         await this.createOffer(signal.fromPlayerId);
         break;
       }
@@ -458,6 +475,23 @@ export class VoiceRadio {
   private async answerOffer(peerId: string, sdp: string): Promise<void> {
     const pc = this.getOrCreatePeer(peerId);
     try {
+      // v33 FIX 6 (glare): simultaneous `enable()` on both sides
+      // means both peers hold a local offer (`have-local-offer`) —
+      // a bare `setRemoteDescription({ type: 'offer' })` throws
+      // `InvalidStateError` in that state and both sides ended
+      // `failed`. Deterministic polite/impolite tie-break on
+      // playerId (the smaller id is polite): the polite side rolls
+      // its own offer back and answers the incoming one; the
+      // impolite side ignores the incoming offer and its own offer
+      // stands (the polite side's answer completes it). Symmetric
+      // on both sides, so exactly one offer survives — no deadlock.
+      if (pc.signalingState === 'have-local-offer') {
+        if (this.myPlayerId < peerId) {
+          await pc.setLocalDescription({ type: 'rollback' });
+        } else {
+          return;
+        }
+      }
       await pc.setRemoteDescription({ type: 'offer', sdp });
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);

@@ -270,7 +270,11 @@ test('F2 pin: the radio cannot be re-created after ejection (creation effect nev
 });
 
 test('F2 pin: the eject effect sits next to the rejoin-token effect and touches no spectator logic', () => {
-  const rejoinAt = pageSrc.indexOf('clearRejoinToken(roomId)');
+  // Re-pointed (v33): the play page gained `joinLobbyAgain` (a fresh
+  // join that also clears the rejoin token) BEFORE the rejoin-token
+  // effect, so a bare `clearRejoinToken(roomId)` search now lands on
+  // the join handler. Anchor on the effect's own line instead.
+  const rejoinAt = pageSrc.indexOf('if (ejectedAt) clearRejoinToken(roomId);');
   const f2At = pageSrc.indexOf('v30 (Zara F2');
   assert.ok(rejoinAt > 0 && f2At > rejoinAt, 'F2 must live next to the ejectedAt rejoin-token effect');
   assert.ok(f2At - rejoinAt < 2000, 'the two ejectedAt effects must be adjacent');

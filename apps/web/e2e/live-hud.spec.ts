@@ -80,10 +80,35 @@ test.describe('live HUD (demo)', () => {
     // "09:59"), so the minutes half is \d+, not \d\d.
     await expect(page.getByText(/Zone 500 m shrinks in \d+:\d\d/)).toBeVisible();
     await expect(page.getByRole('progressbar', { name: 'Runners left' })).toBeVisible();
-    // No fix has ever arrived in a headless context without geolocation.
-    await expect(page.getByText('Location never reported')).toBeVisible();
+    // No fix has ever arrived in a headless context without geolocation
+    // — but assert it on a GUEST seat, not the host's own dot. The
+    // bringToFront + connected-poll above auto-resumes the host seat,
+    // and resume stamps `lastFixAt` (demo-store `resumePlayer`), so
+    // the host's dot reads an age ("0:00 ago"), never "Location never
+    // reported" — and a teammate dot only exists when the host drew
+    // Runner, so the host page matches zero or one elements by role
+    // draw. A guest page never hid-and-resumed (it was created
+    // backgrounded and never brought forward), so its seat is still
+    // suspended — deterministic (Diya-verified) — and no fix ever
+    // arrived for it.
+    //
+    // v32 fix round (Diya A2 — the old assertion was wrong): Ana's
+    // own YOU dot does NOT read "Location never reported". While the
+    // seat is suspended the dot label reads 'Suspended'
+    // (play/page.tsx:1166-1174); "Location never reported" is the
+    // freshness half of the SUSPENDED BANNER
+    // (`formatSuspendedLabel`, freshness.ts:38-44), shown because no
+    // fix ever arrived. The old `.first()` match came from that
+    // banner and/or a teammate dot, not deterministically from the
+    // YOU dot. Assert the banner's full exact text instead: it pins
+    // both halves of the premise at once (suspended AND never
+    // reported).
+    await expect(
+      guestPages[0]!.getByText('Suspended — location unknown · Location never reported', {
+        exact: true,
+      }),
+    ).toBeVisible();
     expect(roles.size).toBe(3);
-    void guestPages;
   });
 
   test('head start: hunters see the waiting line, runners see the hidden line', async ({
@@ -204,7 +229,21 @@ test.describe('live HUD (demo)', () => {
     await expect(hostPage.getByText('Time left')).toBeVisible();
   });
 
-  test('suspended banner: tab-hide suspends, Resume sharing clears it', async ({ context }) => {
+  test('suspended banner: tab-hide suspends, Resume sharing clears it', async ({ browser }) => {
+    // Geolocation granted + an emulated fix at the Ranchi default zone
+    // centre (the outside-zone.spec.ts CENTRE, accuracy 10 m): without
+    // it the play-page watch errors permission-denied at mount, the
+    // seat suspends for GPS-denied (v28 F16) and v30 hides "Resume
+    // sharing" while GPS is denied — the button this test clicks never
+    // renders, so the test fails before the tab-hide path is even
+    // exercised. With fixes flowing, the seat suspends ONLY for the
+    // faked tab-hide below, which is what this test is about. Both the
+    // coordinates AND the permission are needed (Playwright: permission
+    // is a separate control from the emulated position).
+    const context = await browser.newContext({
+      geolocation: { latitude: 23.36, longitude: 85.33, accuracy: 10 },
+      permissions: ['geolocation'],
+    });
     const { hostPage } = await startDemoMatch(context);
     await hostPage.evaluate(() => {
       Object.defineProperty(document, 'hidden', { value: true, configurable: true });
@@ -230,6 +269,7 @@ test.describe('live HUD (demo)', () => {
       document.dispatchEvent(new Event('visibilitychange'));
     });
     await expect(hostPage.getByText(/Suspended — location unknown/)).toBeHidden();
+    await context.close();
   });
 
   test('catch buttons are one per role: hunter gets Tag a runner, runner gets Got Tagged', async ({

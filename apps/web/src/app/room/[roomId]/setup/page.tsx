@@ -32,8 +32,6 @@ import {
   demoRoomChangeKey,
   getRoom,
   pollDemoRoom,
-  setSelectedHunters,
-  setTeamAssignment,
   updateRoomConfig,
 } from '../../../../lib/demo-store';
 import {
@@ -424,9 +422,14 @@ export default function SetupPage() {
     if (lobby && !zone) setZone(zoneFromConfig(lobby.room.config));
   }, [lobby, zone]);
 
-  // -- Config edits (host only). Normalised so a 'selected' team always
-  //    carries exactly hunterCount picks (the config validator requires
-  //    it) and 'random' carries none. -----------------------------------
+  // -- Config edits (host only). Normalised so a 'selected' team
+  //    carries only picks the host actually made ('random' carries
+  //    none, a changed count or assignment clears the pick) — the
+  //    exact count is enforced by the start gate, never auto-filled
+  //    here. An earlier version filled the pick up to the effective
+  //    count with the first roster rows, so turning Random OFF
+  //    pre-picked hunters the host never chose and the roster read
+  //    "2 of 2 Hunters picked" before a single tap (host-setup:150/:168).
   const normaliseConfig = useCallback(
     (next: RoomConfig): RoomConfig => {
       if (next.teamAssignment === 'random') {
@@ -435,14 +438,14 @@ export default function SetupPage() {
       // The pick count is the EFFECTIVE Hunter count (balance table when
       // Balance is ON), never the raw stepper value — the server draws the
       // effective count, so asking for `config.hunterCount` picks here
-      // would block the start when the two disagree.
+      // would block the start when the two disagree. Trim only: drop
+      // picks that left the roster or exceed the effective count, and
+      // NEVER fill — a short pick is the hand-pick state (the host taps
+      // roster rows to fill it) and the start gate blocks until it is
+      // complete.
       const count = effectiveHunterCount(next, activePlayers.length);
       const activeIds = activePlayers.map((p) => p.playerId);
       const kept = next.selectedHunterIds.filter((id) => activeIds.includes(id));
-      for (const id of activeIds) {
-        if (kept.length >= count) break;
-        if (!kept.includes(id)) kept.push(id);
-      }
       return { ...next, selectedHunterIds: kept.slice(0, count) };
     },
     [activePlayers],
@@ -460,17 +463,26 @@ export default function SetupPage() {
           if (!demo) return;
           const prev = demo.room.config;
           if (next.teamAssignment !== prev.teamAssignment) {
-            setTeamAssignment(demo, next.teamAssignment);
-            if (next.teamAssignment === 'selected') {
-              setSelectedHunters(getRoom(roomId) ?? demo, next.selectedHunterIds);
-            }
-          } else if (next.hunterCount !== prev.hunterCount) {
+            // One call, whole config: `updateRoomConfig` persists the
+            // full config AND clears the pick on the change, so the
+            // roster starts at 0 of N. The old path called
+            // `setTeamAssignment` (which writes only teamAssignment +
+            // picks, never `randomDraw`) and then `setSelectedHunters`
+            // (which demands exactly `hunterCount` picks) — so the
+            // stored `randomDraw` stayed true and the 1 s poll
+            // reverted the Random toggle/hint, and a short pick threw
+            // and rolled the whole change back. The validator now
+            // allows a 'selected' config with 0 picks (transient
+            // hand-pick state; the start gate enforces the count).
             updateRoomConfig(demo, next);
-            if (next.teamAssignment === 'selected') {
-              // updateRoomConfig clears the pick on a hunter-count
-              // change — restore the normalised pick right after.
-              setSelectedHunters(getRoom(roomId) ?? demo, next.selectedHunterIds);
-            }
+          } else if (next.hunterCount !== prev.hunterCount) {
+            // `updateRoomConfig` clears the pick on a hunter-count
+            // change — the host re-picks from 0. Do NOT restore the
+            // normalised pick here: it is short by construction now
+            // (trim-only, no fill) and `setSelectedHunters` demands
+            // exactly `hunterCount`, so the restore threw and rolled
+            // the stepper change back.
+            updateRoomConfig(demo, next);
           } else {
             updateRoomConfig(demo, next);
           }
@@ -935,11 +947,13 @@ export default function SetupPage() {
               </div>
             )}
           </section>
-        ) : (
-          <p className="text-[13px] text-[#A1A1AA]">
-            No zone and no pings. Classic hide and seek — hunters get no locations at all.
-          </p>
-        )}
+        ) : // Zone OFF: no map and no zone controls. The one-line
+          // explanation lives under the Play zone toggle in
+          // RulesControls (shared with the lobby Settings sheet) —
+          // rendering it here too put the identical sentence on the
+          // screen twice, so `getByText` matched two elements and the
+          // host-setup:138 assertion strict-violated.
+          null}
 
         <section
           aria-label="Game mode"

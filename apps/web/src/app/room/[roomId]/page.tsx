@@ -25,8 +25,8 @@
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
-import type { PlayerView, Room, RoomConfig } from '@pakdam/shared';
-import { MIN_PLAYERS } from '@pakdam/shared';
+import type { MatchPhase, PlayerView, Room, RoomConfig } from '@pakdam/shared';
+import { MIN_PLAYERS, TERMINAL_PHASES } from '@pakdam/shared';
 import { PakdamSocket } from '../../../lib/websocket';
 import type { WsSnapshotPayload } from '../../../lib/websocket';
 import { isFixSendableToServer, watchLocation } from '../../../lib/geolocation';
@@ -52,8 +52,6 @@ import {
   pollDemoRoom,
   recordPlayerSuspension,
   resumePlayer,
-  setSelectedHunters,
-  setTeamAssignment,
   startDemoMatch,
   toggleReady,
   updateRoomConfig,
@@ -212,6 +210,25 @@ export default function LobbyPage() {
     router.push(`/room/${roomId}/play`);
   }, [roomId, router]);
 
+  const goResults = useCallback(() => {
+    if (navigatedRef.current) return;
+    navigatedRef.current = true;
+    router.push(`/room/${roomId}/results`);
+  }, [roomId, router]);
+
+  // v33 FIX 2: a terminal room is over — a seat returning to the
+  // lobby belongs on RESULTS, never on /play: the play page bounces
+  // terminal rooms straight back to results, so pushing to /play
+  // loops with no way into the lobby. Non-terminal non-lobby phases
+  // (a match already LIVE) still go to play.
+  const routeFromPhase = useCallback(
+    (phase: MatchPhase) => {
+      if (TERMINAL_PHASES.includes(phase)) goResults();
+      else if (phase !== 'LOBBY') goPlay();
+    },
+    [goPlay, goResults],
+  );
+
   // Room deleted (founder decision, 2026-11-21): the host cancelled and
   // the room is gone — home with the one plain message, once. Every
   // deletion path on this page (404 fetch, `room.deleted` event, a
@@ -308,7 +325,7 @@ export default function LobbyPage() {
           if (cancelled) return;
           setLobby({ room: state.room, players: state.players, hostGraceEndsAtMs: readHostGraceEndsAtMs(state) });
           noteLiveSeatState(state.players, found.playerId);
-          if (state.room.phase !== 'LOBBY') goPlay();
+          routeFromPhase(state.room.phase);
         })
         .catch((err: unknown) => {
           if (cancelled) return;
@@ -340,7 +357,7 @@ export default function LobbyPage() {
         onSnapshot: (snapshot: WsSnapshotPayload) => {
           if (cancelled) return;
           if (snapshot.room.phase !== 'LOBBY') {
-            goPlay();
+            routeFromPhase(snapshot.room.phase);
             return;
           }
           // B14 (v29 R1, fix round M1): identical-skip — the key is
@@ -485,7 +502,7 @@ export default function LobbyPage() {
         return;
       }
       if (current.room.phase !== 'LOBBY') {
-        goPlay();
+        routeFromPhase(current.room.phase);
         return;
       }
       const key = demoRoomChangeKey(current);
@@ -580,9 +597,14 @@ export default function LobbyPage() {
     void getHostTokenLive(roomId).catch(() => undefined);
   }, [roomId, isLive, session, isHost, lobby]);
 
-  // -- Config edits (host only, via the Settings sheet). Normalised so a
-  //    'selected' team always carries exactly hunterCount picks (the
-  //    config validator requires it) and 'random' carries none. ----------
+  // -- Config edits (host only, via the Settings sheet). Normalised so
+  //    a 'selected' team carries only picks the host actually made
+  //    ('random' carries none, a changed count or assignment clears the
+  //    pick) — the exact count is enforced by the start gate, never
+  //    auto-filled here. An earlier version filled the pick up to the
+  //    effective count with the first roster rows, so turning Random
+  //    OFF pre-picked hunters the host never chose and the roster read
+  //    "2 of 2 Hunters picked" before a single tap (host-setup:150/:168).
   const normaliseConfig = useCallback(
     (next: RoomConfig): RoomConfig => {
       if (next.teamAssignment === 'random') {
@@ -591,14 +613,14 @@ export default function LobbyPage() {
       // The pick count is the EFFECTIVE Hunter count (balance table when
       // Balance is ON), never the raw stepper value — the server draws the
       // effective count, so asking for `config.hunterCount` picks here
-      // would block the start when the two disagree.
+      // would block the start when the two disagree. Trim only: drop
+      // picks that left the roster or exceed the effective count, and
+      // NEVER fill — a short pick is the hand-pick state (the host taps
+      // roster rows to fill it) and the start gate blocks until it is
+      // complete.
       const count = effectiveHunterCount(next, activePlayers.length);
       const activeIds = activePlayers.map((p) => p.playerId);
       const kept = next.selectedHunterIds.filter((id) => activeIds.includes(id));
-      for (const id of activeIds) {
-        if (kept.length >= count) break;
-        if (!kept.includes(id)) kept.push(id);
-      }
       return { ...next, selectedHunterIds: kept.slice(0, count) };
     },
     [activePlayers],
@@ -621,17 +643,26 @@ export default function LobbyPage() {
           if (!demo) return;
           const prev = demo.room.config;
           if (next.teamAssignment !== prev.teamAssignment) {
-            setTeamAssignment(demo, next.teamAssignment);
-            if (next.teamAssignment === 'selected') {
-              setSelectedHunters(getRoom(roomId) ?? demo, next.selectedHunterIds);
-            }
-          } else if (next.hunterCount !== prev.hunterCount) {
+            // One call, whole config: `updateRoomConfig` persists the
+            // full config AND clears the pick on the change, so the
+            // roster starts at 0 of N. The old path called
+            // `setTeamAssignment` (which writes only teamAssignment +
+            // picks, never `randomDraw`) and then `setSelectedHunters`
+            // (which demands exactly `hunterCount` picks) — so the
+            // stored `randomDraw` stayed true and the 1 s poll
+            // reverted the Random toggle/hint, and a short pick threw
+            // and rolled the whole change back. The validator now
+            // allows a 'selected' config with 0 picks (transient
+            // hand-pick state; the start gate enforces the count).
             updateRoomConfig(demo, next);
-            if (next.teamAssignment === 'selected') {
-              // updateRoomConfig clears the pick on a hunter-count
-              // change — restore the normalised pick right after.
-              setSelectedHunters(getRoom(roomId) ?? demo, next.selectedHunterIds);
-            }
+          } else if (next.hunterCount !== prev.hunterCount) {
+            // `updateRoomConfig` clears the pick on a hunter-count
+            // change — the host re-picks from 0. Do NOT restore the
+            // normalised pick here: it is short by construction now
+            // (trim-only, no fill) and `setSelectedHunters` demands
+            // exactly `hunterCount`, so the restore threw and rolled
+            // the stepper change back.
+            updateRoomConfig(demo, next);
           } else {
             updateRoomConfig(demo, next);
           }
@@ -690,7 +721,7 @@ export default function LobbyPage() {
       void fetchLiveRoomState(roomId, session.playerId, session.reconnectToken ?? '')
         .then((state) => {
           setLobby({ room: state.room, players: state.players, hostGraceEndsAtMs: readHostGraceEndsAtMs(state) });
-          if (state.room.phase !== 'LOBBY') goPlay();
+          routeFromPhase(state.room.phase);
           void socketRef.current?.retry();
         })
         .catch((err: unknown) => {
@@ -718,7 +749,7 @@ export default function LobbyPage() {
       const demo = getRoom(roomId);
       if (demo) setLobby({ room: demo.room, players: demo.players, hostGraceEndsAtMs: demo.hostGraceEndsAtMs ?? null });
     }
-  }, [goPlay, goHomeDeleted, roomId, session, showNotice]);
+  }, [routeFromPhase, goHomeDeleted, roomId, session, showNotice]);
 
   const toggleMyReady = (): void => {
     if (!me || !session) return;

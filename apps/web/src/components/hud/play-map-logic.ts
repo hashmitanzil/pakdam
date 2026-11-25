@@ -365,9 +365,24 @@ function pillTextForStateRaw(
   // "Map ready" would be a lie. The pill names the loss and offers
   // Retry (the map remounts on Retry).
   contextLost = false,
+  // v33 FIX 4: the context came back but the style is still
+  // reloading — the canvas is blank until `style.load` lands, so
+  // "Map ready" would be a lie in the same way. Outranks the parts
+  // below; cleared by the `style.load` handler in PlayMap.
+  contextRestoring = false,
+  // v33 FIX 4: a repaint was requested but no `render` frame followed
+  // within the stall window — the loop is stalled on a canvas that
+  // has size, so the size-only checks all pass while nothing paints.
+  // A parts entry (composes with tile errors etc.), not a top-level
+  // return: the stall is one more ready-state problem, and Retry is
+  // the escape.
+  paintStalled = false,
 ): string {
   if (mapState === 'ready' && contextLost) {
     return 'Map graphics lost — try Retry';
+  }
+  if (mapState === 'ready' && contextRestoring) {
+    return 'Map graphics restored — reloading…';
   }
   if (mapState === 'ready' && heightDiagnosis === 'container-zero-height') {
     return 'Map container has no height — try Retry';
@@ -404,6 +419,9 @@ function pillTextForStateRaw(
     }
     if (recentreFailed) {
       parts.push(RECENTRE_FAILED_COPY);
+    }
+    if (paintStalled) {
+      parts.push('Map isn\u2019t painting — try Retry');
     }
     if (fitPending) {
       parts.push('Camera moving to the zone…');
@@ -445,6 +463,8 @@ export function pillTextForState(
   heightDiagnosis: MapAreaHeightDiagnosis | null = null,
   recentreFailed = false,
   contextLost = false,
+  contextRestoring = false,
+  paintStalled = false,
 ): string {
   return redactKeyValues(
     pillTextForStateRaw(
@@ -463,6 +483,8 @@ export function pillTextForState(
       heightDiagnosis,
       recentreFailed,
       contextLost,
+      contextRestoring,
+      paintStalled,
     ),
   );
 }
@@ -1567,6 +1589,26 @@ export function zoneBboxInView(
 }
 
 /**
+ * True when a single fix (the YOU dot) is inside the camera's current
+ * view — the point form of `zoneBboxInView`, same `viewBounds` maths.
+ * A null / non-finite fix is never "in view" (there is nothing to keep
+ * on screen, and the caller must not treat a missing fix as visible).
+ * Used on tab return: if the fix drifted off screen while the tab was
+ * hidden, the camera pulls it back (v33 FIX 5). Fresh fixes never
+ * trigger it — free panning is never fought in general.
+ */
+export function fixInView(
+  map: Pick<MapLibreMapLike, 'getCenter' | 'getZoom'>,
+  fix: { lng: number; lat: number } | null,
+  widthPx: number,
+  heightPx: number,
+): boolean {
+  if (!fix || !Number.isFinite(fix.lng) || !Number.isFinite(fix.lat)) return false;
+  const view = viewBounds(map.getCenter(), map.getZoom(), widthPx, heightPx);
+  return fix.lng >= view[0][0] && fix.lat >= view[0][1] && fix.lng <= view[1][0] && fix.lat <= view[1][1];
+}
+
+/**
  * Whether a container-size change is MATERIAL (Diya 4 — A1ii). The fit
  * landed at one size; the container may not be final when the zone
  * effect runs (layout settling, overlay dismiss, keyboard, rotation),
@@ -1684,6 +1726,11 @@ export function shouldOfferMapRetry(input: {
   hasOtherResource: boolean;
   recentreFailed: boolean;
   contextLost: boolean;
+  // v33 FIX 4: a restoring style and a stalled paint loop are both
+  // Retry escapes — a reload that never lands and a loop that never
+  // paints are otherwise unrecoverable without reopening the PWA.
+  contextRestoring?: boolean;
+  paintStalled?: boolean;
 }): boolean {
   if (input.mapState !== 'ready') return true;
   return (
@@ -1694,7 +1741,9 @@ export function shouldOfferMapRetry(input: {
     input.zeroWidth ||
     input.hasOtherResource ||
     input.recentreFailed ||
-    input.contextLost
+    input.contextLost ||
+    input.contextRestoring === true ||
+    input.paintStalled === true
   );
 }
 
@@ -1997,6 +2046,43 @@ export function meAccuracyFeatures(
 export function shouldWatchLocation(phase: string, hidden: boolean): boolean {
   if (hidden) return false;
   return phase === 'HEAD_START' || phase === 'ACTIVE' || phase === 'SAFETY_PAUSED';
+}
+
+/**
+ * v33 FIX 1 (suspend delivery — re-assert): the socket-side queue
+ * covers a suspension reported while DOWN, but a suspension that
+ * already LANDED is wiped by the next hello — the DO resumes a
+ * suspended seat on every hello/reconnect (`resumeOnHello`,
+ * room-do.ts), and nothing re-asserts it while the GPS watch stays
+ * dead. With the seat `connected` again and no fix arriving, the
+ * (4a) alarm ejects it after 30 s — the founder's live-v31 ejection.
+ * Re-assert (re-send `player.suspended`) exactly when the socket
+ * JUST (re)connected (`socketState` flipped to 'connected') while
+ * the watch is dead/denied (`gpsDenied`), in a live match, for a
+ * seat that is not ejected and not already suspended per the latest
+ * snapshot. A re-send while already suspended is a server no-op
+ * (`suspendSeat`, room-do.ts), so the `connectionState` gate is a
+ * noise guard, not a correctness gate — but it stops the page
+ * spamming a suspend on every snapshot that still reads 'connected'
+ * before the suspension lands.
+ */
+export interface ReassertSuspensionInput {
+  mode: 'live' | 'demo';
+  gpsDenied: boolean;
+  socketState: string;
+  prevSocketState: string | null;
+  connectionState: string | null | undefined;
+  ejectedAt: string | null | undefined;
+}
+
+export function shouldReassertSuspension(input: ReassertSuspensionInput): boolean {
+  if (input.mode !== 'live') return false;
+  if (!input.gpsDenied) return false;
+  if (input.socketState !== 'connected') return false;
+  if (input.prevSocketState === 'connected') return false;
+  if (input.ejectedAt !== null && input.ejectedAt !== undefined) return false;
+  if (input.connectionState === 'suspended') return false;
+  return true;
 }
 
 /** How long with no fix at all before the player gets a plain GPS state (v28, Diya F16). */
