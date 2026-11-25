@@ -56,23 +56,18 @@ test.describe('live HUD (demo)', () => {
     // interval the first shrink is pending, so the strip shows its
     // countdown. The shortened 10-min round would put the first shrink at
     // round end and the strip correctly shows "no shrink left" instead.
-    const { hostPage, guestPages, roles, roomId } = await startDemoMatch(context, { roundShort: false });
+    const { hostPage, guestPages, roles } = await startDemoMatch(context, { roundShort: false });
     const page = hostPage;
-    // H5 (v28 CI): the host tab is backgrounded while the guest pages
-    // are created, and the play page suspends the seat on tab-hide
-    // (useRoomState visibilitychange) — so the YOU dot reads
-    // 'Suspended', not 'Location never reported'. Bring the host tab
-    // forward (tab-visible auto-resumes) and wait for the resume.
-    await page.bringToFront();
-    await expect
-      .poll(
-        async () =>
-          (await getDemoRoom(page, roomId))?.players.find(
-            (p) => p.displayName === HOST_NAME,
-          )?.connectionState,
-        { timeout: 10000 },
-      )
-      .toBe('connected');
+    // v34: NO bringToFront + connected-poll here. That premise was
+    // false in headless CI: real backgrounding never fires
+    // `visibilitychange` (every page reads `document.hidden ===
+    // false`), so fronting resumes nothing — and this fixture grants
+    // no geolocation, so the play page's GPS watch denies and the
+    // seat stays `gps-denied`-suspended by design (F16) until a fix
+    // arrives, which never happens here. The strip does not depend
+    // on connectionState, so assert it directly; the suspended-guest
+    // premise below (banner on Ana's page) is the one that pins the
+    // suspension, and it holds for the same reason.
     await expect(page.getByText('Time left')).toBeVisible();
     await expect(page.getByText('Next ping')).toBeVisible();
     await expect(page.getByText(/Runners left 2 of 2/)).toBeVisible();
@@ -81,16 +76,19 @@ test.describe('live HUD (demo)', () => {
     await expect(page.getByText(/Zone 500 m shrinks in \d+:\d\d/)).toBeVisible();
     await expect(page.getByRole('progressbar', { name: 'Runners left' })).toBeVisible();
     // No fix has ever arrived in a headless context without geolocation
-    // — but assert it on a GUEST seat, not the host's own dot. The
-    // bringToFront + connected-poll above auto-resumes the host seat,
-    // and resume stamps `lastFixAt` (demo-store `resumePlayer`), so
-    // the host's dot reads an age ("0:00 ago"), never "Location never
-    // reported" — and a teammate dot only exists when the host drew
-    // Runner, so the host page matches zero or one elements by role
-    // draw. A guest page never hid-and-resumed (it was created
-    // backgrounded and never brought forward), so its seat is still
-    // suspended — deterministic (Diya-verified) — and no fix ever
-    // arrived for it.
+    // — but assert it on a GUEST seat, not the host's own dot. v34:
+    // there is no bringToFront above any more (it resumed nothing —
+    // see the comment at the top of this test), and no resume ever
+    // stamps `lastFixAt` here, so the host's dot reads 'Suspended'
+    // too, never an age. The guest banner is still the assertion to
+    // make: it pins BOTH halves of the premise at once (suspended
+    // AND never reported) in one exact string, where a dot label
+    // alone pins only the first half — and a teammate dot only
+    // exists when the host drew Runner, so the host page matches
+    // zero or one elements by role draw. A guest page never
+    // hid-and-resumed (it was created backgrounded and never brought
+    // forward), so its seat is still suspended — deterministic
+    // (Diya-verified) — and no fix ever arrived for it.
     //
     // v32 fix round (Diya A2 — the old assertion was wrong): Ana's
     // own YOU dot does NOT read "Location never reported". While the

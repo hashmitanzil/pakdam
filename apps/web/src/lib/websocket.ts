@@ -59,7 +59,7 @@ import {
   type WsServerEnvelope,
   type WsSnapshotPayload,
 } from '@pakdam/shared';
-import { getSessionForRoom } from './session-credentials';
+import { getSessionForRoom, takeWsJoinTicket } from './session-credentials';
 import { buildLastSnapshotKey, type LastSnapshotKey } from './snapshot-key';
 
 /**
@@ -393,7 +393,22 @@ export class PakdamSocket {
     payload: TPayload,
     commandId?: string,
   ): boolean {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return false; // discarded, never queued (R12)
+    return this.sendCommandReturningId(type, payload, commandId) !== null;
+  }
+
+  /**
+   * Scope C follow-up A (R2-14 seam 2): the same send, but returning
+   * the `commandId` actually put on the wire (null when nothing was
+   * sent) — the server echoes it back as `requestId` on error
+   * envelopes, so the caller can match a rejection to the exact
+   * command it sent instead of by receipt time alone.
+   */
+  sendCommandReturningId<TPayload extends AnyPayload>(
+    type: WsClientMessageType,
+    payload: TPayload,
+    commandId?: string,
+  ): string | null {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return null; // discarded, never queued (R12)
     const id = commandId ?? crypto.randomUUID();
     const envelope = {
       v: PROTOCOL_VERSION,
@@ -409,9 +424,9 @@ export class PakdamSocket {
     this.clientSeq += 1;
     try {
       this.ws.send(JSON.stringify(envelope));
-      return true;
+      return id;
     } catch {
-      return false;
+      return null;
     }
   }
 
@@ -511,10 +526,12 @@ export class PakdamSocket {
    * v18 runner Self Confirm: the Runner names the Hunter who tagged them
    * (`hunterId`) — no QR, no token, no Hunter confirmation needed. The
    * server creates the claim if none is open for that Hunter + Runner,
-   * then confirms it in one atomic op.
+   * then confirms it in one atomic op. Returns the `commandId` sent
+   * (null when nothing was sent) so the caller can match the server's
+   * error envelope by its echoed `requestId` (follow-up A).
    */
-  sendCatchSelfConfirm(hunterId: string): boolean {
-    return this.sendCommand('catch.self-confirm', { hunterId });
+  sendCatchSelfConfirm(hunterId: string): string | null {
+    return this.sendCommandReturningId('catch.self-confirm', { hunterId });
   }
 
   /** Runner confirms with the QR token (or manual confirm with no token). */
@@ -583,9 +600,15 @@ export class PakdamSocket {
     const workerUrl = getWorkerUrl();
     // v29 (R8): a server-pushed ticket (`ticket.renewed`) is used first
     // — no HTTP leg. Single-use: consumed here, whatever happens next.
+    // v34 (join ticket): the ticket the server minted inside the
+    // create/join response is spent on the seat's FIRST connect —
+    // same single-use pattern, no POST ws-ticket leg. A pushed ticket
+    // (minted over a live socket, fresher) wins over the join ticket;
+    // absent/expired → the existing fetch below.
     const pushed = this.takePushedTicket();
+    const joined = pushed ?? this.takeJoinTicket();
     const ticket =
-      pushed ??
+      joined ??
       (await fetchWsTicket(this.roomId, this.playerId, reconnectToken, 'connect'));
     const wsUrl = `${workerUrl.replace(/^http/, 'ws')}/v1/rooms/${this.roomId}/ws?ticket=${encodeURIComponent(ticket.ticket)}`;
     await this.openSocket(wsUrl);
@@ -597,6 +620,18 @@ export class PakdamSocket {
     this.pushedTicket = null;
     if (!pushed || pushed.expiresAtMs <= Date.now()) return null;
     return { ok: true, ticket: pushed.ticket, ticketId: '', expiresAtMs: pushed.expiresAtMs };
+  }
+
+  /**
+   * v34 (join ticket): consume the ticket minted inside the
+   * create/join response for this seat — single-use, so the take
+   * clears it from storage whether or not it is still valid. Null
+   * when absent or expired (60 s TTL): the caller fetches one.
+   */
+  private takeJoinTicket(): WsTicketResponse | null {
+    const stored = takeWsJoinTicket(this.roomId);
+    if (!stored || stored.expiresAtMs <= Date.now()) return null;
+    return { ok: true, ticket: stored.ticket, ticketId: stored.ticketId, expiresAtMs: stored.expiresAtMs };
   }
 
   private openSocket(url: string): Promise<void> {

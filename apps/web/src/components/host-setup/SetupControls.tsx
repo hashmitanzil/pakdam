@@ -2,8 +2,11 @@
  * SetupControls — the lobby-is-setup controls (SCRAM-SPEC §5d + §5f),
  * shared by the lobby page and the HostSettingsSheet (same controls, no
  * map). Every decided setting stays, as one stepper / toggle
- * with at most one short hint. No presets, no extra blocks.
- * All number settings are ShadowHunt-style − / + steppers — no sliders.
+ * with a one-line explainer underneath it (Scope C item 6 — ShadowHunt
+ * sections: PLAY AREA / PLAYERS / TIMING / RULES, one line under every
+ * control). All number settings are ShadowHunt-style − / + steppers —
+ * no sliders. House-rules presets (Scope C item 5) live here too, as
+ * one-tap shortcuts above the steppers — the steppers stay the controls.
  */
 import { memo, type ReactNode } from 'react';
 import {
@@ -15,6 +18,12 @@ import {
 import { Stepper } from '../ui/Stepper';
 import { Toggle } from '../ui/Toggle';
 import { formatDurationShort } from '../../lib/utils';
+import {
+  HOUSE_PRESETS,
+  matchBuiltInPreset,
+  matchesCustomPreset,
+  type HousePreset,
+} from '../../lib/house-rules';
 
 export interface SetupControlsProps {
   config: RoomConfig;
@@ -43,14 +52,115 @@ function row(label: string, value: string, control: ReactNode, hint?: string) {
   );
 }
 
-/** Rules steppers + shrink + play-zone toggle (SCRAM-SPEC §5d–§5e). */
-/** Memoized (B14): setup re-renders on every poll tick — the controls only re-render when the config or host state changes. */
-export const RulesControls = memo(function RulesControls({ config, isHost, onChange }: SetupControlsProps) {
+/**
+ * House-rules presets (Scope C item 5) — Quick / Standard / Big park /
+ * Custom + Save, above the steppers. A tap applies the preset (timing
+ * + zone size); changing any stepper afterwards drops back to Custom
+ * with a "Changed. Save them…" line and a Save button that stores the
+ * current settings on this device.
+ */
+export interface HouseRulesPresetsProps {
+  config: RoomConfig;
+  /** Circle-zone radius in metres, or null for a drawn zone (the radius is ignored then). */
+  zoneRadiusMeters: number | null;
+  /** The saved Custom preset, or null when nothing was saved yet. */
+  savedCustom: HousePreset | null;
+  isHost: boolean;
+  onApplyPreset: (preset: HousePreset) => void;
+  onSaveCustom: () => void;
+  /** Shown right after a save ("Saved — pick Custom next time."). */
+  saveNotice: string | null;
+}
+
+export const HouseRulesPresets = memo(function HouseRulesPresets({
+  config,
+  zoneRadiusMeters,
+  savedCustom,
+  isHost,
+  onApplyPreset,
+  onSaveCustom,
+  saveNotice,
+}: HouseRulesPresetsProps) {
+  const builtIn = matchBuiltInPreset(config, zoneRadiusMeters);
+  const customMatches = matchesCustomPreset(config, zoneRadiusMeters, savedCustom);
+  const activeId = builtIn ?? (customMatches ? 'custom' : null);
+  const changed = activeId === null;
+  const activePreset: HousePreset | null =
+    HOUSE_PRESETS.find((p) => p.id === builtIn) ?? (customMatches ? savedCustom : null);
+  return (
+    <div>
+      <p className="pakdam-label">House rules</p>
+      <p className="mt-1 text-[13px] text-[#A1A1AA]">
+        One tap for a common game — the steppers below still change anything.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2" role="group" aria-label="House rules presets">
+        {HOUSE_PRESETS.map((preset) => (
+          <button
+            key={preset.id}
+            type="button"
+            aria-pressed={activeId === preset.id}
+            disabled={!isHost}
+            onClick={() => onApplyPreset(preset)}
+            className={`rounded-full border px-4 py-2 text-[14px] font-bold disabled:opacity-40 ${
+              activeId === preset.id
+                ? 'border-[#EF4444] bg-[#EF4444] text-white'
+                : 'border-[#26262B] bg-[#1E1E22] text-white'
+            }`}
+          >
+            {preset.label}
+          </button>
+        ))}
+        <button
+          key="custom"
+          type="button"
+          aria-pressed={activeId === 'custom'}
+          disabled={!isHost || !savedCustom}
+          onClick={() => {
+            if (savedCustom) onApplyPreset(savedCustom);
+          }}
+          className={`rounded-full border px-4 py-2 text-[14px] font-bold disabled:opacity-40 ${
+            activeId === 'custom'
+              ? 'border-[#EF4444] bg-[#EF4444] text-white'
+              : 'border-[#26262B] bg-[#1E1E22] text-white'
+          }`}
+        >
+          Custom
+        </button>
+      </div>
+      {saveNotice ? (
+        <p className="mt-2 text-[13px] text-[#22C55E]">{saveNotice}</p>
+      ) : changed ? (
+        <p className="mt-2 text-[13px] text-[#A1A1AA]">
+          Changed. Save them to pick them next time.{' '}
+          <button
+            type="button"
+            onClick={onSaveCustom}
+            disabled={!isHost}
+            className="font-semibold text-[#EF4444] disabled:opacity-40"
+          >
+            + Save
+          </button>
+        </p>
+      ) : activePreset ? (
+        <p className="mt-2 text-[13px] text-[#A1A1AA]">{activePreset.line}</p>
+      ) : null}
+      {!savedCustom && !changed ? (
+        <p className="mt-1 text-[13px] text-[#A1A1AA]">
+          No saved Custom yet — change any setting, then Save it here.
+        </p>
+      ) : null}
+    </div>
+  );
+});
+
+/** Timing steppers (SCRAM-SPEC §5d): round length, head start, pings. */
+export const TimingControls = memo(function TimingControls({ config, isHost, onChange }: SetupControlsProps) {
   const set = (patch: Partial<RoomConfig>): void => onChange({ ...config, ...patch });
   const pingsOff = config.pingIntervalSeconds === 0;
   const zoneOff = config.playZoneEnabled === false;
   return (
-    <section aria-label="Rules">
+    <section aria-label="Timing">
+      <p className="pakdam-label">Timing</p>
       {row(
         'Round length',
         formatDurationShort(config.durationSeconds),
@@ -100,6 +210,17 @@ export const RulesControls = memo(function RulesControls({ config, isHost, onCha
           ? 'No pings. Neither side sees the other — hunters get no locations at all, including for runners who leave the zone (no code emits a reveal on zone exit).'
           : 'How often both sides see where the other team is.',
       )}
+    </section>
+  );
+});
+
+/** Rules toggles (SCRAM-SPEC §5d–§5e): zone shrink + play zone. */
+export const RulesControls = memo(function RulesControls({ config, isHost, onChange }: SetupControlsProps) {
+  const set = (patch: Partial<RoomConfig>): void => onChange({ ...config, ...patch });
+  const zoneOff = config.playZoneEnabled === false;
+  return (
+    <section aria-label="Rules">
+      <p className="pakdam-label">Rules</p>
       <div className="mt-4 flex items-center justify-between gap-3">
         <div>
           <p className="text-[15px] font-semibold text-white">Zone shrinks</p>
@@ -134,11 +255,11 @@ export const RulesControls = memo(function RulesControls({ config, isHost, onCha
       <div className="mt-4 flex items-center justify-between gap-3">
         <div>
           <p className="text-[15px] font-semibold text-white">Play zone</p>
-          {zoneOff ? (
-            <p className="text-[13px] text-[#A1A1AA]">
-              No zone and no pings. Classic hide and seek — hunters get no locations at all.
-            </p>
-          ) : null}
+          <p className="text-[13px] text-[#A1A1AA]">
+            {zoneOff
+              ? 'No zone and no pings. Classic hide and seek — hunters get no locations at all.'
+              : 'The zone is on — runners must stay inside it.'}
+          </p>
         </div>
         <Toggle
           label="Play zone"
@@ -171,6 +292,7 @@ export const TeamControls = memo(function TeamControls({
   const maxHunters = Math.max(1, config.maxPlayers - 1);
   return (
     <section aria-label="Players">
+      <p className="pakdam-label">Players</p>
       <div className="mt-4 flex items-center justify-between gap-3 first:mt-0">
         <div>
           <p className="text-[15px] font-semibold text-white">Balance hunters</p>
@@ -212,6 +334,7 @@ export const TeamControls = memo(function TeamControls({
               format={(v) => String(v)}
               onChange={(v) => set({ hunterCount: Math.max(1, Math.min(maxHunters, v)) })}
             />,
+            'How many Hunters the match draws. It must leave at least one Runner.',
           )}
       <div className="mt-4 flex items-center justify-between gap-3">
         <div>

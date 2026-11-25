@@ -74,7 +74,9 @@ test('validateFix: a fix older than 60 s is STALE_LOCATION', () => {
 test('validateFix: a timestamp >5 min in the future is clock skew, not stale', () => {
   const r = validateFix(fix({ timestampMs: NOW + 300_001 }), null, NOW);
   assert.equal(r.ok, false);
-  assert.equal(r.code, 'VALIDATION_FAILED');
+  // v34 (Diya R2-6) — the future-dated rejection carries the distinct
+  // CLOCK_SKEW code so the client can warn about the phone clock.
+  assert.equal(r.code, 'CLOCK_SKEW');
 });
 
 test('validateFix: an exact duplicate of the previous fix is rejected', () => {

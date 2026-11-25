@@ -34,6 +34,12 @@
  * re-fetch as the primary liveness mechanism) is added, so the count
  * is now 22 client / 36 server types.
  *
+ * v34 correction (Arjun R2): v23 fix round 1 (S12) had already unfrozen
+ * `room.deleted` without bumping this count, so the true count has been
+ * 22 client / 37 server types since then — the header said 36. The
+ * `WS_SERVER_TYPES` array below is the contract; the count here now
+ * matches it (37).
+ *
  * Broadcast scoping (server-side, must be preserved): direct messages
  * (`welcome`, `snapshot`, `error`, `heartbeat.ack`, `auth.refreshed`,
  * `ticket.renewal-required`, `catch.runner-token`) go only to the sender; `voice.signal` and
@@ -287,7 +293,7 @@ export function isWsClientMessageType(value: string): value is WsClientMessageTy
 }
 
 // ---------------------------------------------------------------------------
-// Server → client (36 enumerated types; see note at the top of this file)
+// Server → client (37 enumerated types; see note at the top of this file)
 // ---------------------------------------------------------------------------
 
 export interface WelcomePayload {

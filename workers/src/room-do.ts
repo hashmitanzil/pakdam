@@ -87,6 +87,7 @@ import {
   QUICK_SIGNALS,
   RADIO_MAX_CHARS,
   RENEWAL_WARNING_MS,
+  STALE_FIX_MS,
   VOICE_SDP_MAX_BYTES,
   WS_MESSAGE_RATE_LIMITS,
   WS_MESSAGE_RATE_LIMIT_DEFAULT,
@@ -315,6 +316,25 @@ export interface RoomDoState {
 /** Memory-only state — rebuilt empty after hibernation, never persisted. */
 export interface RoomMemory {
   latestFix: Record<string, LocationFix>;
+  /**
+   * v34 (Diya R2-4) — gate-only fix retention: the latest accepted fix
+   * per seat, purged at the CATCH gate's own freshness (STALE_FIX_MS,
+   * 60 s), not the 30 s liveness purge. The 30 s purge deletes fixes
+   * the gate still accepts, so a stationary pair standing together
+   * 45 s failed the OK tap with STALE_LOCATION even though the gate's
+   * documented window is 60 s. The general map MUST stay on the 30 s
+   * purge — `teammateViewFor` and `dueSubjectIds` read presence
+   * without an age check, so a 45 s-old fix there would paint a stale
+   * dot / fire a stale ping. Only the three catch-gate call sites
+   * (self-confirm create + confirm, hunter claim) read this map, and
+   * only they may: it is the gate's window, not liveness. Written
+   * next to `latestFix` on every accepted fix; cleared with it on
+   * leave / match end / replay. This does NOT weaken (4a) (which
+   * reads durable `lastFixAt`, never either map) and it is NOT
+   * receipt-time freshness (the gate still judges the fix's device
+   * timestamp — that question stays the open founder call).
+   */
+  latestFixForCatch: Record<string, LocationFix>;
   outsideZone: Record<string, OutsideZoneState>;
   pendingPings: Ping[];
   tickets: WsTicketRecord[];
@@ -676,6 +696,9 @@ export const STATE_KEY = 'room-state-v1';
 export function emptyMemory(): RoomMemory {
   return {
     latestFix: {},
+    // v34 (Diya R2-4) — gate-only map, purged at 60 s (see the
+    // interface comment); written next to latestFix on every fix.
+    latestFixForCatch: {},
     outsideZone: {},
     pendingPings: [],
     tickets: [],
@@ -939,6 +962,14 @@ export class RoomStore {
     retryable: boolean,
     retryAfterSeconds?: number,
     nowMs: number = Date.now(),
+    // v34 (R2-14 seam 2) — echo of the request that caused this error:
+    // the caller's `commandId`, carried as `requestId` so the client
+    // can match an error to the request that caused it instead of
+    // matching by receipt time. Additive only — omitted entirely when
+    // the caller sent no commandId (old clients), and never renamed
+    // or removed: `WsErrorPayload.requestId` already exists in
+    // @pakdam/shared, the server just never set it.
+    requestId?: string,
   ): OutboundEvent {
     // v29 (Gap 5) — every WS error is logged by code (no payload, no
     // coordinates). The entry rides out with the next persist batch
@@ -957,6 +988,7 @@ export class RoomStore {
         message,
         retryable,
         ...(retryAfterSeconds !== undefined ? { retryAfterSeconds } : {}),
+        ...(requestId !== undefined ? { requestId } : {}),
         serverTs: new Date(nowMs).toISOString(),
       },
       [toPlayerId],
@@ -994,7 +1026,18 @@ export class RoomStore {
       return this.allPlayerIds();
     }
     return this.state.players
-      .filter((p) => p.team === me.team)
+      .filter(
+        (p) =>
+          p.team === me.team &&
+          // v34 (Zara 8b) — a caught spectator hears no live team
+          // comms: radio / signal / visibility stop at the tag, the
+          // same "once tagged they lose the live view" rule the
+          // snapshot already enforces (teammateFixes empty for caught
+          // runners). Their own fix is still broadcast TO live
+          // teammates by design (safety) — that direction is
+          // `teammateFixRecipients`, untouched here.
+          !this.isCaughtSpectator(p.playerId),
+      )
       .map((p) => p.playerId);
   }
 
@@ -1147,6 +1190,33 @@ export class RoomStore {
     );
   }
 
+  /**
+   * v34 (Diya R2-5) — does this viewer need to re-send their last known
+   * fix? True exactly in the post-eviction hole: the seat has reported
+   * before (durable `lastFixAt` set — the DO persisted it before the
+   * wake) but no live fix sits in memory (`mem.latestFix` rebuilds
+   * empty on every wake). The client re-sends on seeing the flag in
+   * the snapshot (debounced — once per flag flip, not per snapshot).
+   * False when the seat never reported (nothing to re-send), when the
+   * fix is present, or when the phase is not live (in the lobby the
+   * client streams fixes continuously anyway, and the gate does not
+   * apply). No coordinates are involved — the flag names the hole,
+   * the client's own stored fix fills it.
+   */
+  fixReseedNeededFor(viewerId: string): boolean {
+    const viewer = this.player(viewerId);
+    if (!viewer || viewer.leftAt !== null || viewer.ejectedAt !== null) return false;
+    if (
+      this.room.phase !== 'HEAD_START' &&
+      this.room.phase !== 'ACTIVE' &&
+      this.room.phase !== 'SAFETY_PAUSED'
+    ) {
+      return false;
+    }
+    if (viewer.lastFixAt === null) return false;
+    return this.mem.latestFix[viewerId] === undefined;
+  }
+
   snapshotFor(viewerId: string, nowMs: number = Date.now()): WsSnapshotPayload {
     const viewer = this.player(viewerId);
     return buildSnapshot({
@@ -1172,6 +1242,8 @@ export class RoomStore {
       // v29 (R5 fix round): the memory epoch — top-level on the
       // payload so the client can include it in its snapshot key.
       epochMs: this.mem.epochMs,
+      // v34 (Diya R2-5): re-send signal for the post-eviction hole.
+      fixReseedNeeded: this.fixReseedNeededFor(viewerId),
     });
   }
 
@@ -1494,7 +1566,6 @@ export class RoomStore {
       return errResult('This room is full.', 'CONFLICT', 409);
     }
     const rawToken = randomHex(16);
-    const tokenHash = await hashReconnectToken(rawToken);
     const now = new Date(nowMs).toISOString();
     const player: Player = {
       playerId: newId(),
@@ -1504,7 +1575,19 @@ export class RoomStore {
       isHost: false,
       matchRole: null,
       team: null,
-      reconnectTokenHash: tokenHash,
+      // v34 (delivery gate, duplicate-join race) — RESERVED
+      // synchronously, BEFORE the await below. Two concurrent joins
+      // with the same codename used to both pass the `existing` find
+      // (neither had pushed yet) and both await the token hash, then
+      // both push — two seats, one codename, two roles. The push is
+      // now in the synchronous section, so the second call's find sees
+      // the reserved seat and 403s "name taken". The hash is filled in
+      // after the await; a hashing failure rolls the reservation back
+      // (the seat never existed to any other caller — the push and the
+      // hash-set are separated only by this one await, and the
+      // reservation is invisible: `playerViewFor` is never served
+      // before the hash lands because this op has not returned).
+      reconnectTokenHash: '',
       joinedAt: now,
       leftAt: null,
       ejectedAt: null,
@@ -1517,6 +1600,17 @@ export class RoomStore {
       suspensionCount: 0,
     };
     this.state.players.push(player);
+    let tokenHash: string;
+    try {
+      tokenHash = await hashReconnectToken(rawToken);
+    } catch {
+      // Roll the reservation back: a seat without a token hash must
+      // never persist (verifyReconnect would never match it, and the
+      // name would be squatted forever).
+      this.state.players = this.state.players.filter((p) => p !== player);
+      return errResult('Could not create the seat — try again.', 'SERVER_ERROR', 500);
+    }
+    player.reconnectTokenHash = tokenHash;
     this.bumpVersion();
     const events = [
       ...this.emitPlayerEvent('player.joined', player, nowMs),
@@ -1729,6 +1823,65 @@ export class RoomStore {
   }
 
   /**
+   * v34 (slow entry) — mint + register a CONNECT WS ticket for a seat
+   * the DO itself just created or restored (join / create), so the
+   * client's first socket connect skips the POST ws-ticket leg
+   * (one client↔Worker↔DO round-trip + one DO save off the entry
+   * path). Mirrors `mintRenewalTicket` exactly except for purpose:
+   * a 'connect' ticket opens a socket (`redeemTicketForConnect`
+   * refuses a 'renew' ticket), and a renewal ticket can never open
+   * one — the two purposes must never be confused. Same checks as
+   * the renewal mint: no ticket on a deleted room, seat must exist
+   * and be neither left nor ejected, same per-seat issue rate limit
+   * (10/min/seat, same table). No reconnect-token check applies
+   * here — the caller is the DO class acting on a seat it just
+   * created/restored in the same op, exactly like the renewal mint
+   * acting on an authenticated socket. The raw value is returned to
+   * the caller for ONE delivery in the join/create HTTP response;
+   * only the hash is stored, exactly like the HTTP mint path.
+   * Best-effort by contract: the caller attaches the ticket only
+   * when this returns ok — a failure never fails the join/create,
+   * and the client falls back to POST ws-ticket (today's path).
+   * 60 s TTL (`WS_TICKET_TTL_MS`): a ticket that expires before the
+   * client connects 4401s, and the client fetches a fresh one via
+   * the existing fresh-ticket-reconnect-once path.
+   */
+  async mintJoinTicket(
+    playerId: string,
+    nowMs: number,
+  ): Promise<OpResult<{ ticket: string; ticketId: string; expiresAtMs: number }>> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    const seat = this.player(playerId);
+    if (!seat || seat.leftAt !== null || seat.ejectedAt !== null) {
+      return errResult('Seat not found in this room.', 'FORBIDDEN', 403);
+    }
+    const issueCheck = this.checkTicketIssueRateLimit(playerId, nowMs);
+    if (!issueCheck.allowed) {
+      return errResult(
+        'Too many tries — slow down.',
+        'RATE_LIMITED',
+        429,
+        [],
+        [],
+        issueCheck.retryAfterSeconds,
+      );
+    }
+    const ticket = randomHex(32);
+    const ticketId = newId();
+    const expiresAtMs = nowMs + WS_TICKET_TTL_MS;
+    this.mem.tickets.push({
+      ticketId,
+      playerId,
+      ticketHash: await hashWsTicket(ticket),
+      purpose: 'connect',
+      expiresAtMs,
+      redeemed: false,
+      createdAtMs: nowMs,
+    });
+    return okResult({ ticket, ticketId, expiresAtMs });
+  }
+
+  /**
    * One roster event per recipient, each carrying that recipient's view of
    * the subject (BEHAVIOUR §4 role secrecy: only the subject sees their
    * own matchRole/team). A single broadcast view would leak the subject's
@@ -1833,7 +1986,7 @@ export class RoomStore {
       return errResult('Only the host can transfer hosting.', 'FORBIDDEN', 403);
     }
     const next = this.player(input.newHostPlayerId);
-    if (!next || next.leftAt !== null) {
+    if (!next || next.leftAt !== null || next.ejectedAt !== null) {
       return errResult('The new host must be a player still in the room.', 'CONFLICT', 409);
     }
     if (next.playerId === host.playerId) {
@@ -2313,6 +2466,38 @@ export class RoomStore {
   }
 
   /**
+   * v34 (Diya R2-8) — expire a seat's open claims when it is ejected.
+   * A claim whose Hunter was ejected can never complete (the Hunter
+   * cannot return), and a claim against an ejected Runner cannot
+   * either — but without this the claim lived until its 120 s TTL,
+   * blocking the Runner from any other Hunter for up to two minutes
+   * while the self-confirm tap failed with a message that never said
+   * why waiting helps. The expiry reuses the exact `catch.expired`
+   * event + `catch-update` persist `expireOverdueCatches` emits, so
+   * the client clears the claim the same way it does on TTL expiry.
+   * Called from every ejection site (ejectWithWinCheck + the two
+   * direct outside-zone ejects), never from `suspendSeat`: during
+   * the 30 s grace the Hunter may still return and complete the tag.
+   */
+  private expireOpenClaimsForSeat(
+    playerId: string,
+    nowMs: number,
+    events: OutboundEvent[],
+    persist: PersistIntent[],
+  ): void {
+    for (const c of this.state.catches) {
+      if (!isPendingCatch(c)) continue;
+      if (c.hunterPlayerId !== playerId && c.runnerPlayerId !== playerId) continue;
+      Object.assign(c, { state: 'expired' });
+      this.mem.rawCatchTokens.delete(c.catchId);
+      events.push(
+        this.emit('catch.expired', { catch: toCatchView(c) }, this.catchRecipients(c), nowMs),
+      );
+      persist.push({ kind: 'catch-update', catch: c });
+    }
+  }
+
+  /**
    * Eject one seat + run the win check. Shared by the tick-side
    * ejections (missing-fix step (4a), outside-zone step (4)). Returns
    * true when the ejection completed the match — the caller must return
@@ -2331,6 +2516,9 @@ export class RoomStore {
     const ejected = applyOutsideZoneEjection(p, nowMs);
     Object.assign(p, ejected);
     delete this.mem.outsideZone[p.playerId];
+    // v34 (Diya R2-8) — the seat's open claims die with it, not at
+    // their 120 s TTL (see the helper comment).
+    this.expireOpenClaimsForSeat(p.playerId, nowMs, events, persist);
     this.bumpVersion();
     events.push(this.roomStateEvent('player-ejected', nowMs));
     persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: p });
@@ -2391,6 +2579,20 @@ export class RoomStore {
     const seat = this.verifyReconnect(input.playerId, input.reconnectTokenHash);
     if (!seat) {
       return errResult('Seat not found or reconnect token does not match.', 'FORBIDDEN', 403);
+    }
+    // v34 (Zara 6a) — an ejected/left seat issues no raw token. The
+    // reconnect token stays valid for `get-results` by design, so
+    // without this an ejected runner (socket closed 4405) could curl
+    // POST /v1/rooms/:id/catch-token and receive the live 128-bit QR
+    // token. Bounded today only because `confirmCatch` rejects ejected
+    // runners — credential issuance to an out seat is the exact class
+    // v33 F2c closed for WS tickets. Mirrors `registerTicket`
+    // (left -> 409 CONFLICT, ejected -> 403 FORBIDDEN).
+    if (seat.leftAt !== null) {
+      return errResult('That seat has left the room.', 'CONFLICT', 409);
+    }
+    if (seat.ejectedAt !== null) {
+      return errResult('That seat has been ejected from the game.', 'FORBIDDEN', 403);
     }
     const c = this.state.catches.find((x) => x.catchId === input.catchId);
     if (!c) {
@@ -2494,6 +2696,13 @@ export class RoomStore {
     const me = this.player(input.playerId);
     if (!me || me.leftAt !== null) {
       return errResult('Seat not found in this room.', 'FORBIDDEN', 403);
+    }
+    // v34 (Zara 6b) — explicit ejected guard. The engine
+    // `isCatchableRunner` check below already refuses an ejected
+    // runner, but the guarantee lived one layer down and invisible at
+    // this op: a future engine change would silently reopen the mint.
+    if (me.ejectedAt !== null) {
+      return errResult('That seat has been ejected from the game.', 'FORBIDDEN', 403);
     }
     if (me.matchRole !== 'runner') {
       return errResult('Only a Runner can show a catch QR.', 'FORBIDDEN', 403);
@@ -2662,6 +2871,12 @@ export class RoomStore {
     if (!me || me.leftAt !== null) {
       return errResult('Seat not found in this room.', 'FORBIDDEN', 403);
     }
+    // v34 (Zara 6b) — explicit ejected guard, same defence-in-depth
+    // as `mintRunnerQrToken`: the engine `isCatchableRunner` check
+    // below already refuses, but this op must not depend on it alone.
+    if (me.ejectedAt !== null) {
+      return errResult('That seat has been ejected from the game.', 'FORBIDDEN', 403);
+    }
     if (me.matchRole !== 'runner') {
       return errResult('Only a Runner can self-confirm a tag.', 'FORBIDDEN', 403);
     }
@@ -2716,12 +2931,15 @@ export class RoomStore {
         catchId: newId(),
         roomId: this.room.roomId,
         nowMs,
-        hunterFix: this.mem.latestFix[hunter.playerId] ?? null,
-        runnerFix: this.mem.latestFix[me.playerId] ?? null,
+        // v34 (Diya R2-4) — the gate reads the gate-only map (60 s
+        // retention), not the 30 s-purged live map: a stationary pair
+        // at 45 s still has a valid gate input here.
+        hunterFix: this.mem.latestFixForCatch[hunter.playerId] ?? null,
+        runnerFix: this.mem.latestFixForCatch[me.playerId] ?? null,
         // P1-11: physical tag — the engine enforces proximity on these.
         positions: {
-          hunter: this.mem.latestFix[hunter.playerId] ?? null,
-          runner: this.mem.latestFix[me.playerId] ?? null,
+          hunter: this.mem.latestFixForCatch[hunter.playerId] ?? null,
+          runner: this.mem.latestFixForCatch[me.playerId] ?? null,
         },
         maxDistanceMeters: CATCH_MAX_DISTANCE_METERS,
       });
@@ -2751,7 +2969,13 @@ export class RoomStore {
       hunter.leftAt !== null
     ) {
       return errResult(
-        'That Hunter is suspended or no longer in play — they cannot be credited with a tag right now.',
+        // v34 (Diya R2-8) — the old copy never said to WAIT: the Runner
+        // tapped OK into a dead window with no guidance. The claim is
+        // still open (it was not created here) and the Hunter may return
+        // inside their 30 s window; if they are ejected instead, the
+        // claim expires with them (expireOpenClaimsForSeat) instead of
+        // lingering to its 120 s TTL.
+        'That Hunter is suspended — wait for them to come back, or the claim ends when they are ejected.',
         'CONFLICT',
         409,
         events,
@@ -2772,9 +2996,11 @@ export class RoomStore {
       phase: this.room.phase,
       nowMs,
       ttlSeconds: CATCH_TOKEN_TTL_SECONDS,
+      // v34 (Diya R2-4) — the gate reads the gate-only map (60 s
+      // retention), not the 30 s-purged live map.
       positions: {
-        hunter: this.mem.latestFix[c.hunterPlayerId] ?? null,
-        runner: this.mem.latestFix[c.runnerPlayerId] ?? null,
+        hunter: this.mem.latestFixForCatch[c.hunterPlayerId] ?? null,
+        runner: this.mem.latestFixForCatch[c.runnerPlayerId] ?? null,
       },
       maxDistanceMeters: CATCH_MAX_DISTANCE_METERS,
     });
@@ -2944,6 +3170,7 @@ export class RoomStore {
     this.bumpVersion();
     // Fixes are purged at match end; raw catch tokens die with the match.
     this.mem.latestFix = {};
+    this.mem.latestFixForCatch = {};
     this.mem.outsideZone = {};
     this.mem.rawCatchTokens.clear();
     this.state.runnerQrTokens = [];
@@ -3113,6 +3340,7 @@ export class RoomStore {
     this.mem.announcements = [];
     this.mem.lastDisconnectAtMs = {};
     this.mem.latestFix = {};
+    this.mem.latestFixForCatch = {};
     this.mem.lastFixAcceptedAtMs = {};
     this.mem.lastPlayerPersistAtMs = {};
     // v29 — a fresh game starts with no return windows, no fix
@@ -3664,7 +3892,14 @@ export class RoomStore {
     if (host.leftAt === null) return { events: [], persist: [] };
     if (isTerminalPhase(this.room.phase)) return { events: [], persist: [] };
     const next = this.state.players
-      .filter((p) => p.leftAt === null && p.connectionState !== 'suspended')
+      .filter(
+        (p) =>
+          p.leftAt === null &&
+          // v34 (Zara 6d) — an ejected seat must never be crowned
+          // (cannot verify host while live; strands the room).
+          p.ejectedAt === null &&
+          p.connectionState !== 'suspended',
+      )
       .sort((a, b) => Date.parse(a.joinedAt) - Date.parse(b.joinedAt))[0];
     if (!next) return { events: [], persist: [] };
     const s = this.transferHostToSeat(host, next, nowMs);
@@ -3818,9 +4053,21 @@ export class RoomStore {
   ): { events: OutboundEvent[]; persist: PersistIntent[] } {
     const seat = this.player(playerId);
     if (!seat || seat.leftAt !== null) return { events: [], persist: [] };
+    // v34 (Diya R3-N2) — an ejected seat stays ejected: a leave from
+    // a second tab (or any leave call after ejection) must not stamp
+    // `leftAt` over the ejection. Without this the play / catch pages
+    // render BOTH the ejected banner and the removed banner, both
+    // headed "You were removed from the game." with contradictory
+    // copy. Same no-op shape as `suspendSeat` for ejected/left seats
+    // (v33): the ejection is authoritative, the leave is dropped, and
+    // the snapshot keeps carrying `ejectedAt`. Live-phase only, like
+    // the `ejectedWhileLive` guards elsewhere: in a terminal phase
+    // the ejection is history and leaving proceeds as before.
+    if (this.ejectedWhileLive(seat)) return { events: [], persist: [] };
     seat.leftAt = new Date(nowMs).toISOString();
     seat.connectionState = 'disconnected';
     delete this.mem.latestFix[playerId];
+    delete this.mem.latestFixForCatch[playerId];
     // v29 — a seat that left for good carries no return window, fix
     // history, or violation count into a later restore (a restore
     // re-starts clean; the suspension count stays on the record).
@@ -3841,6 +4088,11 @@ export class RoomStore {
         .filter(
           (p) =>
             p.leftAt === null &&
+            // v34 (Zara 6d) — an ejected seat must never be crowned:
+            // it cannot verify host while live, so crowning it strands
+            // the room hostless mid-match (same rule as the suspended
+            // exclusion above it).
+            p.ejectedAt === null &&
             // v23 fix round 1 (S14): mirror
             // `succeedHostAfterDisconnect` — a suspended seat must not
             // be crowned. It cannot mint a host token until it
@@ -4063,6 +4315,9 @@ export class RoomStore {
       .filter(
         (p) =>
           p.leftAt === null &&
+          // v34 (Zara 6d) — an ejected seat must never be crowned
+          // (cannot verify host while live; strands the room).
+          p.ejectedAt === null &&
           p.playerId !== seat.playerId &&
           p.connectionState !== 'suspended',
       )
@@ -4092,6 +4347,13 @@ export class RoomStore {
     nowMs: number,
     batchId?: string,
   ): { transferred: boolean; events: OutboundEvent[]; persist: PersistIntent[] } {
+    // v34 (Zara 6c/6d, defence in depth) — the shared transfer core
+    // never crowns an ejected seat, whatever the caller filtered.
+    // Every caller filters too; this is the backstop so a future
+    // caller cannot strand host on a seat that cannot verify it.
+    if (next.ejectedAt !== null || next.leftAt !== null) {
+      return { transferred: false, events: [], persist: [] };
+    }
     // v24: any completed transfer ends the grace for the previous
     // host — a transferred host never gets a grace back.
     if (this.state.hostGrace?.hostPlayerId === prev.playerId) {
@@ -4222,11 +4484,24 @@ export class RoomStore {
 
     // (1) Purge stale fixes + expired pending pings + stale idempotency.
     // Fixes purge after 30 s (LOCATION_FRESHNESS_SECONDS), not 120 s —
-    // the freshness window is 30 s, so a fix older than that is already
-    // 'unknown' everywhere it is read.
+    // the liveness window is 30 s, so a fix older than that is already
+    // 'unknown' to the map, the pings and the liveness readers. The
+    // catch gate is the exception: it reads `latestFixForCatch`,
+    // purged at its own 60 s window just below.
     for (const [pid, fix] of Object.entries(this.mem.latestFix)) {
       if (nowMs - fix.timestampMs > LOCATION_FRESHNESS_SECONDS * 1000) {
         delete this.mem.latestFix[pid];
+      }
+    }
+    // v34 (Diya R2-4) — the gate-only map purges at the GATE's window
+    // (STALE_FIX_MS, 60 s), not the 30 s liveness purge above: a fix
+    // 31–60 s old is stale for the map and the pings, but still a valid
+    // input to the catch gate. Purging it at 30 s made the gate's
+    // documented 60 s window a dead letter in live play (the tick runs
+    // every second, so any fix past 30 s was gone within a second).
+    for (const [pid, fix] of Object.entries(this.mem.latestFixForCatch)) {
+      if (nowMs - fix.timestampMs > STALE_FIX_MS) {
+        delete this.mem.latestFixForCatch[pid];
       }
     }
     const pingsBefore = this.mem.pendingPings;
@@ -4593,6 +4868,8 @@ export class RoomStore {
           const ejected = applyOutsideZoneEjection(p, nowMs);
           Object.assign(p, ejected);
           delete this.mem.outsideZone[p.playerId];
+          // v34 (Diya R2-8) — the seat's open claims die with it.
+          this.expireOpenClaimsForSeat(p.playerId, nowMs, events, persist);
           this.bumpVersion();
           events.push(this.roomStateEvent('player-ejected', nowMs));
           persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: p });
@@ -5002,6 +5279,17 @@ export class RoomStore {
     // duration log (the handler's `nowMs` is the receive time and does
     // not advance inside the handler, so it cannot measure duration).
     const receivedWallMs = Date.now();
+    // v34 (R2-14 seam 2) — the id of THIS request, echoed as
+    // `requestId` on every error envelope this handler emits (via
+    // `errorEvent` below). The client mints one `commandId` per send
+    // (`websocket.ts sendCommand`), so each request — the self-confirm
+    // OK tap and the background `location.update` stream alike — has
+    // its own id, and an error carries exactly the id of the request
+    // that caused it. `undefined` when the client sent none (old
+    // client): the field is then omitted, never an empty value.
+    // Declared before the early guards (deleted room, unknown seat):
+    // those return error envelopes too, and must echo as well.
+    const requestId = envelope.commandId;
     // v23 fix round 1 (S4): no WS traffic on a deleted room. Every op
     // below is served from the store, so one guard here covers
     // snapshot.request, radio.send, signal.send, pin.place,
@@ -5010,7 +5298,7 @@ export class RoomStore {
     if (this.isDeleted()) {
       return {
         events: [
-          this.errorEvent(playerId, 'ROOM_NOT_FOUND', 'This room has been deleted.', false, undefined, nowMs),
+          this.errorEvent(playerId, 'ROOM_NOT_FOUND', 'This room has been deleted.', false, undefined, nowMs, requestId),
         ],
         persist,
         durable: false,
@@ -5048,7 +5336,7 @@ export class RoomStore {
     };
 
     if (!me) {
-      const errorEvents = [this.errorEvent(playerId, 'ROOM_NOT_FOUND', 'Seat not found in this room.', false, undefined, nowMs)];
+      const errorEvents = [this.errorEvent(playerId, 'ROOM_NOT_FOUND', 'Seat not found in this room.', false, undefined, nowMs, requestId)];
       cacheEarlyReply(errorEvents);
       return {
         events: errorEvents,
@@ -5060,7 +5348,7 @@ export class RoomStore {
     // A seat that left the room has no socket business left; its socket
     // should already be closed, so a message from it is a protocol error.
     if (me.leftAt !== null) {
-      const errorEvents = [this.errorEvent(playerId, 'FORBIDDEN', 'That seat has left the room.', false, undefined, nowMs)];
+      const errorEvents = [this.errorEvent(playerId, 'FORBIDDEN', 'That seat has left the room.', false, undefined, nowMs, requestId)];
       cacheEarlyReply(errorEvents);
       return {
         events: errorEvents,
@@ -5084,7 +5372,7 @@ export class RoomStore {
     // NOT served here — it was already pushed before the 4405 close
     // at ejection time.
     if (this.ejectedWhileLive(me)) {
-      const errorEvents = [this.errorEvent(playerId, 'FORBIDDEN', 'That seat has been ejected from the game.', false, undefined, nowMs)];
+      const errorEvents = [this.errorEvent(playerId, 'FORBIDDEN', 'That seat has been ejected from the game.', false, undefined, nowMs, requestId)];
       cacheEarlyReply(errorEvents);
       return {
         events: errorEvents,
@@ -5122,7 +5410,7 @@ export class RoomStore {
         metadata: { operation: type, code: 'RATE_LIMITED' },
       });
       const errorEvents = [
-        this.errorEvent(playerId, 'RATE_LIMITED', 'Too many messages — slow down.', true, rl.retryAfterSeconds, nowMs),
+        this.errorEvent(playerId, 'RATE_LIMITED', 'Too many messages — slow down.', true, rl.retryAfterSeconds, nowMs, requestId),
       ];
       // Phase 4 (q): cache the rate-limit error — a retry gets the
       // error, not an empty [] that looks like success.
@@ -5157,7 +5445,7 @@ export class RoomStore {
           'You are out — spectating players cannot message the live team.',
           false,
           undefined,
-          nowMs,
+          nowMs, requestId,
         ),
       );
       rememberReply(events);
@@ -5217,7 +5505,7 @@ export class RoomStore {
       }
       case 'ready.set': {
         if (typeof payload['isReady'] !== 'boolean') {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'ready.set needs isReady: boolean.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'ready.set needs isReady: boolean.', false, undefined, nowMs, requestId));
           break;
         }
         me.isReady = payload['isReady'] as boolean;
@@ -5258,7 +5546,7 @@ export class RoomStore {
           // VALIDATION_FAILED, only a fix that arrived too old is
           // STALE_LOCATION. Clients branch on the code.
           events.push(
-            this.errorEvent(playerId, check.code ?? 'VALIDATION_FAILED', check.errors.join(' ') || 'Fix rejected.', false, undefined, nowMs),
+            this.errorEvent(playerId, check.code ?? 'VALIDATION_FAILED', check.errors.join(' ') || 'Fix rejected.', false, undefined, nowMs, requestId),
           );
           break;
         }
@@ -5364,6 +5652,10 @@ export class RoomStore {
           }
         }
         this.mem.latestFix[playerId] = goodFix;
+        // v34 (Diya R2-4) — same fix into the gate-only map (purged at
+        // 60 s, not 30 s): the catch gate reads this map, never the
+        // 30 s-purged one above.
+        this.mem.latestFixForCatch[playerId] = goodFix;
         // Phase 4 (i) — snapshot-key fix: an accepted fix mutates
         // snapshot content (players[].lastFixAt, teammateFixes, and the
         // time-derived locationStatus) without any emit, so the
@@ -5454,6 +5746,8 @@ export class RoomStore {
             const ejected = applyOutsideZoneEjection(me, nowMs);
             Object.assign(me, ejected);
             delete this.mem.outsideZone[playerId];
+            // v34 (Diya R2-8) — the seat's open claims die with it.
+            this.expireOpenClaimsForSeat(playerId, nowMs, events, persist);
             this.bumpVersion();
             events.push(this.roomStateEvent('player-ejected', nowMs));
             persist.push({ kind: 'player-upsert', roomId: this.room.roomId, player: me });
@@ -5536,7 +5830,7 @@ export class RoomStore {
         // ACTIVE-only, one live token per Runner, re-mint replaces).
         const r = await this.mintRunnerQrToken({ playerId, nowMs });
         if (!r.ok) {
-          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs, requestId));
           if (r.events) events.push(...r.events);
           if (r.persist) persist.push(...r.persist);
           break;
@@ -5569,7 +5863,7 @@ export class RoomStore {
         let scanned: { record: RunnerQrToken; raw: string } | null = null;
         if (typeof qrToken === 'string') {
           if (!isValidCatchToken(qrToken)) {
-            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', "That QR didn't scan as a catch token — try again.", false, undefined, nowMs));
+            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', "That QR didn't scan as a catch token — try again.", false, undefined, nowMs, requestId));
             break;
           }
           const resolved = await resolveRunnerQrToken(this.state.runnerQrTokens, qrToken, nowMs);
@@ -5589,7 +5883,7 @@ export class RoomStore {
             const claim = await resolveOpenClaimQrToken(this.state.catches, qrToken, nowMs);
             if (claim !== null) {
               if (runnerId !== undefined && runnerId !== claim.runnerPlayerId) {
-                events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That QR is for a different Runner.', false, undefined, nowMs));
+                events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That QR is for a different Runner.', false, undefined, nowMs, requestId));
                 break;
               }
               runnerId = claim.runnerPlayerId;
@@ -5600,16 +5894,16 @@ export class RoomStore {
               // say so, instead of the bare "didn't match". The
               // distinct CATCH_EXPIRED code below is kept for tokens
               // that are genuinely expired.
-              events.push(this.errorEvent(playerId, 'FORBIDDEN', "That QR didn't match — it may have expired or been refreshed. Ask the Runner to show a fresh QR.", false, undefined, nowMs));
+              events.push(this.errorEvent(playerId, 'FORBIDDEN', "That QR didn't match — it may have expired or been refreshed. Ask the Runner to show a fresh QR.", false, undefined, nowMs, requestId));
               break;
             }
           }
           if (resolved.status === 'expired') {
-            events.push(this.errorEvent(playerId, 'CATCH_EXPIRED', 'That QR expired — ask the Runner to show a fresh QR.', false, undefined, nowMs));
+            events.push(this.errorEvent(playerId, 'CATCH_EXPIRED', 'That QR expired — ask the Runner to show a fresh QR.', false, undefined, nowMs, requestId));
             break;
           }
           if (resolved.status === 'used') {
-            events.push(this.errorEvent(playerId, 'FORBIDDEN', 'That QR was already used — ask the Runner to show a fresh QR.', false, undefined, nowMs));
+            events.push(this.errorEvent(playerId, 'FORBIDDEN', 'That QR was already used — ask the Runner to show a fresh QR.', false, undefined, nowMs, requestId));
             break;
           }
           // 'valid' only — 'unknown' was handled above (claim lookup
@@ -5618,7 +5912,7 @@ export class RoomStore {
           if (resolved.status === 'valid') {
             const record = resolved.record as RunnerQrToken;
             if (runnerId !== undefined && runnerId !== record.runnerPlayerId) {
-              events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That QR is for a different Runner.', false, undefined, nowMs));
+              events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That QR is for a different Runner.', false, undefined, nowMs, requestId));
               break;
             }
             runnerId = record.runnerPlayerId;
@@ -5626,12 +5920,12 @@ export class RoomStore {
           }
         }
         if (runnerId === undefined) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.request needs runnerId or a scanned qrToken.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.request needs runnerId or a scanned qrToken.', false, undefined, nowMs, requestId));
           break;
         }
         const runner = this.player(runnerId);
         if (!runner) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That Runner is not in the room.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That Runner is not in the room.', false, undefined, nowMs, requestId));
           break;
         }
         const sweep = this.expireOverdueCatches(nowMs);
@@ -5662,19 +5956,21 @@ export class RoomStore {
           catchId: newId(),
           roomId: this.room.roomId,
           nowMs,
-          hunterFix: this.mem.latestFix[playerId] ?? null,
-          runnerFix: this.mem.latestFix[runnerId] ?? null,
+          // v34 (Diya R2-4) — the gate reads the gate-only map (60 s
+          // retention), not the 30 s-purged live map.
+          hunterFix: this.mem.latestFixForCatch[playerId] ?? null,
+          runnerFix: this.mem.latestFixForCatch[runnerId] ?? null,
           // P1-11: physical tag — the engine enforces proximity on these.
           positions: {
-            hunter: this.mem.latestFix[playerId] ?? null,
-            runner: this.mem.latestFix[runnerId] ?? null,
+            hunter: this.mem.latestFixForCatch[playerId] ?? null,
+            runner: this.mem.latestFixForCatch[runnerId] ?? null,
           },
           maxDistanceMeters: CATCH_MAX_DISTANCE_METERS,
         });
         if (!req.ok) {
           const status = req.code === 'FORBIDDEN' ? 403 : 409;
           void status;
-          events.push(this.errorEvent(playerId, req.code, req.reason, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, req.code, req.reason, false, undefined, nowMs, requestId));
           break;
         }
         const claim = req.value;
@@ -5700,6 +5996,28 @@ export class RoomStore {
             expiresAtMs: Date.parse(claim.requestedAt) + CATCH_TOKEN_TTL_SECONDS * 1000,
           });
         }
+        // v34 (Arjun R2) — the token mint above AWAITS, so two Hunters
+        // racing the same Runner both passed the open-claim check (in
+        // `requestCatch` and in the early `open` check above) before
+        // either claim was pushed, and one Runner ended up with TWO
+        // claims. Re-check before the push: the check-and-push is
+        // atomic again (no await between this re-check and the push
+        // below). On a race, roll back this claim's token — the minted
+        // raw token was never attached to a pushed claim, and a scanned
+        // runner token is never consumed for a refused claim — then
+        // answer exactly as the early paths do (same-Hunter re-request
+        // returns the open claim; another Hunter gets CONFLICT).
+        const raced = openCatchForRunner(this.state.catches, runnerId);
+        if (raced) {
+          this.mem.rawCatchTokens.delete(claim.catchId);
+          if (scanned !== null) scanned.record.used = false;
+          if (raced.hunterPlayerId === playerId) {
+            events.push(direct('catch.requested', { catch: toCatchView(raced) }));
+          } else {
+            events.push(this.errorEvent(playerId, 'CONFLICT', 'Another Hunter has already claimed this Runner.', false, undefined, nowMs, requestId));
+          }
+          break;
+        }
         this.state.catches.push(claim);
         events.push(this.emit('catch.requested', { catch: toCatchView(claim) }, this.catchRecipients(claim), nowMs));
         persist.push({ kind: 'catch-insert', roomId: this.room.roomId, catch: claim });
@@ -5710,17 +6028,17 @@ export class RoomStore {
         const qrToken = payload['qrToken'];
         const manualConfirm = payload['manualConfirm'] === true;
         if (typeof catchId !== 'string') {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.confirm needs catchId.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.confirm needs catchId.', false, undefined, nowMs, requestId));
           break;
         }
         const c = this.state.catches.find((x) => x.catchId === catchId);
         if (!c) {
-          events.push(this.errorEvent(playerId, 'CATCH_EXPIRED', 'That catch no longer exists.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'CATCH_EXPIRED', 'That catch no longer exists.', false, undefined, nowMs, requestId));
           break;
         }
         const runner = this.player(c.runnerPlayerId);
         if (!runner) {
-          events.push(this.errorEvent(playerId, 'CONFLICT', 'The Runner is no longer in the room.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'CONFLICT', 'The Runner is no longer in the room.', false, undefined, nowMs, requestId));
           break;
         }
         const isRunnerConfirmer = playerId === c.runnerPlayerId;
@@ -5750,14 +6068,16 @@ export class RoomStore {
           ttlSeconds: CATCH_TOKEN_TTL_SECONDS,
           // P1-11: physical tag — the engine rejects the confirm when
           // either fix is missing/stale or the seats are too far apart.
+          // v34 (Diya R2-4) — the gate reads the gate-only map (60 s
+          // retention), not the 30 s-purged live map.
           positions: {
-            hunter: this.mem.latestFix[c.hunterPlayerId] ?? null,
-            runner: this.mem.latestFix[c.runnerPlayerId] ?? null,
+            hunter: this.mem.latestFixForCatch[c.hunterPlayerId] ?? null,
+            runner: this.mem.latestFixForCatch[c.runnerPlayerId] ?? null,
           },
           maxDistanceMeters: CATCH_MAX_DISTANCE_METERS,
         });
         if (!conf.ok) {
-          events.push(this.errorEvent(playerId, conf.code, conf.reason, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, conf.code, conf.reason, false, undefined, nowMs, requestId));
           break;
         }
         // P1-2: validate the completion transition BEFORE mutating the
@@ -5771,7 +6091,7 @@ export class RoomStore {
               'The match cannot complete from its current phase — the catch stays pending.',
               false,
               undefined,
-              nowMs,
+              nowMs, requestId,
             ),
           );
           break;
@@ -5793,12 +6113,12 @@ export class RoomStore {
         // created if none open, physical-tag gate, no token, no code).
         const hunterId = payload['hunterId'];
         if (typeof hunterId !== 'string') {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.self-confirm needs hunterId.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.self-confirm needs hunterId.', false, undefined, nowMs, requestId));
           break;
         }
         const r = this.selfConfirmCatch({ playerId, hunterId, nowMs });
         if (!r.ok) {
-          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs, requestId));
           if (r.events) events.push(...r.events);
           if (r.persist) persist.push(...r.persist);
           break;
@@ -5810,12 +6130,12 @@ export class RoomStore {
       case 'catch.dispute': {
         const catchId = payload['catchId'];
         if (typeof catchId !== 'string') {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.dispute needs catchId.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'catch.dispute needs catchId.', false, undefined, nowMs, requestId));
           break;
         }
         const c = this.state.catches.find((x) => x.catchId === catchId);
         if (!c) {
-          events.push(this.errorEvent(playerId, 'CATCH_EXPIRED', 'That catch no longer exists.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'CATCH_EXPIRED', 'That catch no longer exists.', false, undefined, nowMs, requestId));
           break;
         }
         const disp = disputeCatch({
@@ -5826,7 +6146,7 @@ export class RoomStore {
           ttlSeconds: CATCH_TOKEN_TTL_SECONDS,
         });
         if (!disp.ok) {
-          events.push(this.errorEvent(playerId, disp.code, disp.reason, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, disp.code, disp.reason, false, undefined, nowMs, requestId));
           break;
         }
         Object.assign(c, disp.value);
@@ -5837,12 +6157,12 @@ export class RoomStore {
       case 'safety.pause': {
         const reason = typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null;
         if (reason !== null && reason.length > REASON_MAX_CHARS) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `Pause reason must be at most ${REASON_MAX_CHARS} characters.`, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `Pause reason must be at most ${REASON_MAX_CHARS} characters.`, false, undefined, nowMs, requestId));
           break;
         }
         const r = this.doSafetyPause(playerId, reason, nowMs);
         if (!r.ok) {
-          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs, requestId));
           break;
         }
         events.push(...r.events);
@@ -5850,15 +6170,29 @@ export class RoomStore {
         break;
       }
       case 'safety.resume': {
-        // P1-10: only the host can resume — matching the REST lifecycle
-        // resume rule. (Pause is any player; resume is host-only.)
-        if (!me.isHost) {
-          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Only the host can resume the match.', false, undefined, nowMs));
+        // v34 (Zara 5a) — resume needs HOST-TOKEN proof, matching the
+        // REST lifecycle resume rule (`lifecycleOp`). The old check
+        // (`me.isHost` only) let anyone holding the host seat's
+        // reconnect token resume a paused match over WS, while REST
+        // refused them — an inconsistent second factor. The client
+        // sends its stored host token in `payload.hostToken`
+        // (Meera: `websocket.ts safetyResume()` — COORDINATED CHANGE:
+        // the current client sends no token, so until it ships, WS
+        // resume from the old client fails with this coded FORBIDDEN
+        // and the host resumes via REST instead; no crash, no silent
+        // failure). `verifyHost` also refuses left/ejected-while-live
+        // hosts, strictly stronger than the old `me.isHost` check.
+        const rawHostToken =
+          typeof payload['hostToken'] === 'string' ? (payload['hostToken'] as string) : null;
+        const hostTokenHash =
+          rawHostToken !== null ? await hashHostToken(rawHostToken) : null;
+        if (!this.verifyHost(playerId, hostTokenHash)) {
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Only the host can resume the match.', false, undefined, nowMs, requestId));
           break;
         }
         const r = this.doSafetyResume(playerId, nowMs);
         if (!r.ok) {
-          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, r.code, r.error, false, undefined, nowMs, requestId));
           break;
         }
         events.push(...r.events);
@@ -5872,7 +6206,7 @@ export class RoomStore {
       case 'leave': {
         const reason = typeof payload['reason'] === 'string' ? (payload['reason'] as string) : null;
         if (reason !== null && reason.length > REASON_MAX_CHARS) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `Leave reason must be at most ${REASON_MAX_CHARS} characters.`, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `Leave reason must be at most ${REASON_MAX_CHARS} characters.`, false, undefined, nowMs, requestId));
           break;
         }
         const r = this.leaveSeat(playerId, reason, nowMs);
@@ -5908,7 +6242,7 @@ export class RoomStore {
         const text = payload['text'];
         const kind = payload['kind'] === 'quick' ? 'quick' : 'text';
         if (typeof text !== 'string' || text.trim().length === 0 || text.length > RADIO_MAX_CHARS) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `Radio text must be 1–${RADIO_MAX_CHARS} characters.`, false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', `Radio text must be 1–${RADIO_MAX_CHARS} characters.`, false, undefined, nowMs, requestId));
           break;
         }
         if (
@@ -5916,14 +6250,14 @@ export class RoomStore {
           this.room.config.huntersCanTalk === false &&
           this.room.phase !== 'LOBBY'
         ) {
-          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Hunters cannot send radio in this room — text radio still works for Runners.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Hunters cannot send radio in this room — text radio still works for Runners.', false, undefined, nowMs, requestId));
           break;
         }
         if (kind === 'quick') {
           const scope = this.room.phase === 'LOBBY' ? 'lobby' : me.team === 'hunters' ? 'hunters' : 'runners';
           const allowed = QUICK_SIGNALS[scope] as readonly string[];
           if (!allowed.includes(text)) {
-            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That quick message is not in the closed set.', false, undefined, nowMs));
+            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'That quick message is not in the closed set.', false, undefined, nowMs, requestId));
             break;
           }
         }
@@ -5973,7 +6307,7 @@ export class RoomStore {
       case 'signal.send': {
         const code = payload['code'];
         if (typeof code !== 'string') {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'signal.send needs a code.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'signal.send needs a code.', false, undefined, nowMs, requestId));
           break;
         }
         const all = [
@@ -5982,7 +6316,7 @@ export class RoomStore {
           ...QUICK_SIGNALS.runners,
         ] as readonly string[];
         if (!all.includes(code)) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Unknown quick-signal code.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Unknown quick-signal code.', false, undefined, nowMs, requestId));
           break;
         }
         events.push(
@@ -5999,23 +6333,23 @@ export class RoomStore {
         const toPlayerId = payload['toPlayerId'];
         const kind = payload['kind'];
         if (typeof toPlayerId !== 'string' || typeof kind !== 'string') {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'voice.signal needs toPlayerId and kind.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'voice.signal needs toPlayerId and kind.', false, undefined, nowMs, requestId));
           break;
         }
         if (!['join', 'leave', 'offer', 'answer', 'ice'].includes(kind)) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Unknown voice signal kind.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Unknown voice signal kind.', false, undefined, nowMs, requestId));
           break;
         }
         const target = this.player(toPlayerId);
         if (!target) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice peer is not in the room.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice peer is not in the room.', false, undefined, nowMs, requestId));
           break;
         }
         // F2 (v30 AppSec): an ejected seat keeps no live team voice.
         // Reject before the team check so an ejected seat's signals
         // are never forwarded and its peers never answer.
         if (me.ejectedAt !== null) {
-          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs, requestId));
           break;
         }
         // F2 (v30 AppSec, target half): the sender block above cannot
@@ -6030,7 +6364,16 @@ export class RoomStore {
         // only the client `disable()` does that — which is why both
         // halves remain necessary.
         if (target.ejectedAt !== null) {
-          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs, requestId));
+          break;
+        }
+        // v34 (Zara 8b, target half) — a caught spectator hears no
+        // live team voice either: same rule as the ejected-target
+        // check above, and the same rule `teamRecipients` applies to
+        // radio / signal. Voice takes an explicit target, so it needs
+        // its own check here (it does not go through teamRecipients).
+        if (this.isCaughtSpectator(toPlayerId)) {
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs, requestId));
           break;
         }
         // Team-only: the DO rejects cross-team signals (lobby = whole lobby).
@@ -6040,13 +6383,13 @@ export class RoomStore {
           target.team !== null &&
           me.team !== target.team
         ) {
-          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'FORBIDDEN', 'Voice radio is team-only.', false, undefined, nowMs, requestId));
           break;
         }
         if (kind === 'offer' || kind === 'answer') {
           const sdp = typeof payload['sdp'] === 'string' ? payload['sdp'] : '';
           if (sdp.length > VOICE_SDP_MAX_BYTES) {
-            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice SDP payload is too large.', false, undefined, nowMs));
+            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice SDP payload is too large.', false, undefined, nowMs, requestId));
             break;
           }
         }
@@ -6060,7 +6403,7 @@ export class RoomStore {
             candidateSize = VOICE_CANDIDATE_MAX_BYTES + 1;
           }
           if (candidateSize > VOICE_CANDIDATE_MAX_BYTES) {
-            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice ICE candidate is too large.', false, undefined, nowMs));
+            events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Voice ICE candidate is too large.', false, undefined, nowMs, requestId));
             break;
           }
         }
@@ -6094,7 +6437,7 @@ export class RoomStore {
           typeof label !== 'string' ||
           label.length > 140
         ) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'pin.place needs a valid point and a label up to 140 characters.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'pin.place needs a valid point and a label up to 140 characters.', false, undefined, nowMs, requestId));
           break;
         }
         events.push(
@@ -6119,7 +6462,7 @@ export class RoomStore {
       case 'announcement.send': {
         const text = payload['text'];
         if (typeof text !== 'string' || text.trim().length === 0 || text.length > 500) {
-          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Announcements must be 1–500 characters.', false, undefined, nowMs));
+          events.push(this.errorEvent(playerId, 'VALIDATION_FAILED', 'Announcements must be 1–500 characters.', false, undefined, nowMs, requestId));
           break;
         }
         const ann: Announcement = {
@@ -6145,7 +6488,7 @@ export class RoomStore {
       }
       default: {
         events.push(
-          this.errorEvent(playerId, 'VALIDATION_FAILED', `Unknown message type: ${type}.`, false, undefined, nowMs),
+          this.errorEvent(playerId, 'VALIDATION_FAILED', `Unknown message type: ${type}.`, false, undefined, nowMs, requestId),
         );
         break;
       }

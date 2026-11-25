@@ -911,6 +911,30 @@ export class RoomDO implements DurableObject {
     return `${playerId}:${op}:${key}`;
   }
 
+  /**
+   * v34 (Arjun R1) — concurrent double-submit replay: two /op calls
+   * with the SAME idempotency key fired at once both miss the
+   * pre-check cache (the reply is cached only after the first
+   * succeeds), so the second re-executes against already-mutated
+   * state and fails (start 409, join 403 name-taken, replay 409)
+   * for an action that succeeded. Call this on a failure with a
+   * cache key: a cached success proves the same action already
+   * succeeded — replay it instead of the spurious failure. Only
+   * successes are cached, so the re-check can never mask a genuine
+   * failure (a real failure finds no cached reply and the caller
+   * returns its error unchanged). The re-execution mutated nothing
+   * in the covered cases (startMatch / replayMatch fail before any
+   * assignment; addPlayerAsync's reservation rolls back on failure).
+   * This is the targeted fix for the R1 race; full /op-dispatch
+   * serialisation remains an open hardening item (see the report).
+   */
+  private httpIdempotentReplay(httpCacheKey: string | null, nowMs: number): Response | null {
+    if (httpCacheKey === null || !this.store) return null;
+    const raced = this.store.getHttpIdempotentReply(httpCacheKey, nowMs);
+    if (raced === null) return null;
+    return json(raced.body, raced.status);
+  }
+
   private async dispatchOp(op: string, body: Record<string, unknown>): Promise<Response> {
     const nowMs = Date.now();
     const asString = (v: unknown): string | null => (typeof v === 'string' ? v : null);
@@ -938,6 +962,13 @@ export class RoomDO implements DurableObject {
         nowMs,
       });
       this.store = store;
+      // v34 (slow entry) — same join-time ticket as 'add-player', for
+      // the host seat: the setup page's first socket connect skips the
+      // POST ws-ticket leg too. Minted BEFORE the save below, so that
+      // one save persists the registry. Best-effort — a mint failure
+      // never fails the create; the client falls back to POST
+      // ws-ticket.
+      const minted = await store.mintJoinTicket(body['hostPlayerId'] as string, nowMs);
       this.ctx.waitUntil(executePersistIntents(this.env as SupabaseEnv, persist));
       await this.save();
       await this.armAlarm();
@@ -947,6 +978,7 @@ export class RoomDO implements DurableObject {
         roomCode: store.room.roomCode,
         hostPlayerId: store.room.hostPlayerId,
         phase: store.room.phase,
+        ...(minted.ok ? { wsTicket: minted.value } : {}),
       }, 201);
     }
 
@@ -1008,22 +1040,52 @@ export class RoomDO implements DurableObject {
           reconnectTokenHash,
           nowMs,
         });
-        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
-        await this.afterMutation(r.events, r.persist);
+        if (!r.ok) {
+          // v34 (Arjun R1) — concurrent double-submit: replay a
+          // cached success instead of the spurious re-execution failure.
+          const replayed = this.httpIdempotentReplay(httpCacheKey, nowMs);
+          if (replayed !== null) return replayed;
+          return json({ ok: false, error: r.error, code: r.code }, r.status);
+        }
+        // v34 (slow entry) — mint the join-time WS ticket BEFORE the
+        // save inside `afterMutation`, so that one save persists the
+        // ticket registry too (no second save). Best-effort: a mint
+        // failure never fails the join — the client falls back to POST
+        // ws-ticket (today's path). The ticket is attached to the
+        // reply below, AFTER the mutation, so a failed mutation can
+        // never hand out a ticket for a seat that was not created.
+        const minted = await store.mintJoinTicket(r.value.player.playerId, nowMs);
         // addPlayerAsync already returns the subject's PlayerView (hash
         // stripped) — pass it through, do not re-derive from a raw Player.
-        const joinBody = {
+        const joinBody: Record<string, unknown> = {
           ok: true,
           player: r.value.player,
           reconnectToken: r.value.reconnectToken,
           restored: r.value.restored,
         };
+        if (minted.ok) joinBody['wsTicket'] = minted.value;
         // v29 (Gap 4) — cache the success reply for the key (with the
         // ORIGINAL reconnectToken, so a lost-response retry does not
-        // mint a second seat).
+        // mint a second seat). The cached reply carries the raw WS
+        // ticket too — memory-only, like the raw reconnect token
+        // (never persisted: `save()` writes durable state only, and
+        // the cache lives in `mem`). A replayed ticket is still
+        // single-use and 60 s TTL, so a stale replay 4401s and the
+        // client fetches a fresh one.
+        // v34 (Arjun R1) — the cache write sits BEFORE `afterMutation`
+        // (not after it): the write is synchronous with the mutation,
+        // so a concurrent duplicate-key call either hits the pre-check
+        // cache or fails its re-execution and replays via
+        // `httpIdempotentReplay` — never a spurious 409/403 for an
+        // action that succeeded. (A save failure inside `afterMutation`
+        // still throws after caching; the retry then replays the
+        // cached 200 while durable state lags one save behind — the
+        // same in-memory/durable skew a failed save already caused,
+        // now visible instead of a 409. The next mutation saves.)
         if (httpCacheKey !== null) {
           store.putHttpIdempotentReply(httpCacheKey, 200, joinBody, nowMs);
         }
+        await this.afterMutation(r.events, r.persist);
         return json(joinBody);
       }
       case 'verify-reconnect': {
@@ -1058,13 +1120,22 @@ export class RoomDO implements DurableObject {
       case 'start': {
         if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
         const r = store.startMatch({ playerId, hostTokenHash, nowMs });
-        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
-        await this.afterMutation(r.events, r.persist);
+        if (!r.ok) {
+          // v34 (Arjun R1) — concurrent double-submit: replay a
+          // cached success instead of the spurious re-execution failure.
+          const replayed = this.httpIdempotentReplay(httpCacheKey, nowMs);
+          if (replayed !== null) return replayed;
+          return json({ ok: false, error: r.error, code: r.code }, r.status);
+        }
         const startBody = { ok: true, ...r.value };
-        // v29 (Gap 4) — cache the success reply for the key.
+        // v34 (Arjun R1) — cache BEFORE `afterMutation` (see the
+        // add-player case): the write is synchronous with the
+        // mutation, so exactly one of two concurrent same-key starts
+        // executes and the other replays the cached 200.
         if (httpCacheKey !== null) {
           store.putHttpIdempotentReply(httpCacheKey, 200, startBody, nowMs);
         }
+        await this.afterMutation(r.events, r.persist);
         return json(startBody);
       }
       case 'replay': {
@@ -1094,6 +1165,10 @@ export class RoomDO implements DurableObject {
         const roomId = store.room.roomId;
         const reg = await this.registryCall('register', code, roomId);
         if (!reg.ok) {
+          // v34 (Arjun R1) — a concurrent same-key replay may already
+          // have succeeded (and cached) while this register awaited.
+          const replayed = this.httpIdempotentReplay(httpCacheKey, nowMs);
+          if (replayed !== null) return replayed;
           return json(
             { ok: false, error: 'That invite code was reused by another room — the room cannot be replayed on it.', code: 'CONFLICT', status: 409 },
             409,
@@ -1102,14 +1177,21 @@ export class RoomDO implements DurableObject {
         const r = store.replayMatch({ playerId, hostTokenHash, nowMs });
         if (!r.ok) {
           await this.registryCall('unregister', code, roomId);
+          // v34 (Arjun R1) — concurrent double-submit: replay a
+          // cached success instead of the spurious re-execution failure.
+          const replayed = this.httpIdempotentReplay(httpCacheKey, nowMs);
+          if (replayed !== null) return replayed;
           return json({ ok: false, error: r.error, code: r.code }, r.status);
         }
-        await this.afterMutation(r.events, r.persist);
         const replayBody = { ok: true, ...r.value };
-        // v29 (Gap 4) — cache the success reply for the key.
+        // v34 (Arjun R1) — cache BEFORE `afterMutation` (see the
+        // add-player case): the write is synchronous with the
+        // mutation, so exactly one of two concurrent same-key replays
+        // executes and the other replays the cached 200.
         if (httpCacheKey !== null) {
           store.putHttpIdempotentReply(httpCacheKey, 200, replayBody, nowMs);
         }
+        await this.afterMutation(r.events, r.persist);
         return json(replayBody);
       }
       case 'update-config': {
@@ -1409,6 +1491,12 @@ export class RoomDO implements DurableObject {
     const tabTag = tags.find((t) => t.startsWith('tab:'));
     const tabSessionId = tabTag !== undefined ? tabTag.slice('tab:'.length) : undefined;
     if (socketPlayerId === null || socketPlayerId !== playerId) {
+      // v34 (R2-14 seam 2) — echo the request's id, same as the store's
+      // `errorEvent`: a client matching errors to requests by
+      // `requestId` must not lose the match on this pre-dispatch error.
+      // Additive only; omitted when the message carried no commandId.
+      const mismatchRequestId =
+        typeof data['commandId'] === 'string' ? (data['commandId'] as string) : undefined;
       const envelope = JSON.stringify({
         v: 1,
         type: 'error',
@@ -1417,6 +1505,7 @@ export class RoomDO implements DurableObject {
           code: 'FORBIDDEN',
           message: 'Socket identity does not match the message playerId.',
           retryable: false,
+          ...(mismatchRequestId !== undefined ? { requestId: mismatchRequestId } : {}),
           serverTs: new Date(nowMs).toISOString(),
         },
       });

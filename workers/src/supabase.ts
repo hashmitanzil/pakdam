@@ -195,6 +195,19 @@ function playerRow(roomId: string, p: Player): Record<string, unknown> {
     reconnect_token_hash: p.reconnectTokenHash,
     joined_at: p.joinedAt,
     left_at: p.leftAt,
+    // v34 Scope D (12a) — the mirror used to drop these six columns,
+    // so the Supabase row showed an ejected player as still present,
+    // a ready player as not-ready, and every seat as 'connected'.
+    // All six columns exist in migration 0001; the values are already
+    // on the Player (timestamps/flags only — never a fix, never a
+    // coordinate). `connection_state` is one of the CHECK values
+    // ('stale' is never set by the server; the column allows it).
+    ejected_at: p.ejectedAt,
+    connection_state: p.connectionState,
+    last_fix_at: p.lastFixAt,
+    location_quality: p.locationQuality,
+    is_ready: p.isReady,
+    briefing_confirmed: p.briefingConfirmed,
     age_gate_passed: p.ageGatePassed,
     suspension_count: p.suspensionCount,
   };

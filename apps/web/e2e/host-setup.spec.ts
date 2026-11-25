@@ -203,7 +203,7 @@ test.describe('host setup (demo)', () => {
     await expect(
       guest.getByText('View only — only the host can change settings.'),
     ).toBeVisible();
-    await expect(guest.getByText('Round length')).toBeVisible();
+    await expect(guest.getByText('Round length', { exact: true })).toBeVisible();
     await expect(guest.getByRole('button', { name: 'Decrease Round length' })).toBeDisabled();
     await expect(guest.getByRole('button', { name: 'Increase Round length' })).toBeDisabled();
     await expect(guest.getByRole('switch', { name: 'Zone shrinks' })).toBeDisabled();
@@ -216,9 +216,18 @@ test.describe('host setup (demo)', () => {
     await expect(guest.getByText('Only the host can change the game settings.')).toBeVisible();
     await expect(guest.getByRole('dialog', { name: 'Settings' })).toBeHidden();
     // The host CAN open it, and the steppers there are enabled.
+    // v34: the room's round length sits at the grid FLOOR (10 min —
+    // setupThreePlayerLobby sets index 0), so Decrease is correctly
+    // disabled at the floor (Stepper canDecrease needs gridIndex >
+    // 0) and asserting it enabled can never pass. Prove the host's
+    // steppers are enabled the honest way: Increase is enabled, one
+    // tap up takes the value off the floor, and Decrease is enabled
+    // after that.
     await hostPage.getByRole('button', { name: 'Settings', exact: true }).click();
     await expect(hostPage.getByRole('dialog', { name: 'Settings' })).toBeVisible();
     await expect(hostPage.getByRole('heading', { name: 'Settings' })).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: 'Increase Round length' })).toBeEnabled();
+    await hostPage.getByRole('button', { name: 'Increase Round length' }).click();
     await expect(hostPage.getByRole('button', { name: 'Decrease Round length' })).toBeEnabled();
     await hostPage.getByRole('button', { name: 'Done' }).click();
   });

@@ -39,7 +39,9 @@ test('catch proximity: a missing fix on either side waits for GPS', () => {
     {
       ok: false,
       code: 'STALE_LOCATION',
-      reason: 'Waiting for GPS — move closer and try again.',
+      // v34 (Diya R2-9) — the reason names whose fix is missing: the
+      // Runner tapping OK must be able to tell it is the Hunter's GPS.
+      reason: "Waiting for the Hunter's GPS — they have no fix yet.",
     },
   );
   assert.deepEqual(
@@ -50,6 +52,38 @@ test('catch proximity: a missing fix on either side waits for GPS', () => {
       reason: 'Waiting for GPS — move closer and try again.',
     },
   );
+});
+
+// v34 (Diya R2-9) — the rejection reason names whose fix is the problem:
+// a coarse or stale HUNTER fix must not read as the Runner's "move
+// closer". The code stays STALE_LOCATION in every case; only the reason
+// distinguishes. No acceptance rule changes here (F1 stays open).
+test('catch proximity: the reason names the Hunter when their fix is coarse or stale', () => {
+  const coarseHunter = checkCatchProximity({
+    hunterFix: fix({ accuracyMeters: 100 }),
+    runnerFix: fix(),
+    nowMs: NOW,
+  });
+  assert.equal(coarseHunter.ok, false);
+  assert.equal(coarseHunter.code, 'STALE_LOCATION');
+  assert.match(coarseHunter.reason, /Hunter's GPS is too rough/);
+  assert.match(coarseHunter.reason, /±100 m/);
+  const coarseRunner = checkCatchProximity({
+    hunterFix: fix(),
+    runnerFix: fix({ accuracyMeters: 100 }),
+    nowMs: NOW,
+  });
+  assert.equal(coarseRunner.ok, false);
+  assert.equal(coarseRunner.code, 'STALE_LOCATION');
+  assert.match(coarseRunner.reason, /Your GPS is too rough/);
+  const staleHunter = checkCatchProximity({
+    hunterFix: fix({ timestampMs: NOW - 61_000 }),
+    runnerFix: fix(),
+    nowMs: NOW,
+  });
+  assert.equal(staleHunter.ok, false);
+  assert.equal(staleHunter.code, 'STALE_LOCATION');
+  assert.match(staleHunter.reason, /Hunter's GPS fix is stale/);
 });
 
 test('catch proximity: a fix older than 60 s waits for GPS', () => {

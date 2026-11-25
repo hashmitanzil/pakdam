@@ -10,6 +10,7 @@ import { test, expect } from '@playwright/test';
 import {
   LIVE,
   createHostRoom,
+  dismissOnboardingIfShown,
   expectNoForgeOfficeText,
   startDemoMatch,
 } from './helpers';
@@ -19,6 +20,7 @@ test.describe('no Forge office in the PWA (demo)', () => {
 
   test('Home and Mode select have no Forge-office references', async ({ page }) => {
     await page.goto('/');
+    await dismissOnboardingIfShown(page);
     await expectNoForgeOfficeText(page);
     await expect(page).toHaveTitle(/Pakdam/);
     await page.getByRole('button', { name: /HOST A GAME/ }).click();

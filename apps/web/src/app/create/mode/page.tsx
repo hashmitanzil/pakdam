@@ -39,6 +39,19 @@ export default function ModeSelectPage() {
   useEffect(() => {
     prefetchMapAssets();
   }, []);
+  // Scope C item 9: the home "Try a demo" door lands here with
+  // ?demo=1 — the room is created as a LOCAL demo room even when live
+  // transport is up, so a player can practise on this device. Read
+  // from window.location on mount (no useSearchParams, so no Suspense
+  // boundary is needed for this page's prerender).
+  const [demoMode, setDemoMode] = useState(false);
+  useEffect(() => {
+    try {
+      setDemoMode(new URLSearchParams(window.location.search).get('demo') === '1');
+    } catch {
+      setDemoMode(false);
+    }
+  }, []);
   // The host MUST confirm they are at the play location — the server
   // rejects configs without `hostOnSiteConfirmed`, so this is a real
   // gate, never silently set true.
@@ -70,7 +83,7 @@ export default function ModeSelectPage() {
           shrinkPhases: [],
         },
       };
-      if (isLiveTransportEnabled()) {
+      if (isLiveTransportEnabled() && !demoMode) {
         const session = await createLiveRoom(name, config);
         router.push(`/room/${session.roomId}/setup`);
       } else {
@@ -105,6 +118,13 @@ export default function ModeSelectPage() {
         <h1 className="flex-1 text-center text-[18px] font-bold text-white">Pick a mode</h1>
         <span className="w-6" aria-hidden />
       </header>
+
+      {demoMode ? (
+        <p className="mt-4 rounded-[14px] border border-[#26262B] bg-[#141416] px-4 py-3 text-[14px] text-[#A1A1AA]">
+          Demo round — played on this device only. Other players join with the code like a
+          normal game.
+        </p>
+      ) : null}
 
       <label className="mt-6 block">
         <span className="pakdam-label">Your codename</span>

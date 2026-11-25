@@ -297,6 +297,21 @@ export function canStartLiveMatch(
 }
 
 /**
+ * Scope C item 7: the blocked Start button's own label — the button
+ * states WHY it cannot start, in a few words that fit on it (the full
+ * reason still shows on tap). Matched on the gate reason's stable
+ * prefixes, so a renamed player list never changes the label.
+ */
+export function shortStartBlocker(reason: string | null, activeCount: number): string {
+  if (activeCount < MIN_PLAYERS) return `NEED ${MIN_PLAYERS}+ PLAYERS TO START`;
+  if (reason === null) return 'START GAME';
+  if (reason.startsWith('Waiting for:')) return 'WAITING FOR PLAYERS';
+  if (reason.startsWith('Pick ')) return 'PICK HUNTERS FIRST';
+  if (reason.startsWith('Hunter count')) return 'TOO MANY HUNTERS';
+  return 'CANNOT START YET';
+}
+
+/**
  * Snapshot → room-state adapter. The snapshot is the whole truth; this
  * helper only reshapes it for pages that render from `LiveRoomState`.
  * Pings never arrive in a snapshot (they come as `ping` events only).

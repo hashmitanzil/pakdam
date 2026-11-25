@@ -54,7 +54,7 @@ export interface FixValidationResult {
    * this, never hard-code one code for every failure — a malformed fix
    * is not a stale one, and clients branch on the code.
    */
-  code: 'VALIDATION_FAILED' | 'STALE_LOCATION' | null;
+  code: 'VALIDATION_FAILED' | 'STALE_LOCATION' | 'CLOCK_SKEW' | null;
 }
 
 /**
@@ -105,13 +105,21 @@ export function validateFix(
   const timestampMs = f.timestampMs as number;
   // A timestamp too far in the future is a validity problem (clock skew /
   // replay), not staleness; only a fix that arrived too old is stale.
+  // v34 (Diya R2-6) — it gets its OWN code, CLOCK_SKEW, not the generic
+  // VALIDATION_FAILED: the client can branch on the code and tell the
+  // player "your phone clock is wrong" instead of failing silently.
+  // (A phone BEHIND still trips STALE_LOCATION below — the server cannot
+  // tell skew from genuine staleness on one fix; the error envelope
+  // already carries serverTs, so the client can spot a stable offset
+  // across repeated STALE_LOCATION rejections. Receipt-time validation
+  // is the open founder call, not built here.)
   if (timestampMs - nowMs > CLOCK_SKEW_MS) {
     return {
       ok: false,
       errors: ['fix timestamp is too far in the future (clock skew or replay)'],
       warnings,
       quality: null,
-      code: 'VALIDATION_FAILED',
+      code: 'CLOCK_SKEW',
     };
   }
   if (nowMs - timestampMs > STALE_FIX_MS) {

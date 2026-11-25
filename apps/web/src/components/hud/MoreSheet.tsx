@@ -10,7 +10,7 @@
  *
  * No behaviour change — same buttons, same copy, same props flow.
  */
-import { memo } from 'react';
+import { memo, useState } from 'react';
 import type { MatchPhase, PlayerView } from '@pakdam/shared';
 import { SafetyControls } from '@/components/match/SafetyControls';
 import { Toggle } from '@/components/ui/Toggle';
@@ -57,8 +57,36 @@ export const MoreSheet = memo(function MoreSheet({
   onLeave,
   leaveArmed,
 }: MoreSheetProps) {
+  // Scope C item 4: "Get help" is one tap away in this sheet. It
+  // opens plain-words help in place — trouble during a round means
+  // Safety pause below (freezes the match for everyone) or Leave game.
+  const [helpOpen, setHelpOpen] = useState(false);
   return (
     <div className="flex flex-col gap-4">
+      <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-4">
+        <button
+          type="button"
+          onClick={() => setHelpOpen((v) => !v)}
+          aria-expanded={helpOpen}
+          className="flex w-full items-center justify-between text-left"
+        >
+          <span className="text-[15px] font-bold text-white">Get help</span>
+          <span aria-hidden className="text-[18px] text-[#A1A1AA]">
+            {helpOpen ? '‹' : '›'}
+          </span>
+        </button>
+        {helpOpen ? (
+          <p className="mt-2 text-[14px] leading-snug text-[#A1A1AA]">
+            In trouble during a round? Tap Safety pause below — it freezes the match and the
+            clock for everyone until the host resumes it. Or tap Leave game at the bottom to
+            step out; you can rejoin with the room code.
+          </p>
+        ) : (
+          <p className="mt-1 text-[13px] text-[#A1A1AA]">
+            In trouble during a round? Tap for what to do.
+          </p>
+        )}
+      </div>
       {/* Host only: end the round early (POST …/lifecycle, host-only).
           Host cancel deletes the room (founder decision, 2026-11-21),
           so every player goes home with the one plain message —

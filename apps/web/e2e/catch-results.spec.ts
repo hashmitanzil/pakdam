@@ -60,7 +60,7 @@ test.describe('catch → results (demo)', () => {
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
     // Classic: the tagged Runner is out — after-tagged screen.
-    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByText('You were tagged', { exact: true })).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
     await hunterPage.goto(`/room/${roomId}/catch`);
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
@@ -152,9 +152,11 @@ test.describe('catch → results (demo)', () => {
     ).toBeVisible({ timeout: 15000 });
     // Catching the last free runner completes the match at once, so the
     // catch page may show the done card or the match-over card — either
-    // proves the confirm landed.
+    // proves the confirm landed. v34: anchored — the bare
+    // /You were tagged/ also matches "You were tagged by X.", a
+    // strict-mode violation on the after-tagged screen.
     await expect(
-      runnerPages[1]!.getByText(/You were tagged|Match over — see the results page/),
+      runnerPages[1]!.getByText(/^(You were tagged|Match over — see the results page\.)$/),
     ).toBeVisible();
     // Catching the last free runner completes the match at once.
     await goToResults(hostPage, roomId);
@@ -259,6 +261,21 @@ test.describe('catch → results (demo)', () => {
       await expect(page.getByRole('heading', { name: 'Lobby' })).toBeVisible();
       await expect(page.getByRole('button', { name: "I'm ready", exact: true })).toBeVisible();
       await expect(page.getByRole('button', { name: /I'm ready — tap to change/ })).toBeHidden();
+    }
+    // v34 (Meera — probe zz-probe-172): after Replay everyone is
+    // un-ready, so the gate is closed and the host sees the BLOCKED
+    // button ("▶ START GAME"), not the exact 'START GAME' CTA — the
+    // gate requires every seat ready (canStartDemoMatch), and the
+    // blocked tap shows the reason. The old assertion expected the
+    // exact CTA with 0 ready players, which the product can never
+    // show. Ready all three seats and the gate opens: that is the
+    // "host can start again" the test means to prove.
+    await expect(hostPage.getByRole('button', { name: '▶ START GAME', exact: true })).toBeVisible();
+    await hostPage.getByRole('button', { name: '▶ START GAME', exact: true }).click();
+    await expect(hostPage.getByText(/Waiting for:/)).toBeVisible();
+    for (const page of [hostPage, ...guestPages]) {
+      await page.getByRole('button', { name: "I'm ready", exact: true }).click();
+      await expect(page.getByRole('button', { name: /I'm ready — tap to change/ })).toBeVisible();
     }
     await expect(hostPage.getByRole('button', { name: 'START GAME', exact: true })).toBeVisible();
     stopKeepFresh();

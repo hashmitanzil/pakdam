@@ -366,7 +366,13 @@ export const WS_MESSAGE_RATE_LIMITS: Readonly<Record<string, { readonly limit: n
     'signal.send': { limit: 10, windowSeconds: 60 },
     'radio.send': { limit: 10, windowSeconds: 60 },
     'pin.place': { limit: 10, windowSeconds: 60 },
-    'voice.signal': { limit: 600, windowSeconds: 60 },
+    // v34 (Zara 8a) — was 600/min/seat (10/s): a tight offer/ice loop
+    // at 10/s from one seat burns DO fan-out and holds a target's
+    // client busy, each signal carrying up to 8 KB SDP + 8 KB ICE.
+    // A legitimate WebRTC setup needs an offer/answer plus a trickle
+    // of ICE (tens of messages), not 600. 60/min/seat still allows a
+    // full renegotiation per second.
+    'voice.signal': { limit: 60, windowSeconds: 60 },
     'announcement.send': { limit: 5, windowSeconds: 60 },
     'briefing.confirm': { limit: 5, windowSeconds: 60 },
     'ready.set': { limit: 10, windowSeconds: 60 },

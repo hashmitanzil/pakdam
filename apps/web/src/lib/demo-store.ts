@@ -1021,6 +1021,15 @@ export function selfConfirmCatch(
   if (hunter.leftAt !== null || hunter.ejectedAt !== null) {
     throw new Error('That Hunter is no longer in play.');
   }
+  // Follow-up B: the suspended-Hunter check — live added it in v18,
+  // and this demo path missed it. `requestCatch` below checks it when
+  // it CREATES the claim, but an ALREADY-OPEN claim skips that call,
+  // so a tag against a Hunter who went away after claiming completed
+  // here where live refuses. Same words as `requestCatch`, same order
+  // (after left/ejected, before the open-claim reuse).
+  if (hunter.connectionState === 'suspended' || hunter.connectionState === 'disconnected') {
+    throw new Error('A suspended or disconnected Hunter cannot tag.');
+  }
   const open = demo.catches.find(
     (c) =>
       c.runnerPlayerId === runnerPlayerId &&

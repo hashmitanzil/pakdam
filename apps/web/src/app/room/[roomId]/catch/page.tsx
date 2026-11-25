@@ -49,16 +49,28 @@ import { Button } from '@/components/ui/Button';
 import { Sheet } from '@/components/ui/Sheet';
 import { fetchLiveCatchToken } from '@/lib/live-client';
 import { resolveLiveCatch } from '@/lib/live-room-client';
+import {
+  shouldSendFix,
+  watchLocation,
+  type GeolocationError,
+  type LastSentFix,
+  type LocationFix,
+  type WatchHandle,
+} from '@/lib/geolocation';
+import { MAX_FIX_ACCURACY_METERS } from '@pakdam/shared';
+import { clockSkewNotice } from '@/lib/clock-skew';
 import { clearRejoinToken } from '@/lib/rejoin-token';
 import { clearSession, getSessionForRoom } from '@/lib/session-credentials';
 import { goHomeAfterRoomDeleted } from '@/lib/room-deleted';
 import { formatClock } from '@/lib/utils';
+import { confirmErrorMatches } from '@/lib/self-confirm-error';
 import {
   confirmCatch,
   getCatchRaw,
   getRoom,
   listCatchPickerNames,
   mintRunnerQrToken,
+  recordPlayerFix,
   rejectCatch,
   requestCatch,
   resolveEffectiveRunner,
@@ -93,6 +105,7 @@ export default function CatchPage({
     socket,
     socketState,
     lastSocketError,
+    clockSkewMs,
     lastRunnerToken,
     demo,
     myPlayerId,
@@ -128,6 +141,22 @@ export default function CatchPage({
   const [manualMode, setManualMode] = useState(false);
   const [qrToken, setQrToken] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // v34 (R2-7): the catch page's own GPS notice — separate from
+  // `notice` (confirm errors) so a denial never clobbers a confirm
+  // failure and vice versa. `catchGpsRetryable` shows the "Try
+  // again" tap; `catchGpsRetryNonce` re-runs the watch effect.
+  const [catchFixNotice, setCatchFixNotice] = useState<string | null>(null);
+  const [catchGpsRetryable, setCatchGpsRetryable] = useState(false);
+  const [catchGpsRetryNonce, setCatchGpsRetryNonce] = useState(0);
+  // v34 (R2-4/R2-5): the last fix actually SENT from this page
+  // (component-level so the re-send timer AND the re-seed effect can
+  // reach it — the watch effect's old effect-local `lastSent` could
+  // not).
+  const lastCatchSentFixRef = useRef<LastSentFix | null>(null);
+  // v34 (R2-8): which Hunter the pending Way 2 confirm is for, so a
+  // suspended-Hunter rejection can name them in plain words.
+  const pendingConfirmHunterIdRef = useRef<string | null>(null);
+  const pendingConfirmHunterNameRef = useRef<string | null>(null);
   // The Hunter's scanned QR token, held until they tap Tag. A scan never
   // confirms on its own — Tag is the confirm step (Way 1).
   const [scannedToken, setScannedToken] = useState<string | null>(null);
@@ -149,6 +178,11 @@ export default function CatchPage({
   // error envelope to the pending catch action that caused it; the
   // timeout is the fallback if no envelope ever arrives.
   const pendingConfirmAtMsRef = useRef<number | null>(null);
+  // Follow-up A: the `commandId` sent with the pending self-confirm —
+  // the server echoes it as `requestId` on the error envelope, so a
+  // rejection is matched to THIS command, not to any error that
+  // happens to arrive within 15 s.
+  const pendingConfirmRequestIdRef = useRef<string | null>(null);
   const pendingScanAtMsRef = useRef<number | null>(null);
   const confirmTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const clearConfirmTimeout = () => {
@@ -157,6 +191,7 @@ export default function CatchPage({
       confirmTimeoutRef.current = null;
     }
     pendingConfirmAtMsRef.current = null;
+    pendingConfirmRequestIdRef.current = null;
   };
   const [doneCatchId, setDoneCatchId] = useState<string | null>(null);
   // The done card falls back to the latest confirmed catch (so it survives
@@ -197,6 +232,123 @@ export default function CatchPage({
     // Once on arrival.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [mode, demo?.room.roomId, myPlayerId]);
+
+  // v34 (Kabir — Way 2 stale fix): the GPS watch lives only on the
+  // play page, so the Runner's fix froze at navigation and any OK tap
+  // >60 s later was STALE_LOCATION by construction (server
+  // STALE_FIX_MS). Keep the watch running here while the match is
+  // live so the fix stays fresh for the server's physical gate. The
+  // liveness send mirrors the play page exactly: a fix is sent
+  // whenever it is within the server validity bound (±1000 m) — NOT
+  // the ±50 m usability bar, so a poor-but-present GPS still stamps
+  // `lastFixAt` — throttled by `shouldSendFix` (1 fix / 5 s or ≥10 m
+  // movement). Foreground only: a hidden tab never watches (a fix
+  // arriving would resume a suspended seat).
+  //
+  // v34 (R2-7): the watch now has an error handler — a denial used
+  // to kill it silently, and the Runner's only signal was a failed
+  // OK tap a minute later. A denial shows the notice + "Try again"
+  // (mirroring the play page's kinds) — but it NEVER suspends the
+  // seat here: the P0-1 harbour (resume on arrival) is load-bearing
+  // for the catch e2e specs, and the play page's denial-suspend is
+  // exactly what the v32 harbour pin forbade on this page.
+  //
+  // v34 (R2-4): the re-send timer — same heartbeat as the play
+  // page: a stationary Runner's OS watch may never call back, so
+  // the server purges `mem.latestFix` after 30 s and the OK tap
+  // fails STALE_LOCATION with both phones together.
+  useEffect(() => {
+    // `myPlayer` (not the `ejectedAt`/`removedAt` consts below — they
+    // are declared after this effect): the seat must be live.
+    const seatOut = myPlayer?.ejectedAt != null || myPlayer?.leftAt != null;
+    if (phase !== 'ACTIVE' || !myPlayerId || seatOut) return;
+    let stopped = false;
+    let watchHandle: WatchHandle | null = null;
+    const sendFix = (fix: LocationFix): void => {
+      // A fix means location works again — clear the denial state.
+      setCatchFixNotice(null);
+      setCatchGpsRetryable(false);
+      if (fix.accuracyMeters > MAX_FIX_ACCURACY_METERS) return;
+      if (!shouldSendFix(fix, lastCatchSentFixRef.current, fix.timestampMs)) return;
+      lastCatchSentFixRef.current = { fix, sentAtMs: fix.timestampMs };
+      if (mode === 'live') {
+        socket?.sendLocationUpdate(fix);
+      } else {
+        const current = getRoom(roomId);
+        if (current) recordPlayerFix(current, myPlayerId, fix);
+      }
+    };
+    const onError = (err: GeolocationError): void => {
+      if (err.kind === 'permission-denied') {
+        setCatchFixNotice(
+          'Location is off or blocked — turn it on so your tag can be confirmed, then tap Try again.',
+        );
+        setCatchGpsRetryable(true);
+      } else if (err.kind === 'position-unavailable') {
+        setCatchFixNotice('GPS is unavailable right now — your tag will confirm when it comes back.');
+        setCatchGpsRetryable(true);
+      } else if (err.kind === 'timeout') {
+        setCatchFixNotice('GPS is taking a while — your tag will confirm when your phone reports a location.');
+        setCatchGpsRetryable(true);
+      } else if (err.kind === 'unsupported') {
+        setCatchFixNotice('This device has no GPS — you can still confirm by QR, but self-confirm needs a location.');
+        setCatchGpsRetryable(true);
+      }
+    };
+    const startWatch = (): void => {
+      if (stopped || watchHandle !== null) return;
+      if (document.hidden) return;
+      watchHandle = watchLocation(sendFix, onError);
+    };
+    const stopWatch = (): void => {
+      watchHandle?.stop();
+      watchHandle = null;
+    };
+    const onVisibility = (): void => {
+      if (document.hidden) stopWatch();
+      else startWatch();
+    };
+    startWatch();
+    document.addEventListener('visibilitychange', onVisibility);
+    const resendTimer = setInterval(() => {
+      if (stopped || document.hidden) return;
+      const last = lastCatchSentFixRef.current;
+      if (!last) return;
+      const restamped: LocationFix = { ...last.fix, timestampMs: Date.now() };
+      if (restamped.accuracyMeters > MAX_FIX_ACCURACY_METERS) return;
+      if (!shouldSendFix(restamped, lastCatchSentFixRef.current, Date.now())) return;
+      lastCatchSentFixRef.current = { fix: restamped, sentAtMs: Date.now() };
+      if (mode === 'live') {
+        socket?.sendLocationUpdate(restamped);
+      } else {
+        const current = getRoom(roomId);
+        if (current) recordPlayerFix(current, myPlayerId, restamped);
+      }
+    }, 5000);
+    return () => {
+      stopped = true;
+      document.removeEventListener('visibilitychange', onVisibility);
+      clearInterval(resendTimer);
+      stopWatch();
+    };
+  }, [phase, myPlayerId, mode, roomId, socket, myPlayer?.ejectedAt, myPlayer?.leftAt, catchGpsRetryNonce]);
+
+  // v34 (R2-5): re-seed on (re)connect — the DO's `mem.latestFix`
+  // is memory-only and starts empty after an eviction/wake, so a
+  // stationary Runner's fix is gone server-side until their OS watch
+  // next fires. On every (re)connect while ACTIVE with a last-sent
+  // fix, re-send it at once, re-stamped. Bypasses the 5 s throttle
+  // (a reconnect is a rare event); the accuracy bound still applies.
+  // Live only — demo keeps fixes in the store.
+  useEffect(() => {
+    if (socketState !== 'connected' || phase !== 'ACTIVE') return;
+    if (mode !== 'live') return;
+    const last = lastCatchSentFixRef.current;
+    if (!last || last.fix.accuracyMeters > MAX_FIX_ACCURACY_METERS) return;
+    const restamped: LocationFix = { ...last.fix, timestampMs: Date.now() };
+    lastCatchSentFixRef.current = { fix: restamped, sentAtMs: Date.now() };
+    socket?.sendLocationUpdate(restamped);
+  }, [socketState, phase, mode, socket]);
 
   // Room deleted (founder decision, 2026-11-21): the host cancelled
   // and the room is gone — home with the one plain message. Declared
@@ -656,6 +808,19 @@ export default function CatchPage({
     setSelfConfirmOpen(true);
   };
 
+  // v34 (R2-8): a suspended-Hunter rejection leaves the claim open
+  // for its 120 s TTL — the Runner cannot pick another Hunter and
+  // nothing says waiting helps. When the server's reason names a
+  // suspended Hunter, append the plain-words wait guidance. Matched
+  // on the message text because the server sends no distinct code
+  // for this rejection (CONFLICT covers claim races too) — if the
+  // server copy changes, this falls back to the raw message.
+  const suspendedHunterRejectionNotice = (message: string, hunterName: string | null): string => {
+    if (!/suspended/i.test(message)) return message;
+    const who = hunterName ?? 'That hunter';
+    return `${message} ${who} is away right now — wait for them to come back and tap OK again, or wait up to 2 minutes for this tag request to expire and try again. You can't pick another hunter while this request is open.`;
+  };
+
   const handleSelfConfirmOk = () => {
     const hunterId = selfConfirmHunterId;
     if (!hunterId) return;
@@ -668,7 +833,11 @@ export default function CatchPage({
     setConfirming(true);
     setNotice(null);
     if (mode === 'live') {
-      if (!socket?.sendCatchSelfConfirm(hunterId)) {
+      // Follow-up A: keep the sent `commandId` — the server echoes it
+      // as `requestId` on the error envelope, so the rejection below
+      // is matched to this exact command.
+      const requestId = socket?.sendCatchSelfConfirm(hunterId) ?? null;
+      if (!requestId) {
         setConfirming(false);
         setNotice('Not connected — the confirmation was not sent. Wait for the reconnect, then tap again.');
         return;
@@ -676,16 +845,26 @@ export default function CatchPage({
       // Confirmed state arrives over the socket; the done card renders from it.
       // A server rejection arrives only as an error envelope (the effect
       // on lastSocketError below clears this and shows the reason); the
-      // 10 s timeout is the fallback if no envelope ever arrives, so a
+      // 15 s timeout is the fallback if no envelope ever arrives, so a
       // Runner can never wedge on "Confirming…" with a disabled button.
+      // v34 (R2-14): 15 s, not 10 s — the error window below is 15 s,
+      // and a rejection arriving at 11–15 s was dropped by the old
+      // 10 s timeout first.
       clearConfirmTimeout();
       pendingConfirmAtMsRef.current = Date.now();
+      pendingConfirmRequestIdRef.current = requestId;
+      pendingConfirmHunterIdRef.current = hunterId;
+      pendingConfirmHunterNameRef.current =
+        players.find((p) => p.playerId === hunterId)?.displayName ?? null;
       confirmTimeoutRef.current = setTimeout(() => {
         confirmTimeoutRef.current = null;
         pendingConfirmAtMsRef.current = null;
+        pendingConfirmRequestIdRef.current = null;
+        pendingConfirmHunterIdRef.current = null;
+        pendingConfirmHunterNameRef.current = null;
         setConfirming(false);
         setNotice('Confirmation timed out — the server did not answer. Tap Self confirm again.');
-      }, 10_000);
+      }, 15_000);
       return;
     }
     const current = getRoom(roomId);
@@ -706,9 +885,22 @@ export default function CatchPage({
 
   // The pending state clears the moment the done card can render (the
   // server echo / store write landed) or the claim goes away.
+  // v34 (Kabir — Way 2 error swallow): in the normal no-claim Way 2
+  // path there never IS an open claim, so the old `!openClaim` leg
+  // cleared `pendingConfirmAtMsRef` (via clearConfirmTimeout) on the
+  // very first render after OK was tapped — and the error effect below
+  // then ignored the server's rejection because the ref was null:
+  // "tap hunter → tap OK → nothing happens". The wait IS over when
+  // there is no claim to wait on, so `confirming` still clears — but
+  // the ref and the 15 s timeout stay alive, so a rejection arriving
+  // within 15 s still surfaces with the server's reason. Only the
+  // done card (the server confirmed) clears the ref.
   useEffect(() => {
-    if (confirming && (doneCatch || !openClaim)) {
+    if (!confirming) return;
+    if (doneCatch) {
       clearConfirmTimeout();
+      setConfirming(false);
+    } else if (!openClaim) {
       setConfirming(false);
     }
     // A decided catch answers any pending scan too — a later error is
@@ -719,10 +911,15 @@ export default function CatchPage({
   // (b) A server rejection of the pending confirm/scan/mint arrives only
   // as an error envelope: clear the pending state and show the server's
   // reason. Tied to the pending action by receipt time (within 15 s of
-  // the send) so an unrelated error never surfaces as a catch failure.
+  // the send) so an unrelated error never surfaces as a catch failure —
+  // except the self-confirm, which matches by `requestId` when the
+  // envelope carries one (follow-up A, R2-14 seam 2): a `location.update`
+  // STALE_LOCATION arriving within 15 s of an OK tap no longer reads as
+  // the confirm's failure. No `requestId` on the envelope falls back to
+  // the 15 s window, unchanged.
   useEffect(() => {
     if (!lastSocketError) return;
-    const { atMs, message, code } = lastSocketError;
+    const { atMs, message, code, requestId } = lastSocketError;
     const mintAt = pendingMintAtMsRef.current;
     if (mintAt !== null && atMs >= mintAt && atMs - mintAt < 15_000) {
       pendingMintAtMsRef.current = null;
@@ -736,10 +933,25 @@ export default function CatchPage({
       return;
     }
     const confirmAt = pendingConfirmAtMsRef.current;
-    if (confirmAt !== null && atMs >= confirmAt && atMs - confirmAt < 15_000) {
+    if (
+      confirmAt !== null &&
+      confirmErrorMatches({
+        errorRequestId: requestId ?? null,
+        pendingRequestId: pendingConfirmRequestIdRef.current,
+        errorAtMs: atMs,
+        pendingAtMs: confirmAt,
+      })
+    ) {
       clearConfirmTimeout();
       setConfirming(false);
-      setNotice(message);
+      // v34 (R2-8): a suspended-Hunter rejection needs the wait
+      // guidance, not just the server's reason — the claim stays open
+      // up to 2 minutes and no other Hunter can be picked meanwhile.
+      setNotice(
+        suspendedHunterRejectionNotice(message, pendingConfirmHunterNameRef.current),
+      );
+      pendingConfirmHunterIdRef.current = null;
+      pendingConfirmHunterNameRef.current = null;
       return;
     }
     const scanAt = pendingScanAtMsRef.current;
@@ -884,6 +1096,36 @@ export default function CatchPage({
         <p className="rounded-2xl border border-[#26262B] bg-[#141416] p-3 text-[14px] text-[#EF4444]">
           {notice}
         </p>
+      ) : null}
+
+      {/* v34 (R2-6): the clock-skew banner — a device clock >30 s off
+          the server makes every fix look stale server-side while the
+          client thinks it is fine. Shown here so the real cause is
+          named before any GPS troubleshooting. */}
+      {clockSkewMs !== null ? (
+        <p className="rounded-2xl border border-[#F59E0B] bg-[#141416] p-3 text-[14px] text-[#F59E0B]" role="status">
+          {clockSkewNotice(clockSkewMs)}
+        </p>
+      ) : null}
+
+      {/* v34 (R2-7): the catch page's own GPS notice — a denial used
+          to kill the watch silently, and the Runner's only signal was
+          a failed OK tap a minute later. "Try again" re-runs the
+          watch effect (a tap while still denied just errors again;
+          it never suspends the seat — the P0-1 harbour). */}
+      {catchFixNotice ? (
+        <div className="rounded-2xl border border-[#26262B] bg-[#141416] p-3">
+          <p className="text-[14px] text-[#A1A1AA]">{catchFixNotice}</p>
+          {catchGpsRetryable ? (
+            <button
+              type="button"
+              onClick={() => setCatchGpsRetryNonce((n) => n + 1)}
+              className="mt-2 text-[15px] font-semibold text-[#EF4444]"
+            >
+              Try again
+            </button>
+          ) : null}
+        </div>
       ) : null}
 
       {/* v31 fix round (F3): ejected or host-removed while this tab

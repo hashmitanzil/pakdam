@@ -105,7 +105,12 @@ async function expectEndRound(page: Page, visible: boolean): Promise<void> {
   const sheet = page.getByRole('dialog', { name: 'More' });
   await expect(sheet).toBeVisible();
   await expect(sheet.getByRole('button', { name: 'End the round' })).toHaveCount(visible ? 1 : 0);
-  await sheet.getByRole('button', { name: 'Close', exact: true }).click();
+  // v34: close with the sheet's own visible control ("Done",
+  // aria-label "Close sheet") — NOT the backdrop ("Close"): the
+  // backdrop is a full-screen button whose centre sits under the
+  // sheet panel, so a Playwright centre-click on it is intercepted
+  // by the panel forever (60 s timeout, host-cancel:254/332).
+  await sheet.getByRole('button', { name: 'Close sheet' }).click();
   await expect(sheet).toBeHidden();
 }
 

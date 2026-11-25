@@ -194,6 +194,12 @@ export function buildSnapshot(input: {
    * include it in its snapshot key.
    */
   epochMs: number;
+  /**
+   * v34 (Diya R2-5) — pass-through for `WsSnapshotPayload.fixReseedNeeded`:
+   * true when the viewer's live fix is missing although the seat has
+   * reported before. Optional; snapshots built without it omit the flag.
+   */
+  fixReseedNeeded?: boolean;
 }): WsSnapshotPayload {
   const teammates = teammateViewFor(
     input.viewerPlayerId,
@@ -276,5 +282,8 @@ export function buildSnapshot(input: {
     // v24: null when no grace is running (older callers that omit
     // the field read as null, not undefined).
     hostGraceEndsAtMs: input.hostGraceEndsAtMs ?? null,
+    // v34 (Diya R2-5) — present only when the DO supplies it; older
+    // callers omit it and the field stays undefined (falsy).
+    ...(input.fixReseedNeeded !== undefined ? { fixReseedNeeded: input.fixReseedNeeded } : {}),
   };
 }

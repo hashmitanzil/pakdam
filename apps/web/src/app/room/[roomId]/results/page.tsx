@@ -321,7 +321,15 @@ export default function ResultsPage({ params }: { params: Promise<{ roomId: stri
         ) : liveResultMissing ? (
           <p className="text-center text-[15px] text-white">The match hasn&rsquo;t finished yet.</p>
         ) : scoresError ? (
-          <p className="text-center text-[15px] text-white">Your result could not be loaded.</p>
+          <>
+            <p className="text-center text-[15px] text-white">Your result could not be loaded.</p>
+            {/* Scope D item 10: this branch showed the failure with no
+                way back — Retry re-runs the scores fetch (the main
+                results branch already had one). */}
+            <Button variant="outline" onClick={retryScores}>
+              Retry
+            </Button>
+          </>
         ) : (
           <p className="py-6 text-center text-[15px] text-[#A1A1AA]">Loading your result…</p>
         )}

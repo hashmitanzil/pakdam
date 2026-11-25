@@ -65,7 +65,7 @@ test.describe('join + lobby (demo)', () => {
     await expect(hostPage.getByText("Tagged? You're out. Watch live.")).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Change', exact: true })).toBeVisible();
     // Rules + teams.
-    await expect(hostPage.getByText('Round length')).toBeVisible();
+    await expect(hostPage.getByText('Round length', { exact: true })).toBeVisible();
     await expect(hostPage.getByText('Head start')).toBeVisible();
     await expect(hostPage.getByText('Pings every')).toBeVisible();
     await expect(hostPage.getByText('Zone shrinks')).toBeVisible();
@@ -89,7 +89,7 @@ test.describe('join + lobby (demo)', () => {
     await expect(hostPage.getByText('Share the code — no account needed to join.')).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Copy', exact: true })).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Share code' })).toBeVisible();
-    await expect(hostPage.getByRole('button', { name: 'Settings' })).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: 'Settings', exact: true })).toBeVisible();
     // Item 3: "Show QR" opens the invite-QR sheet (lobby only — this is
     // the invite QR, not a catch code).
     await expect(hostPage.getByRole('button', { name: 'Show QR', exact: true })).toBeVisible();
@@ -174,6 +174,18 @@ test.describe('join + lobby (demo)', () => {
     await expect(
       hostPage.getByRole('button', { name: /I'm ready — tap to change/ }),
     ).toBeVisible();
+    // v34 (Meera — probe zz-probe-169): the host page is backgrounded
+    // while the guest pages are created, and in headless its 1 s demo
+    // poll does not tick while backgrounded — so the start button's
+    // onClick still closes over the gate from the render before Ben
+    // joined ("Waiting for: Ana."), even though the store already has
+    // Ben un-ready. On a real phone this cannot happen (the host's
+    // phone is foreground while guests join on their own phones).
+    // Front the host tab and wait for Ben in the roster — that proves
+    // the poll delivered the joined seat and the gate is fresh —
+    // before tapping the blocked button.
+    await hostPage.bringToFront();
+    await expect(hostPage.getByText('Ben')).toBeVisible();
     // The blocked host start button renders "▶ START GAME" (the label is
     // 'START GAME' once ≥2 players; there is no 'WAITING FOR EVERYONE TO
     // BE READY' button anywhere in the app — the waiting line is the

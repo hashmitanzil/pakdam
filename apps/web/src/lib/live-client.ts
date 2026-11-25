@@ -18,7 +18,7 @@ import {
   type RoomConfig,
 } from '@pakdam/shared';
 import { getWorkerUrl, isLiveTransportEnabled } from './websocket';
-import { clearHostToken, getSessionForRoom, storeLiveSeat, type PakdamSession } from './session-credentials';
+import { clearHostToken, getSessionForRoom, storeLiveSeat, storeWsJoinTicket, type PakdamSession } from './session-credentials';
 import { fetchWithRetry } from './api-client';
 import { clearJoinKey, getOrCreateJoinKey } from './join-key';
 import { storeRejoinToken } from './rejoin-token';
@@ -179,6 +179,8 @@ export interface CreateRoomResponse {
   hostPlayerId: string;
   reconnectToken: string;
   hostToken: string;
+  /** v34 join ticket (best-effort — absent when the mint failed; the socket then fetches one). */
+  wsTicket?: { ticket: string; ticketId: string; expiresAtMs: number };
 }
 
 export interface JoinRoomResponse {
@@ -191,6 +193,8 @@ export interface JoinRoomResponse {
   };
   reconnectToken: string;
   restored: boolean;
+  /** v34 join ticket (best-effort — absent when the mint failed; the socket then fetches one). */
+  wsTicket?: { ticket: string; ticketId: string; expiresAtMs: number };
 }
 
 /** POST /v1/rooms — create room (host). Stores both tokens, returns the session. */
@@ -219,6 +223,9 @@ export async function createLiveRoom(
   };
   storeLiveSeat(session);
   mirrorRejoinToken(data.roomId);
+  // v34 join ticket: spend it on the first socket connect (no POST
+  // ws-ticket leg). Best-effort — absent when the server mint failed.
+  if (data.wsTicket) storeWsJoinTicket(data.roomId, data.wsTicket);
   return session;
 }
 
@@ -281,6 +288,9 @@ export async function joinLiveRoom(
   };
   storeLiveSeat(session);
   mirrorRejoinToken(roomId);
+  // v34 join ticket: spend it on the first socket connect (no POST
+  // ws-ticket leg). Best-effort — absent when the server mint failed.
+  if (data.wsTicket) storeWsJoinTicket(roomId, data.wsTicket);
   // A2: join never returns a host token, so a host who rejoined in a
   // fresh tab used to pay a second round-trip (POST /host/token) on
   // every host action — including START. Mint it here, in the
@@ -345,6 +355,9 @@ export async function joinLiveRoomByCode(
   };
   storeLiveSeat(session);
   mirrorRejoinToken(data.roomId);
+  // v34 join ticket: spend it on the first socket connect (no POST
+  // ws-ticket leg). Best-effort — absent when the server mint failed.
+  if (data.wsTicket) storeWsJoinTicket(data.roomId, data.wsTicket);
   // A2 (same background mint as joinLiveRoom — this is the join path
   // both join pages actually use): a host who joined in a fresh tab
   // mints the host token now, so START is a single POST by the time

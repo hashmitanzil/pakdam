@@ -86,11 +86,15 @@ test.describe('brutal phone end-to-end (demo)', () => {
 
     // Classic: the tagged Runner is out — after-tagged screen.
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByText('You were tagged', { exact: true })).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
 
     // Back to the map, end the match, results, fresh game.
-    await hunterPage.getByRole('button', { name: 'Back to the map' }).click();
+    // exact:true — the catch page has TWO "Back to the map"
+    // buttons (the header '‹ Back to the map' link AND the done
+    // card's primary CTA); both route to /play, and the CTA is the
+    // flow's target after a confirmed catch.
+    await hunterPage.getByRole('button', { name: 'Back to the map', exact: true }).click();
     await expect(hunterPage).toHaveURL(/\/room\/[^/]+\/play/);
     await forceDemoMatchEnd(hostPage, roomId);
     await hostPage.goto(`/room/${roomId}/results`);

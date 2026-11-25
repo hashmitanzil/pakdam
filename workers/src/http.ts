@@ -53,21 +53,37 @@ export function isUuid(value: string): boolean {
  * handler below checks this limiter AFTER parsing the credential and
  * BEFORE calling the DO.
  *
- * EXCEPTION (v18 fix round, F5): the replay route passes an explicit
- * `bucketKey` of room + playerId instead of the token hash. A limit
- * keyed by the presented host-token hash gives every guessed host
- * token a fresh bucket, so it cannot throttle credential guessing at
- * all. Keying by room + seat still bounds the host's own replay rate
- * (5/min) while a guessing attacker shares one bucket per seat.
- * v23 fix round 1 (S5): the lifecycle route gets the same F5
- * treatment — its old token-hash key let every garbage hostToken mint
- * a fresh 10/min bucket and load DO state unboundedly. Other
- * host-token routes (start / config / remove-player /
- * regenerate-code / resolve / host/token / host/transfer) keep the
- * token-hash key in this round — recorded as a known follow-up.
+ * v34 (Diya R3-N1) — verify-then-limit (SUPERSEDES the v18 F5 /
+ * v23 S5 / v34 Zara 10b seat-keyed pre-auth bucket): keying the
+ * pre-auth bucket by room + seat let ANY room member burn the HOST's
+ * bucket — playerIds are in every snapshot, so 5 unauthenticated
+ * `start` calls with the host's playerId 429'd the host's real Start
+ * for up to 60 s. The seat bucket is now touched ONLY after the DO
+ * has verified the credential (`verifyHostThenLimit` /
+ * `verifySeatThenLimit` below): an unverified attempt never consumes
+ * the victim's budget, and a verified holder still gets the same
+ * per-seat limit as before. The pre-auth bucket that remains is
+ * keyed per PRESENTED credential (`preAuthKey`), so hammering with
+ * one (stale/leaked) credential is still throttled; rotating
+ * credentials get fresh pre-auth buckets — accepted, because host /
+ * reconnect tokens are 128-bit and guessing is infeasible, and the
+ * DO verify still refuses each attempt. The old F5 tests that pinned
+ * "rotating guessed tokens share one bucket" (v18 F5, v23 T6, Zara
+ * 10b) were re-pinned to this design; see those tests.
  */
 const seatLimiter = new HttpRateLimiter();
 
+/**
+ * v34 (Diya R3-N1) — the seat bucket is keyed by room+seat
+ * (`seatKey(roomId, playerId)`) and is touched ONLY by a verified
+ * holder (see `verifyHostThenLimit` / `verifySeatThenLimit` below).
+ * Seat routes keyed by a presented RECONNECT hash (ws-ticket,
+ * get-state, results, catch-token) keep their hash key — the
+ * reconnect token is the seat credential itself, and ws-ticket
+ * issue/revoke carry a second DO-enforced window. Those routes are
+ * NOT vulnerable to R3-N1: an attacker who does not know the
+ * victim's token hash cannot address the victim's bucket at all.
+ */
 async function checkSeatLimit(
   routeKey: string,
   roomId: string,
@@ -80,6 +96,86 @@ async function checkSeatLimit(
   const headers = new Headers(res.headers);
   headers.set('Retry-After', String(check.retryAfterSeconds));
   return new Response(res.body, { status: 429, headers });
+}
+
+/**
+ * v34 (Diya R3-N1) — pre-auth bucket key: room + seat + the PRESENTED
+ * credential hash. An unauthenticated caller chooses the playerId in
+ * the body, so no pre-auth key may be addressable by playerId alone —
+ * otherwise the caller burns the victim seat's budget (the R3-N1
+ * hole). Binding the key to the presented credential means a forged
+ * attempt consumes only its own credential's budget, never the host's
+ * seat bucket; the host's real token has its own pre-auth bucket.
+ * The `preauth:` prefix keeps these keys out of the seat-bucket
+ * namespace (`roomId:playerId`) entirely.
+ */
+function preAuthKey(roomId: string, playerId: string, tokenHash: string): string {
+  return `preauth:${roomId}:${playerId}:${tokenHash}`;
+}
+
+/**
+ * v34 (Diya R3-N1) — verify-then-limit for host-token routes.
+ * Order matters, and each stage has a different job:
+ *   1. Pre-auth bucket (per presented credential, route limit):
+ *      throttles hammering with ONE credential (stale/leaked token,
+ *      buggy retry loop). Rotating credentials get fresh buckets —
+ *      accepted (128-bit tokens; guessing is infeasible).
+ *   2. DO `verify-host-token`: the credential is proven BEFORE the
+ *      seat bucket is touched, so an unverified attempt can never
+ *      consume the host's budget. A failed verify 403s here and the
+ *      real op is never called.
+ *   3. Seat bucket (room+seat, route limit): the real per-seat limit,
+ *      consumable only by a verified holder — and it still binds
+ *      across token rotations by that holder (a fresh host token gets
+ *      a fresh pre-auth bucket but the SAME seat bucket).
+ * Returns a 429 / 403 Response when the call must stop, else null.
+ */
+async function verifyHostThenLimit(
+  ctx: HttpContext,
+  routeKey: string,
+  roomId: string,
+  playerId: string,
+  hostTokenHash: string,
+): Promise<Response | null> {
+  const preAuth = await checkSeatLimit(routeKey, roomId, hostTokenHash, preAuthKey(roomId, playerId, hostTokenHash));
+  if (preAuth) return preAuth;
+  const verified = await callDo(ctx.env, roomId, 'verify-host-token', {
+    playerId,
+    hostTokenHash,
+  });
+  if (!verified.ok) return doError(verified);
+  if (verified['valid'] !== true) {
+    return err('Only the host can do that.', 403, undefined, 'FORBIDDEN');
+  }
+  return checkSeatLimit(routeKey, roomId, hostTokenHash, seatKey(roomId, playerId));
+}
+
+/**
+ * v34 (Diya R3-N1) — verify-then-limit for reconnect-proven routes
+ * (`host/token` mint/rotate, lifecycle `pause`). Same three stages
+ * as `verifyHostThenLimit`, but the credential proven in the DO is
+ * the seat's reconnect token (`verify-reconnect`), not the host
+ * token — a forged reconnect token must not burn the seat's budget
+ * either.
+ */
+async function verifySeatThenLimit(
+  ctx: HttpContext,
+  routeKey: string,
+  roomId: string,
+  playerId: string,
+  reconnectTokenHash: string,
+): Promise<Response | null> {
+  const preAuth = await checkSeatLimit(routeKey, roomId, reconnectTokenHash, preAuthKey(roomId, playerId, reconnectTokenHash));
+  if (preAuth) return preAuth;
+  const verified = await callDo(ctx.env, roomId, 'verify-reconnect', {
+    playerId,
+    reconnectTokenHash,
+  });
+  if (!verified.ok) return doError(verified);
+  if (verified['valid'] !== true) {
+    return err('Seat not found or reconnect token does not match.', 403, undefined, 'FORBIDDEN');
+  }
+  return checkSeatLimit(routeKey, roomId, reconnectTokenHash, seatKey(roomId, playerId));
 }
 
 /** 400 when a body id is present but not a UUID (P2, unvalidated ids). */
@@ -106,11 +202,32 @@ export function json(data: unknown, status: number = 200): Response {
  * DO's code through instead of dropping it, so a client can branch on
  * RATE_LIMITED / FORBIDDEN / ROOM_NOT_FOUND without parsing text.
  * No new codes are introduced by this change.
+ *
+ * v34 (delivery gate, zero-break bar) — `code` now defaults from the
+ * status, so EVERY error envelope carries a code the client can
+ * surface. A caller may still pass an explicit code to override the
+ * default (e.g. a 400 that is really a RATE_LIMITED is never
+ * mislabelled by the default). Previously `err()` without a code
+ * produced a codeless `{ error }` body — parse errors included — so
+ * a client branching on `code` saw nothing.
  */
+const DEFAULT_ERROR_CODE_BY_STATUS: Readonly<Record<number, string>> = {
+  400: 'VALIDATION_FAILED',
+  401: 'UNAUTHORIZED',
+  403: 'FORBIDDEN',
+  404: 'NOT_FOUND',
+  409: 'CONFLICT',
+  413: 'BODY_TOO_LARGE',
+  429: 'RATE_LIMITED',
+  500: 'SERVER_ERROR',
+  502: 'SERVER_ERROR',
+  503: 'SERVICE_UNAVAILABLE',
+};
+
 export function err(message: string, status: number, issues?: string[], code?: string): Response {
   const body: Record<string, unknown> =
     issues ? { error: message, issues } : { error: message };
-  if (code) body['code'] = code;
+  body['code'] = code ?? DEFAULT_ERROR_CODE_BY_STATUS[status] ?? 'SERVER_ERROR';
   return json(body, status);
 }
 
@@ -123,7 +240,7 @@ export async function parseBody(req: Request): Promise<{ ok: true; body: Record<
   }
   // P1-16: cap the body at 1 MB before parsing it.
   if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) {
-    return { ok: false, response: json({ error: 'Body too large (max 1 MB).' }, 413) };
+    return { ok: false, response: err('Body too large (max 1 MB).', 413) };
   }
   let raw: unknown;
   try {
@@ -268,7 +385,24 @@ function stripDoEnvelope(r: DoResponse): Record<string, unknown> {
 // -- rooms ---------------------------------------------------------------------
 
 /** POST /v1/rooms — create room (host). 201 + roomId, code, host seat, both tokens. */
+/**
+ * v34 (Diya R2-10) — per-leg server timings for the join/create legs.
+ * The founder's repro ("guest join is slow, host is fast") was never
+ * measured per leg: the join ticket removed one leg (POST ws-ticket)
+ * but nothing said which leg was slow. Each join/create response now
+ * carries `serverTimings` — the Worker-side milliseconds per leg
+ * (registry lookup, DO call, handler total) — so the client can log
+ * which leg is slow on a real phone. Server-side only: the client
+ * still owns the network + first-paint legs (socket connect, snapshot
+ * fetch), which no server timing can see. Timings are rounded whole
+ * ms; a leg that did not run is omitted, never zero-filled.
+ */
+function legTimings(startedAtMs: number, legs: Record<string, number>): Record<string, number> {
+  return { ...legs, totalMs: Math.max(0, Math.round(performance.now() - startedAtMs)) };
+}
+
 export async function handleCreateRoom(req: Request, ctx: HttpContext): Promise<Response> {
+  const startedAtMs = performance.now();
   const parsed = await parseBody(req);
   if (!parsed.ok) return parsed.response;
   const body = parsed.body;
@@ -301,9 +435,12 @@ export async function handleCreateRoom(req: Request, ctx: HttpContext): Promise<
   // that is already taken.
   let roomCode = '';
   let registered = false;
+  let registryMs = 0;
   for (let attempt = 0; attempt < 5; attempt += 1) {
     roomCode = generateRoomCode();
+    const regStartedAtMs = performance.now();
     const reg = await callRegistry(ctx.env, 'register', { code: roomCode, roomId });
+    registryMs += performance.now() - regStartedAtMs;
     if (reg.ok) {
       registered = true;
       break;
@@ -313,6 +450,7 @@ export async function handleCreateRoom(req: Request, ctx: HttpContext): Promise<
   }
   if (!registered || !roomCode) return err('Could not allocate a room code — try again.', 503);
 
+  const doStartedAtMs = performance.now();
   const created = await callDo(ctx.env, roomId, 'create', {
     roomId,
     roomCode,
@@ -322,6 +460,7 @@ export async function handleCreateRoom(req: Request, ctx: HttpContext): Promise<
     reconnectTokenHash: await hashReconnectToken(reconnectToken),
     hostTokenHash: await hashHostToken(hostToken),
   });
+  const doMs = Math.round(performance.now() - doStartedAtMs);
   if (!created.ok) {
     // Roll the code registration back so the code can be reused.
     await callRegistry(ctx.env, 'unregister', { code: roomCode, roomId });
@@ -329,7 +468,18 @@ export async function handleCreateRoom(req: Request, ctx: HttpContext): Promise<
   }
   recordTelemetry('player_games', 1);
   return json(
-    { ok: true, roomId, roomCode, hostPlayerId, reconnectToken, hostToken },
+    { ok: true, roomId, roomCode, hostPlayerId, reconnectToken, hostToken,
+      // v34 (slow entry) — join-time WS ticket minted by the DO at
+      // create (see `mintJoinTicket`): the setup page's first socket
+      // connect spends it instead of POSTing ws-ticket. Absent only
+      // when the best-effort mint failed — the client falls back.
+      ...(created['wsTicket'] !== undefined ? { wsTicket: created['wsTicket'] } : {}),
+      // v34 (Diya R2-10) — per-leg server timings (see `legTimings`).
+      serverTimings: legTimings(startedAtMs, {
+        registryMs: Math.round(registryMs),
+        doMs,
+      }),
+    },
     201,
   );
 }
@@ -356,6 +506,7 @@ export async function handleJoin(
   ctx: HttpContext,
   roomId: string,
 ): Promise<Response> {
+  const startedAtMs = performance.now();
   const parsed = await parseBody(req);
   if (!parsed.ok) return parsed.response;
   const body = parsed.body;
@@ -371,6 +522,7 @@ export async function handleJoin(
     return err('roomCode must be 6 characters A–Z0–9.', 400);
   }
   const rawReconnect = asString(body['reconnectToken']);
+  const doStartedAtMs = performance.now();
   const joined = await callDo(ctx.env, roomId, 'add-player', {
     displayName: displayName.trim(),
     roomCode,
@@ -379,6 +531,7 @@ export async function handleJoin(
     // returns the cached reply, including the ORIGINAL reconnectToken.
     idempotencyKey: idempotencyKeyFromRequest(req),
   });
+  const doMs = Math.round(performance.now() - doStartedAtMs);
   if (!joined.ok) return doError(joined);
   // A restore returns an EMPTY reconnect token — the client must never
   // overwrite a good stored token with it (enforced client-side).
@@ -398,6 +551,13 @@ export async function handleJoin(
     player,
     reconnectToken: joined['reconnectToken'],
     restored: joined['restored'],
+    // v34 (slow entry) — join-time WS ticket minted by the DO at
+    // add-player (see `mintJoinTicket`): the room page's first socket
+    // connect spends it instead of POSTing ws-ticket. Absent only when
+    // the best-effort mint failed — the client falls back.
+    ...(joined['wsTicket'] !== undefined ? { wsTicket: joined['wsTicket'] } : {}),
+    // v34 (Diya R2-10) — per-leg server timings (see `legTimings`).
+    serverTimings: legTimings(startedAtMs, { doMs }),
   });
 }
 
@@ -412,6 +572,7 @@ export async function handleJoinByCode(
   req: Request,
   ctx: HttpContext,
 ): Promise<Response> {
+  const startedAtMs = performance.now();
   const parsed = await parseBody(req);
   if (!parsed.ok) return parsed.response;
   const body = parsed.body;
@@ -426,12 +587,15 @@ export async function handleJoinByCode(
   if (!roomCode || !isValidRoomCode(roomCode)) {
     return err('roomCode must be 6 characters A–Z0–9.', 400);
   }
+  const registryStartedAtMs = performance.now();
   const found = await callRegistry(ctx.env, 'lookup', { code: roomCode.trim().toUpperCase() });
+  const registryMs = Math.round(performance.now() - registryStartedAtMs);
   if (!found.ok) {
     return err('No live room for that code.', 404);
   }
   const roomId = found['roomId'] as string;
   const rawReconnect = asString(body['reconnectToken']);
+  const doStartedAtMs = performance.now();
   const joined = await callDo(ctx.env, roomId, 'add-player', {
     displayName: displayName.trim(),
     roomCode: roomCode.trim().toUpperCase(),
@@ -439,6 +603,7 @@ export async function handleJoinByCode(
     // v29 (Gap 4) — same as handleJoin.
     idempotencyKey: idempotencyKeyFromRequest(req),
   });
+  const doMs = Math.round(performance.now() - doStartedAtMs);
   if (!joined.ok) return doError(joined);
   const joinedPlayer = joined['player'];
   const player =
@@ -455,6 +620,10 @@ export async function handleJoinByCode(
     player,
     reconnectToken: joined['reconnectToken'],
     restored: joined['restored'],
+    // v34 (slow entry) — join-time WS ticket, same as handleJoin.
+    ...(joined['wsTicket'] !== undefined ? { wsTicket: joined['wsTicket'] } : {}),
+    // v34 (Diya R2-10) — per-leg server timings (see `legTimings`).
+    serverTimings: legTimings(startedAtMs, { registryMs, doMs }),
   });
 }
 
@@ -567,12 +736,10 @@ export async function handleReplay(
   if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
   const hostTokenHash = await hashHostToken(rawHost);
-  // F5: keyed by room + playerId, NOT by the presented host-token hash
-  // — otherwise every guessed host token gets a fresh rate-limit
-  // bucket and the limit cannot throttle credential guessing. (Host
-  // tokens are 128-bit so guessing is infeasible anyway; this is
-  // defence-in-depth. The DO still verifies the token.)
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/replay', roomId, hostTokenHash, seatKey(roomId, playerId));
+  // v34 (Diya R3-N1) — verify-then-limit: the DO proves the host
+  // token BEFORE the seat bucket is touched, so forged attempts with
+  // the host's playerId cannot burn the host's budget.
+  const limited = await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/replay', roomId, playerId, hostTokenHash);
   if (limited) return limited;
   const replayed = await callDo(ctx.env, roomId, 'replay', {
     playerId,
@@ -599,7 +766,8 @@ export async function handleStart(
   if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
   const hostTokenHash = await hashHostToken(rawHost);
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/start', roomId, hostTokenHash);
+  // v34 (Diya R3-N1) — verify-then-limit (see `verifyHostThenLimit`).
+  const limited = await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/start', roomId, playerId, hostTokenHash);
   if (limited) return limited;
   const started = await callDo(ctx.env, roomId, 'start', {
     playerId,
@@ -634,7 +802,8 @@ export async function handleUpdateConfig(
   // unchanged and still rejects a bad config with 400. (Create keeps its
   // Worker-side check: createRoom has no DO yet to validate in.)
   const hostTokenHash = await hashHostToken(rawHost);
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/config', roomId, hostTokenHash);
+  // v34 (Diya R3-N1) — verify-then-limit (see `verifyHostThenLimit`).
+  const limited = await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/config', roomId, playerId, hostTokenHash);
   if (limited) return limited;
   const updated = await callDo(ctx.env, roomId, 'update-config', {
     playerId,
@@ -663,7 +832,8 @@ export async function handleRemovePlayer(
   if (!targetPlayerId) return err('targetPlayerId is required.', 400);
   if (!isUuid(targetPlayerId)) return badUuid('targetPlayerId');
   const hostTokenHash = await hashHostToken(rawHost);
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/remove-player', roomId, hostTokenHash);
+  // v34 (Diya R3-N1) — verify-then-limit (see `verifyHostThenLimit`).
+  const limited = await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/remove-player', roomId, playerId, hostTokenHash);
   if (limited) return limited;
   const removed = await callDo(ctx.env, roomId, 'remove-player', {
     playerId,
@@ -689,17 +859,14 @@ export async function handleRegenerateCode(
   if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
   const hostTokenHash = await hashHostToken(rawHost);
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/regenerate-code', roomId, hostTokenHash);
+  // v34 (Diya R3-N1) — verify-then-limit (see `verifyHostThenLimit`).
+  // The verify here ALSO serves the old verify-then-register (P2):
+  // host authority is confirmed BEFORE the new code is registered,
+  // so a failed host check never squats a code (and a failure after
+  // registration leaves no orphan mapping — the fresh code is
+  // unregistered below).
+  const limited = await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/regenerate-code', roomId, playerId, hostTokenHash);
   if (limited) return limited;
-  // Verify-then-register (P2): the DO confirms host authority BEFORE the
-  // new code is registered, so a failed host check never squats a code
-  // (and a failure after registration leaves no orphan mapping — the
-  // fresh code is unregistered below).
-  const verified = await callDo(ctx.env, roomId, 'verify-host-token', {
-    playerId,
-    hostTokenHash,
-  });
-  if (!verified.ok) return doError(verified);
   const newCode = generateRoomCode();
   const reg = await callRegistry(ctx.env, 'register', { code: newCode, roomId });
   if (!reg.ok) {
@@ -742,7 +909,10 @@ export async function handleHostToken(
   if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawReconnect) return err('reconnectToken is required.', 400);
   const reconnectTokenHash = await hashReconnectToken(rawReconnect);
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/host/token', roomId, reconnectTokenHash);
+  // v34 (Diya R3-N1) — verify-then-limit on the RECONNECT credential
+  // (see `verifySeatThenLimit`): a forged reconnect token must not
+  // burn this seat's host/token budget.
+  const limited = await verifySeatThenLimit(ctx, 'POST /v1/rooms/:id/host/token', roomId, playerId, reconnectTokenHash);
   if (limited) return limited;
   const minted = await callDo(ctx.env, roomId, 'issue-host-token', {
     playerId,
@@ -770,7 +940,8 @@ export async function handleHostTransfer(
   if (!newHostPlayerId) return err('newHostPlayerId is required.', 400);
   if (!isUuid(newHostPlayerId)) return badUuid('newHostPlayerId');
   const hostTokenHash = await hashHostToken(rawHost);
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/host/transfer', roomId, hostTokenHash);
+  // v34 (Diya R3-N1) — verify-then-limit (see `verifyHostThenLimit`).
+  const limited = await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/host/transfer', roomId, playerId, hostTokenHash);
   if (limited) return limited;
   const transferred = await callDo(ctx.env, roomId, 'transfer-host', {
     playerId,
@@ -849,7 +1020,8 @@ export async function handleResolveCatch(
     return err('reason must be at most 500 characters.', 400);
   }
   const hostTokenHash = await hashHostToken(rawHost);
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/catches/:cid/resolve', roomId, hostTokenHash);
+  // v34 (Diya R3-N1) — verify-then-limit (see `verifyHostThenLimit`).
+  const limited = await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/catches/:cid/resolve', roomId, playerId, hostTokenHash);
   if (limited) return limited;
   const resolved = await callDo(ctx.env, roomId, 'resolve-catch', {
     playerId,
@@ -888,16 +1060,16 @@ export async function handleLifecycle(
   if (!rawHost && !rawReconnect) {
     return err('hostToken or reconnectToken is required.', 400);
   }
-  // Seat limit, keyed by room + seat (v23 fix round 1, S5 — the F5
-  // treatment, same as replay): keying by the presented host-token
-  // hash gives every guessed host token a fresh bucket, so it cannot
-  // throttle credential guessing at all, and each spam call loads DO
-  // state unboundedly. Keying by room + playerId still bounds the
-  // caller's own rate (10/min/seat) while a guessing attacker shares
-  // one bucket per seat. The DO still verifies the token.
+  // v34 (Diya R3-N1) — verify-then-limit. Host actions (start /
+  // resume / end) prove the HOST token; pause proves the RECONNECT
+  // token (safety is not host-gated). Either way the credential is
+  // proven in the DO before the seat bucket is touched, so a forged
+  // call with the host's playerId cannot burn the host's budget.
   const hostTokenHash = rawHost ? await hashHostToken(rawHost) : null;
   const reconnectTokenHash = rawReconnect ? await hashReconnectToken(rawReconnect) : null;
-  const limited = await checkSeatLimit('POST /v1/rooms/:id/lifecycle', roomId, hostTokenHash ?? reconnectTokenHash ?? '', seatKey(roomId, playerId));
+  const limited = hostTokenHash !== null
+    ? await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/lifecycle', roomId, playerId, hostTokenHash)
+    : await verifySeatThenLimit(ctx, 'POST /v1/rooms/:id/lifecycle', roomId, playerId, reconnectTokenHash ?? '');
   if (limited) return limited;
   const done = await callDo(ctx.env, roomId, 'lifecycle', {
     action,

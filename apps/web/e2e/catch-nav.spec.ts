@@ -185,7 +185,7 @@ test.describe('catch flow (demo)', () => {
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
     // Classic: the tagged Runner is out — after-tagged screen.
-    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByText('You were tagged', { exact: true })).toBeVisible();
     await expect(runnerPage.getByText(`You were tagged by ${hunterName}.`)).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
   }
@@ -207,7 +207,7 @@ test.describe('catch flow (demo)', () => {
     await expect(hunterPage.getByRole('button', { name: 'Tag someone else' })).toBeVisible();
     // The tagged Runner sees the after-tagged screen on their own phone.
     await runnerPage.goto(`/room/${roomId}/catch`);
-    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByText('You were tagged', { exact: true })).toBeVisible();
     await expect(runnerPage.getByText(`You were tagged by ${hunterName}.`)).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Back to home' })).toBeVisible();
@@ -259,7 +259,7 @@ test.describe('catch flow (demo)', () => {
     await expect(runnerPage.getByRole('button', { name: otherRunnerName, exact: true })).toBeHidden();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
-    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByText('You were tagged', { exact: true })).toBeVisible();
     await expect(runnerPage.getByText(`You were tagged by ${hunterName}.`)).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
     // The Hunter's catch screen shows the confirmed tag without the
@@ -342,7 +342,7 @@ test.describe('catch flow (demo)', () => {
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
     // Classic: the tagged Runner is out — after-tagged screen, not the
     // hunter's "Catch confirmed" card.
-    await expect(runnerPage.getByText('You were tagged')).toBeVisible();
+    await expect(runnerPage.getByText('You were tagged', { exact: true })).toBeVisible();
     await expect(runnerPage.getByRole('button', { name: 'Spectate match' })).toBeVisible();
     await context.close();
   });

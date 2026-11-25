@@ -188,6 +188,82 @@ export function hasLiveCredential(roomId: string): boolean {
   );
 }
 
+/**
+ * v34 (join ticket, Kabir's server half): the single-use WS ticket the
+ * server mints inside create/join/join-by-code
+ * (`wsTicket: { ticket, ticketId, expiresAtMs }`, 60 s TTL,
+ * purpose-connect). It is spent on the seat's FIRST socket connect —
+ * one fewer sequential HTTP leg on the join path (no POST ws-ticket)
+ * — and then it is gone: single-use, so it must never be re-spent.
+ *
+ * Stored under its OWN sessionStorage key, NOT on the PakdamSession
+ * (that type lives in @pakdam/shared, outside apps/web): same tab,
+ * same lifetime as the seat, never localStorage (it must die with the
+ * tab), never logged. `takeWsJoinTicket` consumes it — the entry is
+ * removed whether it was usable or expired, so a stale ticket can
+ * never be offered twice. Absent/expired → the caller falls back to
+ * POST ws-ticket (today's path).
+ */
+export interface WsJoinTicket {
+  ticket: string;
+  ticketId: string;
+  expiresAtMs: number;
+}
+
+const WS_JOIN_TICKET_KEY = 'pakdam.ws-join-ticket.v1';
+
+interface StoredWsJoinTicket extends WsJoinTicket {
+  roomId: string;
+}
+
+function readWsJoinTickets(): StoredWsJoinTicket[] {
+  if (!isBrowser()) return [];
+  try {
+    const raw = window.sessionStorage.getItem(WS_JOIN_TICKET_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as StoredWsJoinTicket[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeWsJoinTickets(tickets: StoredWsJoinTicket[]): void {
+  if (!isBrowser()) return;
+  try {
+    window.sessionStorage.setItem(WS_JOIN_TICKET_KEY, JSON.stringify(tickets));
+  } catch {
+    // Storage full — the ticket is lost and the caller falls back to
+    // POST ws-ticket; the join itself is unaffected.
+  }
+}
+
+export function storeWsJoinTicket(
+  roomId: string,
+  ticket: { ticket: string; ticketId: string; expiresAtMs: number },
+): void {
+  if (
+    typeof ticket.ticket !== 'string' ||
+    ticket.ticket.length === 0 ||
+    typeof ticket.expiresAtMs !== 'number' ||
+    !Number.isFinite(ticket.expiresAtMs)
+  ) {
+    return;
+  }
+  const rest = readWsJoinTickets().filter((t) => t.roomId !== roomId);
+  rest.push({ roomId, ticket: ticket.ticket, ticketId: ticket.ticketId, expiresAtMs: ticket.expiresAtMs });
+  writeWsJoinTickets(rest);
+}
+
+/** Consume the stored join ticket for a room (single-use): null when absent or expired. */
+export function takeWsJoinTicket(roomId: string): WsJoinTicket | null {
+  const rest = readWsJoinTickets().filter((t) => t.roomId !== roomId);
+  const found = readWsJoinTickets().find((t) => t.roomId === roomId) ?? null;
+  writeWsJoinTickets(rest);
+  if (!found || found.expiresAtMs <= Date.now()) return null;
+  return { ticket: found.ticket, ticketId: found.ticketId, expiresAtMs: found.expiresAtMs };
+}
+
 /** All live sessions saved on this device (host dashboard lists these only — the server has no room-list endpoint). */
 export function loadAllLiveSessions(): PakdamSession[] {
   return readAll().filter((s) => s.mode === 'live');

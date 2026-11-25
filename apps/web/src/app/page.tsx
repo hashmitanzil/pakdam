@@ -22,6 +22,8 @@ import { useEffect, useState } from 'react';
 import { Button } from '../components/ui/Button';
 import { PakdamWordmark } from '../components/PakdamWordmark';
 import { WelcomeScreen } from '../components/WelcomeScreen';
+import { OnboardingCards } from '../components/OnboardingCards';
+import { hasSeenOnboarding } from '../lib/onboarding';
 import { ROOM_DELETED_MESSAGE, takeRoomDeletedNotice } from '../lib/room-deleted';
 import { listRejoinTokens, type RejoinEntry } from '../lib/rejoin-token';
 import { storeLiveSeat } from '../lib/session-credentials';
@@ -33,6 +35,13 @@ export default function HomePage() {
   // It unmounts itself via onDone once the real work settles or the
   // 2.5 s cap fires — the home buttons are never blocked past that.
   const [welcomeDone, setWelcomeDone] = useState(false);
+  // Scope C item 1: the rules cards show once, before the first game
+  // (after the welcome screen), and never auto-show again — "How to
+  // play" below re-opens them any time.
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  useEffect(() => {
+    if (welcomeDone && !hasSeenOnboarding()) setShowOnboarding(true);
+  }, [welcomeDone]);
   // One-shot notice for a room deleted under this player (host cancel,
   // founder decision 2026-11-21): the flag is consumed once, so a
   // later reload of home does not re-show it.
@@ -80,6 +89,13 @@ export default function HomePage() {
   return (
     <>
       {!welcomeDone && <WelcomeScreen onDone={() => setWelcomeDone(true)} />}
+      {welcomeDone && showOnboarding ? (
+        <OnboardingCards
+          onClose={() => setShowOnboarding(false)}
+          onHost={() => router.push('/create/mode')}
+          onJoin={() => router.push('/join')}
+        />
+      ) : null}
       {/* While the welcome overlay is up the home content is inert:
           the overlay blocks pointer events, but without inert Tab
           could still reach HOST/JOIN behind it (focus ring invisible)
@@ -203,6 +219,29 @@ export default function HomePage() {
         </Button>
       </div>
 
+      {/* Scope C item 9: the third door — a demo round, played on this
+          device only (local demo room, even when live play is up).
+          Same mode screen as Host; the demo flag is carried in the URL. */}
+      <div className="pakdam-anim-rise mt-3" style={{ animationDelay: '0.36s' }}>
+        <button
+          type="button"
+          onClick={() => router.push('/create/mode?demo=1')}
+          className="inline-flex h-14 w-full items-center justify-center gap-2 rounded-[14px] border-[1.5px] border-[#EF4444] bg-transparent px-4 text-[17px] font-bold text-[#EF4444] transition-colors active:scale-95"
+        >
+          <span className="flex w-full items-center justify-between">
+            <span className="text-left">
+              <span className="block text-[17px] font-bold">TRY A DEMO</span>
+              <span className="mt-1 block text-[13px] font-medium text-[#A1A1AA]">
+                PRACTICE ROUND ON THIS DEVICE
+              </span>
+            </span>
+            <span aria-hidden className="text-[20px]">
+              →
+            </span>
+          </span>
+        </button>
+      </div>
+
       {/* v29 (A): "Rejoin your game" — a game you left mid-match (or
           the app was killed) is one tap away, with your role and
           score intact. Only live rooms with a stored reconnect token
@@ -282,6 +321,15 @@ export default function HomePage() {
 
       <p className="mt-auto pt-8 text-center text-[13px] text-[#A1A1AA]">
         Free · No download · 2–30 players · No account needed.
+      </p>
+      <p className="mt-2 text-center">
+        <button
+          type="button"
+          onClick={() => setShowOnboarding(true)}
+          className="text-[14px] font-semibold text-[#EF4444]"
+        >
+          How to play
+        </button>
       </p>
       </main>
     </>

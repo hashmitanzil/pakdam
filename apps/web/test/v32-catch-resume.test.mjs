@@ -202,9 +202,20 @@ test('v32 (harbour property): the catch page mounts the P0-1 resume and runs no 
     page.includes('resumePlayerOnCatchPageArrival(demo, myPlayerId)'),
     'the catch page must resume the seat on arrival (P0-1) — that is what the e2e harbour relies on',
   );
+  // v34 (Kabir item 2 — SUPERSEDES the no-watcher grep below): the
+  // catch page now runs a GPS watch so the Runner's fix stays fresh
+  // for self-confirm (a frozen fix is STALE_LOCATION >60 s after
+  // navigation). The property this pin protects is NOT "no watcher"
+  // — it is "the watch cannot re-suspend the seat". The play page's
+  // re-suspension lives in a separate effect (F16:
+  // recordPlayerSuspension('gps-denied')), which the catch page
+  // never had and the new watch does not add: the watch effect only
+  // SENDS fixes (sendLocationUpdate / recordPlayerFix) and stops on
+  // hide. So the pin asserts the mechanism, not the proxy: no
+  // suspension call anywhere on this page.
   assert.ok(
-    !page.includes('watchLocation') && !page.includes('shouldWatchLocation'),
-    'the catch page must run no GPS watcher — a watcher would re-suspend the seat on GPS denial (the play page does exactly that) and the harbour would not hold',
+    !page.includes('recordPlayerSuspension'),
+    'the catch page must never suspend a seat — its GPS watch only sends fixes, so the P0-1 harbour holds',
   );
   assert.ok(
     page.includes("resumePlayerOnCatchPageArrival"),

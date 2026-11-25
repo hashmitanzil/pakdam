@@ -6,6 +6,7 @@ register('../resolve-hooks.mjs', import.meta.url);
 
 const { RoomStore, emptyMemory, durableSnapshot, restoreState } = await import('../src/room-do.ts');
 const { handleReplay } = await import('../src/http.ts');
+const { hashHostToken } = await import('@pakdam/shared');
 
 // v18 FIX ROUND tests (Kabir): B1 poor-fix liveness vs usability, B2
 // original-zone restore on replay, A1 claim-QR scan, A2/F3 Hunter
@@ -478,15 +479,33 @@ test('F6/A10 replay clears announcements + disconnect times and un-suspends kept
 });
 
 // ---------------------------------------------------------------------------
-// F5 — replay rate limit is keyed by room + playerId, not by token hash
+// F5 — replay rate limit, re-pinned by v34 (Diya R3-N1)
 // ---------------------------------------------------------------------------
+//
+// The old pin ("six replays from the SAME seat with a DIFFERENT
+// guessed host token each time: the 6th is 429") IS the R3-N1 hole:
+// the pre-auth bucket was keyed by the client-supplied playerId, so
+// forged attempts burned the victim seat's budget. Verify-then-limit
+// replaced it: the DO proves the host token BEFORE the seat bucket is
+// touched, so forged replays never consume the host's budget; the
+// per-credential pre-auth bucket still throttles hammering with ONE
+// guessed token, and the seat bucket still bites verified excess.
 
 const REPLAY_ROOM_ID = '33333333-3333-4333-8333-333333333333';
 const REPLAY_PLAYER_ID = '44444444-4444-4444-8444-444444444444';
 
-async function replayWithDo(hostToken) {
+async function replayWithDo(hostToken, validHashes = new Set(), playerId = REPLAY_PLAYER_ID) {
+  const ops = [];
   const stub = {
-    fetch: async () => {
+    fetch: async (_url, init) => {
+      const body = JSON.parse(String(init?.body ?? '{}'));
+      ops.push(body.op);
+      if (body.op === 'verify-host-token') {
+        return new Response(JSON.stringify({ ok: true, valid: validHashes.has(body.hostTokenHash) }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       return new Response(
         JSON.stringify({ ok: true, phase: 'LOBBY', roomCode: 'ABCDEF', playerCount: 3 }),
         { status: 200, headers: { 'Content-Type': 'application/json' } },
@@ -497,21 +516,51 @@ async function replayWithDo(hostToken) {
   const req = new Request(`https://worker.example/v1/rooms/${REPLAY_ROOM_ID}/replay`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ playerId: REPLAY_PLAYER_ID, hostToken }),
+    body: JSON.stringify({ playerId, hostToken }),
   });
-  return handleReplay(req, { env, ctx: { waitUntil: () => {} } }, REPLAY_ROOM_ID);
+  const res = await handleReplay(req, { env, ctx: { waitUntil: () => {} } }, REPLAY_ROOM_ID);
+  return { res, ops };
 }
 
-test('F5 replay limit shares one bucket per seat: fresh host tokens do not dodge it', async () => {
-  // The limit is 5/min. Six replays from the SAME seat with a DIFFERENT
-  // (guessed) host token each time: keyed by token hash, every one
-  // would pass; keyed by room + playerId, the 6th is 429.
-  for (let i = 1; i <= 5; i += 1) {
-    const res = await replayWithDo(`host-token-guess-${i}`);
-    assert.equal(res.status, 200, `replay ${i} must pass the limiter`);
+test('v34 R3-N1 (F5 re-pin): forged replays with the host playerId do NOT burn the host bucket — the real replay still succeeds', async () => {
+  // The limit is 5/min. Six replays from the SAME seat with a
+  // DIFFERENT (guessed) host token each time: every one must 403 at
+  // verify, none may 429, and the host's real replay afterwards must
+  // still reach the DO and succeed.
+  const realHash = await hashHostToken('real-host-token');
+  const valid = new Set([realHash]);
+  for (let i = 1; i <= 6; i += 1) {
+    const { res } = await replayWithDo(`host-token-guess-${i}`, valid);
+    assert.equal(res.status, 403, `forged replay ${i} must 403 at verify, got ${res.status}`);
   }
-  const sixth = await replayWithDo('host-token-guess-6');
-  assert.equal(sixth.status, 429, 'the 6th replay from the same seat must be rate-limited');
-  const body = await sixth.json();
+  const { res, ops } = await replayWithDo('real-host-token', valid);
+  assert.equal(res.status, 200, `the host's real replay must still succeed after 6 forged attempts, got ${res.status}`);
+  assert.ok(ops.includes('replay'), 'the real replay must reach the replay op');
+});
+
+test('v34 R3-N1 (F5 re-pin): hammering replay with ONE guessed token still 429s, and verified excess still 429s', async () => {
+  // Same guessed token six times: the first five 403 at verify, the
+  // sixth 429s at the per-credential pre-auth bucket.
+  for (let i = 1; i <= 5; i += 1) {
+    const { res } = await replayWithDo('same-guessed-token');
+    assert.equal(res.status, 403, `forged replay ${i} must 403 at verify`);
+  }
+  const sixth = await replayWithDo('same-guessed-token');
+  assert.equal(sixth.res.status, 429, 'the 6th replay with the same guessed token must be rate-limited');
+  const body = await sixth.res.json();
   assert.match(String(body.error ?? ''), /Too many tries/);
+  assert.equal(sixth.ops.filter((op) => op === 'verify-host-token').length, 0, 'the 429d attempt must never reach the DO');
+  // Verified excess: five real replays pass, the sixth 429s at the
+  // seat bucket. A FRESH playerId: the seat bucket is module-level
+  // and shared across tests in this file, and the real replay in the
+  // test above already consumed one slot for REPLAY_PLAYER_ID.
+  const VERIFIED_PLAYER_ID = '55555555-5555-4555-8555-555555555555';
+  const realHash = await hashHostToken('real-host-token-2');
+  const valid = new Set([realHash]);
+  for (let i = 1; i <= 5; i += 1) {
+    const { res } = await replayWithDo('real-host-token-2', valid, VERIFIED_PLAYER_ID);
+    assert.equal(res.status, 200, `verified replay ${i} must pass the limiter`);
+  }
+  const over = await replayWithDo('real-host-token-2', valid, VERIFIED_PLAYER_ID);
+  assert.equal(over.res.status, 429, 'the 6th verified replay must be rate-limited');
 });

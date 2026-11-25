@@ -204,12 +204,35 @@ export async function expectDemoMode(page: Page): Promise<void> {
  * — it appears only on the lobby screen, after CREATE LOBBY. Returns
  * the room id (from the URL).
  */
+/**
+ * Scope C item 1: the onboarding cards auto-show on home before the
+ * first game (after the welcome screen fades) and cover the whole
+ * viewport — a test that wants the home buttons must Skip them first.
+ * Waits out the welcome screen, then Skips the cards when they are
+ * showing; a no-op when they are not (already seen, or home never
+ * reached). Skipping marks them seen, so they never re-appear in
+ * this context.
+ */
+export async function dismissOnboardingIfShown(page: Page): Promise<void> {
+  await page
+    .locator('[data-testid="welcome-screen"]')
+    .waitFor({ state: 'detached', timeout: 5000 })
+    .catch(() => undefined);
+  const dialog = page.getByRole('dialog', { name: 'How Pakdam works' });
+  const skip = dialog.getByRole('button', { name: 'Skip', exact: true });
+  if (await skip.isVisible().catch(() => false)) {
+    await skip.click();
+    await expect(dialog).toBeHidden();
+  }
+}
+
 export async function createHostSetupRoom(
   page: Page,
   hostName: string = HOST_NAME,
   mode: 'Classic' | 'Infection' = 'Classic',
 ): Promise<{ roomId: string }> {
   await page.goto('/');
+  await dismissOnboardingIfShown(page);
   await page.getByRole('button', { name: /HOST A GAME/ }).click();
   await expect(page.getByRole('heading', { name: 'Pick a mode' })).toBeVisible();
   await page.getByLabel('Your codename').fill(hostName);

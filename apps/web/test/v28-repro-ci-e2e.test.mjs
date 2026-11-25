@@ -168,18 +168,37 @@ test('v28 CI-E2E H4 STALE TEST (fails — strict violation): the safety-pause te
 });
 
 // --- H5 — status strip needs the host tab fronted -----------------------
-test('v28 CI-E2E H5 TEST-ENVIRONMENT (fails — backgrounded tab): the status-strip test must bring the host page to front and wait for the resume', () => {
+// v34 SUPERSEDED (Meera, PROBE4/PROBE5 — the premise this pin
+// encoded was DISPROVEN in a real headless browser): real
+// backgrounding never fires `visibilitychange` here (every page
+// reads `document.hidden === false`), so `bringToFront()` resumes
+// nothing, and the fixture grants no geolocation, so the play
+// page's GPS watch denies and the seat stays `gps-denied`-suspended
+// by design (F16) — a connected-poll can never land. The test now
+// asserts the strip directly (it does not depend on
+// connectionState); the suspension itself is pinned by the guest
+// banner assertion below it. This pin asserts the new approach and
+// forbids the old one coming back.
+test('v34 H5 SUPERSEDED (was: bringToFront + connected-poll): the status-strip test asserts the strip directly, with no bringToFront and no connected-poll', () => {
   const src = readE2E('live-hud.spec.ts');
   const start = src.indexOf("'status strip: time left, next ping, zone shrink, runners left'");
   assert.ok(start > -1, 'the status-strip test must exist');
   const body = src.slice(start, src.indexOf("test('head start", start));
   assert.ok(
-    body.includes('bringToFront()'),
-    'the host tab is backgrounded when the guest pages are created, so useRoomState suspends the seat and the YOU dot reads \'Suspended\' — the test must bringToFront() the host page before asserting \'Location never reported\'',
+    !body.includes('bringToFront()'),
+    'bringToFront() never resumes a seat in headless CI (no visibilitychange fires) — the test must not depend on it',
   );
   assert.ok(
-    body.includes("toBe('connected')"),
-    'after bringToFront the test must wait for the seat to resume (connectionState connected) before asserting the dot label',
+    !body.includes("toBe('connected')"),
+    'a connected-poll can never land here (GPS-denied suspension, F16) — the test must not wait for it',
+  );
+  assert.ok(
+    body.includes("getByText('Time left')"),
+    'the test must assert the strip directly — the strip does not depend on connectionState',
+  );
+  assert.ok(
+    body.includes('Suspended — location unknown · Location never reported'),
+    'the suspension itself is still pinned — by the guest banner assertion, not by a connection poll',
   );
 });
 

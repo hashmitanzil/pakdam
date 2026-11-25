@@ -47,7 +47,13 @@ import { circlePolygon } from '@pakdam/engine';
 import { Button } from '../../../../components/ui/Button';
 import { Stepper } from '../../../../components/ui/Stepper';
 import { PlayAreaMap, type ZoneDraft } from '../../../../components/host-setup/PlayAreaMap';
-import { RulesControls, TeamControls } from '../../../../components/host-setup/SetupControls';
+import { HouseRulesPresets, RulesControls, TeamControls, TimingControls } from '../../../../components/host-setup/SetupControls';
+import {
+  applyHousePreset,
+  loadCustomPreset,
+  saveCustomPreset,
+  type HousePreset,
+} from '../../../../lib/house-rules';
 import { effectiveHunterCount } from '../../../../components/host-setup/draft';
 import {
   autoFinalRadiusMeters,
@@ -104,6 +110,10 @@ export default function SetupPage() {
   const [loadNonce, setLoadNonce] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
   const [gpsNote, setGpsNote] = useState<string | null>(null);
+  // Scope C item 5: the host's saved Custom preset (this device) + the
+  // one-line confirmation shown right after a save.
+  const [savedCustom, setSavedCustom] = useState<HousePreset | null>(() => loadCustomPreset());
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
   const [zone, setZone] = useState<ZoneState | null>(null);
   const [userLocation, setUserLocation] = useState<GeoPoint | null>(null);
   const [locateNonce, setLocateNonce] = useState(0);
@@ -739,6 +749,75 @@ export default function SetupPage() {
     });
   }, [flushConfigPush, goLobby]);
 
+  // Scope C item 7: CREATE LOBBY states its own blocker — a drawn zone
+  // with fewer than 3 corners is not a zone yet, so the lobby must not
+  // open on an empty boundary. A circle is always set; zone OFF needs
+  // no zone at all.
+  const zoneReady =
+    config?.playZoneEnabled === false ||
+    zone === null ||
+    zone.shape === 'circle' ||
+    zone.drawPoints.length >= 3;
+  const createBlockedReason = zoneReady
+    ? null
+    : 'Place at least 3 corners — the zone is not set yet.';
+
+  // Scope C item 5: apply a house-rules preset — timing via the config
+  // (the shrink interval follows the round length, as the stepper does)
+  // and the zone size via the draft when the zone is a circle. A drawn
+  // zone keeps its shape; the preset never rewrites it.
+  const applyPreset = useCallback(
+    (preset: HousePreset): void => {
+      if (!config) return;
+      setSaveNotice(null);
+      const presetConfig = applyHousePreset(config, preset);
+      if (zone && zone.shape === 'circle') {
+        // ONE config write: the preset timing + the new zone boundary
+        // together. Two writes would race — the zone write reads the
+        // pre-preset config from the lobby ref and would drop the
+        // preset timing.
+        const draft: ZoneDraft = {
+          centre: zone.centre,
+          radiusMeters: preset.zoneRadiusMeters,
+          shape: 'circle',
+          drawPoints: [],
+        };
+        setZone(draft);
+        applyConfig({
+          ...presetConfig,
+          zone: { ...presetConfig.zone, boundary: circleBoundary(draft.centre, draft.radiusMeters) },
+          zoneShape: 'circle',
+          finalSizePercent: null,
+        });
+      } else {
+        applyConfig(presetConfig);
+      }
+    },
+    [config, zone, applyConfig],
+  );
+
+  // Scope C item 5: save the current settings as the Custom preset on
+  // this device, so the host can pick them again next time.
+  const saveCurrentAsCustom = useCallback((): void => {
+    if (!config) return;
+    const radius =
+      zone && zone.shape === 'circle'
+        ? zone.radiusMeters
+        : config.zone.boundary.length >= 3
+          ? boundaryRadiusMeters(config.zone.boundary)
+          : 500;
+    const preset = {
+      durationSeconds: config.durationSeconds,
+      headStartSeconds: config.headStartSeconds,
+      pingIntervalSeconds: config.pingIntervalSeconds,
+      zoneRadiusMeters: radius,
+      zoneShrinkEnabled: config.zoneShrinkEnabled,
+    };
+    saveCustomPreset(preset);
+    setSavedCustom(loadCustomPreset());
+    setSaveNotice('Saved — pick Custom next time.');
+  }, [config, zone]);
+
   // -- Render states. ------------------------------------------------------
   if (session === undefined) {
     return (
@@ -836,11 +915,15 @@ export default function SetupPage() {
       <div className="mt-4 flex flex-col gap-3">
         {config.playZoneEnabled !== false && zone ? (
           <section
-            aria-label="Play zone"
+            aria-label="Play area"
             className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4"
           >
+            <p className="pakdam-label">Play area</p>
+            <p className="mt-1 text-[13px] text-[#A1A1AA]">
+              The host draws the zone. Everyone plays inside it.
+            </p>
             <div
-              className="grid grid-cols-2 gap-1 rounded-[14px] bg-[#1E1E22] p-1"
+              className="mt-3 grid grid-cols-2 gap-1 rounded-[14px] bg-[#1E1E22] p-1"
               role="group"
               aria-label="Zone shape"
             >
@@ -858,6 +941,9 @@ export default function SetupPage() {
                 </button>
               ))}
             </div>
+            <p className="mt-2 text-[13px] text-[#A1A1AA]">
+              Circle: one round zone. Draw: your own shape, placed corner by corner.
+            </p>
 
             <div className="mt-3">
               <PlayAreaMap
@@ -987,6 +1073,27 @@ export default function SetupPage() {
         </section>
 
         <div className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4">
+          <HouseRulesPresets
+            config={config}
+            zoneRadiusMeters={zone.shape === 'circle' ? zone.radiusMeters : null}
+            savedCustom={savedCustom}
+            isHost
+            onApplyPreset={applyPreset}
+            onSaveCustom={saveCurrentAsCustom}
+            saveNotice={saveNotice}
+          />
+        </div>
+
+        <div className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4">
+          <TimingControls
+            config={config}
+            activePlayerCount={activePlayers.length}
+            isHost
+            onChange={applyConfig}
+          />
+        </div>
+
+        <div className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4">
           <RulesControls
             config={config}
             activePlayerCount={activePlayers.length}
@@ -1006,9 +1113,18 @@ export default function SetupPage() {
       </div>
 
       <div className="sticky bottom-0 mt-4 bg-[#0A0A0B] pb-[env(safe-area-inset-bottom,0px)] pt-2">
-        <Button variant="primary" onClick={handleCreateLobby}>
-          CREATE LOBBY
-        </Button>
+        {createBlockedReason ? (
+          <Button
+            variant="blocked"
+            onClick={() => showNotice(createBlockedReason)}
+          >
+            PLACE AT LEAST 3 CORNERS
+          </Button>
+        ) : (
+          <Button variant="primary" onClick={handleCreateLobby}>
+            CREATE LOBBY
+          </Button>
+        )}
       </div>
     </main>
   );

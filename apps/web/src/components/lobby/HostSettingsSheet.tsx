@@ -22,7 +22,7 @@ import { memo } from 'react';
 import type { RoomConfig } from '@pakdam/shared';
 import { Sheet } from '../ui/Sheet';
 import { Button } from '../ui/Button';
-import { RulesControls, TeamControls } from '../host-setup/SetupControls';
+import { RulesControls, TeamControls, TimingControls } from '../host-setup/SetupControls';
 
 export interface HostSettingsSheetProps {
   open: boolean;
@@ -84,8 +84,13 @@ export const HostSettingsSheet = memo(function HostSettingsSheet({
           ) : null}
         </div>
       </section>
-      <RulesControls config={config} activePlayerCount={activePlayerCount} isHost={isHost} onChange={handleChange} />
-      <TeamControls config={config} activePlayerCount={activePlayerCount} isHost={isHost} onChange={handleChange} />
+      <TimingControls config={config} activePlayerCount={activePlayerCount} isHost={isHost} onChange={handleChange} />
+      <div className="mt-4">
+        <RulesControls config={config} activePlayerCount={activePlayerCount} isHost={isHost} onChange={handleChange} />
+      </div>
+      <div className="mt-4">
+        <TeamControls config={config} activePlayerCount={activePlayerCount} isHost={isHost} onChange={handleChange} />
+      </div>
       <div className="mt-6">
         <Button variant="primary" onClick={onClose}>
           Done

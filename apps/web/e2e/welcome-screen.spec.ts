@@ -17,7 +17,7 @@
  * ~1 s staging gate) and the screen is gone by ~1.4 s on the normal path.
  */
 import { test, expect } from '@playwright/test';
-import { collectPageErrors, expectNoHorizontalOverflow, expectNoPageErrors } from './helpers';
+import { collectPageErrors, dismissOnboardingIfShown, expectNoHorizontalOverflow, expectNoPageErrors } from './helpers';
 
 const WELCOME = '[data-testid="welcome-screen"]';
 const PIN_ALT = 'Pakdam pin art — a red location pin with a boy hiding behind a tree';
@@ -92,6 +92,9 @@ test.describe('welcome screen', () => {
       .toBeGreaterThan(0);
     await expect(page.getByRole('button', { name: /HOST A GAME/ })).toBeVisible();
     await expect(page.getByRole('button', { name: /JOIN A GAME/ })).toBeVisible();
+    // Scope C item 1: the onboarding cards auto-show once the welcome
+    // screen is gone — Skip them before the home button is clickable.
+    await dismissOnboardingIfShown(page);
     await page.getByRole('button', { name: /JOIN A GAME/ }).click();
     await expect(page.getByRole('heading', { name: 'Join a game' })).toBeVisible();
     expectNoPageErrors(errors);
@@ -111,6 +114,7 @@ test.describe('welcome screen', () => {
   }) => {
     await page.goto('/');
     await expect(page.locator(WELCOME)).toBeHidden({ timeout: 10000 });
+    await dismissOnboardingIfShown(page);
     await page.getByRole('button', { name: /JOIN A GAME/ }).click();
     await expect(page.getByRole('heading', { name: 'Join a game' })).toBeVisible();
     await page.goBack();

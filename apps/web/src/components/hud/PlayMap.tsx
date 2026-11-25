@@ -161,6 +161,7 @@ import {
   isMaterialSizeChange,
   mapBuildDecision,
   meAccuracyFeatures,
+  meAccuracyLayers,
   meDotMarkerStyle,
   otherResourceStale,
   pillTextForState,
@@ -178,6 +179,7 @@ import {
   shrinkFrame,
   syncSource,
   tileLedgerStale,
+  tilesStalledAfterMs,
   tryFitZone,
   TRAIL_DOT_RADIUS_PX,
   unknownErrorDetail,
@@ -287,6 +289,21 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // nothing paints. Set by the stall-guard effect below; cleared by
   // the next `render` frame, or by Retry / a fresh map.
   const [paintStalled, setPaintStalled] = useState(false);
+  // v34 (B1): the TILES signal — `mapReady` only means the style
+  // loaded. `tilesLoaded` is true once MapLibre reports every tile
+  // loaded ('idle' event, backstopped by `areTilesLoaded()`); until
+  // then the pill says "Loading map tiles…" instead of "Map ready".
+  // `tilesStalled` fires when the style has been ready 10 s with no
+  // tiles — the founder's black-map state — and the pill names it
+  // with a working Retry. Both reset on a fresh map; 'idle' clears
+  // the stall if the tiles land late.
+  const [tilesLoaded, setTilesLoaded] = useState(false);
+  const [tilesStalled, setTilesStalled] = useState(false);
+  const tilesStalledRef = useRef(false);
+  // v34 (B1): when the style became 'ready' — the watchdog measures
+  // the 10 s tile stall from here, not from creation (a slow style
+  // load must not eat the tiles' window).
+  const readyAtMsRef = useRef(0);
   // v33 FIX 4: bumped on every `style.load` (first load AND every
   // style reload, including the one after a context restore) — the
   // six overlay effects depend on it, so the runtime sources/layers
@@ -657,6 +674,11 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       setContextRestoring(false);
       setPaintStalled(false);
       paintStalledRef.current = false;
+      // v34 (B1): a fresh map gets a fresh tiles slate too.
+      setTilesLoaded(false);
+      setTilesStalled(false);
+      tilesStalledRef.current = false;
+      readyAtMsRef.current = 0;
       repaintRequestedAtMsRef.current = null;
       setAreaDiagnosis(null);
       setZeroWidth(false);
@@ -836,6 +858,19 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
             setPaintStalled(false);
           }
         });
+        // v34 (B1): the tiles-loaded signal. MapLibre fires 'idle'
+        // when the map has no ongoing transitions and all tiles are
+        // loaded (installed maplibre-gl 5.24.1) — that is the real
+        // signal the v33 render-frame stall guard could not give
+        // (a live loop with no tiles still renders frames). A late
+        // 'idle' also clears a fired stall: tiles that land late are
+        // a recovery, not a failure.
+        map.on('idle', () => {
+          if (cancelled) return;
+          tilesStalledRef.current = false;
+          setTilesStalled(false);
+          setTilesLoaded(true);
+        });
         // v33 FIX 4 (context restore): `style.load` fires on the
         // first load AND on every style (re)load, including the one
         // MapLibre triggers after a context restore (`_loaded` stays
@@ -863,6 +898,9 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
           loadedRef.current = true;
           setSlowLoad(false);
           setMapReady(true);
+          // v34 (B1): the tiles watchdog measures from the style
+          // landing, not from creation.
+          readyAtMsRef.current = Date.now();
           // 'ready' only AFTER the style loads — never before.
           setMapState('ready');
           setMapDetail('ready');
@@ -1187,6 +1225,31 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
       }
     }
   }, [nowMs, mapReady]);
+
+  // v34 (B1): the tiles watchdog + backstop, on the same 5 s clock
+  // as the stall guard (no new interval). Backstop first:
+  // `areTilesLoaded()` catches a map whose 'idle' fired before the
+  // listener attached (cached style, fast load). Then the watchdog:
+  // style ready 10 s with no tiles → stalled. A stalled map that
+  // later loads clears via the 'idle' listener above, not here.
+  useEffect(() => {
+    if (!mapReady || tilesLoaded) return;
+    const map = mapRef.current;
+    if (!map) return;
+    try {
+      if (typeof map.areTilesLoaded === 'function' && map.areTilesLoaded()) {
+        setTilesLoaded(true);
+        return;
+      }
+    } catch {
+      // Dead map: the stall guard / Retry below still covers it.
+    }
+    const now = nowMs ?? Date.now();
+    if (!tilesStalledRef.current && tilesStalledAfterMs(readyAtMsRef.current, now)) {
+      tilesStalledRef.current = true;
+      setTilesStalled(true);
+    }
+  }, [nowMs, mapReady, tilesLoaded]);
 
   // Ping circles (64-pt geodesic) are built once per ping set, not once
   // per clock tick — the old single overlay effect rebuilt every circle
@@ -1619,20 +1682,16 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
   // circle, from `meAccuracyFeatures` (play-map-logic.ts) — a
   // geodesic circle, untouched by the v29 dot change. Null /
   // non-finite fixes yield no features, never a NaN point.
+  // v34 (B2): the ring is LINE-ONLY (`meAccuracyLayers`) — the old
+  // fill layer drew a ±100 m fix as a ~105–175 px solid disc over a
+  // black map. The outline keeps the honest radius with no fill.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady) return;
     syncSource(
       map,
       'pakdam-me-accuracy',
-      [
-        {
-          id: 'pakdam-me-accuracy-fill',
-          type: 'fill',
-          source: 'pakdam-me-accuracy',
-          paint: { 'fill-color': 'rgba(239, 68, 68, 0.10)' },
-        },
-      ],
+      meAccuracyLayers(),
       collection(meAccuracyFeatures(myFix)),
     );
   }, [mapReady, myFix, nowMs, styleNonce]);
@@ -2168,6 +2227,11 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     // never "Map ready" either.
     contextRestoring,
     paintStalled,
+    // v34 (B1): a style with no tiles yet is never "Map ready"
+    // either — "Loading map tiles…" while pending, "Map tiles not
+    // loading — try Retry" once the watchdog fires.
+    !tilesLoaded,
+    tilesStalled,
   );
   // v31 (Fix 2): the Retry affordance is ONE tested mapping
   // (`shouldOfferMapRetry`) — a failed ◎ tap on a 'ready' map offers
@@ -2189,6 +2253,9 @@ export const PlayMap = memo(function PlayMap({ zoneBoundary, pings, noGoAreas, m
     contextLost,
     contextRestoring,
     paintStalled,
+    // v34 (B1): stalled tiles are a Retry escape — the black map
+    // with a "Map ready" pill had no working Retry.
+    tilesStalled,
   });
   // Zara 4: both Retry buttons stay disabled while a load is in flight
   // and for 2 s after a tap — spamming Retry aborts creation and can

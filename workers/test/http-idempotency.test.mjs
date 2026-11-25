@@ -124,8 +124,14 @@ test('err() carries the code field alongside error (additive envelope)', async (
   const res = err('Only the host can start.', 403, undefined, 'FORBIDDEN');
   assert.equal(res.status, 403);
   assert.deepEqual(await res.json(), { error: 'Only the host can start.', code: 'FORBIDDEN' });
+  // v34 delivery gate (zero-break bar): a codeless error is a silent
+  // failure the client cannot surface, so err() now DEFAULTS the code
+  // from the status (VALIDATION_FAILED for 400 here) when no explicit
+  // code is given. An explicit code still overrides the default.
   const plain = err('Plain.', 400);
-  assert.deepEqual(await plain.json(), { error: 'Plain.' }, 'no code param means no code field');
+  assert.deepEqual(await plain.json(), { error: 'Plain.', code: 'VALIDATION_FAILED' });
+  const server = err('Boom.', 500);
+  assert.deepEqual(await server.json(), { error: 'Boom.', code: 'SERVER_ERROR' });
 });
 
 test('DO add-player with the same key returns the cached reply with the ORIGINAL reconnectToken', async () => {

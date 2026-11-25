@@ -23,6 +23,15 @@ async function startWithDoFailure({ error, hostToken }) {
     fetch: async (_url, init) => {
       const body = JSON.parse(String(init?.body ?? '{}'));
       seenOp = body.op;
+      // v34 (Diya R3-N1) — handleStart verifies the host token in the
+      // DO BEFORE the seat limit, so the stub must model that op: the
+      // host's token verifies, and the start op itself is refused 409.
+      if (body.op === 'verify-host-token') {
+        return new Response(JSON.stringify({ ok: true, valid: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       return new Response(
         JSON.stringify({ ok: false, error, code: 'CONFLICT', status: 409 }),
         { status: 200, headers: { 'Content-Type': 'application/json' } },

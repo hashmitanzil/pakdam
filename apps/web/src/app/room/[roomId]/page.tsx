@@ -26,7 +26,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useRouter } from 'next/navigation';
 import type { MatchPhase, PlayerView, Room, RoomConfig } from '@pakdam/shared';
-import { MIN_PLAYERS, TERMINAL_PHASES } from '@pakdam/shared';
+import { TERMINAL_PHASES } from '@pakdam/shared';
 import { PakdamSocket } from '../../../lib/websocket';
 import type { WsSnapshotPayload } from '../../../lib/websocket';
 import { isFixSendableToServer, watchLocation } from '../../../lib/geolocation';
@@ -37,6 +37,7 @@ import {
   readHostGraceEndsAtMs,
   regenerateLiveRoomCode,
   removeLivePlayer,
+  shortStartBlocker,
   snapshotToLiveRoomState,
   startLiveMatch,
   updateLiveRoomConfig,
@@ -1030,8 +1031,17 @@ export default function LobbyPage() {
         <p className="text-[15px] text-white">
           {loadError ?? 'No live seat saved on this device for this room.'}
         </p>
-        <div className="mt-4">
-          <Button variant="primary" onClick={() => router.push('/')}>
+        {/* Scope D item 10: a transient first-paint failure must not
+            dead-end here — Retry re-runs the load (the setup page
+            already had one; this branch did not). No Retry when there
+            is no seat at all: nothing can reload then. */}
+        <div className="mt-4 flex flex-col gap-3">
+          {session !== null ? (
+            <Button variant="primary" onClick={retryConnection}>
+              Retry
+            </Button>
+          ) : null}
+          <Button variant="outline" onClick={() => router.push('/')}>
             Go home
           </Button>
         </div>
@@ -1069,15 +1079,11 @@ export default function LobbyPage() {
 
   const room = lobby.room;
   const pickingHunters = isHost && config.teamAssignment === 'selected';
-  // Start button label: "NEED 2+…" only while under the minimum. Once
-  // 2 players have joined the label is START GAME — grey (blocked) until
-  // the gate passes, red once it does. Tapping the grey button shows the
-  // gate reason (who is not ready / what is missing), so the label
-  // change does not bypass the readiness + teams gate.
-  const startLabel =
-    activePlayers.length < MIN_PLAYERS
-      ? `NEED ${MIN_PLAYERS}+ PLAYERS TO START`
-      : 'START GAME';
+  // Scope C item 7: the blocked Start button states its own blocker —
+  // not just "NEED 2+…" under the minimum, but "WAITING FOR PLAYERS"
+  // / "PICK HUNTERS FIRST" / "TOO MANY HUNTERS" for the other gates.
+  // The full reason (who is not ready) still shows on tap.
+  const startLabel = shortStartBlocker(gate.reason, activePlayers.length);
   const summary = formatRoomSummary(config, activePlayers.length);
 
   return (
@@ -1192,7 +1198,11 @@ export default function LobbyPage() {
             the deadline is the server's, and the client never
             computes it. */}
         {hostGraceActive ? (
-          <p className="text-[13px] text-[#F59E0B]" role="status">
+          <p
+            className="text-[13px] text-[#F59E0B]"
+            role="status"
+            aria-label="Waiting for the host to reconnect…"
+          >
             Waiting for the host to reconnect…
           </p>
         ) : null}

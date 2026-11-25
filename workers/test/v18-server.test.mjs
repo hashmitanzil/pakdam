@@ -404,6 +404,14 @@ async function replayWithDo(doBody, status = 200) {
       const body = JSON.parse(String(init?.body ?? '{}'));
       seenOp = body.op;
       seenBody = body;
+      // v34 (Diya R3-N1) — handleReplay verifies the host token in the
+      // DO BEFORE the seat limit, so the stub must model that op.
+      if (body.op === 'verify-host-token') {
+        return new Response(JSON.stringify({ ok: true, valid: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
       return new Response(JSON.stringify(doBody), {
         status,
         headers: { 'Content-Type': 'application/json' },

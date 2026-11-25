@@ -7,7 +7,7 @@
  * Text-only: DOM text and roles, no screenshots.
  */
 import { test, expect } from '@playwright/test';
-import { LIVE, collectPageErrors, expectNoHorizontalOverflow, expectNoPageErrors } from './helpers';
+import { LIVE, collectPageErrors, dismissOnboardingIfShown, expectNoHorizontalOverflow, expectNoPageErrors } from './helpers';
 
 test.describe('smoke', () => {
   test.skip(LIVE, 'demo-only spec — run without NEXT_PUBLIC_WORKER_URL');
@@ -40,6 +40,7 @@ test.describe('smoke', () => {
 
   test('JOIN A GAME goes to the join screen with the code input', async ({ page }) => {
     await page.goto('/');
+    await dismissOnboardingIfShown(page);
     await page.getByRole('button', { name: /JOIN A GAME/ }).click();
     await expect(page.getByRole('heading', { name: 'Join a game' })).toBeVisible();
     await expect(page.getByLabel('Room code')).toBeVisible();
@@ -50,6 +51,7 @@ test.describe('smoke', () => {
 
   test('HOST A GAME goes to mode select with both mode cards', async ({ page }) => {
     await page.goto('/');
+    await dismissOnboardingIfShown(page);
     await page.getByRole('button', { name: /HOST A GAME/ }).click();
     await expect(page.getByRole('heading', { name: 'Pick a mode' })).toBeVisible();
     await expect(page.getByLabel('Your codename')).toBeVisible();

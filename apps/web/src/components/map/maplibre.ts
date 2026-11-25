@@ -219,6 +219,11 @@ export interface MapLibreMapLike {
   off(event: string, handler: (...args: unknown[]) => void): void;
   getCenter(): { lng: number; lat: number };
   getZoom(): number;
+  /** True when all tiles for the current view are loaded (installed
+   *  maplibre-gl 5.x). v34 (B1): the tiles-loaded backstop for the
+   *  'idle' listener — optional so the test fake need not implement
+   *  it; the component guards with a typeof check. */
+  areTilesLoaded?(): boolean;
   /** Current bearing in degrees (0 = north up); the compass lock seeds
    *  its last-bearing from this when locking, so the first heading
    *  event does not snap the map (PlayMap toggleCompass). */

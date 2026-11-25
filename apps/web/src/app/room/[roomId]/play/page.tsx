@@ -55,6 +55,7 @@ import { Button } from '@/components/ui/Button';
 import { formatSuspendedLabel, formatOutsideCountdown } from '@/components/match/freshness';
 import { formatDurationShort, ageLabelFromTimestamp, haversineMeters } from '@/lib/utils';
 import { watchLocation, shouldSendFix, type GeolocationError, type LastSentFix, type WatchHandle } from '@/lib/geolocation';
+import { clockSkewNotice } from '@/lib/clock-skew';
 import { effectiveNowMs, GPS_DENIED_NOTICE, gpsNoFixNoticeForWatch, gpsStaleFixNotice, shouldEjectForMissingFix, shouldReassertSuspension, shouldWatchLocation } from '@/components/hud/play-map-logic';
 import { requestWakeLock } from '@/lib/wake-lock';
 import { clearSession } from '@/lib/session-credentials';
@@ -172,6 +173,7 @@ export default function PlayPage({
     socketState,
     socketError,
     lastSocketError,
+    clockSkewMs,
     demo,
     hostGraceEndsAtMs,
     myPlayerId,
@@ -677,9 +679,37 @@ export default function PlayPage({
     };
     startWatch();
     document.addEventListener('visibilitychange', onVisibility);
+    // v34 (R2-4): the re-send timer — a stationary phone's OS watch
+    // may never call back, so `shouldSendFix`'s 5 s leg never fires
+    // and the server purges `mem.latestFix` after 30 s (the next OK
+    // tap then fails STALE_LOCATION with both phones standing
+    // still). Every 5 s, re-assert the last SENT fix, re-stamped
+    // with now: the position is unchanged (no callback = no movement
+    // beyond the OS threshold), so this is a heartbeat, not a new
+    // observation — coordinates + accuracy are the last observed
+    // values, only the timestamp is refreshed. The send gate still
+    // applies (accuracy bound + 5 s leg), so a tick within 5 s of a
+    // live send is a no-op. Same lifecycle as the watch (same
+    // cleanup); paused while hidden.
+    const resendTimer = setInterval(() => {
+      if (stopped || document.hidden) return;
+      const last = lastSentFixRef.current;
+      if (!last) return;
+      const restamped: LocationFix = { ...last.fix, timestampMs: Date.now() };
+      if (restamped.accuracyMeters > MAX_FIX_ACCURACY_METERS) return;
+      if (!shouldSendFix(restamped, lastSentFixRef.current, Date.now())) return;
+      lastSentFixRef.current = { fix: restamped, sentAtMs: Date.now() };
+      if (mode === 'live') {
+        socketRef.current?.sendLocationUpdate(restamped);
+      } else {
+        const current = getRoom(roomId);
+        if (current) recordPlayerFix(current, myPlayerId, restamped);
+      }
+    }, 5000);
     return () => {
       stopped = true;
       document.removeEventListener('visibilitychange', onVisibility);
+      clearInterval(resendTimer);
       stopWatch();
     };
     // The watcher is created once per seat/mode/phase. `gpsRetryNonce`
@@ -719,6 +749,26 @@ export default function PlayPage({
       socketRef.current?.reportSuspended('unknown');
     }
   }, [socketState, gpsDenied, mode, myPlayer?.connectionState, myPlayer?.ejectedAt]);
+
+  // v34 (R2-5): re-seed on (re)connect — the DO's `mem.latestFix`
+  // is memory-only and starts empty after an eviction/wake, so a
+  // stationary Hunter's fix is gone server-side until their OS watch
+  // next fires (which may be never while standing still). On every
+  // (re)connect while ACTIVE with a last-sent fix, re-send it at
+  // once, re-stamped: the hello already resumed the seat, and this
+  // restores the fix the server lost. Bypasses the 5 s send throttle
+  // (a reconnect is a rare event, not a periodic send); the accuracy
+  // bound still applies. Live only — demo keeps fixes in the store,
+  // so there is nothing to re-seed.
+  useEffect(() => {
+    if (socketState !== 'connected' || phase !== 'ACTIVE') return;
+    if (mode !== 'live') return;
+    const last = lastSentFixRef.current;
+    if (!last || last.fix.accuracyMeters > MAX_FIX_ACCURACY_METERS) return;
+    const restamped: LocationFix = { ...last.fix, timestampMs: Date.now() };
+    lastSentFixRef.current = { fix: restamped, sentAtMs: Date.now() };
+    socketRef.current?.sendLocationUpdate(restamped);
+  }, [socketState, phase, mode]);
 
   // v33 (4405 companion / constraint 3): a terminal socket close
   // (4403 removed, 4405 ejected, 4404 room gone) ends the seat's
@@ -1563,7 +1613,11 @@ export default function PlayPage({
       />
 
       {hostGraceActive ? (
-        <p className="rounded-2xl border border-[#26262B] bg-[#141416] p-3 text-[13px] text-[#F59E0B]" role="status">
+        <p
+          className="rounded-2xl border border-[#26262B] bg-[#141416] p-3 text-[13px] text-[#F59E0B]"
+          role="status"
+          aria-label="Waiting for the host to reconnect…"
+        >
           Waiting for the host to reconnect…
         </p>
       ) : null}
@@ -1657,6 +1711,16 @@ export default function PlayPage({
           <span className="rounded-full bg-[#F59E0B] px-2 py-0.5 text-[12px] font-bold text-black">
             30s
           </span>
+        </div>
+      ) : null}
+
+      {/* v34 (R2-6): the clock-skew banner — a device clock >30 s off
+          the server makes every fix look stale server-side while the
+          client thinks it is fine. Shown above the GPS notice so the
+          real cause is named before any GPS troubleshooting. */}
+      {clockSkewMs !== null ? (
+        <div className="rounded-2xl border border-[#F59E0B] bg-[#141416] p-3" role="status">
+          <p className="text-[13px] text-[#F59E0B]">{clockSkewNotice(clockSkewMs)}</p>
         </div>
       ) : null}
 

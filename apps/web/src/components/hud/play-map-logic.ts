@@ -377,6 +377,12 @@ function pillTextForStateRaw(
   // return: the stall is one more ready-state problem, and Retry is
   // the escape.
   paintStalled = false,
+  // v34 (B1): the tiles signal — see the 'ready' branch. Defaults
+  // keep every pre-v34 call (all of them pass neither) on the old
+  // behaviour: a map whose tiles loaded before this flag existed
+  // still reads 'Map ready'.
+  tilesPending = false,
+  tilesStalled = false,
 ): string {
   if (mapState === 'ready' && contextLost) {
     return 'Map graphics lost — try Retry';
@@ -423,6 +429,23 @@ function pillTextForStateRaw(
     if (paintStalled) {
       parts.push('Map isn\u2019t painting — try Retry');
     }
+    // v34 (B1): the TILES signal. `mapState === 'ready'` only means
+    // the STYLE loaded — the founder's black map had a live loop, a
+    // painted-size canvas and a "Map ready" pill while no tile ever
+    // painted (loop-alive ≠ tiles-loaded). While tiles are still
+    // loading the pill says so honestly; once the watchdog fires
+    // (`tilesStalled`) it names the failure and Retry is the escape.
+    // Both are parts, so either one suppresses "Map ready". The flag
+    // is named `tilesPending` and defaults FALSE, like every other
+    // flag in this function (defaults = healthy map; a problem must
+    // be passed explicitly) — the production caller passes the real
+    // value, and a legacy caller that never heard of tiles keeps the
+    // old output instead of gaining a spurious pending part.
+    if (tilesStalled) {
+      parts.push('Map tiles not loading — try Retry');
+    } else if (tilesPending) {
+      parts.push('Loading map tiles…');
+    }
     if (fitPending) {
       parts.push('Camera moving to the zone…');
     }
@@ -465,6 +488,8 @@ export function pillTextForState(
   contextLost = false,
   contextRestoring = false,
   paintStalled = false,
+  tilesPending = false,
+  tilesStalled = false,
 ): string {
   return redactKeyValues(
     pillTextForStateRaw(
@@ -485,8 +510,24 @@ export function pillTextForState(
       contextLost,
       contextRestoring,
       paintStalled,
+      tilesPending,
+      tilesStalled,
     ),
   );
+}
+
+/**
+ * v34 (B1): the tiles watchdog. The style is 'ready' at `readyAtMs`;
+ * if the map's tiles have still not loaded `TILE_STALL_MS` later,
+ * the loop is alive but nothing is painting — the founder's black-map
+ * state — and the pill must say so instead of "Map ready". 10 s: a
+ * healthy tile fetch on mobile data lands in 1–3 s; 10 s is past any
+ * normal fetch, before any human gives up. Pure function, unit-pinned.
+ */
+export const TILE_STALL_MS = 10_000;
+
+export function tilesStalledAfterMs(readyAtMs: number, nowMs: number): boolean {
+  return readyAtMs > 0 && nowMs - readyAtMs >= TILE_STALL_MS;
 }
 
 export type MapErrorClassification =
@@ -1731,6 +1772,12 @@ export function shouldOfferMapRetry(input: {
   // paints are otherwise unrecoverable without reopening the PWA.
   contextRestoring?: boolean;
   paintStalled?: boolean;
+  // v34 (B1): tiles that never loaded after the style did are a
+  // Retry escape too — the black map with a "Map ready" pill had NO
+  // working Retry, because no failure was ever surfaced. Pending
+  // tiles (not yet stalled) are NOT an escape: they resolve on their
+  // own or trip the watchdog.
+  tilesStalled?: boolean;
 }): boolean {
   if (input.mapState !== 'ready') return true;
   return (
@@ -1743,7 +1790,8 @@ export function shouldOfferMapRetry(input: {
     input.recentreFailed ||
     input.contextLost ||
     input.contextRestoring === true ||
-    input.paintStalled === true
+    input.paintStalled === true ||
+    input.tilesStalled === true
   );
 }
 
@@ -2019,6 +2067,34 @@ export function meAccuracyFeatures(
       circlePolygon({ lng: myFix.lng, lat: myFix.lat }, radius, 64),
       {},
     ),
+  ];
+}
+
+/**
+ * v34 (B2 — the giant red disc): the accuracy ring's LAYERS. The
+ * v28 ring was a `fill` layer (`rgba(239, 68, 68, 0.10)`) — honest
+ * in itself, but a ±100 m fix in a 500 m zone draws a ~105–175 px
+ * disc, and over a black (tile-less) map that 10% fill is the only
+ * colour on screen, so it reads as a giant solid blob with the
+ * 18 px dot lost in its centre (the founder's screenshot). A filled
+ * disc can never look like a locator at that size. The ring is now
+ * LINE-ONLY: a thin (1.5 px) red outline at the fix's true accuracy
+ * radius — the radius is still the honest accuracy (no precision is
+ * invented, no cap), but nothing fills the disc. Small dot + faint
+ * ring, the way a locator should read, even for a rough fix, even
+ * over a black map.
+ */
+export function meAccuracyLayers(): Record<string, unknown>[] {
+  return [
+    {
+      id: 'pakdam-me-accuracy-ring',
+      type: 'line',
+      source: 'pakdam-me-accuracy',
+      paint: {
+        'line-color': 'rgba(239, 68, 68, 0.65)',
+        'line-width': 1.5,
+      },
+    },
   ];
 }
 

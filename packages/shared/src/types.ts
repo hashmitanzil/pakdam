@@ -595,6 +595,16 @@ export interface WsSnapshotPayload {
    * wake. Every snapshot leaving the DO carries it.
    */
   epochMs: number;
+  /**
+   * v34 (Diya R2-5) — the viewer's live fix is missing server-side
+   * although this seat has reported before (durable `lastFixAt` set,
+   * no live fix in memory): the DO was evicted/woken and `mem` was
+   * rebuilt empty. The client should re-send its last known fix on
+   * seeing this (debounced — once per flag flip, not per snapshot).
+   * False when the seat never reported (nothing to re-send) or the
+   * phase is not live. Additive: older clients ignore it.
+   */
+  fixReseedNeeded?: boolean;
 }
 
 /** Client → server envelope. Retries reuse the same `commandId`; the DO drops repeats for 10 min. */
@@ -641,6 +651,7 @@ export type WsErrorCode =
   | 'CATCH_EXPIRED'
   | 'CATCH_DISPUTED'
   | 'STALE_LOCATION'
+  | 'CLOCK_SKEW'
   | 'CONFLICT'
   | 'SERVER_ERROR'
   | 'SERVICE_UNAVAILABLE';

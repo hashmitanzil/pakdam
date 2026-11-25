@@ -37,6 +37,7 @@ import type {
   WsServerEnvelope,
 } from '@pakdam/shared';
 import { PakdamSocket } from '@/lib/websocket';
+import { detectClockSkew } from '@/lib/clock-skew';
 import { fetchLiveRoomState, LiveHttpError, readHostGraceEndsAtMs } from '@/lib/live-room-client';
 import { clearRejoinToken, refreshRejoinToken } from '@/lib/rejoin-token';
 import { buildSnapshotKey } from '@/lib/snapshot-key';
@@ -103,7 +104,21 @@ export interface RoomStateData {
    * instead of wedging. `socketError` (the plain string) stays for the
    * generic banners; this is the structured, per-envelope companion.
    */
-  lastSocketError: { code: WsErrorCode; message: string; atMs: number } | null;
+  lastSocketError: {
+    code: WsErrorCode;
+    message: string;
+    atMs: number;
+    /** Follow-up A: the `requestId` the server echoed on this error envelope (the failed command's `commandId`), when it sent one. */
+    requestId?: string;
+  } | null;
+  /**
+   * v34 (R2-6): device-clock skew vs the server clock, in ms
+   * (device minus server; null when in sync or unknown). A device
+   * >30 s off makes every fix look stale to the server while the
+   * client thinks it is fine — the play + catch pages show the
+   * plain-words banner from this. Demo has no socket, so null.
+   */
+  clockSkewMs: number | null;
   /**
    * v18 follow-up — the direct `catch.runner-token` reply: the Runner's
    * own claim-less QR token, once, to the Runner only. The catch page
@@ -263,7 +278,17 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     code: WsErrorCode;
     message: string;
     atMs: number;
+    /** Follow-up A: the `requestId` the server echoed on this error envelope, when it sent one. */
+    requestId?: string;
   } | null>(null);
+  // v34 (R2-6): device-clock skew vs the server clock, in ms
+  // (device minus server; null when in sync). Every server envelope
+  // carries the DO's `serverTs`; a device >30 s off makes every fix
+  // look stale to the server while the client thinks it is fine.
+  // Set from onServerMessage below; read by the play + catch pages
+  // for the plain-words banner. Demo has no socket, so no skew.
+  const [clockSkewMs, setClockSkewMs] = useState<number | null>(null);
+  const lastReportedSkewMsRef = useRef<number | null>(null);
   const [lastRunnerToken, setLastRunnerToken] = useState<{
     token: string;
     runnerId: string;
@@ -710,6 +735,20 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       },
       onServerMessage: (envelope: WsServerEnvelope) => {
         if (cancelled) return;
+        // v34 (R2-6): clock-skew detection on EVERY server envelope
+        // — the DO's `serverTs` is the server's clock at send time.
+        // Only report a change (crossing the 30 s threshold, or
+        // moving >5 s), so a message storm doesn't re-render on
+        // every envelope.
+        const skew = detectClockSkew(envelope.serverTs, Date.now());
+        const prevSkew = lastReportedSkewMsRef.current;
+        if (
+          (prevSkew === null) !== (skew === null) ||
+          (prevSkew !== null && skew !== null && Math.abs(skew - prevSkew) > 5000)
+        ) {
+          lastReportedSkewMsRef.current = skew;
+          setClockSkewMs(skew);
+        }
         // `room.deleted` — the host cancelled and the server deleted the
         // room (founder decision, 2026-11-21). It is NOT in the frozen
         // @pakdam/shared catalogue (that package is out of scope for
@@ -978,7 +1017,18 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
       onError: (err: WsErrorPayload) => {
         if (!cancelled) {
           setSocketError(err.message);
-          setLastSocketError({ code: err.code, message: err.message, atMs: Date.now() });
+          setLastSocketError({
+            code: err.code,
+            message: err.message,
+            atMs: Date.now(),
+            // Follow-up A: carry the server's echoed requestId through
+            // so the catch page can match this envelope to the exact
+            // command it rejects (a location.update STALE_LOCATION
+            // must not read as a self-confirm failure).
+            ...(typeof err.requestId === 'string' && err.requestId !== ''
+              ? { requestId: err.requestId }
+              : {}),
+          });
           // A5 rollback, by error CODE — not by message-text regex. The
           // old `/radio/i` test missed the two rejections that matter
           // most: the rate limit ("Too many messages — slow down.",
@@ -1183,6 +1233,7 @@ export function useRoomState(roomId: string, options?: UseRoomStateOptions): Roo
     socketState,
     socketError,
     lastSocketError,
+    clockSkewMs,
     lastRunnerToken,
     hostGraceEndsAtMs,
     demo,

@@ -333,7 +333,23 @@ export function checkCatchProximity(input: {
   maxDistanceMeters?: number;
 }): CatchResult<void> {
   const maxDistanceMeters = input.maxDistanceMeters ?? CATCH_MAX_DISTANCE_METERS;
+  // v34 (Diya R2-9) — the reason names WHOSE fix is the problem. The
+  // old single message ("Waiting for GPS — move closer and try again")
+  // was shown to the Runner for every cause, including a coarse
+  // HUNTER fix, while both phones stood together — the Runner could
+  // not tell whose GPS was at fault. The code stays STALE_LOCATION
+  // for all of these (the client branches on it); only the reason
+  // distinguishes. This changes no acceptance rule: the ±50 m
+  // accuracy leg and the 60 s freshness leg are untouched (F1 stays
+  // a founder call).
   if (input.hunterFix === null || input.runnerFix === null) {
+    if (input.hunterFix === null) {
+      return {
+        ok: false,
+        code: 'STALE_LOCATION',
+        reason: "Waiting for the Hunter's GPS — they have no fix yet.",
+      };
+    }
     return {
       ok: false,
       code: 'STALE_LOCATION',
@@ -344,6 +360,13 @@ export function checkCatchProximity(input: {
     input.nowMs - input.hunterFix.timestampMs > STALE_FIX_MS ||
     input.nowMs - input.runnerFix.timestampMs > STALE_FIX_MS
   ) {
+    if (input.nowMs - input.hunterFix.timestampMs > STALE_FIX_MS) {
+      return {
+        ok: false,
+        code: 'STALE_LOCATION',
+        reason: "The Hunter's GPS fix is stale — wait for it to refresh, then try again.",
+      };
+    }
     return {
       ok: false,
       code: 'STALE_LOCATION',
@@ -362,10 +385,17 @@ export function checkCatchProximity(input: {
     input.hunterFix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M ||
     input.runnerFix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M
   ) {
+    if (input.hunterFix.accuracyMeters > ZONE_AUTO_CENTRE_MAX_ACCURACY_M) {
+      return {
+        ok: false,
+        code: 'STALE_LOCATION',
+        reason: `The Hunter's GPS is too rough (±${Math.round(input.hunterFix.accuracyMeters)} m) — wait for a better lock, then try again.`,
+      };
+    }
     return {
       ok: false,
       code: 'STALE_LOCATION',
-      reason: 'Waiting for GPS — move closer and try again.',
+      reason: `Your GPS is too rough (±${Math.round(input.runnerFix.accuracyMeters)} m) — wait for a better lock, then try again.`,
     };
   }
   const distance = haversineMeters(input.hunterFix, input.runnerFix);
@@ -458,8 +488,9 @@ export function requestCatch(input: {
   hunterFix: LocationFix | null;
   runnerFix: LocationFix | null;
   /**
-   * Latest fixes for both seats (the DO passes `mem.latestFix` for the
-   * Hunter and the Runner). When given, the physical-tag gate runs on
+   * Latest fixes for both seats (the DO passes `mem.latestFixForCatch`
+   * for the Hunter and the Runner — the gate-only map, purged at the
+   * gate's 60 s window). When given, the physical-tag gate runs on
    * these; otherwise it runs on `hunterFix` / `runnerFix`.
    */
   positions?: { hunter: LocationFix | null; runner: LocationFix | null };
