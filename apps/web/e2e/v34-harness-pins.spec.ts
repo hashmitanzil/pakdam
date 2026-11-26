@@ -232,7 +232,23 @@ test.describe('v34 harness pins (demo)', () => {
     await forceDemoMatchEnd(hostPage, roomId);
     await hostPage.goto(`/room/${roomId}/results`);
     await expect(hostPage.getByText('MATCH OVER')).toBeVisible();
-    await expect(hostPage.getByText(new RegExp(`${hunterName}.*${runnerName}|${runnerName}.*${hunterName}`))).toBeVisible();
+    // v36 (Meera): the bare /Ben.*Teo|Teo.*Ben/ pattern matched TWO
+    // elements — the scores list ('Ana10 ptsBen3 ptsTeo0 pts') and the
+    // timeline (':01 Ben tagged Teo'). Latent test bug, unmasked by v35
+    // (the pin used to fail earlier, at the confirm step, so it never
+    // reached this line). Fixed by scoping to the timeline AND requiring
+    // the timeline row's own shape: the timeline has no role/label of its
+    // own (ResultsTimeline.tsx renders a bare div; the results page wraps
+    // it in an unlabelled card under an <h2>What happened</h2>), so the
+    // card is located by that heading and the row must read
+    // '{m:ss} {hunter} tagged {runner}' (formatAgeLabel is m:ss, e.g.
+    // '0:07'). The scores list contains neither 'tagged' nor a time, so
+    // this can only match the timeline row — and the single direction
+    // proves which hunter tagged which runner, with the time.
+    const timeline = hostPage.locator('div:has(> h2:text-is("What happened"))');
+    await expect(
+      timeline.getByText(new RegExp(`\\d+:\\d{2} ${hunterName} tagged ${runnerName}`)),
+    ).toBeVisible();
     stopKeepFresh();
     await context.close();
   });

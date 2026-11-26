@@ -61,17 +61,28 @@ test.describe('join + lobby (demo)', () => {
     // No room code on the create screen — the room does not exist yet.
     await expect(hostPage.getByText('Game code')).toBeHidden();
     // Mode card.
-    await expect(hostPage.getByText('Game mode')).toBeVisible();
+    // v36 (Meera): 'Game mode' gets exact:true like the block below —
+    // it is a short label of the same substring-collision class.
+    await expect(hostPage.getByText('Game mode', { exact: true })).toBeVisible();
     await expect(hostPage.getByText("Tagged? You're out. Watch live.")).toBeVisible();
     await expect(hostPage.getByRole('button', { name: 'Change', exact: true })).toBeVisible();
     // Rules + teams.
+    // v36 (Meera): every label here gets exact:true. The active preset
+    // line (house-rules.ts — default config matches Standard: 'The usual
+    // game — 30 minutes, 500 m zone, pings every 3 minutes.') contains
+    // 'Pings every' as a substring, so the bare getByText strict-violated
+    // at :70 (preset line + <span class="pakdam-label">). The 'Shrinks
+    // every' hint ('Auto from the round length — 3 shrinks per game.')
+    // likewise contains 'round length' — that is why :68 was already
+    // exact. The other labels have no second leaf today, but exact:true
+    // pins them against the next preset/hint wording change instead.
     await expect(hostPage.getByText('Round length', { exact: true })).toBeVisible();
-    await expect(hostPage.getByText('Head start')).toBeVisible();
-    await expect(hostPage.getByText('Pings every')).toBeVisible();
-    await expect(hostPage.getByText('Zone shrinks')).toBeVisible();
-    await expect(hostPage.getByText('Play zone')).toBeVisible();
-    await expect(hostPage.getByText('Balance hunters')).toBeVisible();
-    await expect(hostPage.getByText('Random hunters')).toBeVisible();
+    await expect(hostPage.getByText('Head start', { exact: true })).toBeVisible();
+    await expect(hostPage.getByText('Pings every', { exact: true })).toBeVisible();
+    await expect(hostPage.getByText('Zone shrinks', { exact: true })).toBeVisible();
+    await expect(hostPage.getByText('Play zone', { exact: true })).toBeVisible();
+    await expect(hostPage.getByText('Balance hunters', { exact: true })).toBeVisible();
+    await expect(hostPage.getByText('Random hunters', { exact: true })).toBeVisible();
     // P1-26: the dead "Show ping history" toggle is removed.
     await expect(hostPage.getByText('Show ping history')).toBeHidden();
     await expect(
