@@ -915,7 +915,7 @@ export default function SetupPage() {
       <div className="mt-4 flex flex-col gap-3">
         {config.playZoneEnabled !== false && zone ? (
           <section
-            aria-label="Play area"
+            aria-label="Play zone"
             className="rounded-[16px] border border-[#26262B] bg-[#141416] p-4"
           >
             <p className="pakdam-label">Play area</p>

@@ -337,7 +337,7 @@ test('C5/C6/C7 (wiring): setup has presets, sections with explainers, and a bloc
   assert.ok(controls.includes('How many Hunters the match draws.'), 'every control has its line — Hunters stepper included');
   assert.ok(controls.includes('The zone is on — runners must stay inside it.'), 'the Play zone toggle explains itself when on, too');
   const setup = readSrc('app/room/[roomId]/setup/page.tsx');
-  assert.ok(setup.includes('aria-label="Play area"'), 'section: Play area');
+  assert.ok(setup.includes('aria-label="Play zone"'), 'section: Play zone');
   assert.ok(setup.includes('Circle: one round zone. Draw: your own shape'), 'the shape switch explains itself');
   assert.ok(setup.includes('<HouseRulesPresets'), 'the presets sit above the steppers on the setup screen');
   assert.ok(setup.includes('PLACE AT LEAST 3 CORNERS'), 'CREATE LOBBY states its zone blocker');

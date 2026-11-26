@@ -65,3 +65,16 @@ jobs:
       # tests executed, which hid the gap. See root package.json `test`.
       - name: Unit tests
         run: pnpm test
+
+      # v35: Playwright writes its failure snapshots (error-context.md per
+      # failed test, plus any traces/screenshots) to apps/web/test-results/
+      # on the runner — but without an upload step that directory was
+      # discarded with the runner, so NO failure artifact ever existed on
+      # GitHub (v31–v34 all had to guess from pasted excerpts). Upload on
+      # failure only, so passing runs stay clean; default retention.
+      - name: Upload Playwright failure snapshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: apps/web/test-results/

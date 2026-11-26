@@ -43,7 +43,7 @@ test.describe('v34 Scope C (demo)', () => {
     await dialog.getByRole('button', { name: 'Next', exact: true }).click();
     await expect(dialog.getByText('The zone keeps shrinking')).toBeVisible();
     await dialog.getByRole('button', { name: 'Next', exact: true }).click();
-    await expect(dialog.getByText('Your turn')).toBeVisible();
+    await expect(dialog.getByRole('heading', { name: 'Your turn' })).toBeVisible();
     await dialog.getByRole('button', { name: 'Skip', exact: true }).click();
     await expect(dialog).toBeHidden();
     // Reload: seen, so the cards never auto-show again.
@@ -107,8 +107,9 @@ test.describe('v34 Scope C (demo)', () => {
       'aria-pressed',
       'true',
     );
-    // Round length now reads 10 min.
-    await expect(page.locator('section[aria-label="Timing"]').getByText('10m').first()).toBeVisible();
+    // Round length now reads '10 min' (formatDurationShort(600) —
+    // utils.ts:44-49 — never '10m').
+    await expect(page.locator('section[aria-label="Timing"]').getByText('10 min').first()).toBeVisible();
     // Change a stepper: the preset drops to Custom with the Save line.
     await setStepper(page, 'Round length', 1); // 10 min -> 15 min
     await expect(page.getByText('Changed. Save them to pick them next time.')).toBeVisible();
@@ -144,7 +145,10 @@ test.describe('v34 Scope C (demo)', () => {
     const context = await newCentredDemoContext(browser);
     const page = await context.newPage();
     await createHostSetupRoom(page);
-    await page.getByRole('button', { name: 'Draw', exact: true }).click();
+    // Shape labels are lowercase DOM text ('circle'/'draw') with
+    // CSS-only capitalisation (setup/page.tsx:930-940) — exact: true
+    // is case-sensitive, so 'Draw' can never match.
+    await page.getByRole('button', { name: 'draw', exact: true }).click();
     // A fresh Draw has the circle sampled as 6 corners — remove them all
     // with the Corners stepper, then the CTA must block with its reason.
     await setStepper(page, 'Corners', 0);
@@ -164,8 +168,10 @@ test.describe('v34 Scope C (demo)', () => {
     const { hostPage, guestPages, code } = await setupThreePlayerLobby(context);
     void code;
     // Two guests joined; the host is ready, the guests are not.
+    // The blocked button carries the ▶ prefix (room/[roomId]/page.tsx:1247),
+    // so the exact name is '▶ WAITING FOR PLAYERS'.
     await expect(
-      hostPage.getByRole('button', { name: 'WAITING FOR PLAYERS', exact: true }),
+      hostPage.getByRole('button', { name: '▶ WAITING FOR PLAYERS', exact: true }),
     ).toBeVisible();
     await readyAll(guestPages);
     await expect(hostPage.getByRole('button', { name: 'START GAME', exact: true })).toBeVisible();

@@ -30,6 +30,15 @@
  *    P0-1 resume and runs no GPS watcher);
  *  - the three specs harbour both seats before any claim/confirm.
  *
+ * These tests pin the mechanism the spec fix relies on:
+ *  - a suspended Runner blocks the Hunter's claim; resuming the
+ *    Runner (the P0-1 arrival resume) restores the claim;
+ *  - a suspended Hunter blocks a claim AND a Runner self-confirm;
+ *    resuming the Hunter restores both;
+ *  - the catch page itself cannot re-suspend the seat (it mounts the
+ *    P0-1 resume and runs no GPS watcher);
+ *  - the three specs harbour both seats before any claim/confirm.
+ *
  * Harness mirrors v30-happy-path.test.mjs (demo store direct, no DOM,
  * no network). Timer hygiene: a host suspension schedules one 30 s
  * wake-up timer, so every test that suspends the host ends with a

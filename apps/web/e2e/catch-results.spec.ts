@@ -264,15 +264,15 @@ test.describe('catch → results (demo)', () => {
     }
     // v34 (Meera — probe zz-probe-172): after Replay everyone is
     // un-ready, so the gate is closed and the host sees the BLOCKED
-    // button ("▶ START GAME"), not the exact 'START GAME' CTA — the
-    // gate requires every seat ready (canStartDemoMatch), and the
-    // blocked tap shows the reason. The old assertion expected the
-    // exact CTA with 0 ready players, which the product can never
-    // show. Ready all three seats and the gate opens: that is the
+    // button — '▶ WAITING FOR PLAYERS' (shortStartBlocker on the
+    // 'Waiting for: …' reason; the open button renders plain
+    // 'START GAME' with no ▶ prefix, room/[roomId]/page.tsx:1240-1247,
+    // so '▶ START GAME' can never render). The blocked tap shows the
+    // reason. Ready all three seats and the gate opens: that is the
     // "host can start again" the test means to prove.
-    await expect(hostPage.getByRole('button', { name: '▶ START GAME', exact: true })).toBeVisible();
-    await hostPage.getByRole('button', { name: '▶ START GAME', exact: true }).click();
-    await expect(hostPage.getByText(/Waiting for:/)).toBeVisible();
+    await expect(hostPage.getByRole('button', { name: '▶ WAITING FOR PLAYERS', exact: true })).toBeVisible();
+    await hostPage.getByRole('button', { name: '▶ WAITING FOR PLAYERS', exact: true }).click();
+    await expect(hostPage.getByText('Waiting for: Teo, Ana, Ben.')).toBeVisible();
     for (const page of [hostPage, ...guestPages]) {
       await page.getByRole('button', { name: "I'm ready", exact: true }).click();
       await expect(page.getByRole('button', { name: /I'm ready — tap to change/ })).toBeVisible();

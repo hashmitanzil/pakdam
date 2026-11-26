@@ -24,12 +24,14 @@ import {
   GUEST_NAMES,
   HOST_NAME,
   LIVE,
+  OLA_KEY_SET,
   collectPageErrors,
   createHostRoom,
-  dismissOnboardingIfShown,
+  createHostSetupRoom,
   expectNoHorizontalOverflow,
   expectNoPageErrors,
   forceDemoMatchEnd,
+  getDemoRoom,
   joinRoomAsGuest,
   newCentredDemoContext,
   resumeSeatViaCatchPage,
@@ -89,10 +91,12 @@ test.describe('v34 harness pins (demo)', () => {
   }) => {
     const context = await newCentredDemoContext(browser);
     const hostPage = await context.newPage();
-    await hostPage.goto('/');
-    await dismissOnboardingIfShown(hostPage);
-    await expect(hostPage.getByRole('button', { name: /HOST A GAME/ })).toBeVisible();
-    await hostPage.getByRole('button', { name: /HOST A GAME/ }).click();
+    // HOST A GAME lands on /create/mode (Pick a mode); the steppers
+    // live only on /room/[id]/setup, reached via codename + on-site
+    // checkbox + mode click — createHostSetupRoom does that whole
+    // path (helpers.ts). Going no further than /create/mode finds
+    // zero /Decrease/ buttons.
+    await createHostSetupRoom(hostPage);
     // No sliders anywhere on setup (the v20 founder repro: sliders
     // still present). Every number is a minus/plus stepper.
     await expect(hostPage.locator('input[type="range"]')).toHaveCount(0);
@@ -113,8 +117,14 @@ test.describe('v34 harness pins (demo)', () => {
     await showTab(hostPage);
     await hostPage.bringToFront();
     await expect(guestPage.getByText('Waiting for the host to reconnect…')).toBeHidden({ timeout: 15000 });
-    // The host is still the host: START GAME is theirs alone.
-    await expect(hostPage.getByRole('button', { name: 'START GAME', exact: true })).toBeVisible();
+    // The host is still the host: the host-only blocked bar
+    // '▶ WAITING FOR PLAYERS' is theirs alone — the guest sees the
+    // host-only bar 'WAITING FOR THE HOST TO START' instead, and has
+    // no START GAME button at all. (Diya round 1: the wait line
+    // appearing + hiding proves grace works, but only this pair
+    // proves the crown stayed with the host.)
+    await expect(hostPage.getByRole('button', { name: '▶ WAITING FOR PLAYERS', exact: true })).toBeVisible();
+    await expect(guestPage.getByRole('button', { name: 'WAITING FOR THE HOST TO START', exact: true })).toBeVisible();
     await expect(guestPage.getByRole('button', { name: 'START GAME', exact: true })).toHaveCount(0);
     await context.close();
   });
@@ -165,14 +175,27 @@ test.describe('v34 harness pins (demo)', () => {
     const runnerName = names[runnerIdx]!;
     // The founder's Way 2 repro: catch page loads, shows the hunter
     // name, tapping them + OK "doesn't work". The tag must complete.
+    // v35 (Kabir): the pin had TWO independent defects. (1) Missing
+    // harbour: requestCatch rejects a suspended Hunter
+    // (demo-store.ts:744-745), and the hunter's tab is backgrounded /
+    // suspended with probability 2/3 (roles random, pages created
+    // host → guest 1 → guest 2, each newPage() backgrounds the
+    // previous tab) — so OK threw and only a red notice showed on
+    // the runner's page. Harbour the hunter FIRST, like the
+    // originals (catch-nav.spec.ts:181-182). (2) Wrong page: '✓ Catch
+    // confirmed' renders ONLY on the catch page (catch/page.tsx:1208,
+    // sole renderer) — the pin asserted it on the hunter's /play
+    // page, which never renders it. Prove the tag on the runner's
+    // page first, then navigate the hunter to /catch.
+    await resumeSeatViaCatchPage(hunterPage, roomId, hunterName);
     await resumeSeatViaCatchPage(runnerPage, roomId, runnerName);
     await runnerPage.goto(`/room/${roomId}/catch`);
     await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
-    await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
-    await runnerPage.goto(`/room/${roomId}/catch`);
     await expect(runnerPage.getByText('You were tagged', { exact: true })).toBeVisible();
+    await hunterPage.goto(`/room/${roomId}/catch`);
+    await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
     stopKeepFresh();
     await context.close();
   });
@@ -192,11 +215,19 @@ test.describe('v34 harness pins (demo)', () => {
     const runnerPage = pages[runnerIdx]!;
     const hunterName = names[hunterIdx]!;
     const runnerName = names[runnerIdx]!;
+    // Same Way 2 pattern as the pin above (v35 Kabir): harbour the
+    // hunter first (requestCatch rejects a suspended Hunter,
+    // demo-store.ts:744-745), prove the tag on the runner's page,
+    // then navigate the hunter to /catch — '✓ Catch confirmed'
+    // renders only there (catch/page.tsx:1208).
+    await resumeSeatViaCatchPage(hunterPage, roomId, hunterName);
     await resumeSeatViaCatchPage(runnerPage, roomId, runnerName);
     await runnerPage.goto(`/room/${roomId}/catch`);
     await runnerPage.getByRole('button', { name: 'Self confirm', exact: true }).click();
     await runnerPage.getByRole('button', { name: hunterName, exact: true }).click();
     await runnerPage.getByRole('button', { name: 'OK', exact: true }).click();
+    await expect(runnerPage.getByText('You were tagged', { exact: true })).toBeVisible();
+    await hunterPage.goto(`/room/${roomId}/catch`);
     await expect(hunterPage.getByText('✓ Catch confirmed')).toBeVisible({ timeout: 15000 });
     await forceDemoMatchEnd(hostPage, roomId);
     await hostPage.goto(`/room/${roomId}/results`);
@@ -206,16 +237,49 @@ test.describe('v34 harness pins (demo)', () => {
     await context.close();
   });
 
-  test('live-hud:54/207 — the front tab polls to connected and stays there; the HUD never wedges on suspended', async ({
+  test('live-hud:54/207 — the front tab suspends on hide and polls back to connected on return; the HUD never wedges on suspended', async ({
     browser,
   }) => {
     test.setTimeout(120000);
     const context = await newCentredDemoContext(browser);
-    const { hostPage, guestPages } = await startDemoMatch(context);
+    const { hostPage, guestPages, roomId } = await startDemoMatch(context);
     const stopKeepFresh = startCentreFixKeepFresh(context);
-    // live-hud:54 was a poll for 'connected' that timed out while the
-    // seat stayed 'suspended'. The front tab must read connected.
-    await expect(hostPage.getByText(/connected/i)).toBeVisible({ timeout: 20000 });
+    // v35 (Diya round 1): the old pin polled for the WORD 'connected'
+    // — it never renders, and that is by design, not a gap: the HUD
+    // communicates state in words only when it matters (the
+    // 'Suspended — location unknown' banner); silence when connected
+    // is the design. The original live-hud.spec.ts status-strip test
+    // contains no 'connected' poll either (v34 removed it). So the
+    // property "front tab polls to connected" is pinned as STATE,
+    // via getDemoRoom polling of connectionState — the same read
+    // resumeSeatViaCatchPage uses — with the banner as the visible
+    // half: hide the front tab (state must flip to 'suspended' and
+    // the banner must appear), bring it back (state must flip to
+    // 'connected' and the banner must clear), and the status strip
+    // must stay live throughout ('Time left' + 'Runners left 2 of 2').
+    // bringToFront alone resumes nothing in headless (v34): the
+    // hide/show is driven with the dispatched visibilitychange the
+    // passing live-hud.spec suspended-banner test uses (same
+    // hideTab/showTab helpers as the host-grace pin above).
+    const hostState = async (): Promise<string | undefined> =>
+      (await getDemoRoom(hostPage, roomId))?.players.find((p) => p.displayName === HOST_NAME)
+        ?.connectionState;
+    await hostPage.bringToFront();
+    await hideTab(hostPage);
+    await expect.poll(hostState, { timeout: 15000 }).toBe('suspended');
+    await expect(hostPage.getByText(/Suspended — location unknown/)).toBeVisible({ timeout: 15000 });
+    await expect(hostPage.getByText('Time left')).toBeVisible();
+    await showTab(hostPage);
+    await expect.poll(hostState, { timeout: 15000 }).toBe('connected');
+    await expect(hostPage.getByText(/Suspended — location unknown/)).toBeHidden({ timeout: 15000 });
+    await expect(hostPage.getByText('Time left')).toBeVisible();
+    await expect(hostPage.getByText(/Runners left 2 of 2/)).toBeVisible();
+    // Stays connected, not a flash: one more poll tick later the
+    // state is still 'connected', the banner is still gone and the
+    // strip is still live.
+    await hostPage.waitForTimeout(3000);
+    await expect.poll(hostState, { timeout: 15000 }).toBe('connected');
+    await expect(hostPage.getByText(/Suspended — location unknown/)).toBeHidden();
     await expect(hostPage.getByText('Time left')).toBeVisible();
     for (const guest of guestPages) {
       await guest.bringToFront();
@@ -251,7 +315,17 @@ test.describe('v34 harness pins (demo)', () => {
     const errors = collectPageErrors(page);
     await page.goto('/room/00000000-0000-4000-8000-000000000000');
     await expect(page.locator('body')).not.toBeEmpty();
-    await expect(page.getByText(/not found|no longer|deleted|doesn.t exist|gone/i)).toBeVisible({ timeout: 15000 });
+    // v35: the old pin guessed the copy ('not found' / 'deleted' /
+    // …) — none of those words render. A bogus room in demo mode has
+    // no seat on this device, so the room page's handled dead-end
+    // (page.tsx:1028-1046) reads 'No live seat saved on this device
+    // for this room.' with a Go home button and no Retry (nothing
+    // can reload with no seat). Same copy as session-restore.spec.ts:85.
+    await expect(page.getByText('No live seat saved on this device for this room.')).toBeVisible({
+      timeout: 15000,
+    });
+    await expect(page.getByRole('button', { name: 'Go home', exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Retry', exact: true })).toHaveCount(0);
     expectNoPageErrors(errors);
     await context.close();
   });
@@ -274,8 +348,107 @@ test.describe('v34 harness pins (demo)', () => {
     await context.close();
   });
 
-  test('FIELD black map + Map ready [NEEDS-CI] — the pill never reads Map ready while no tile has painted', async () => {
-    test.skip(true, 'NEEDS-CI: needs real MapLibre tiles over the network — the VM cannot run Playwright at all, and headless tile painting is not the founder\'s black-map condition (loop alive, tiles never painting). CI must load the play page on a real network and assert the pill reads Loading map tiles… / Map tiles not loading — try Retry, never Map ready, until a tile paints.');
+  // v35 (Arjun): the NEEDS-CI pin, un-skipped — but split in two,
+  // because CI has NO Ola key by design and the two halves observe
+  // different things. The B1 tiles signal itself (idle listener +
+  // areTilesLoaded() backstop + 10 s watchdog, PlayMap.tsx:1231-1252)
+  // is pure-function unit-pinned (test/v34-tiles-signal.test.mjs);
+  // what e2e pins here is the wiring from that signal to the pill
+  // on a real page — the founder's exact bug was the pill claiming
+  // 'Map ready' while no tile had painted.
+  test('FIELD black map + Map ready [no-key] — the pill never reads Map ready when no map exists', async ({
+    browser,
+  }) => {
+    test.skip(OLA_KEY_SET, 'no-key pin — skip when NEXT_PUBLIC_OLA_MAPS_API_KEY is set');
+    test.setTimeout(120000);
+    const context = await newCentredDemoContext(browser);
+    const { hostPage } = await startDemoMatch(context);
+    const stopKeepFresh = startCentreFixKeepFresh(context);
+    const errors = collectPageErrors(hostPage);
+    // No key → no map is ever created (PlayMap.tsx:636-640 sets
+    // mapState 'no-key' and returns) — so the pill can only read the
+    // honest no-key text (pillTextForStateRaw's final return:
+    // `Map no-key — <detail>`), never 'Map ready'. This is the
+    // CI-observable form of the pin: the same class of lie (pill
+    // claims ready with nothing painted) at the boundary CI can see.
+    await expect(
+      hostPage.getByText('Map no-key — NEXT_PUBLIC_OLA_MAPS_API_KEY is empty in this build', {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(hostPage.getByText('Map ready', { exact: true })).toHaveCount(0);
+    await expect(hostPage.getByText('Map needs an Ola key — the game still works without it.')).toBeVisible();
+    await expect(hostPage.locator('[aria-label="Play map"] canvas')).toBeHidden();
+    await expect(hostPage.getByRole('button', { name: 'Retry map', exact: true })).toBeVisible();
+    // The game still works without the map.
+    await expect(hostPage.getByText('Time left')).toBeVisible();
+    // Stable, not a flash: the no-key pill never changes.
+    await hostPage.waitForTimeout(3000);
+    await expect(
+      hostPage.getByText('Map no-key — NEXT_PUBLIC_OLA_MAPS_API_KEY is empty in this build', {
+        exact: true,
+      }),
+    ).toBeVisible();
+    await expect(hostPage.getByText('Map ready', { exact: true })).toHaveCount(0);
+    expectNoPageErrors(errors);
+    stopKeepFresh();
+    await context.close();
+  });
+
+  test('FIELD black map + Map ready [with-key] — stalled tiles never read Map ready; the watchdog names it', async ({
+    browser,
+  }) => {
+    test.skip(
+      !OLA_KEY_SET,
+      'with-key pin — skip when NEXT_PUBLIC_OLA_MAPS_API_KEY is not set (CI has no key by design)',
+    );
+    test.setTimeout(180000);
+    const context = await newCentredDemoContext(browser);
+    // Stall every Ola tile request and nothing else: the style JSON
+    // (pathname ends style.json — the URL is OLA_STYLE_URL in
+    // components/map/maplibre.ts:36, key appended as a query param,
+    // so the pathname check is what matters) and sprites/glyphs go
+    // through, so the map reaches 'ready' — 'load' waits for style +
+    // sprite + glyphs, not tiles — while no tile ever paints. That
+    // is the founder's black-map state, made deterministic: a live
+    // loop, a sized canvas, tiles never painting. The pattern is
+    // deliberately narrow (tile-looking requests only); the counter
+    // below is the tripwire — if Ola ever changes its tile URL shape
+    // so nothing is stalled, the test fails on the precondition,
+    // not on the pill, so a pattern drift can never masquerade as
+    // a product failure.
+    let stalledTileRequests = 0;
+    await context.route('**/api.olamaps.io/**', async (route) => {
+      const pathname = new URL(route.request().url()).pathname;
+      if (pathname.endsWith('style.json') || /sprite|glyph|font/i.test(pathname)) {
+        await route.continue();
+        return;
+      }
+      stalledTileRequests += 1;
+      await new Promise<void>(() => undefined);
+    });
+    const { hostPage } = await startDemoMatch(context);
+    const stopKeepFresh = startCentreFixKeepFresh(context);
+    const errors = collectPageErrors(hostPage);
+    // Precondition: a tile request really was stalled.
+    await expect.poll(() => stalledTileRequests, { timeout: 30000 }).toBeGreaterThan(0);
+    // The 10 s watchdog (TILE_STALL_MS, play-map-logic.ts) fires and
+    // the pill names it — with a working Retry. The pending text
+    // ('Loading map tiles…') in between is unit-pinned
+    // (test/v34-tiles-signal.test.mjs:83); what this pins is the
+    // end of the chain on a real page.
+    await expect(hostPage.getByText(/Map tiles not loading — try Retry/)).toBeVisible({
+      timeout: 60000,
+    });
+    // And 'Map ready' never appeared: with tiles stalled the pill
+    // parts are non-empty from style-load on (tilesPending, then
+    // tilesStalled), so by the state machine the ready text could
+    // never have rendered at any point in this run.
+    await expect(hostPage.getByText('Map ready', { exact: true })).toHaveCount(0);
+    await expect(hostPage.getByRole('button', { name: 'Retry', exact: true })).toBeVisible();
+    expectNoPageErrors(errors);
+    stopKeepFresh();
+    await context.close();
   });
 
   test('FIELD giant GPS marker [NEEDS-PHONE] — a rough fix draws a small dot with a faint ring, never a giant disc', async () => {

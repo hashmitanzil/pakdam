@@ -1201,7 +1201,6 @@ export default function LobbyPage() {
           <p
             className="text-[13px] text-[#F59E0B]"
             role="status"
-            aria-label="Waiting for the host to reconnect…"
           >
             Waiting for the host to reconnect…
           </p>

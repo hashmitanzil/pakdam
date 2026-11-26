@@ -186,14 +186,15 @@ test.describe('join + lobby (demo)', () => {
     // before tapping the blocked button.
     await hostPage.bringToFront();
     await expect(hostPage.getByText('Ben')).toBeVisible();
-    // The blocked host start button renders "▶ START GAME" (the label is
-    // 'START GAME' once ≥2 players; there is no 'WAITING FOR EVERYONE TO
-    // BE READY' button anywhere in the app — the waiting line is the
-    // notice shown after tapping, from the gate reason).
+    // The blocked host start button renders '▶ WAITING FOR PLAYERS'
+    // (shortStartBlocker on the 'Waiting for: …' reason — the open
+    // button is plain 'START GAME' with no ▶ prefix, so '▶ START
+    // GAME' can never render). The waiting line is the notice shown
+    // after tapping, from the gate reason.
     await expect(
-      hostPage.getByRole('button', { name: '▶ START GAME' }),
+      hostPage.getByRole('button', { name: '▶ WAITING FOR PLAYERS', exact: true }),
     ).toBeVisible();
-    await hostPage.getByRole('button', { name: '▶ START GAME' }).click();
+    await hostPage.getByRole('button', { name: '▶ WAITING FOR PLAYERS', exact: true }).click();
     await expect(hostPage.getByText(`Waiting for: ${GUEST_NAMES[0]}, ${GUEST_NAMES[1]}.`)).toBeVisible();
     // A guest sees the host-only bar instead of a start button.
     await expect(

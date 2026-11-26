@@ -1616,7 +1616,6 @@ export default function PlayPage({
         <p
           className="rounded-2xl border border-[#26262B] bg-[#141416] p-3 text-[13px] text-[#F59E0B]"
           role="status"
-          aria-label="Waiting for the host to reconnect…"
         >
           Waiting for the host to reconnect…
         </p>
