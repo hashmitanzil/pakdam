@@ -68,8 +68,14 @@ test.describe('live HUD (demo)', () => {
     // on connectionState, so assert it directly; the suspended-guest
     // premise below (banner on Ana's page) is the one that pins the
     // suspension, and it holds for the same reason.
-    await expect(page.getByText('Time left')).toBeVisible();
-    await expect(page.getByText('Next ping')).toBeVisible();
+    // v37: exact:true — the Radio tab panel stays mounted (hidden) while
+    // Map is active, and the hunter quick-chip set contains 'Moving to
+    // the next ping area', which substring-matches bare 'Next ping'
+    // (strict-mode violation when the host draws Hunter, ~1/3 of runs).
+    // 'Time left' has no second match today but is the same latent
+    // class, so it is hardened in the same block.
+    await expect(page.getByText('Time left', { exact: true })).toBeVisible();
+    await expect(page.getByText('Next ping', { exact: true })).toBeVisible();
     await expect(page.getByText(/Runners left 2 of 2/)).toBeVisible();
     // Countdown minutes are NOT zero-padded (formatAgeLabel: "9:59", not
     // "09:59"), so the minutes half is \d+, not \d\d.
@@ -107,6 +113,38 @@ test.describe('live HUD (demo)', () => {
       }),
     ).toBeVisible();
     expect(roles.size).toBe(3);
+  });
+
+  test('v37 pin: host forced Hunter still shows the strip labels (strict-mode)', async ({
+    context,
+  }) => {
+    // The status-strip test above only draws Hunter for the host ~1/3
+    // of runs (random draw), so the v36 CI failure was intermittent:
+    // bare getByText('Next ping') resolves to BOTH the StatusStrip
+    // label and the hidden Radio panel's hunter chip 'Moving to the
+    // next ping area' (the Radio tab stays mounted with the `hidden`
+    // class while Map is active). This pin forces the Hunter draw
+    // deterministically through the existing hand-pick UI — no product
+    // change: Balance stays ON, so 3 players means exactly 1 Hunter;
+    // Random OFF + picking Teo makes the host that Hunter. It FAILS
+    // on the bare locator and PASSES with exact:true.
+    const { hostPage, guestPages, roomId } = await setupThreePlayerLobby(context);
+    await hostPage.getByRole('button', { name: 'Settings', exact: true }).click();
+    await hostPage.getByRole('switch', { name: 'Random hunters' }).click();
+    await hostPage.getByRole('button', { name: 'Done' }).click();
+    await hostPage.getByRole('button', { name: 'Pick Teo as Hunter' }).click();
+    await expect(
+      hostPage.getByText('1 of 1 Hunters picked — tap a player to pick them.'),
+    ).toBeVisible();
+    await readyAll([hostPage, ...guestPages]);
+    await startMatchAsHost(hostPage);
+    for (const guest of guestPages) await waitForPlay(guest);
+    for (const page of [hostPage, ...guestPages]) await dismissRoleReveal(page);
+    const room = await getDemoRoom(hostPage, roomId);
+    const hostRole = room?.players.find((p) => p.displayName === HOST_NAME)?.matchRole;
+    expect(hostRole, 'hand-pick must force the host to draw Hunter').toBe('hunter');
+    await expect(hostPage.getByText('Time left', { exact: true })).toBeVisible();
+    await expect(hostPage.getByText('Next ping', { exact: true })).toBeVisible();
   });
 
   test('head start: hunters see the waiting line, runners see the hidden line', async ({
@@ -224,7 +262,9 @@ test.describe('live HUD (demo)', () => {
     await expect(hostPage.getByText('Paused', { exact: true })).toBeVisible();
     await sheet.getByRole('button', { name: 'Resume the match' }).click();
     await expect(hostPage.getByText('Paused', { exact: true })).toBeHidden();
-    await expect(hostPage.getByText('Time left')).toBeVisible();
+    // v37: exact:true — same latent class as the :71/:72 strip labels
+    // (hidden Radio panel substring collision); hardened with the block.
+    await expect(hostPage.getByText('Time left', { exact: true })).toBeVisible();
   });
 
   test('suspended banner: tab-hide suspends, Resume sharing clears it', async ({ browser }) => {

@@ -193,7 +193,12 @@ test('v34 H5 SUPERSEDED (was: bringToFront + connected-poll): the status-strip t
     'a connected-poll can never land here (GPS-denied suspension, F16) — the test must not wait for it',
   );
   assert.ok(
-    body.includes("getByText('Time left')"),
+    body.includes("getByText('Time left', { exact: true })"),
+    // v37: the bare form is gone — 'Time left' is now asserted with
+    // exact:true like 'Next ping' (hidden Radio panel substring
+    // collision class; the bare 'Next ping' resolved to the strip
+    // label AND the hunter chip 'Moving to the next ping area').
+    // The pin's intent is unchanged: the strip is asserted directly.
     'the test must assert the strip directly — the strip does not depend on connectionState',
   );
   assert.ok(
