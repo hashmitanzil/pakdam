@@ -36,8 +36,8 @@ jobs:
         run: pnpm lint
 
       # Playwright browsers for the web e2e suite (root `pnpm test` runs
-      # it via `pakdam-web test:e2e`; Chromium cannot launch in the
-      # sandbox VM, so the e2e leg is CI-only until a local runner exists).
+      # it via `pakdam-web test:e2e`; VM Chromium launches fine here
+      # (proven 2026-11-26) — CI stays the verdict for live flows).
       - name: Install Playwright browsers
         run: pnpm --filter pakdam-web exec playwright install --with-deps chromium
 

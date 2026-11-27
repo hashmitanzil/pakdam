@@ -440,6 +440,21 @@ export const HTTP_RATE_LIMITS: Readonly<Record<string, { readonly limit: number;
     // 60/min per room covers a full roster connecting + retries. The
     // Worker builds the key from the roomId (see workers/src/index.ts).
     'WS /v1/rooms/:id/ws': { limit: 60, windowSeconds: 60, key: 'room' },
+    // -- Admin Console (Mission Control, 2026-11-25) -------------------------
+    // Admin routes are few humans, not 30-player rosters: per-IP
+    // buckets are safe here (no NAT-JOIN concern — an admin panel is
+    // not a venue WiFi). Login is 5 attempts per 15 min per IP AND
+    // per account (the per-account lockout lives in the admin_users
+    // row, so it survives isolate eviction — see admin-auth.ts).
+    // Authed admin reads/writes share grouped keys so the table stays
+    // small; the per-route seat limiter is not used for admin routes.
+    'POST /v1/admin/auth/login': { limit: 5, windowSeconds: 900, key: 'ip' },
+    'POST /v1/admin/auth/setup': { limit: 5, windowSeconds: 900, key: 'ip' },
+    'GET /v1/admin/read': { limit: 120, windowSeconds: 60, key: 'ip' },
+    'POST /v1/admin/write': { limit: 60, windowSeconds: 60, key: 'ip' },
+    'PUT /v1/admin/write': { limit: 60, windowSeconds: 60, key: 'ip' },
+    'DELETE /v1/admin/write': { limit: 60, windowSeconds: 60, key: 'ip' },
+    'GET /v1/admin/public': { limit: 120, windowSeconds: 60, key: 'ip' },
   } as const;
 
 /**

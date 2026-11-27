@@ -62,6 +62,7 @@ import {
   type PersistIntent,
   type SupabaseEnv,
 } from './supabase.js';
+import { getRuntimeFlags } from './admin-flags.js';
 import type { Env } from './index.js';
 
 interface SessionRecord {
@@ -1318,6 +1319,72 @@ export class RoomDO implements DurableObject {
         if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
         return json({ ok: true, ...r.value });
       }
+      case 'admin-summary': {
+        // Admin console: live room summary. No credential is checked
+        // here — the Worker enforced the admin session + RBAC before
+        // calling; the /op channel itself is secret-gated.
+        const r = store.adminSummaryOp();
+        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        return json({ ok: true, room: r.value.room, players: r.value.players });
+      }
+      case 'admin-live-fix': {
+        // Admin console (Owner only, enforced in the Worker): the
+        // seat's live fix from DO memory. Never persisted, never logged.
+        if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
+        const r = store.adminLiveFixOp(playerId);
+        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        return json({ ok: true, fix: r.value.fix });
+      }
+      case 'admin-kick': {
+        const targetPlayerId = asString(body['targetPlayerId']);
+        if (!targetPlayerId) return json({ ok: false, error: 'Missing targetPlayerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
+        const r = store.adminKickOp({ targetPlayerId, nowMs });
+        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        await this.afterMutation(r.events, r.persist);
+        if (r.disconnect) await this.disconnectPlayers(r.disconnect);
+        return json({ ok: true, ...r.value });
+      }
+      case 'admin-redact-player': {
+        // Admin erasure (fix round M3-B): the DO itself forgets the
+        // player (result / config / hostPlayerId → '[erased]' in DO
+        // memory) so a later persistRoom can never rewrite the id
+        // back into the mirror. No credential is checked here — the
+        // Worker enforced the admin session + RBAC before calling;
+        // the /op channel itself is secret-gated.
+        const targetPlayerId = asString(body['targetPlayerId']);
+        if (!targetPlayerId) return json({ ok: false, error: 'Missing targetPlayerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
+        const r = store.adminRedactPlayerOp({ targetPlayerId });
+        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        await this.afterMutation(r.events, r.persist);
+        // Fix round 4 (M3-B hole 2): the seat is gone from state, but
+        // its live tab + session records are not state — close the
+        // sockets (4403, as for an admin kick) and delete every
+        // session record, so the erased seat cannot keep reading (or
+        // resume) after the erase. No-op when nothing was redacted.
+        if (r.value.redacted) {
+          await this.disconnectPlayers([
+            { playerId: targetPlayerId, code: 4403, reason: 'Removed from the room by an admin.' },
+          ]);
+        }
+        return json({ ok: true, ...r.value });
+      }
+      case 'admin-end': {
+        // Admin cancel: same primitive + same delete flow as the host
+        // lifecycle 'end' (v23 Rule 1) — cancelMatch, then wipe.
+        const r = store.adminEndOp({ adminActor: asString(body['adminActor']) ?? 'admin', nowMs });
+        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        let deleted = false;
+        await this.ctx.blockConcurrencyWhile(async () => {
+          deleted = await this.deleteRoomAfterHostCancel(r.events, r.persist, nowMs);
+        });
+        return json({ ok: true, ...r.value, deleted });
+      }
+      case 'admin-force-results': {
+        const r = store.adminForceResultsOp({ nowMs });
+        if (!r.ok) return json({ ok: false, error: r.error, code: r.code }, r.status);
+        await this.afterMutation(r.events, r.persist);
+        return json({ ok: true, ...r.value });
+      }
       case 'register-ticket': {
         if (!playerId) return json({ ok: false, error: 'Missing playerId.', code: 'VALIDATION_FAILED', status: 400 }, 400);
         const purpose = body['purpose'];
@@ -1682,6 +1749,37 @@ export class RoomDO implements DurableObject {
         nowMs,
       );
       return;
+    }
+
+    // Admin console (Mission Control): the `radio` feature flag is
+    // consulted server-side at runtime, before any radio message
+    // reaches the store. When OFF, radio.send / voice.signal /
+    // signal.send are REFUSED with an error event — never silently
+    // dropped (a silent failure counts as a break). Flags are cached
+    // 60 s; any fetch failure fails OPEN to the shared default
+    // (radio ON), so a Supabase outage cannot mute a live game.
+    // Pings (`pings` flag) and zone enforcement (`zone` flag) are
+    // specified consult points with no wiring yet — they are built in
+    // the DO tick (buildPing / zone enforcement in room-do.ts) and
+    // need an async flag read threaded through the tick; that is an
+    // OPEN merge item (docs/admin-console.md). demoMode has no
+    // consult point: no demo mode exists in the game.
+    if (type === 'radio.send' || type === 'voice.signal' || type === 'signal.send') {
+      const flags = await getRuntimeFlags(this.env as SupabaseEnv);
+      if (flags['radio'] === false) {
+        await this.sendToPlayer(
+          playerId,
+          'error',
+          {
+            code: 'FEATURE_DISABLED',
+            message: 'Radio is turned off.',
+            retryable: false,
+            serverTs: new Date(nowMs).toISOString(),
+          },
+          nowMs,
+        );
+        return;
+      }
     }
 
     const result = await this.store.handleWsMessage(

@@ -630,9 +630,14 @@ test('v34 gate (2): wiring — the Worker scheduled handler runs deleteOldLogs (
     const ctx = { waitUntil: (p) => void waited.push(p) };
     await workerDefault.scheduled({}, { SUPABASE_URL: 'https://supabase.test', SUPABASE_SERVICE_ROLE_KEY: 'k' }, ctx);
     await Promise.allSettled(waited);
-    assert.equal(calls.length, 1, 'the scheduled run must issue exactly one DELETE');
+    // Merge, 2026-11-27: the scheduled run issues FOUR DELETEs now,
+    // not one — the game-log cleanup plus the three admin cleanups
+    // (expired sessions, 180-day admin audit, 24 h login attempts).
+    // The game-log DELETE is still first and still the 7-day cutoff.
+    assert.equal(calls.length, 4, 'the scheduled run must issue four DELETEs (game logs + three admin cleanups)');
+    assert.ok(calls.every((c) => c.method === 'DELETE'), 'every scheduled call is a DELETE');
     assert.equal(calls[0].method, 'DELETE');
-    assert.match(calls[0].url, /\/rest\/v1\/logs\?created_at=lt\./, 'the DELETE must target logs older than the cutoff');
+    assert.match(calls[0].url, /\/rest\/v1\/logs\?created_at=lt\./, 'the first DELETE must target logs older than the cutoff');
     // The cutoff is 7 days before now — the URL carries it.
     const cutoff = decodeURIComponent(calls[0].url.split('created_at=lt.')[1]);
     const ageMs = Date.now() - Date.parse(cutoff);
@@ -640,6 +645,10 @@ test('v34 gate (2): wiring — the Worker scheduled handler runs deleteOldLogs (
       ageMs >= 7 * 24 * 60 * 60 * 1000 - 60_000 && ageMs <= 7 * 24 * 60 * 60 * 1000 + 60_000,
       `cutoff must be ~7 days ago, got ${cutoff}`,
     );
+    const urls = calls.map((c) => c.url);
+    assert.ok(urls.some((u) => /\/rest\/v1\/admin_sessions\?/.test(u)), 'expired admin sessions are revoked');
+    assert.ok(urls.some((u) => /\/rest\/v1\/admin_audit_log\?/.test(u)), 'admin audit rows older than 180 days are deleted');
+    assert.ok(urls.some((u) => /\/rest\/v1\/admin_login_attempts\?/.test(u)), 'login-attempt rows older than 24 h are deleted');
     // And the direct helper agrees (same call, same shape).
     const ok = await deleteOldLogs({ SUPABASE_URL: 'https://supabase.test', SUPABASE_SERVICE_ROLE_KEY: 'k' });
     assert.equal(ok, true);

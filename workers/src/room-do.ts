@@ -311,6 +311,20 @@ export interface RoomDoState {
    * writes / test-built states lack it — `restoreState` fills {}.
    */
   disconnectDeadlineMs?: Record<string, number>;
+  /**
+   * Fix round 4 (M3-B hole 2) — lowercased display names (codenames)
+   * of seats erased by `adminRedactPlayerOp`. The seat record itself
+   * is DROPPED from `players`, so no read path can re-serve its id or
+   * codename — but a dropped seat would otherwise be re-creatable by
+   * joining under the same codename, and its reconnect token would
+   * still match nothing (the seat is gone) so the join would mint a
+   * FRESH seat for the same person. The tombstone makes `addPlayerAsync`
+   * refuse any join under an erased codename (403) in this room,
+   * permanently — erasure is permanent for the room, including across
+   * replay (replay never clears this list). Older durable writes /
+   * test-built states lack it — `restoreState` fills [].
+   */
+  erasedSeatNames?: string[];
 }
 
 /** Memory-only state — rebuilt empty after hibernation, never persisted. */
@@ -687,6 +701,52 @@ export function errResult(
   return { ok: false, error, code, status, events, persist, retryAfterSeconds };
 }
 
+/**
+ * The erasure marker (fix round M3-B): the same '[erased]' the
+ * Worker-side scrub uses (`workers/src/admin.ts`
+ * `ERASED_PLAYER_ID`). A local const, not an import — room-do.ts
+ * cannot import admin.ts without a cycle. The marker is not a UUID,
+ * so it can never collide with a real player id — and, as a
+ * consequence, it cannot be stored in the uuid `host_player_id`
+ * column: `roomRow` in supabase.ts translates it to null at the
+ * persist boundary (see the comment there).
+ */
+export const ERASED_PLAYER_ID = '[erased]';
+
+/**
+ * Deep-redact one player id out of a JSON value: every string
+ * exactly equal to `playerId`, at any depth (arrays, nested objects,
+ * result tags/caught lists), is replaced with ERASED_PLAYER_ID.
+ * Same semantics as `redactPlayerId` in workers/src/admin.ts
+ * (duplicated here for the same no-cycle reason); other ids are
+ * untouched.
+ */
+export function redactIdDeep(value: unknown, playerId: string): { value: unknown; changed: boolean } {
+  if (typeof value === 'string') {
+    return value === playerId ? { value: ERASED_PLAYER_ID, changed: true } : { value, changed: false };
+  }
+  if (Array.isArray(value)) {
+    let changed = false;
+    const out = value.map((item) => {
+      const r = redactIdDeep(item, playerId);
+      if (r.changed) changed = true;
+      return r.value;
+    });
+    return { value: out, changed };
+  }
+  if (typeof value === 'object' && value !== null) {
+    let changed = false;
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      const r = redactIdDeep(v, playerId);
+      if (r.changed) changed = true;
+      out[k] = r.value;
+    }
+    return { value: out, changed };
+  }
+  return { value, changed: false };
+}
+
 // ---------------------------------------------------------------------------
 // Durable-state (de)serialisation
 // ---------------------------------------------------------------------------
@@ -755,6 +815,11 @@ export function durableSnapshot(state: RoomDoState): RoomDoState {
     noSocketsSinceMs: state.noSocketsSinceMs ?? null,
     // v29: 30 s return deadlines — {} means no window is running.
     disconnectDeadlineMs: state.disconnectDeadlineMs ?? {},
+    // Fix round 4 (M3-B hole 2): erased-seat tombstone — [] means no
+    // seat has been erased yet. The snapshot is an explicit allow-list:
+    // a field missing here is LOST on every save (and therefore on
+    // every DO wake), so this line is load-bearing, not cosmetic.
+    erasedSeatNames: state.erasedSeatNames ?? [],
   };
 }
 
@@ -801,6 +866,9 @@ export function restoreState(raw: unknown): RoomDoState | null {
     // v29: older durable writes lack return deadlines — {} means no
     // window is running, same as a fresh room.
     disconnectDeadlineMs: s.disconnectDeadlineMs ?? {},
+    // Fix round 4 (M3-B hole 2): older durable writes lack the erased-
+    // seat tombstone — [] means no seat has been erased yet.
+    erasedSeatNames: s.erasedSeatNames ?? [],
   };
 }
 
@@ -835,6 +903,9 @@ export class RoomStore {
     this.state.noSocketsSinceMs ??= null;
     // v29: same for the return deadlines — {} means no window running.
     this.state.disconnectDeadlineMs ??= {};
+    // Fix round 4 (M3-B hole 2): same for the erased-seat tombstone —
+    // [] means no seat has been erased yet.
+    this.state.erasedSeatNames ??= [];
   }
 
   /**
@@ -1464,6 +1535,7 @@ export class RoomStore {
       pendingPingRecipients: {},
       runnerQrTokens: [],
       hostGrace: null,
+      erasedSeatNames: [],
     };
     const store = new RoomStore(state);
     const persist: PersistIntent[] = [
@@ -1498,6 +1570,17 @@ export class RoomStore {
       return errResult('The room code does not match.', 'FORBIDDEN', 403);
     }
     const name = input.displayName.trim();
+    // Fix round 4 (M3-B hole 2): a codename erased by
+    // `adminRedactPlayerOp` can never be joined under again in this
+    // room — not as a restore (the seat is gone, so there is nothing
+    // to restore) and not as a fresh seat either (that would hand the
+    // same person a new seat under the erased codename). The refusal
+    // is 403, the same status a token-mismatched restore gets, and it
+    // comes before the existing-seat lookup so no code path below can
+    // resurrect the seat. The tombstone survives replay.
+    if ((this.state.erasedSeatNames ?? []).includes(name.toLowerCase())) {
+      return errResult('That seat was erased and cannot rejoin.', 'FORBIDDEN', 403);
+    }
     const existing = this.state.players.find(
       (p) => p.displayName.toLowerCase() === name.toLowerCase(),
     );
@@ -3443,6 +3526,477 @@ export class RoomStore {
       default:
         return errResult('Unknown lifecycle action.', 'VALIDATION_FAILED', 400);
     }
+  }
+
+  // -- Admin Console (Mission Control) ops -----------------------------------
+  //
+  // These run ONLY via the Worker's /op channel (DO_OP_SECRET) after the
+  // Worker enforced the admin session + the RBAC permission. No credential
+  // is checked here — the DO trusts the Worker exactly as it trusts it
+  // for every other /op. Admin identity arrives as `adminActor` (a
+  // username, for the audit trail) — never a password or a token.
+  // All five ops are REAL room-state operations, not row flips:
+  // end/cancel delete the live room, force-results completes the match,
+  // kick removes/ejects the seat and closes its sockets.
+
+  /** Live room summary for the console. NO coordinates anywhere in this shape. */
+  adminSummaryOp(): OpResult<{
+    room: {
+      roomId: string;
+      roomCode: string;
+      phase: MatchPhase;
+      version: number;
+      mode: string;
+      startedAt: string | null;
+      endsAt: string | null;
+      result: MatchResult | null;
+    };
+    players: {
+      playerId: string;
+      displayName: string;
+      isHost: boolean;
+      matchRole: string | null;
+      team: string | null;
+      connectionState: string;
+      lastFixAt: string | null;
+      leftAt: string | null;
+      ejectedAt: string | null;
+      isReady: boolean;
+      suspensionCount: number;
+    }[];
+  }> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    // Deliberately NOT the whole Room object: room.config carries the
+    // zone BOUNDARY (lat/lng points). The boundary is legitimate game
+    // data, but the admin summary must carry no coordinates at all —
+    // the console never needs the boundary shape, only the mode.
+    return okResult({
+      room: {
+        roomId: this.room.roomId,
+        roomCode: this.room.roomCode,
+        phase: this.room.phase,
+        version: this.room.version,
+        mode: this.room.config.mode,
+        startedAt: this.room.startedAt,
+        endsAt: this.room.endsAt,
+        result: this.room.result,
+      },
+      players: this.state.players.map((p) => ({
+        playerId: p.playerId,
+        displayName: p.displayName,
+        isHost: p.isHost,
+        matchRole: p.matchRole,
+        team: p.team,
+        connectionState: p.connectionState,
+        lastFixAt: p.lastFixAt,
+        leftAt: p.leftAt,
+        ejectedAt: p.ejectedAt,
+        isReady: p.isReady,
+        suspensionCount: p.suspensionCount,
+      })),
+    });
+  }
+
+  /**
+   * The seat's LIVE fix from DO memory (or null when there is none).
+   * The Worker serves this ONLY to the Owner, in-session only — it is
+   * never stored, never logged, never exported. The fix is returned
+   * as-is (lat/lng live only in this response object).
+   */
+  adminLiveFixOp(playerId: string): OpResult<{ fix: LocationFix | null }> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    const seat = this.player(playerId);
+    if (!seat || seat.leftAt !== null) {
+      return errResult('That player is not in the room.', 'NOT_FOUND', 404);
+    }
+    return okResult({ fix: this.mem.latestFix[playerId] ?? null });
+  }
+
+  /**
+   * Kick one seat, admin-initiated.
+   * - LOBBY: the seat leaves (leftAt stamped, socket closed 4403),
+   *   exactly like a host remove-player minus the host token.
+   * - Live phases: the seat is EJECTED (ejectedAt stamped, socket
+   *   closed 4405) via the same `ejectWithWinCheck` primitive the
+   *   tick uses — including the win check and the snapshot-before-
+   *   close, so an ejection that ends the match completes it.
+   * - Terminal phases / already-gone seats: 409. The host cannot be
+   *   kicked (409 — end or cancel the room instead); host succession
+   *   is a host action, not an admin one.
+   */
+  adminKickOp(input: { targetPlayerId: string; nowMs: number }): OpResult<{ kickedPlayerId: string; phase: MatchPhase }> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    const target = this.player(input.targetPlayerId);
+    if (!target || target.leftAt !== null || target.ejectedAt !== null) {
+      // leftAt = removed/left; ejectedAt = already ejected mid-game.
+      // Either way the seat is out — a second kick is a 409, not a
+      // silent no-op (the tick's applyOutsideZoneEjection is idempotent
+      // by design, but an admin re-kick must say so).
+      return errResult('That player is not in the room.', 'CONFLICT', 409);
+    }
+    if (target.isHost) {
+      return errResult('The host cannot be kicked — end or cancel the room instead.', 'CONFLICT', 409);
+    }
+    if (this.room.phase === 'LOBBY') {
+      target.leftAt = new Date(input.nowMs).toISOString();
+      target.connectionState = 'disconnected';
+      this.bumpVersion();
+      const events = [
+        ...this.emitPlayerEvent('player.removed', target, input.nowMs),
+        this.roomStateEvent('player-removed', input.nowMs),
+      ];
+      return okResult(
+        { kickedPlayerId: target.playerId, phase: this.room.phase },
+        events,
+        [{ kind: 'player-upsert', roomId: this.room.roomId, player: target }],
+        [{ playerId: target.playerId, code: 4403, reason: 'Removed from the room by an admin.' }],
+      );
+    }
+    if (isTerminalPhase(this.room.phase)) {
+      return errResult(`Cannot kick from phase ${this.room.phase}.`, 'INVALID_STATE', 409);
+    }
+    const events: OutboundEvent[] = [];
+    const persist: PersistIntent[] = [];
+    const disconnect: Array<{ playerId: string; code: number; reason: string }> = [];
+    const startedAtMs = this.room.startedAt === null ? input.nowMs : Date.parse(this.room.startedAt);
+    this.ejectWithWinCheck(target, input.nowMs, startedAtMs, events, persist, disconnect);
+    return okResult(
+      { kickedPlayerId: target.playerId, phase: this.room.phase },
+      events,
+      persist,
+      disconnect,
+    );
+  }
+
+  /**
+   * Admin erasure redaction (fix round M3-B, hardened fix round 4):
+   * make the DO itself forget one player, so no later DO persist,
+   * snapshot, summary, or live-fix read can re-serve the id or the
+   * codename.
+   *
+   * INVARIANT (fix round 4): after this op returns for player P, no
+   * DO state, DO memory, persist intent, snapshot, summary, or
+   * live-fix read contains P's player id or codename, and P's seat
+   * can never be restored or re-created under its codename in this
+   * room. How each path is covered:
+   * - `room.result` / `room.config` / `room.hostPlayerId` / host-grace
+   *   host: the id is replaced with the marker '[erased]' (the same
+   *   marker the Worker-side scrub uses), as before.
+   * - `state.catches` (HOLE 1, proven live by Diya): `hunterPlayerId`
+   *   / `runnerPlayerId` are replaced with '[erased]' — a rebuilt
+   *   result (`caughtRunnerIds()` / `confirmedTags()`) therefore
+   *   carries the marker, never the id, so a later force-results
+   *   cannot re-persist it into the MATCH_COMPLETED event, the
+   *   match-result PATCH, or the room-upsert.
+   * - The SEAT itself (HOLE 2, proven live by Diya): the seat record
+   *   is DROPPED from `state.players` (not left in place — a left
+   *   seat kept its reconnect token, so a LOBBY rejoin by display
+   *   name + saved token restored it and its player-upsert re-created
+   *   the deleted mirror row; and `adminSummaryOp` / `snapshotFor`
+   *   re-served the id + codename from it). Dropping the seat covers
+   *   every read path by construction: summary, snapshot,
+   *   `seatPresenceMap`, `locationStatus`, replay/startMatch
+   *   player-upserts, and result rebuilds all iterate
+   *   `state.players`. Dropping is win-check-neutral: a seat reaches
+   *   this op already kicked/ejected (or in a terminal room), and
+   *   `isRunnerFree` / `isHunterFree` already exclude kicked,
+   *   ejected, and left seats — an erased seat counts as out, exactly
+   *   as an ejected one does, and appears in neither the caught nor
+   *   the surviving list of a rebuilt result (the marker takes its
+   *   place in the caught list). Its codename (lowercased) is kept in
+   *   the durable `erasedSeatNames` tombstone, and `addPlayerAsync`
+   *   refuses any join under it (403) — so the seat can neither be
+   *   restored by token nor re-created fresh under the same codename.
+   *   The tombstone survives replay. `verifyReconnect` fails for the
+   *   dropped seat (no seat → null), so snapshot/result reads refuse
+   *   it, and `adminLiveFixOp` 404s (no seat).
+   * - Remaining copies (Diya): `mem.latestFix[P]` is deleted (the
+   *   live-fix read is served from it); the player's `runnerQrTokens`
+   *   are dropped; pending-ping recipient entries for P are removed
+   *   (a ping left with no recipients, or about P, is dropped);
+   *   `hostTokens[P]`, `lastPingAtMs[P]`, the 30 s return deadline,
+   *   WS tickets, per-seat mem maps (fix history, violations,
+   *   throttles, idempotency caches, radio dedupe, ticket issue /
+   *   revoke windows), announcements addressed to P, the game-event
+   *   log / event log actor ids (+ payload ids and the codename on
+   *   the player's own join entry), the structured-log buffer, and
+   *   the last-succession event are all cleared or redacted. The
+   *   class-level `admin-redact-player` case additionally closes the
+   *   seat's sockets and deletes every session record for P, so a
+   *   live tab cannot keep reading after the erase.
+   * - The cached JOIN reply (fix round 5, proven live by Diya): a
+   *   join reply is cached under `join:<roomId>:<key>` — keyed by
+   *   room, not by seat — so the `${target}:` sweep never touches
+   *   it, and `dispatchOp` serves the cache before dispatch,
+   *   bypassing the tombstone. The redact drops only P's cached
+   *   join replies (matched on the cached body's player id), so a
+   *   replayed add-player with the same idempotency key falls
+   *   through to `addPlayerAsync` and hits the tombstone 403
+   *   instead of re-serving P's id, codename, and raw token.
+   *   Other seats' cached joins are untouched.
+   * Never 404s on an unknown/absent seat: the id may live only in
+   * result/config/catches (e.g. a caught runner whose seat already
+   * left), and the erase must proceed either way. Returns a
+   * room-upsert persist intent only when something actually changed,
+   * so an unchanged room is never re-persisted. A deleted room
+   * answers ROOM_NOT_FOUND, which the erase treats as "already gone".
+   */
+  adminRedactPlayerOp(input: { targetPlayerId: string }): OpResult<{ redacted: boolean }> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    const target = input.targetPlayerId;
+    let changed = false;
+    if (this.room.hostPlayerId === target) {
+      this.room.hostPlayerId = ERASED_PLAYER_ID;
+      changed = true;
+    }
+    if (this.state.hostGrace?.hostPlayerId === target) {
+      this.state.hostGrace.hostPlayerId = ERASED_PLAYER_ID;
+      changed = true;
+    }
+    const configRedacted = redactIdDeep(this.room.config, target);
+    if (configRedacted.changed) {
+      this.room.config = configRedacted.value as RoomConfig;
+      changed = true;
+    }
+    if (this.room.result !== null) {
+      const resultRedacted = redactIdDeep(this.room.result, target);
+      if (resultRedacted.changed) {
+        this.room.result = resultRedacted.value as MatchResult;
+        changed = true;
+      }
+    }
+    // HOLE 1 — state.catches: a confirmed catch rebuilds tags +
+    // caught lists on every result build, so an unredacted catch
+    // re-persisted the erased id through force-results.
+    for (const c of this.state.catches) {
+      if (c.hunterPlayerId === target) {
+        c.hunterPlayerId = ERASED_PLAYER_ID;
+        changed = true;
+      }
+      if (c.runnerPlayerId === target) {
+        c.runnerPlayerId = ERASED_PLAYER_ID;
+        changed = true;
+      }
+    }
+    // HOLE 2 — the seat itself: drop it, tombstone its codename.
+    const seat = this.player(target);
+    if (seat !== undefined) {
+      this.state.players = this.state.players.filter((p) => p.playerId !== target);
+      this.state.erasedSeatNames ??= [];
+      const codename = seat.displayName.toLowerCase();
+      if (!this.state.erasedSeatNames.includes(codename)) {
+        this.state.erasedSeatNames.push(codename);
+      }
+      changed = true;
+    }
+    // Id-keyed durable maps: the key IS the id.
+    if (this.state.hostTokens[target] !== undefined) {
+      delete this.state.hostTokens[target];
+      changed = true;
+    }
+    if (this.state.lastPingAtMs[target] !== undefined) {
+      delete this.state.lastPingAtMs[target];
+      changed = true;
+    }
+    if (this.state.pausedBy === target) {
+      this.state.pausedBy = ERASED_PLAYER_ID;
+      changed = true;
+    }
+    this.clearDisconnectDeadline(target);
+    // WS tickets (durable registry + memory mirror — the save syncs
+    // mem -> state, so both must be cleared or the ticket resurrects).
+    const ticketsBefore = this.state.tickets.length + this.mem.tickets.length;
+    this.state.tickets = this.state.tickets.filter((t) => t.playerId !== target);
+    this.mem.tickets = this.mem.tickets.filter((t) => t.playerId !== target);
+    if (this.state.tickets.length + this.mem.tickets.length !== ticketsBefore) changed = true;
+    // Runner QR tokens: one live record per Runner, keyed by runner id.
+    const qrBefore = this.state.runnerQrTokens.length;
+    this.state.runnerQrTokens = this.state.runnerQrTokens.filter((t) => t.runnerPlayerId !== target);
+    if (this.state.runnerQrTokens.length !== qrBefore) changed = true;
+    // Pending pings: drop pings ABOUT the player, and remove the
+    // player from every other ping's recipient list (durable record
+    // + memory mirror — same resurrection rule as tickets). A ping
+    // left with no recipients is complete by the same rule
+    // `acknowledgePingDeliveryFor` uses, so it is dropped too.
+    const emptiedPingIds = new Set<string>();
+    for (const [pingId, recipients] of Object.entries(this.state.pendingPingRecipients)) {
+      const kept = recipients.filter((id) => id !== target);
+      if (kept.length === 0) {
+        delete this.state.pendingPingRecipients[pingId];
+        emptiedPingIds.add(pingId);
+      } else if (kept.length !== recipients.length) {
+        this.state.pendingPingRecipients[pingId] = kept;
+      }
+    }
+    for (const [pingId, recipients] of [...this.mem.pendingPingRecipients.entries()]) {
+      recipients.delete(target);
+      if (recipients.size === 0) {
+        this.mem.pendingPingRecipients.delete(pingId);
+        emptiedPingIds.add(pingId);
+      }
+    }
+    const pingsBefore = this.state.pendingPings.length + this.mem.pendingPings.length;
+    const keepPing = (p: { pingId: string; subjectPlayerId: string }): boolean =>
+      p.subjectPlayerId !== target && !emptiedPingIds.has(p.pingId);
+    this.state.pendingPings = this.state.pendingPings.filter(keepPing);
+    this.mem.pendingPings = this.mem.pendingPings.filter(keepPing);
+    if (this.state.pendingPings.length + this.mem.pendingPings.length !== pingsBefore) changed = true;
+    // Game-event log / event log: the actor id, plus ids at any depth
+    // in the payload — and the codename on the player's own join
+    // entry, whose payload carries it beside the id.
+    for (const ev of this.state.gameEventLog) {
+      if (ev.actorId === target) {
+        ev.actorId = ERASED_PLAYER_ID;
+        changed = true;
+        const p = ev.payload as unknown as Record<string, unknown>;
+        if (typeof p.displayName === 'string') p.displayName = ERASED_PLAYER_ID;
+      }
+      const pr = redactIdDeep(ev.payload, target);
+      if (pr.changed) {
+        (ev as { payload: unknown }).payload = pr.value;
+        changed = true;
+      }
+    }
+    for (const entry of this.state.eventLog) {
+      if (entry.actorId === target) {
+        entry.actorId = ERASED_PLAYER_ID;
+        changed = true;
+      }
+    }
+    // Memory-only per-seat copies.
+    if (this.mem.latestFix[target] !== undefined) {
+      delete this.mem.latestFix[target];
+      changed = true;
+    }
+    delete this.mem.outsideZone[target];
+    delete this.mem.lastDisconnectAtMs[target];
+    delete this.mem.lastSuspensionReason[target];
+    delete this.mem.lastPlayerPersistAtMs[target];
+    delete this.mem.lastFixAcceptedAtMs[target];
+    delete this.mem.fixHistory[target];
+    delete this.mem.gpsViolations[target];
+    this.mem.ticketIssues.delete(target);
+    this.mem.ticketRevokes.delete(target);
+    const memAnnBefore = this.mem.announcements.length;
+    this.mem.announcements = this.mem.announcements.filter((a) => a.playerId !== target);
+    if (this.mem.announcements.length !== memAnnBefore) changed = true;
+    for (const map of [this.mem.wsRate, this.mem.recentRadio, this.mem.idempotency, this.mem.idempotentReplies, this.mem.httpIdempotentReplies] as Array<Map<string, unknown>>) {
+      for (const key of [...map.keys()]) {
+        if (key.startsWith(`${target}:`)) map.delete(key);
+      }
+    }
+    // Fix round 5 (cached join reply): join replies are cached under
+    // `join:<roomId>:<key>` — keyed by room, not by seat — so the
+    // `${target}:` sweep above never touches them, and `dispatchOp`
+    // serves the cache BEFORE dispatch, bypassing the tombstone. A
+    // replayed add-player with the same idempotency key would
+    // re-serve the erased id, codename, AND the original raw
+    // reconnect token for the 10-min TTL. Drop only THIS player's
+    // cached join replies (identified by the cached body's player
+    // id) — other seats' join retries keep their dedupe (re-executing
+    // their join would mint a second seat). Start/replay replies are
+    // already swept: they are keyed `${playerId}:<op>:<key>`.
+    for (const [key, hit] of [...this.mem.httpIdempotentReplies.entries()]) {
+      if (!key.startsWith('join:')) continue;
+      const cachedPlayer = hit.body['player'];
+      if (
+        typeof cachedPlayer === 'object' &&
+        cachedPlayer !== null &&
+        (cachedPlayer as Record<string, unknown>)['playerId'] === target
+      ) {
+        this.mem.httpIdempotentReplies.delete(key);
+      }
+    }
+    const idemBefore = this.state.idempotency.length + this.state.idempotentReplies.length;
+    this.state.idempotency = this.state.idempotency.filter((e) => !e.key.startsWith(`${target}:`));
+    this.state.idempotentReplies = this.state.idempotentReplies.filter((e) => !e.key.startsWith(`${target}:`));
+    if (this.state.idempotency.length + this.state.idempotentReplies.length !== idemBefore) changed = true;
+    for (const entry of this.mem.logBuffer) {
+      if (entry.playerId === target) {
+        entry.playerId = ERASED_PLAYER_ID;
+        changed = true;
+      }
+      if (entry.metadata !== undefined) {
+        const mr = redactIdDeep(entry.metadata, target);
+        if (mr.changed) {
+          entry.metadata = mr.value as Record<string, unknown>;
+          changed = true;
+        }
+      }
+    }
+    if (this.mem.lastSuccession !== null) {
+      const sr = redactIdDeep(this.mem.lastSuccession, target);
+      if (sr.changed) {
+        this.mem.lastSuccession = sr.value as typeof this.mem.lastSuccession;
+        changed = true;
+      }
+    }
+    if (changed) this.bumpVersion();
+    return okResult(
+      { redacted: changed },
+      [],
+      changed ? [{ kind: 'room-upsert', room: this.room }] : [],
+    );
+  }
+
+  /**
+   * Admin end/cancel: the room is CANCELLED and DELETED — the same
+   * `cancelMatch` primitive the host lifecycle 'end' uses, and the DO
+   * class runs the same delete flow (`deleteRoomAfterHostCancel`).
+   * The result outcome is 'cancelled'.
+   */
+  adminEndOp(input: { adminActor: string; nowMs: number }): OpResult<{ phase: MatchPhase; result: MatchResult }> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    return this.cancelMatch(`admin:${input.adminActor}`, input.nowMs);
+  }
+
+  /**
+   * Admin force-results: complete the match NOW with current
+   * standings. The engine's `maybeCompleteOnWin` decides first; when
+   * no win is determinable yet (mid-game, nobody caught), the forced
+   * result is runners-win while any runner survives, else
+   * hunters-win — the admin is declaring the match over, and the
+   * result says so honestly (outcome + surviving runners + tags).
+   * Only from a phase that can complete (canCompleteMatch), else 409.
+   * The room stays for results + replay (unlike cancel, no delete).
+   */
+  adminForceResultsOp(input: { nowMs: number }): OpResult<{ phase: MatchPhase; result: MatchResult }> {
+    if (this.isDeleted()) return this.deletedRefusal();
+    if (!this.canCompleteMatch()) {
+      return errResult(
+        `The match cannot complete from phase ${this.room.phase}.`,
+        'INVALID_STATE',
+        409,
+      );
+    }
+    const durationSeconds =
+      this.room.startedAt === null
+        ? 0
+        : Math.max(0, Math.floor((input.nowMs - Date.parse(this.room.startedAt)) / 1000));
+    const win = maybeCompleteOnWin({
+      mode: this.room.config.mode,
+      players: this.state.players,
+      caughtRunnerIds: this.caughtRunnerIds(),
+      durationSeconds,
+      tags: confirmedTags(this.state.catches),
+    });
+    const result: MatchResult =
+      win ?? {
+        outcome: freeRunnerIds(this.state.players, this.caughtRunnerIds()).length > 0 ? 'runners-win' : 'hunters-win',
+        durationSeconds,
+        caughtRunnerIds: this.caughtRunnerIds(),
+        survivingRunnerIds: freeRunnerIds(this.state.players, this.caughtRunnerIds()),
+        tags: confirmedTags(this.state.catches),
+      };
+    const done = this.completeMatch(result, input.nowMs);
+    if (!done.ok) {
+      return errResult('The match could not be completed.', 'INVALID_STATE', 409);
+    }
+    return okResult(
+      { phase: this.room.phase, result },
+      done.events,
+      done.persist,
+    );
   }
 
   getStateOp(input: {

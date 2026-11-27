@@ -171,7 +171,15 @@ function roomRow(room: Room): Record<string, unknown> {
   return {
     room_id: room.roomId,
     room_code: room.roomCode,
-    host_player_id: room.hostPlayerId,
+    // Fix round M3-B: the DO's erasure marker '[erased]' is NOT a
+    // UUID, and rooms.host_player_id is a uuid column — sending the
+    // marker would make PostgREST reject the WHOLE room upsert (and
+    // every later upsert for that room), so it is translated to null
+    // at the persist boundary. Null is the faithful mirror value:
+    // the erase's own host-null step writes the same null, the id is
+    // gone from result/config (jsonb carries '[erased]' fine), and no
+    // later persist can ever rewrite the erased id back.
+    host_player_id: room.hostPlayerId === '[erased]' ? null : room.hostPlayerId,
     phase: room.phase,
     version: room.version,
     config: room.config,

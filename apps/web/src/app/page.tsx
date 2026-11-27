@@ -19,11 +19,19 @@
  */
 import { useRouter } from 'next/navigation';
 import { useEffect, useState } from 'react';
+import { shouldShowAnnouncement } from '@pakdam/shared';
+import type { PublicAdminAnnouncement } from '../lib/admin/admin-client';
 import { Button } from '../components/ui/Button';
 import { PakdamWordmark } from '../components/PakdamWordmark';
 import { WelcomeScreen } from '../components/WelcomeScreen';
 import { OnboardingCards } from '../components/OnboardingCards';
 import { hasSeenOnboarding } from '../lib/onboarding';
+import { AnnouncementBanner } from '../components/admin/AnnouncementBanner';
+import {
+  dismissAnnouncement,
+  loadPublicGameReads,
+  readDismissedAnnouncementId,
+} from '../lib/admin/public-reads';
 import { ROOM_DELETED_MESSAGE, takeRoomDeletedNotice } from '../lib/room-deleted';
 import { listRejoinTokens, type RejoinEntry } from '../lib/rejoin-token';
 import { storeLiveSeat } from '../lib/session-credentials';
@@ -74,6 +82,29 @@ export default function HomePage() {
     router.push(`/room/${entry.roomId}`);
   };
 
+  // Mission Control public reads (announcement banner + flags/config):
+  // read once at startup with a 60 s cache. Read-only — the banner is
+  // the only visible effect; flags/config change no game behaviour
+  // (the v34 team owns game behaviour). A failed read fails soft.
+  const [announcement, setAnnouncement] = useState<PublicAdminAnnouncement | null>(null);
+  const [dismissedId, setDismissedId] = useState<string | null>(null);
+  useEffect(() => {
+    setDismissedId(readDismissedAnnouncementId());
+    let cancelled = false;
+    loadPublicGameReads().then((found) => {
+      if (!cancelled) setAnnouncement(found);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  const handleDismissAnnouncement = () => {
+    if (!announcement) return;
+    dismissAnnouncement(announcement.id);
+    setDismissedId(announcement.id);
+  };
+  const showAnnouncement = shouldShowAnnouncement(announcement, dismissedId);
+
   // bfcache: a back/forward-cache restore preserves React state
   // (welcomeDone=true) without a remount, so a browser-back return
   // would otherwise skip the welcome screen. pageshow with
@@ -109,6 +140,12 @@ export default function HomePage() {
       <header className="pakdam-anim-rise flex items-center justify-between">
         <PakdamWordmark />
       </header>
+
+      {showAnnouncement && announcement ? (
+        <div className="mt-4">
+          <AnnouncementBanner announcement={announcement} onDismiss={handleDismissAnnouncement} />
+        </div>
+      ) : null}
 
       {roomDeletedNotice ? (
         <p

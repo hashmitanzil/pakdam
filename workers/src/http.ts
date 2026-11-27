@@ -32,6 +32,8 @@ import {
   newReconnectToken,
   newWsTicket,
 } from './auth.js';
+import { isReconnectHashBlocked } from './admin-db.js';
+import { getRuntimeFlags } from './admin-flags.js';
 import { persistBugReport, persistGrievance, persistReportAudit, type SupabaseEnv } from './supabase.js';
 import { HttpRateLimiter, seatKey } from './rate-limit.js';
 import { recordTelemetry } from './telemetry.js';
@@ -287,13 +289,33 @@ function opSecretHeaders(env: Env): Record<string, string> {
   return env.DO_OP_SECRET ? { 'x-pakdam-op-secret': env.DO_OP_SECRET } : {};
 }
 
-/** Call one DO op; maps DO failures onto HTTP errors. */
-async function callDo(
+// Fix round n9: DO_OP_SECRET unset is fail-LOUD, not silent. The DO
+// is only reachable through this Worker's binding (never the public
+// internet), so an unset secret cannot be exploited remotely — but it
+// removes the defense-in-depth check on the /op channel, and the
+// founder must know. Logged once per isolate (ERROR, not warn) and
+// surfaced in the admin overview (secretsConfigured.doOpSecret).
+// Unlike the admin session secret, the Worker CANNOT refuse here:
+// refusing /op calls would break the entire game. The control is
+// the loud log + the health signal + the deploy checklist.
+let doOpSecretWarned = false;
+
+function warnDoOpSecretUnset(): void {
+  if (doOpSecretWarned) return;
+  doOpSecretWarned = true;
+  console.error(
+    'DO_OP_SECRET is not set — Worker<->DO /op calls carry no shared secret (the DO skips its check in dev). Set it (wrangler secret put DO_OP_SECRET). The DO is only reachable via this Worker, so this is defense-in-depth, not a public hole — but do not ship without it.',
+  );
+}
+
+/** Call one DO op; maps DO failures onto HTTP errors. Exported for the admin handlers (workers/src/admin.ts). */
+export async function callDo(
   env: Env,
   roomId: string,
   op: string,
   payload: Record<string, unknown>,
 ): Promise<DoResponse> {
+  if (!env.DO_OP_SECRET) warnDoOpSecretUnset();
   const stub = doStub(env, roomId);
   let res: Response;
   try {
@@ -310,6 +332,22 @@ async function callDo(
     data = (await res.json()) as DoResponse;
   } catch {
     return { ok: false, error: 'Room service returned an unreadable response.', code: 'SERVER_ERROR', status: 502 };
+  }
+  // Fix round 5 (M3-1): the DO's op-error bodies carry `code` but
+  // NO `status` field (room-do-class.ts:1261 — status is HTTP-only),
+  // and `callDo` never read `res.status`, so `doError` mapped every
+  // such failure through its default branch to 400 — a real HTTP 503
+  // from the DO answered 400. Propagate the HTTP status into the
+  // returned object when the body lacks a numeric status — never
+  // overriding a body status that is present. Only for non-success
+  // bodies with an error HTTP status: success bodies carry no status
+  // today and no caller reads one off a success (they stay
+  // byte-identical), and an HTTP-200 envelope around an ok:false
+  // body must never become a status (`doError` would answer 200 for
+  // an error — the real DO never 200-envelopes errors, so the guard
+  // only ever filters stub-shaped replies).
+  if (data.ok !== true && typeof data.status !== 'number' && res.status >= 400) {
+    return { ...data, status: res.status };
   }
   return data;
 }
@@ -336,6 +374,7 @@ async function callRegistry(
   op: string,
   payload: Record<string, unknown>,
 ): Promise<DoResponse> {
+  if (!env.DO_OP_SECRET) warnDoOpSecretUnset();
   const stub = registryStub(env);
   try {
     const res = await stub.fetch('http://code-registry/op', {
@@ -349,10 +388,10 @@ async function callRegistry(
   }
 }
 
-/** Turn a DO failure into an HTTP error response. A DO rate limit carries
+/** Turn a DO failure into an HTTP error response. Exported for the admin handlers. A DO rate limit carries
  * `Retry-After` (seconds) so the client backs off the same way it does for
  * the Worker-side limiter. */
-function doError(r: DoResponse): Response {
+export function doError(r: DoResponse): Response {
   const status =
     typeof r.status === 'number'
       ? r.status
@@ -522,6 +561,16 @@ export async function handleJoin(
     return err('roomCode must be 6 characters A–Z0–9.', 400);
   }
   const rawReconnect = asString(body['reconnectToken']);
+  // Admin console (Mission Control): a seat whose reconnect-token
+  // hash is blocked (ban/suspend) cannot rejoin with that token.
+  // A fresh join with no token cannot be matched to a block — there
+  // is no device key in the game today; see docs/admin-console.md.
+  if (rawReconnect) {
+    const blocked = await isReconnectHashBlocked(ctx.env, await hashReconnectToken(rawReconnect));
+    if (blocked) {
+      return err('This player is blocked.', 403, undefined, 'FORBIDDEN');
+    }
+  }
   const doStartedAtMs = performance.now();
   const joined = await callDo(ctx.env, roomId, 'add-player', {
     displayName: displayName.trim(),
@@ -595,6 +644,13 @@ export async function handleJoinByCode(
   }
   const roomId = found['roomId'] as string;
   const rawReconnect = asString(body['reconnectToken']);
+  // Admin console: same block gate as handleJoin (see there).
+  if (rawReconnect) {
+    const blocked = await isReconnectHashBlocked(ctx.env, await hashReconnectToken(rawReconnect));
+    if (blocked) {
+      return err('This player is blocked.', 403, undefined, 'FORBIDDEN');
+    }
+  }
   const doStartedAtMs = performance.now();
   const joined = await callDo(ctx.env, roomId, 'add-player', {
     displayName: displayName.trim(),
@@ -766,6 +822,18 @@ export async function handleStart(
   if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost) return err('hostToken is required.', 400);
   const hostTokenHash = await hashHostToken(rawHost);
+  // Admin console (Mission Control): the `gameStart` feature flag is
+  // consulted server-side at runtime, BEFORE any DO work. When OFF,
+  // no new match may start; games already running are untouched.
+  // The flag read is cached 60 s and fails OPEN to ON, so a Supabase
+  // outage cannot block starts. Order matters (merge, 2026-11-27):
+  // v34's verify-then-limit below calls the DO, so the kill-switch
+  // must come first — otherwise a switched-off game still touches
+  // the DO (and during a DO outage answers the wrong 503).
+  const flags = await getRuntimeFlags(ctx.env);
+  if (flags['gameStart'] === false) {
+    return err('New games are turned off by the admin.', 503, undefined, 'FEATURE_DISABLED');
+  }
   // v34 (Diya R3-N1) — verify-then-limit (see `verifyHostThenLimit`).
   const limited = await verifyHostThenLimit(ctx, 'POST /v1/rooms/:id/start', roomId, playerId, hostTokenHash);
   if (limited) return limited;
@@ -1039,6 +1107,9 @@ export async function handleResolveCatch(
  * start / resume / end are host-only (hostToken); pause is ANY player
  * (reconnectToken) — safety is not host-gated. The web app never calls this
  * (pause/resume go over WS); it exists for server-side control.
+ * `start` is refused with 503 FEATURE_DISABLED while the admin
+ * `gameStart` kill-switch is OFF — same consult as handleStart, so
+ * the lifecycle route cannot bypass it.
  */
 export async function handleLifecycle(
   req: Request,
@@ -1059,6 +1130,19 @@ export async function handleLifecycle(
   if (!isUuid(playerId)) return badUuid('playerId');
   if (!rawHost && !rawReconnect) {
     return err('hostToken or reconnectToken is required.', 400);
+  }
+  // Admin console (Mission Control): the `gameStart` feature flag is
+  // consulted server-side at runtime, BEFORE any DO work — same
+  // kill-switch as handleStart (fix round, 2026-11-27: lifecycle
+  // start used to bypass it entirely). Only `start` is gated;
+  // pause/resume/end must keep working while new games are off.
+  // The flag read is cached 60 s and fails OPEN to ON, so a Supabase
+  // outage cannot block starts.
+  if (action === 'start') {
+    const flags = await getRuntimeFlags(ctx.env);
+    if (flags['gameStart'] === false) {
+      return err('New games are turned off by the admin.', 503, undefined, 'FEATURE_DISABLED');
+    }
   }
   // v34 (Diya R3-N1) — verify-then-limit. Host actions (start /
   // resume / end) prove the HOST token; pause proves the RECONNECT

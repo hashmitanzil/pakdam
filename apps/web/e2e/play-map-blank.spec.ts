@@ -14,10 +14,11 @@
  * occurred"), a reload recovered it, a second Radio → Map attempt did
  * NOT crash. Intermittent, 1 of 2.
  *
- * LISTED, NOT RUN here (VM Chromium cannot launch; founder CI is the
- * verdict). Demo-only specs — they skip when LIVE or when no Ola key is
- * configured, mirroring map-tiles.spec.ts. Text-only assertions
- * throughout: DOM text, roles, element state — no screenshots.
+ * LISTED, NOT RUN here (no live site / Ola key in this VM; Chromium
+ * runs fine here — founder CI is the verdict). Demo-only specs — they
+ * skip when LIVE or when no Ola key is configured, mirroring
+ * map-tiles.spec.ts. Text-only assertions throughout: DOM text,
+ * roles, element state — no screenshots.
  *
  * NOTE on the blank-map symptom: "pill says Map ready + canvas visible"
  * cannot by itself prove tiles painted — that is exactly the founder's

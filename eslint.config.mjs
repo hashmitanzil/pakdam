@@ -45,6 +45,13 @@ export default tseslint.config(
         Response: "readonly",
         process: "readonly",
         setTimeout: "readonly",
+        // Fix round 4 (lint): the admin tests legitimately capture
+        // `console.error` to prove a failed audit insert is logged
+        // loudly (workers/test/admin-rbac.test.mjs) — `no-undef`
+        // flags the identifier regardless of method, so the test-file
+        // globals must declare it. The v33 base passed lint without
+        // this line only because no test there used `console` at all.
+        console: "readonly",
       },
     },
   },

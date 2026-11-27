@@ -18,7 +18,8 @@ register('./resolve-hooks.mjs', import.meta.url);
  * stale tests, test-environment artifacts, and ONE product defect
  * (H1 below) that predates v27. Each pin below fails against the
  * current tree and passes when its fix lands; the e2e suite verdict
- * itself stays the founder's CI (VM Chromium cannot launch).
+ * itself stays the founder's CI (VM Chromium launches fine here since
+ * 2026-11-26; CI stays the verdict for live flows).
  *
  * FAILURE MAP (29) — cause per cluster, verified from source:
  *

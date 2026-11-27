@@ -138,6 +138,9 @@ export default function ModeSelectPage() {
           autoComplete="off"
           className="mt-2 h-14 w-full rounded-[14px] border border-[#26262B] bg-[#1E1E22] px-4 text-[17px] font-bold text-white placeholder:text-[#A1A1AA]"
         />
+        <span className="mt-1 block text-[13px] leading-snug text-[#A1A1AA]">
+          This is the name other players see.
+        </span>
       </label>
       {error ? <p className="mt-2 text-[13px] text-[#EF4444]">{error}</p> : null}
 

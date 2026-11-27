@@ -10,12 +10,13 @@
  * and real store propagation (poll the other page, never re-read the
  * same page). Demo mode only (LIVE skips); text-only assertions.
  *
- * VM LIMIT: this VM's Chromium cannot launch, so `playwright test`
- * cannot be executed here — `playwright test --list` only. Founder CI
- * is the verdict for every test in this file. Tests that need a real
- * phone (real GPS chip, real touchscreen) are marked NEEDS-PHONE and
- * skipped with the reason; tests that need real map tiles are marked
- * NEEDS-CI. A skip is never a pass — it is an explicit open item.
+ * LOCAL LIMIT: no live Worker here, so these specs skip locally —
+ * `playwright test --list` only. Chromium runs fine in this VM.
+ * Founder CI is the verdict for every test in this file. Tests that
+ * need a real phone (real GPS chip, real touchscreen) are marked
+ * NEEDS-PHONE and skipped with the reason; tests that need real map
+ * tiles are marked NEEDS-CI. A skip is never a pass — it is an
+ * explicit open item.
  */
 import { expect, test, type Page } from '@playwright/test';
 import {

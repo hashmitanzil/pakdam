@@ -5,9 +5,9 @@
  * onboarding tests use a fresh page (first visit = cards show); every
  * other test Skips the cards first via dismissOnboardingIfShown.
  *
- * VM LIMIT: this VM's Chromium cannot launch, so `playwright test`
- * cannot be executed here — `playwright test --list` only. Founder CI
- * is the verdict for every test in this file.
+ * LOCAL LIMIT: no live Worker here, so these specs skip locally —
+ * `playwright test --list` only. Chromium runs fine in this VM.
+ * Founder CI is the verdict for every test in this file.
  */
 import { expect, test } from '@playwright/test';
 import {

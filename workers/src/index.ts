@@ -39,6 +39,55 @@ import {
   isUuid,
   type HttpContext,
 } from './http.js';
+import {
+  handleAdminAnnouncementCreate,
+  handleAdminAnnouncementDelete,
+  handleAdminAnnouncementUpdate,
+  handleAdminAnnouncements,
+  handleAdminAnnouncementsPublic,
+  handleAdminAudit,
+  handleAdminBillingOverview,
+  handleAdminBillingPlans,
+  handleAdminBillingProviders,
+  handleAdminBillingRefunds,
+  handleAdminBillingTax,
+  handleAdminBillingTransactions,
+  handleAdminChangePassword,
+  handleAdminConfig,
+  handleAdminConfigPublic,
+  handleAdminConfigPut,
+  handleAdminDataRequests,
+  handleAdminDirectoryBan,
+  handleAdminFlags,
+  handleAdminFlagsPublic,
+  handleAdminFlagsPut,
+  handleAdminLogin,
+  handleAdminLoginMethods,
+  handleAdminLogout,
+  handleAdminMe,
+  handleAdminMetrics,
+  handleAdminOverview,
+  handleAdminPlayerAction,
+  handleAdminPlayerErase,
+  handleAdminPlayerLocation,
+  handleAdminPlayers,
+  handleAdminRevokeSessions,
+  handleAdminRoomAction,
+  handleAdminRoomDetail,
+  handleAdminRooms,
+  handleAdminSafety,
+  handleAdminSafetyBlockCreate,
+  handleAdminSafetyBlockDelete,
+  handleAdminSafetyFlagCreate,
+  handleAdminSetup,
+  handleAdminUserCreate,
+  handleAdminUserDelete,
+  handleAdminUserUpdate,
+  handleAdminUsers,
+  handleAdminUsersDirectory,
+  handleAdminUsersDirectoryDetail,
+} from './admin.js';
+import { deleteExpiredAdminSessions, deleteOldAdminAudit, deleteOldLoginAttempts } from './admin-db.js';
 import { deleteOldLogs } from './supabase.js';
 import { flushTelemetry } from './telemetry.js';
 
@@ -57,6 +106,25 @@ export interface Env {
    * (dev). Set in production via `wrangler secret put DO_OP_SECRET`.
    */
   DO_OP_SECRET?: string;
+  /**
+   * Admin Console (Mission Control) — fail-closed secrets (fix round
+   * B1/n1/n9). A console.warn is not a control, so these are refusals:
+   * - ADMIN_SETUP_TOKEN: REQUIRED for first-Owner setup. When unset,
+   *   POST /v1/admin/auth/setup answers 503 — there is no setup
+   *   without it. Set via `wrangler secret put ADMIN_SETUP_TOKEN`.
+   *   The setup page sends the token (it has a token field).
+   * - ADMIN_SESSION_SECRET: HMAC key for admin session tokens. When
+   *   unset, login/setup REFUSE to mint a session (503) — unless the
+   *   deployment explicitly opts into dev mode (ADMIN_DEV_MODE=true),
+   *   in which case `nosecret` tokens are minted with a console.error.
+   *   Set via `wrangler secret put ADMIN_SESSION_SECRET`.
+   * - ADMIN_DEV_MODE: 'true' ONLY for local/dev deploys. Never set
+   *   it in production — it is the only thing that permits
+   *   secret-less admin sessions.
+   */
+  ADMIN_SETUP_TOKEN?: string;
+  ADMIN_SESSION_SECRET?: string;
+  ADMIN_DEV_MODE?: string;
 }
 
 const limiter = new HttpRateLimiter();
@@ -85,10 +153,14 @@ function corsHeaders(req: Request, env: Env): Record<string, string> {
   if (!allowedOrigins(env).includes(origin)) return {};
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
     // v29 (Gap 4) — `Idempotency-Key` is a custom request header, so
     // the browser preflight must allow it or join/start/replay retries
     // can never carry a key.
+    // Admin console (2026-11-25): PUT + DELETE are in the methods
+    // list because the admin client edits flags/config/announcements
+    // with PUT and removes blocks/announcements/users with DELETE —
+    // without them the preflight fails and the panel cannot save.
     'Access-Control-Allow-Headers': 'Content-Type, Authorization, Idempotency-Key',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
@@ -289,6 +361,327 @@ const ROUTES: Route[] = [
     match: seg('/v1/support/grievances'),
     handler: (req, ctx) => handleGrievance(req, ctx),
   },
+  // -- Admin Console (Mission Control) ---------------------------------------
+  // Grouped rate keys (see HTTP_RATE_LIMITS in @pakdam/shared): login /
+  // setup are 5 per 15 min per IP (+ per-(account, IP) DB lockout);
+  // authed reads share 'GET /v1/admin/read', writes share 'POST|PUT|DELETE
+  // /v1/admin/write', public reads share 'GET /v1/admin/public'.
+  // Auth + RBAC live in the handlers (workers/src/admin.ts); the
+  // router only rate-limits here.
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/auth/login',
+    match: seg('/v1/admin/auth/login'),
+    handler: (req, ctx) => handleAdminLogin(req, ctx),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/auth/setup',
+    match: seg('/v1/admin/auth/setup'),
+    handler: (req, ctx) => handleAdminSetup(req, ctx),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/auth/change-password'),
+    handler: (req, ctx) => handleAdminChangePassword(req, ctx),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/auth/logout'),
+    handler: (req, ctx) => handleAdminLogout(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/auth/me'),
+    handler: (req, ctx) => handleAdminMe(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/overview'),
+    handler: (req, ctx) => handleAdminOverview(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/rooms'),
+    handler: (req, ctx) => handleAdminRooms(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/rooms/:id'),
+    handler: (req, ctx, p) => handleAdminRoomDetail(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/rooms/:id/end'),
+    handler: (req, ctx, p) => handleAdminRoomAction(req, ctx, p['id'] as string, 'end'),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/rooms/:id/cancel'),
+    handler: (req, ctx, p) => handleAdminRoomAction(req, ctx, p['id'] as string, 'cancel'),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/rooms/:id/force-results'),
+    handler: (req, ctx, p) => handleAdminRoomAction(req, ctx, p['id'] as string, 'force-results'),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/players'),
+    handler: (req, ctx) => handleAdminPlayers(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/players/:id/location'),
+    handler: (req, ctx, p) => handleAdminPlayerLocation(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/players/:id/kick'),
+    handler: (req, ctx, p) => handleAdminPlayerAction(req, ctx, p['id'] as string, 'kick'),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/players/:id/block'),
+    handler: (req, ctx, p) => handleAdminPlayerAction(req, ctx, p['id'] as string, 'block'),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/players/:id/unblock'),
+    handler: (req, ctx, p) => handleAdminPlayerAction(req, ctx, p['id'] as string, 'unblock'),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/players/:id/erase'),
+    handler: (req, ctx, p) => handleAdminPlayerErase(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/flags'),
+    handler: (req, ctx) => handleAdminFlags(req, ctx),
+  },
+  {
+    method: 'PUT',
+    rateKey: 'PUT /v1/admin/write',
+    match: seg('/v1/admin/flags'),
+    handler: (req, ctx) => handleAdminFlagsPut(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/public',
+    match: seg('/v1/admin/flags/public'),
+    handler: (req, ctx) => handleAdminFlagsPublic(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/config'),
+    handler: (req, ctx) => handleAdminConfig(req, ctx),
+  },
+  {
+    method: 'PUT',
+    rateKey: 'PUT /v1/admin/write',
+    match: seg('/v1/admin/config'),
+    handler: (req, ctx) => handleAdminConfigPut(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/public',
+    match: seg('/v1/admin/config/public'),
+    handler: (req, ctx) => handleAdminConfigPublic(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/safety'),
+    handler: (req, ctx) => handleAdminSafety(req, ctx),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/safety/flags'),
+    handler: (req, ctx) => handleAdminSafetyFlagCreate(req, ctx),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/safety/blocks'),
+    handler: (req, ctx) => handleAdminSafetyBlockCreate(req, ctx),
+  },
+  {
+    method: 'DELETE',
+    rateKey: 'DELETE /v1/admin/write',
+    match: seg('/v1/admin/safety/blocks/:deviceId'),
+    handler: (req, ctx, p) => handleAdminSafetyBlockDelete(req, ctx, p['deviceId'] as string),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/metrics'),
+    handler: (req, ctx) => handleAdminMetrics(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/audit'),
+    handler: (req, ctx) => handleAdminAudit(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/announcements'),
+    handler: (req, ctx) => handleAdminAnnouncements(req, ctx),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/announcements'),
+    handler: (req, ctx) => handleAdminAnnouncementCreate(req, ctx),
+  },
+  {
+    method: 'PUT',
+    rateKey: 'PUT /v1/admin/write',
+    match: seg('/v1/admin/announcements/:id'),
+    handler: (req, ctx, p) => handleAdminAnnouncementUpdate(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'DELETE',
+    rateKey: 'DELETE /v1/admin/write',
+    match: seg('/v1/admin/announcements/:id'),
+    handler: (req, ctx, p) => handleAdminAnnouncementDelete(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/public',
+    match: seg('/v1/admin/announcements/public'),
+    handler: (req, ctx) => handleAdminAnnouncementsPublic(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/users'),
+    handler: (req, ctx) => handleAdminUsers(req, ctx),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/users'),
+    handler: (req, ctx) => handleAdminUserCreate(req, ctx),
+  },
+  {
+    method: 'PUT',
+    rateKey: 'PUT /v1/admin/write',
+    match: seg('/v1/admin/users/:id'),
+    handler: (req, ctx, p) => handleAdminUserUpdate(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'DELETE',
+    rateKey: 'DELETE /v1/admin/write',
+    match: seg('/v1/admin/users/:id'),
+    handler: (req, ctx, p) => handleAdminUserDelete(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/users/:id/revoke-sessions'),
+    handler: (req, ctx, p) => handleAdminRevokeSessions(req, ctx, p['id'] as string),
+  },
+  // -- Payments & Billing (inactive — flag-gated, no provider) --------------
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/billing/overview'),
+    handler: (req, ctx) => handleAdminBillingOverview(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/billing/transactions'),
+    handler: (req, ctx) => handleAdminBillingTransactions(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/billing/plans'),
+    handler: (req, ctx) => handleAdminBillingPlans(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/billing/providers'),
+    handler: (req, ctx) => handleAdminBillingProviders(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/billing/refunds'),
+    handler: (req, ctx) => handleAdminBillingRefunds(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/billing/tax'),
+    handler: (req, ctx) => handleAdminBillingTax(req, ctx),
+  },
+  // -- Users & Accounts directory (real guest data) + future features --------
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/users-directory'),
+    handler: (req, ctx) => handleAdminUsersDirectory(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/users-directory/:id'),
+    handler: (req, ctx, p) => handleAdminUsersDirectoryDetail(req, ctx, p['id'] as string),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/users-directory/:id/ban'),
+    handler: (req, ctx, p) => handleAdminDirectoryBan(req, ctx, p['id'] as string, 'ban'),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/users-directory/:id/suspend'),
+    handler: (req, ctx, p) => handleAdminDirectoryBan(req, ctx, p['id'] as string, 'suspend'),
+  },
+  {
+    method: 'POST',
+    rateKey: 'POST /v1/admin/write',
+    match: seg('/v1/admin/users-directory/:id/unban'),
+    handler: (req, ctx, p) => handleAdminDirectoryBan(req, ctx, p['id'] as string, 'unban'),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/data-requests'),
+    handler: (req, ctx) => handleAdminDataRequests(req, ctx),
+  },
+  {
+    method: 'GET',
+    rateKey: 'GET /v1/admin/read',
+    match: seg('/v1/admin/login-methods'),
+    handler: (req, ctx) => handleAdminLoginMethods(req, ctx),
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -312,6 +705,29 @@ export default {
     ctx.waitUntil(
       deleteOldLogs(env).then((ok) => {
         if (!ok) console.error('Scheduled log retention failed.');
+      }),
+    );
+    // Admin console (Mission Control): expired sessions are revoked
+    // and admin audit rows older than 180 days are deleted (the
+    // audit log is a compliance record — 180 days, NOT the 7-day
+    // game-log retention above). Best-effort, same as the log job.
+    ctx.waitUntil(
+      deleteExpiredAdminSessions(env).then((ok) => {
+        if (!ok) console.error('Scheduled admin session cleanup failed.');
+      }),
+    );
+    ctx.waitUntil(
+      deleteOldAdminAudit(env).then((ok) => {
+        if (!ok) console.error('Scheduled admin audit retention failed.');
+      }),
+    );
+    // Admin console (fix round B2): login-attempt rows older than
+    // 24 h are deleted (a lockout lasts 15 min, so this never
+    // deletes a live lock — it only stops the table growing by one
+    // row per (username, IP) pair that ever failed).
+    ctx.waitUntil(
+      deleteOldLoginAttempts(env).then((ok) => {
+        if (!ok) console.error('Scheduled admin login-attempt cleanup failed.');
       }),
     );
   },
@@ -411,6 +827,20 @@ export default {
         // Best-effort telemetry flush on a completed match response path.
         if (route.rateKey === 'GET /v1/rooms/:id/results') {
           ctx.waitUntil(flushTelemetry(env));
+        }
+        // Admin console (fix round n3): every AUTHENTICATED admin
+        // response carries Cache-Control: no-store — admin JSON
+        // (sessions, locations, audit rows) must never sit in a
+        // browser or proxy cache. The three PUBLIC reads are the
+        // exception: they set their own `public, max-age=60` and are
+        // skipped here (their rateKey is 'GET /v1/admin/public').
+        // Applied here, at the router, so it covers every admin
+        // handler — json() and err() alike — with no per-handler
+        // churn. The game routes are untouched.
+        if (route.rateKey.includes('/admin/') && route.rateKey !== 'GET /v1/admin/public') {
+          const headers = new Headers(res.headers);
+          headers.set('Cache-Control', 'no-store');
+          return withHeaders(new Response(res.body, { status: res.status, headers }), cors);
         }
         return withHeaders(res, cors);
       }
